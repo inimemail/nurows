@@ -1924,7 +1924,7 @@ export default function App() {
                 </div>
               </div> : null}
 
-              {!workspaceFullscreenActive ? <SessionTabs
+              {!workspaceFullscreenActive && terminalSessions.length ? <SessionTabs
                 sessions={terminalSessions}
                 activeId={activeTerminalId}
                 onSelect={setActiveTerminalId}

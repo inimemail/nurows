@@ -808,7 +808,7 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`WebSSH server running at http://localhost:${PORT}`);
+  console.log(`NuroSSH server running at http://localhost:${PORT}`);
 });
 
 function resolveSqlitePath(targetPath) {

@@ -1,8 +1,8 @@
 services:
-  autorun-webssh:
+  nurossh:
     build:
       context: .
-    container_name: autorun-webssh
+    container_name: nurossh
     restart: unless-stopped
     init: true
     environment:

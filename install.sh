@@ -10,7 +10,7 @@ SCRIPT_SOURCE="${BASH_SOURCE[0]:-install.sh}"
 SCRIPT_PATH="$(readlink -f "${SCRIPT_SOURCE}")"
 SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
 
-APP_NAME="autorun-webssh"
+APP_NAME="nurossh"
 DEFAULT_INSTALL_PATH="/opt/${APP_NAME}"
 STATE_FILE="/etc/${APP_NAME}_path"
 
@@ -132,10 +132,10 @@ write_compose_file() {
 
   cat > "${install_path}/docker-compose.yml" <<'EOF'
 services:
-  autorun-webssh:
+  nurossh:
     build:
       context: ./app
-    container_name: autorun-webssh
+    container_name: nurossh
     restart: unless-stopped
     init: true
     env_file:
@@ -332,7 +332,7 @@ logs_service() {
   info "正在显示服务日志，按 Ctrl+C 退出。"
   (
     cd "${workdir}" || exit 1
-    compose_cmd logs --tail "${lines}" -f autorun-webssh
+    compose_cmd logs --tail "${lines}" -f nurossh
   )
 }
 
@@ -437,7 +437,7 @@ main_menu() {
   workdir="$(get_workdir)"
 
   echo "=================================================="
-  echo "             autorun-webssh 管理脚本"
+  echo "                NuroSSH 管理脚本"
   echo "=================================================="
   echo " 当前部署路径：${workdir:-未部署}"
   echo "--------------------------------------------------"

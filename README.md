@@ -1,4 +1,4 @@
-﻿# autorun-webssh
+﻿# NuroSSH
 
 一个带 Web 终端、批量命令执行、代理管理的轻量控制台，现已支持 SQLite 单文件持久化，并提供 Docker / Docker Compose / install.sh 一键部署。
 
@@ -23,18 +23,19 @@
 默认 SQLite 文件：
 - `./data/app.db`
 
-### 2. 用 install.sh 安装到服务器
+### 2. 用 install.sh 一键安装到服务器
 
 适合想做成固定目录、后续通过管理脚本升级/备份/恢复的场景。
 
-1. 上传项目到服务器
-2. 以 root 执行：
+1. 直接执行：
+   - `bash <(curl -fsSL https://raw.githubusercontent.com/inimemail/nurows/main/install.sh)`
+2. 或者先上传项目后再执行：
    - `bash install.sh`
 3. 按提示输入：
    - 安装路径
    - 对外端口
 4. 脚本会自动：
-   - 复制应用到 `/opt/autorun-webssh` 或你指定的目录
+   - 复制应用到 `/opt/nurossh` 或你指定的目录
    - 生成 `.env`
    - 启动 `docker compose`
    - 挂载数据目录
@@ -55,7 +56,7 @@
 
 如果已经安装到了目标目录，也可以用：
 
-- `/opt/autorun-webssh/manage.sh`
+- `/opt/nurossh/manage.sh`
 
 ## 存储说明
 

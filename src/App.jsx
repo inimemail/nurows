@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 
@@ -23,7 +23,7 @@ const EMPTY_COMMAND = {
 const EMPTY_PROXY = {
   id: '',
   name: '',
-  type: 'socks5',
+  type: 'http',
   host: '',
   port: 1080,
   username: '',
@@ -1030,18 +1030,28 @@ export default function App() {
     }
   }
 
-  async function removeServer() {
-    if (!selectedServerId) {
+  async function removeServer(ids = []) {
+    const targetIds = Array.isArray(ids) && ids.length
+      ? ids
+      : (selectedServerId ? [selectedServerId] : []);
+    if (!targetIds.length) {
       return;
     }
     try {
-      const data = await api(`/api/servers/${selectedServerId}`, {
-        method: 'DELETE',
-        onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
-      });
-      setState(data.state);
+      let nextState = state;
+      for (const id of targetIds) {
+        const data = await api(`/api/servers/${id}`, {
+          method: 'DELETE',
+          onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
+        });
+        nextState = data.state;
+      }
+      setState(nextState);
+      if (targetIds.includes(selectedServerId)) {
+        setSelectedServerId(nextState.servers[0]?.id || '');
+      }
       closeEditor();
-      toast('服务器已删除');
+      toast(targetIds.length === 1 ? '服务器已删除' : `已删除 ${targetIds.length} 台服务器`);
     } catch (error) {
       toast(error.message);
     }
@@ -1067,19 +1077,29 @@ export default function App() {
     }
   }
 
-  async function removeCommand() {
-    if (!selectedCommandId) {
+  async function removeCommand(ids = []) {
+    const targetIds = Array.isArray(ids) && ids.length
+      ? ids
+      : (selectedCommandId ? [selectedCommandId] : []);
+    if (!targetIds.length) {
       return;
     }
     try {
-      const data = await api(`/api/commands/${selectedCommandId}`, {
-        method: 'DELETE',
-        onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
-      });
-      setState(data.state);
+      let nextState = state;
+      for (const id of targetIds) {
+        const data = await api(`/api/commands/${id}`, {
+          method: 'DELETE',
+          onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
+        });
+        nextState = data.state;
+      }
+      setState(nextState);
+      if (targetIds.includes(selectedCommandId)) {
+        setSelectedCommandId(nextState.commands[0]?.id || '');
+      }
       setExecutionResults([]);
       closeEditor();
-      toast('命令已删除');
+      toast(targetIds.length === 1 ? '命令已删除' : `已删除 ${targetIds.length} 条命令`);
     } catch (error) {
       toast(error.message);
     }
@@ -1105,20 +1125,79 @@ export default function App() {
     }
   }
 
-  async function removeProxy() {
-    if (!selectedProxyId) {
+  async function removeProxy(ids = []) {
+    const targetIds = Array.isArray(ids) && ids.length
+      ? ids
+      : (selectedProxyId ? [selectedProxyId] : []);
+    if (!targetIds.length) {
       return;
     }
     try {
-      const data = await api(`/api/proxies/${selectedProxyId}`, {
-        method: 'DELETE',
-        onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
-      });
-      setState(data.state);
+      let nextState = state;
+      for (const id of targetIds) {
+        const data = await api(`/api/proxies/${id}`, {
+          method: 'DELETE',
+          onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
+        });
+        nextState = data.state;
+      }
+      setState(nextState);
+      if (targetIds.includes(selectedProxyId)) {
+        setSelectedProxyId(nextState.proxies[0]?.id || '');
+      }
       closeEditor();
-      toast('代理已删除');
+      toast(targetIds.length === 1 ? '代理已删除' : `已删除 ${targetIds.length} 个代理`);
     } catch (error) {
       toast(error.message);
+    }
+  }
+
+  function confirmSidebarDelete(type) {
+    if (type === 'server') {
+      const targetIds = selectedServerId ? [selectedServerId] : state.servers.map((item) => item.id);
+      if (!targetIds.length) {
+        toast('暂无可删除服务器');
+        return;
+      }
+      openConfirm({
+        title: selectedServerId ? '删除服务器' : '全部删除服务器',
+        message: selectedServerId
+          ? '确认删除当前服务器吗？'
+          : `当前未选择服务器，确认删除全部 ${targetIds.length} 台服务器吗？`,
+        onConfirm: () => removeServer(targetIds)
+      });
+      return;
+    }
+
+    if (type === 'command') {
+      const targetIds = selectedCommandId ? [selectedCommandId] : state.commands.map((item) => item.id);
+      if (!targetIds.length) {
+        toast('暂无可删除命令');
+        return;
+      }
+      openConfirm({
+        title: selectedCommandId ? '删除命令' : '全部删除命令',
+        message: selectedCommandId
+          ? '确认删除当前命令吗？'
+          : `当前未选择命令，确认删除全部 ${targetIds.length} 条命令吗？`,
+        onConfirm: () => removeCommand(targetIds)
+      });
+      return;
+    }
+
+    if (type === 'proxy') {
+      const targetIds = selectedProxyId ? [selectedProxyId] : state.proxies.map((item) => item.id);
+      if (!targetIds.length) {
+        toast('暂无可删除代理');
+        return;
+      }
+      openConfirm({
+        title: selectedProxyId ? '删除代理' : '全部删除代理',
+        message: selectedProxyId
+          ? '确认删除当前代理吗？'
+          : `当前未选择代理，确认删除全部 ${targetIds.length} 个代理吗？`,
+        onConfirm: () => removeProxy(targetIds)
+      });
     }
   }
 
@@ -1208,7 +1287,7 @@ export default function App() {
 
   async function runCommand(overrideInteractiveKeywords = interactiveKeywords) {
     if (!selectedServerIds.length) {
-      toast('先选择至少一台服务器');
+      toast('请先选择至少一台服务器');
       return;
     }
     const nextInteractiveKeywords = sanitizeInteractiveKeywords(overrideInteractiveKeywords, { fallbackToDefault: false });
@@ -1438,7 +1517,7 @@ export default function App() {
       return;
     }
     if (!pickerSelectedIds.length) {
-      toast('先选择至少一台服务器');
+      toast('请先选择至少一台服务器');
       return;
     }
 
@@ -1545,7 +1624,7 @@ export default function App() {
             <div className="auth-copy">
               <span className="label-chip">{isSetup ? '首次初始化' : '管理员登录'}</span>
               <h1>{isSetup ? '创建管理员账号' : '登录 NuroSSH'}</h1>
-              <p>{isSetup ? '初始化后进入工作台。' : '登录后进入工作台。'}</p>
+              <p>{isSetup ? '初始化完成后进入工作台。' : '登录后进入工作台。'}</p>
             </div>
             <div className="auth-grid">
               <div className="auth-kpi">
@@ -1619,7 +1698,7 @@ export default function App() {
 
               <button
                 type="submit"
-                className={`primary auth-submit ${busy[isSetup ? 'setup' : 'login'] ? 'is-loading' : ''}`}
+                className={'primary auth-submit ' + (busy[isSetup ? 'setup' : 'login'] ? 'is-loading' : '')}
                 disabled={busy[isSetup ? 'setup' : 'login']}
               >
               {busy[isSetup ? 'setup' : 'login'] ? '处理中...' : (isSetup ? '创建并进入控制台' : '登录')}
@@ -1631,8 +1710,8 @@ export default function App() {
   }
 
   return (
-    <div className={`console-shell ${workspaceFullscreenActive ? 'console-shell-terminal-fullscreen' : ''}`}>
-      <header className={`console-topbar ${workspaceFullscreenActive ? 'console-topbar-hidden' : ''}`}>
+    <div className={'console-shell ' + (workspaceFullscreenActive ? 'console-shell-terminal-fullscreen' : '')}>
+      <header className={'console-topbar ' + (workspaceFullscreenActive ? 'console-topbar-hidden' : '')}>
         <div className="brand-cluster">
           <div className="brand-mark">N</div>
           <div>
@@ -1645,7 +1724,7 @@ export default function App() {
           {TABS.map((item) => {
             const Icon = item.icon;
             return (
-              <button key={item.key} className={`top-tab ${tab === item.key ? 'active' : ''}`} onClick={() => setTab(item.key)}>
+              <button key={item.key} className={'top-tab ' + (tab === item.key ? 'active' : '')} onClick={() => setTab(item.key)}>
                 <Icon />
                 <span>{item.label}</span>
               </button>
@@ -1674,8 +1753,8 @@ export default function App() {
         </div>
       </header>
 
-      <div className={`console-body ${workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : ''}`}>
-        <aside className={`surface side-panel ${assetDrawerOpen ? 'open' : ''} ${workspaceFullscreenActive ? 'side-panel-hidden' : ''}`}>
+      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '')}>
+        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '')}>
           <div className="side-head">
             <div>
               <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : '代理列表'}</strong>
@@ -1696,15 +1775,7 @@ export default function App() {
                     }
                   }}>编辑</button>
                   <button className="primary" onClick={() => resetCreateDraft('server')}>新增</button>
-                  <button className="ghost danger-text-button" onClick={() => {
-                    if (requireSelectedItem('server')) {
-                      openConfirm({
-                        title: '删除服务器',
-                        message: '确认删除当前服务器吗？',
-                        onConfirm: () => removeServer()
-                      });
-                    }
-                  }}>删除</button>
+                  <button className="ghost danger-text-button" onClick={() => confirmSidebarDelete('server')}>删除</button>
                 </>
               ) : null}
               {tab === 'commands' ? (
@@ -1715,15 +1786,7 @@ export default function App() {
                     }
                   }}>编辑</button>
                   <button className="primary" onClick={() => resetCreateDraft('command')}>新增</button>
-                  <button className="ghost danger-text-button" onClick={() => {
-                    if (requireSelectedItem('command')) {
-                      openConfirm({
-                        title: '删除命令',
-                        message: '确认删除当前命令吗？',
-                        onConfirm: () => removeCommand()
-                      });
-                    }
-                  }}>删除</button>
+                  <button className="ghost danger-text-button" onClick={() => confirmSidebarDelete('command')}>删除</button>
                 </>
               ) : null}
               {tab === 'proxies' ? (
@@ -1734,15 +1797,7 @@ export default function App() {
                     }
                   }}>编辑</button>
                   <button className="primary" onClick={() => resetCreateDraft('proxy')}>新增</button>
-                  <button className="ghost danger-text-button" onClick={() => {
-                    if (requireSelectedItem('proxy')) {
-                      openConfirm({
-                        title: '删除代理',
-                        message: '确认删除当前代理吗？',
-                        onConfirm: () => removeProxy()
-                      });
-                    }
-                  }}>删除</button>
+                  <button className="ghost danger-text-button" onClick={() => confirmSidebarDelete('proxy')}>删除</button>
                 </>
               ) : null}
             </div>
@@ -1779,7 +1834,7 @@ export default function App() {
                           items.map((serverItem) => (
                             <div
                               key={serverItem.id}
-                              className={`tree-item ${selectedServerId === serverItem.id ? 'selected' : ''}`}
+                              className={'tree-item ' + (selectedServerId === serverItem.id ? 'selected' : '')}
                               onClick={() => {
                                 setSelectedServerId(serverItem.id);
                               }}
@@ -1827,7 +1882,7 @@ export default function App() {
               {filteredCommands.map((item) => (
                 <button
                   key={item.id}
-                  className={`stack-card ${selectedCommandId === item.id ? 'selected' : ''}`}
+                  className={'stack-card ' + (selectedCommandId === item.id ? 'selected' : '')}
                   onClick={() => {
                     setSelectedCommandId(item.id);
                     setCommandText(item.command);
@@ -1844,7 +1899,7 @@ export default function App() {
               {filteredProxies.map((item) => (
                 <button
                   key={item.id}
-                  className={`stack-card ${selectedProxyId === item.id ? 'selected' : ''}`}
+                  className={'stack-card ' + (selectedProxyId === item.id ? 'selected' : '')}
                   onClick={() => {
                     setSelectedProxyId(item.id);
                   }}
@@ -1856,8 +1911,8 @@ export default function App() {
           ) : null}
         </aside>
 
-        <main className={`main-column ${workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : ''}`}>
-          <section className={`surface workspace-panel ${tab === 'servers' ? '' : 'workspace-panel-hidden'} ${workspaceFullscreenActive ? 'workspace-panel-terminal-fullscreen' : ''}`}>
+        <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '')}>
+          <section className={'surface workspace-panel ' + (tab === 'servers' ? '' : 'workspace-panel-hidden') + ' ' + (workspaceFullscreenActive ? 'workspace-panel-terminal-fullscreen' : '')}>
               {!workspaceFullscreenActive ? <div className="workspace-head">
                 <div>
                   <strong>终端工作区</strong>
@@ -1929,7 +1984,7 @@ export default function App() {
                 <div className="workspace-head">
                   <div>
                     <strong>执行目标</strong>
-                    <span>{selectedServerIds.length ? `已选 ${selectedServerIds.length} 台` : '未选择'}</span>
+                    <span>{selectedServerIds.length ? ('已选 ' + selectedServerIds.length + ' 台') : '未选择'}</span>
                   </div>
                   <div className="toolbar">
                     <button className="ghost" onClick={openServerPicker} disabled={isCommandRunning}>选择服务器</button>
@@ -1948,7 +2003,7 @@ export default function App() {
                     <strong>执行结果</strong>
                     <span>
                       {commandProgress.total
-                        ? `已出结果 ${resolvedCommandResultCount} / ${commandProgress.total}${pendingCommandResultCount ? `，等待 ${pendingCommandResultCount} 台` : ''}`
+                        ? '已出结果 ' + resolvedCommandResultCount + ' / ' + commandProgress.total + (pendingCommandResultCount ? ('，等待 ' + pendingCommandResultCount + ' 台') : '')
                         : '结果'}
                     </span>
                   </div>
@@ -1958,10 +2013,10 @@ export default function App() {
                     </button>
                     {awaitingInputResults.length ? (
                       <button className="ghost" onClick={openBroadcastInputDialog} disabled={!batchInputReady}>
-                        {batchInputReady ? '统一输入' : `等待结果 ${resolvedCommandResultCount}/${commandProgress.total}`}
+                        {batchInputReady ? '统一输入' : ('等待结果 ' + resolvedCommandResultCount + '/' + commandProgress.total)}
                       </button>
                     ) : null}
-                    <button className={`ghost ${busy.clearCommandResults ? 'is-loading' : ''}`} onClick={clearCommandResults} disabled={!canClearCommandResults || busy.clearCommandResults}>
+                    <button className={'ghost ' + (busy.clearCommandResults ? 'is-loading' : '')} onClick={clearCommandResults} disabled={!canClearCommandResults || busy.clearCommandResults}>
                       {isCommandRunning ? '取消并清空' : '清空'}
                     </button>
                   </div>
@@ -1971,7 +2026,11 @@ export default function App() {
                     executionResults.map((item) => (
                       <article
                         key={item.serverId}
-                        className={`result-card result-card-actionable ${(!item.ok && item.status !== 'queued' && item.status !== 'running' && item.status !== 'awaiting_input') ? 'error' : ''} ${item.status === 'running' || item.status === 'queued' || item.status === 'awaiting_input' ? 'running' : ''}`}
+                        className={
+                          'result-card result-card-actionable ' +
+                          ((!item.ok && item.status !== 'queued' && item.status !== 'running' && item.status !== 'awaiting_input') ? 'error ' : '') +
+                          ((item.status === 'running' || item.status === 'queued' || item.status === 'awaiting_input') ? 'running' : '')
+                        }
                         onClick={() => openResultTerminal(item)}
                         onKeyDown={(event) => {
                           if (event.key === 'Enter' || event.key === ' ') {
@@ -1993,7 +2052,7 @@ export default function App() {
                               : item.status === 'awaiting_input'
                                 ? '等待输入'
                               : item.ok
-                                ? `Exit ${item.exitCode ?? 0}`
+                                ? ('Exit ' + (item.exitCode ?? 0))
                                 : '失败'}
                           </em>
                         </div>
@@ -2006,7 +2065,7 @@ export default function App() {
                           <>
                             <div className="result-pending">
                               <span className="spinner" />
-                              <span>执行中，实时显示当前 SSH 输出...</span>
+                              <span>执行中，正在实时显示当前 SSH 输出...</span>
                             </div>
                             {(item.stdout || item.stderr || item.error) ? (
                               <AutoScrollPre text={item.error ? item.error : cleanTerminalOutput([item.stdout, item.stderr].filter(Boolean).join('\n'))} />
@@ -2038,11 +2097,11 @@ export default function App() {
               <div className="surface proxy-hero">
                 <span className="label-chip">代理绑定</span>
                 <strong>{selectedProxy ? selectedProxy.name : '代理工作区'}</strong>
-                <p>{selectedProxy ? `${selectedProxy.type.toUpperCase()} · ${selectedProxy.host}:${selectedProxy.port}` : 'SOCKS5 / HTTP CONNECT'}</p>
+                <p>{selectedProxy ? (selectedProxy.type.toUpperCase() + ' 路 ' + selectedProxy.host + ':' + selectedProxy.port) : 'SOCKS5 / HTTP CONNECT'}</p>
                 <div className="hero-actions">
                   <button className="primary" onClick={openProxyServerPicker}>选择服务器快速应用</button>
                   <button
-                    className={`ghost ${busy.clearAllProxyServers ? 'is-loading' : ''}`}
+                    className={'ghost ' + (busy.clearAllProxyServers ? 'is-loading' : '')}
                     onClick={() => openConfirm({
                       title: '全部取消',
                       message: '确认取消当前代理绑定的全部服务器吗？',
@@ -2059,7 +2118,7 @@ export default function App() {
                 <div className="workspace-head">
                   <div>
                     <strong>{selectedProxy ? '使用范围' : '代理列表'}</strong>
-                    <span>{selectedProxy ? `${proxyUsage.length} 台` : '未选择'}</span>
+                    <span>{selectedProxy ? (proxyUsage.length + ' 台') : '未选择'}</span>
                   </div>
                 </div>
                 <div className="usage-list">
@@ -2072,15 +2131,15 @@ export default function App() {
                             <span>{item.host}:{item.port}</span>
                           </div>
                           <button
-                            className={`ghost mini-remove ${busy[`unassignProxy:${item.id}`] ? 'is-loading' : ''}`}
+                            className={'ghost mini-remove ' + (busy['unassignProxy:' + item.id] ? 'is-loading' : '')}
                             onClick={() => openConfirm({
                               title: '取消代理应用',
-                              message: `确认取消 ${item.name} 的代理绑定吗？`,
+                                message: '确认取消 ' + item.name + ' 的代理绑定吗？',
                               onConfirm: () => unassignProxyServers([item.id])
                             })}
-                            disabled={busy[`unassignProxy:${item.id}`]}
+                            disabled={busy['unassignProxy:' + item.id]}
                           >
-                            {busy[`unassignProxy:${item.id}`] ? '取消中...' : '×'}
+                            {busy['unassignProxy:' + item.id] ? '取消中...' : '×'}
                           </button>
                         </div>
                       ))
@@ -2116,7 +2175,7 @@ export default function App() {
                   openTerminal(selectedServer || serverDraft);
                 }}>终端</button> : null}
                 <button className="ghost" onClick={closeEditor}>取消</button>
-                <button className={`primary ${busy.saveServer ? 'is-loading' : ''}`} onClick={saveServer} disabled={busy.saveServer}>
+                <button className={'primary ' + (busy.saveServer ? 'is-loading' : '')} onClick={saveServer} disabled={busy.saveServer}>
                   {busy.saveServer ? '保存中...' : '保存'}
                 </button>
               </div>
@@ -2189,7 +2248,7 @@ export default function App() {
               })}>删除</button> : <span />}
               <div className="dialog-actions">
                 <button className="ghost" onClick={closeEditor}>取消</button>
-                <button className={`primary ${busy.saveCommand ? 'is-loading' : ''}`} onClick={saveCommand} disabled={busy.saveCommand}>
+                <button className={'primary ' + (busy.saveCommand ? 'is-loading' : '')} onClick={saveCommand} disabled={busy.saveCommand}>
                   {busy.saveCommand ? '保存中...' : '保存'}
                 </button>
               </div>
@@ -2228,7 +2287,7 @@ export default function App() {
               })}>删除</button> : <span />}
               <div className="dialog-actions">
                 <button className="ghost" onClick={closeEditor}>取消</button>
-                <button className={`primary ${busy.saveProxy ? 'is-loading' : ''}`} onClick={saveProxy} disabled={busy.saveProxy}>
+                <button className={'primary ' + (busy.saveProxy ? 'is-loading' : '')} onClick={saveProxy} disabled={busy.saveProxy}>
                   {busy.saveProxy ? '保存中...' : '保存'}
                 </button>
               </div>
@@ -2242,7 +2301,7 @@ export default function App() {
             <Field label="类型">
               <select value={proxyDraft.type} onChange={(event) => setProxyDraft((current) => ({ ...current, type: event.target.value }))}>
                 <option value="socks5">SOCKS5</option>
-                <option value="http">HTTP CONNECT</option>
+                <option value="http">HTTP</option>
               </select>
             </Field>
             <Field label="地址">
@@ -2281,7 +2340,7 @@ export default function App() {
                   setSettingsDialogOpen(false);
                   setAccountError('');
                 }}>取消</button>
-                <button className={`primary ${busy.account ? 'is-loading' : ''}`} onClick={saveAccount} disabled={busy.account}>
+              <button className={'primary ' + (busy.account ? 'is-loading' : '')} onClick={saveAccount} disabled={busy.account}>
                   {busy.account ? '保存中...' : '保存'}
                 </button>
               </div>
@@ -2339,7 +2398,7 @@ export default function App() {
                 <button className="ghost" onClick={selectAllServers}>全选全部</button>
                 <button className="ghost" onClick={() => setPickerSelectedIds([])}>清空全部</button>
                 <button
-                  className={`primary ${busy.applyProxyServers && serverPickerMode === 'proxy' ? 'is-loading' : ''}`}
+                  className={'primary ' + (busy.applyProxyServers && serverPickerMode === 'proxy' ? 'is-loading' : '')}
                   onClick={confirmServerPicker}
                   disabled={serverPickerMode === 'proxy' ? busy.applyProxyServers : false}
                 >
@@ -2357,7 +2416,7 @@ export default function App() {
                 <strong>分组</strong>
                 <span>{state.groups.length + 1}</span>
               </div>
-              <button className={`picker-group-row ${pickerGroupId === 'all' ? 'active' : ''}`} onClick={() => setPickerGroupId('all')}>
+                <button className={'picker-group-row ' + (pickerGroupId === 'all' ? 'active' : '')} onClick={() => setPickerGroupId('all')}>
                 <div>
                   <strong>全部服务器</strong>
                   <span>{state.servers.length} 台</span>
@@ -2367,14 +2426,14 @@ export default function App() {
                 const groupServers = state.servers.filter((item) => item.groupId === group.id);
                 const groupSelected = groupServers.length > 0 && groupServers.every((item) => pickerSelectedIds.includes(item.id));
                 return (
-                  <div key={group.id} className={`picker-group-row ${pickerGroupId === group.id ? 'active' : ''}`}>
+                  <div key={group.id} className={'picker-group-row ' + (pickerGroupId === group.id ? 'active' : '')}>
                     <button className="picker-group-main" onClick={() => setPickerGroupId(group.id)}>
                       <div>
                         <strong>{group.name}</strong>
                         <span>{groupServers.length} 台</span>
                       </div>
                     </button>
-                    <button className={`ghost mini-toggle ${groupSelected ? 'active' : ''}`} onClick={() => toggleGroupChecked(group.id)}>
+                    <button className={'ghost mini-toggle ' + (groupSelected ? 'active' : '')} onClick={() => toggleGroupChecked(group.id)}>
                       {groupSelected ? '取消本组' : '选择本组'}
                     </button>
                   </div>
@@ -2385,7 +2444,7 @@ export default function App() {
             <section className="server-picker-list">
               <div className="picker-toolbar">
                 <div className="picker-toolbar-copy">
-                  <strong>{pickerGroupId === 'all' ? '服务器列表' : state.groups.find((item) => item.id === pickerGroupId)?.name || '服务器列表'}</strong>
+                  <strong>{pickerGroupId === 'all' ? '服务器列表' : (state.groups.find((item) => item.id === pickerGroupId)?.name || '服务器列表')}</strong>
                   <span>{pickerFilteredServers.length} 台</span>
                 </div>
                 <div className="search-shell picker-search">
@@ -2408,7 +2467,7 @@ export default function App() {
               <div className="picker-table-body">
                 {pickerFilteredServers.length ? (
                   pickerFilteredServers.map((item) => (
-                    <label key={item.id} className={`picker-server-row ${pickerSelectedIds.includes(item.id) ? 'selected' : ''}`}>
+                    <label key={item.id} className={'picker-server-row ' + (pickerSelectedIds.includes(item.id) ? 'selected' : '')}>
                       <input type="checkbox" checked={pickerSelectedIds.includes(item.id)} onChange={() => togglePickerServerChecked(item.id)} />
                       <div>
                         <strong>{item.name}</strong>
@@ -2433,7 +2492,7 @@ export default function App() {
           footer={
             <>
               <button className="ghost" onClick={() => setGroupDialog({ open: false, value: EMPTY_GROUP })}>取消</button>
-              <button className={`primary ${busy.saveGroup ? 'is-loading' : ''}`} onClick={saveGroup} disabled={busy.saveGroup}>
+              <button className={'primary ' + (busy.saveGroup ? 'is-loading' : '')} onClick={saveGroup} disabled={busy.saveGroup}>
                 {busy.saveGroup ? '保存中...' : '保存分组'}
               </button>
             </>
@@ -2493,7 +2552,7 @@ export default function App() {
           onClose={() => setImportDialog({ open: false, text: '', preview: null, confirmOverwrite: false, loading: false })}
           footer={
             <>
-              <button className={`ghost ${busy.previewImport ? 'is-loading' : ''}`} onClick={previewImport} disabled={busy.previewImport}>
+              <button className={'ghost ' + (busy.previewImport ? 'is-loading' : '')} onClick={previewImport} disabled={busy.previewImport}>
                 {busy.previewImport ? '预览中...' : '预览'}
               </button>
               {importDialog.preview?.duplicateCount ? (
@@ -2501,11 +2560,11 @@ export default function App() {
                   发现重复 {importDialog.preview.duplicateCount} 台
                 </button>
               ) : null}
-              <button className={`primary ${busy.applyImport ? 'is-loading' : ''}`} onClick={() => applyImport(false)} disabled={busy.applyImport}>
+              <button className={'primary ' + (busy.applyImport ? 'is-loading' : '')} onClick={() => applyImport(false)} disabled={busy.applyImport}>
                 {busy.applyImport ? '导入中...' : '直接导入'}
               </button>
               {importDialog.confirmOverwrite ? (
-                <button className={`primary ${busy.applyImportOverwrite ? 'is-loading' : ''}`} onClick={() => applyImport(true)} disabled={busy.applyImportOverwrite}>
+                <button className={'primary ' + (busy.applyImportOverwrite ? 'is-loading' : '')} onClick={() => applyImport(true)} disabled={busy.applyImportOverwrite}>
                   {busy.applyImportOverwrite ? '覆盖中...' : '覆盖并继续'}
                 </button>
               ) : null}
@@ -2519,24 +2578,24 @@ export default function App() {
                 rows={12}
                 value={importDialog.text}
                 onChange={(event) => setImportDialog((current) => ({ ...current, text: event.target.value }))}
-                placeholder={`hk-node 1.2.3.4 22 root 123456 香港\nsg-prod 8.8.8.8 root passw0rd 新加坡`}
+                placeholder={'hk-node 1.2.3.4 22 root 123456 香港\nsg-prod 8.8.8.8 22 root passw0rd 新加坡'}
               />
             </label>
             <div className="import-preview surface">
               <div className="workspace-head">
                 <div>
                   <strong>导入预览</strong>
-                  <span>{importDialog.loading ? '识别中...' : importDialog.preview ? `${importDialog.preview.total} 条` : '未预览'}</span>
+                  <span>{importDialog.loading ? '识别中...' : importDialog.preview ? (importDialog.preview.total + ' 条') : '未预览'}</span>
                 </div>
               </div>
               <div className="preview-table">
                 {(importDialog.preview?.items || []).map((item) => (
-                  <div key={item.id} className={`preview-row ${item.duplicate ? 'duplicate' : ''}`}>
+                  <div key={item.id} className={'preview-row ' + (item.duplicate ? 'duplicate' : '')}>
                     <strong>{item.name}</strong>
                     <span>{item.host}:{item.port}</span>
                     <em>{item.username}</em>
-                    <b>{item.groupName || '默认分组'}</b>
-                    <small>{item.duplicate ? `重复: ${item.duplicateName}` : '新服务器'}</small>
+                      <b>{item.groupName || '默认分组'}</b>
+                      <small>{item.duplicate ? ('重复: ' + item.duplicateName) : '新服务器'}</small>
                   </div>
                 ))}
                 {!importDialog.preview?.items?.length ? <div className="empty-state">导入前会先告诉你哪些条目需要覆盖。</div> : null}
@@ -2555,7 +2614,7 @@ export default function App() {
               <button className="ghost" onClick={() => setRunCommandConfirmOpen(false)}>取消</button>
               <button className="ghost" onClick={openTemporaryInteractiveKeywordsDialog}>是，去设置</button>
               <button
-                className={`primary ${busy.runCommand ? 'is-loading' : ''}`}
+                className={'primary ' + (busy.runCommand ? 'is-loading' : '')}
                 onClick={() => void runCommandWithGlobalKeywords()}
                 disabled={busy.runCommand}
               >
@@ -2578,7 +2637,7 @@ export default function App() {
             <>
               <button className="ghost" onClick={() => setTemporaryKeywordsDialogOpen(false)}>取消</button>
               <button
-                className={`primary ${busy.runCommand ? 'is-loading' : ''}`}
+                className={'primary ' + (busy.runCommand ? 'is-loading' : '')}
                 onClick={() => void runCommandWithTemporaryKeywords()}
                 disabled={busy.runCommand}
               >
@@ -2611,11 +2670,11 @@ export default function App() {
                 <>
                   <button className="ghost" onClick={closeBatchInputDialog}>取消</button>
                   <button
-                    className={`primary ${busy.submitBatchInput ? 'is-loading' : ''}`}
+                    className={'primary ' + (busy.submitBatchInput ? 'is-loading' : '')}
                     onClick={submitBatchInput}
                     disabled={busy.submitBatchInput}
                   >
-                    {busy.submitBatchInput ? '发送中...' : `发送到 ${batchInputDialog.awaitingServerIds.length} 台服务器`}
+                    {busy.submitBatchInput ? '发送中...' : ('发送到 ' + batchInputDialog.awaitingServerIds.length + ' 台服务器')}
                   </button>
                 </>
               )
@@ -2660,15 +2719,13 @@ export default function App() {
           ) : batchInputDialog.mode === 'wait' ? (
             <div className="field-grid single">
               <div className="confirm-copy batch-input-progress-copy">
-                当前已出结果 {resolvedCommandResultCount} / {commandProgress.total} 台，剩余 {pendingCommandResultCount} 台还在执行中。
-                全部服务器都有结果后，才可以进入统一输入或逐台处理。失败也会算作已有结果。
+                当前已出结果 {resolvedCommandResultCount} / {commandProgress.total} 台，剩余 {pendingCommandResultCount} 台还在执行中。全部服务器都有结果后，才可以进入统一输入或逐台处理。失败也会算作已有结果。
               </div>
             </div>
           ) : (
             <div className="field-grid single">
               <div className="confirm-copy">
-                检测到 {batchInputDialog.awaitingServerIds.length} 台服务器正在等待交互输入。当前已出结果 {resolvedCommandResultCount} / {commandProgress.total} 台。
-                你可以统一输入一份内容广播给它们，或者逐台进入真实会话分别处理。
+                检测到 {batchInputDialog.awaitingServerIds.length} 台服务器正在等待交互输入。当前已出结果 {resolvedCommandResultCount} / {commandProgress.total} 台。你可以统一输入一份内容广播给它们，或者逐台进入真实会话分别处理。
               </div>
               {visibleBatchInputAwaitingResults.length ? (
                 <div className="batch-input-server-list">
@@ -2687,7 +2744,7 @@ export default function App() {
               ) : null}
               {hiddenBatchInputAwaitingResultsCount ? (
                 <div className="confirm-copy batch-input-server-summary">
-                  当前仅展示前 {visibleBatchInputAwaitingResults.length} 台，剩余 {hiddenBatchInputAwaitingResultsCount} 台不再展开，避免数量过多把弹窗撑满。
+                  当前仅展示前 {visibleBatchInputAwaitingResults.length} 台，剩余 {hiddenBatchInputAwaitingResultsCount} 台不再展开，避免数量过多撑满弹窗。
                 </div>
               ) : null}
             </div>
@@ -2707,7 +2764,7 @@ export default function App() {
           }
         >
           <div className="field-grid single">
-            <Field label="关键词列表">
+            <Field label="关键字列表">
               <textarea
                 rows={8}
                 value={interactiveKeywordsText}
@@ -2715,7 +2772,7 @@ export default function App() {
                 placeholder={'请\n请输入\n请选择\n按回车'}
               />
             </Field>
-            <div className="confirm-copy">每行一个关键词。命中这些关键词时，结果会被视为交互式等待输入。</div>
+            <div className="confirm-copy">每行一个关键字。命中这些关键字时，结果会被视为交互式等待输入。</div>
           </div>
         </Dialog>
       ) : null}
@@ -2749,7 +2806,7 @@ function ServerOverview({ selectedServer, state, selectedServerIds, openTerminal
       <div className="surface overview-highlight">
         <span className="label-chip">Workspace</span>
         <strong>{selectedServer ? selectedServer.name : 'NuroSSH'}</strong>
-        <p>{selectedServer ? `${selectedServer.host}:${selectedServer.port} · ${selectedServer.username}` : '服务器管理与终端工作台'}</p>
+        <p>{selectedServer ? (selectedServer.host + ':' + selectedServer.port + ' 路 ' + selectedServer.username) : '服务器管理与终端工作台'}</p>
         <div className="hero-actions">
           {selectedServer ? <button className="primary" onClick={() => openTerminal(selectedServer)}>打开终端</button> : null}
           <button className="ghost" onClick={onCreateServer}>新增服务器</button>
@@ -2901,7 +2958,7 @@ function SessionTabs({ sessions, activeId, onSelect, onClose }) {
   return (
     <div className="session-strip-shell">
       <button
-        className={`icon-button session-scroll-button ${scrollable.left ? '' : 'is-hidden'}`}
+        className={'icon-button session-scroll-button ' + (scrollable.left ? '' : 'is-hidden')}
         onClick={() => scrollTabs(-1)}
         type="button"
         disabled={!scrollable.left}
@@ -2926,7 +2983,7 @@ function SessionTabs({ sessions, activeId, onSelect, onClose }) {
           sessions.map((session) => (
             <button
               key={session.id}
-              className={`session-tab ${activeId === session.id ? 'active' : ''}`}
+              className={'session-tab ' + (activeId === session.id ? 'active' : '')}
               onClick={() => onSelect(session.id)}
             >
               <span>{session.title}</span>
@@ -2955,7 +3012,7 @@ function SessionTabs({ sessions, activeId, onSelect, onClose }) {
         )}
       </div>
       <button
-        className={`icon-button session-scroll-button ${scrollable.right ? '' : 'is-hidden'}`}
+        className={'icon-button session-scroll-button ' + (scrollable.right ? '' : 'is-hidden')}
         onClick={() => scrollTabs(1)}
         type="button"
         disabled={!scrollable.right}
@@ -3146,10 +3203,10 @@ function TerminalWorkspace({
       return;
     }
     const clearCurrentInput = '\u007f'.repeat(currentInputRef.current.length);
-    socketRef.current.send(JSON.stringify({
-      type: 'input',
-      data: `${clearCurrentInput}${commandSuggestion.command}\r`
-    }));
+      socketRef.current.send(JSON.stringify({
+        type: 'input',
+        data: clearCurrentInput + commandSuggestion.command + '\r'
+      }));
     syncCurrentInput('');
     terminalRef.current?.focus();
   }
@@ -3157,7 +3214,7 @@ function TerminalWorkspace({
   async function sendManualCommand(value, options = {}) {
     const { appendEnter = true, preferSocket = false } = options;
     const socket = socketRef.current;
-    const payload = appendEnter ? `${value}\r` : value;
+    const payload = appendEnter ? (value + '\r') : value;
 
     if ((preferSocket || mode !== 'command-job' || !session.jobId) && canWriteToSocket(socket)) {
       socket.send(JSON.stringify({ type: 'input', data: payload }));
@@ -3174,7 +3231,7 @@ function TerminalWorkspace({
 
     try {
       setManualInputBusy(true);
-      await api(`/api/commands/jobs/${session.jobId}/input`, {
+      await api('/api/commands/jobs/' + session.jobId + '/input', {
         method: 'POST',
         body: JSON.stringify({
           serverIds: [session.serverId],
@@ -3187,7 +3244,7 @@ function TerminalWorkspace({
       }
       terminalRef.current?.focus();
     } catch (error) {
-      terminalRef.current?.writeln(`\r\n[系统] ${error.message}`);
+      terminalRef.current?.writeln('\r\n[系统] ' + error.message);
     } finally {
       setManualInputBusy(false);
     }
@@ -3322,18 +3379,18 @@ function TerminalWorkspace({
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const buildSocketPath = () => {
       if (mode === 'command-job') {
-        return `/ws/command-job?jobId=${encodeURIComponent(session.jobId || '')}&serverId=${encodeURIComponent(session.serverId)}`;
+        return '/ws/command-job?jobId=' + encodeURIComponent(session.jobId || '') + '&serverId=' + encodeURIComponent(session.serverId);
       }
-      return `/ws/terminal?serverId=${encodeURIComponent(session.serverId)}`;
+      return '/ws/terminal?serverId=' + encodeURIComponent(session.serverId);
     };
-    const createSocket = () => new WebSocket(`${protocol}//${window.location.host}${buildSocketPath()}`);
+    const createSocket = () => new WebSocket(protocol + '//' + window.location.host + buildSocketPath());
     const socket = createSocket();
     socketRef.current = socket;
 
     setReady(false);
     setCanReconnect(false);
     setStatus(connectNonce ? '重连中...' : '连接中...');
-    terminal.writeln(`\r\n[系统] ${connectNonce ? '正在重连...' : `正在连接 ${session.title} ...`}`);
+    terminal.writeln('\r\n[系统] ' + (connectNonce ? '正在重连...' : ('正在连接 ' + session.title + ' ...')));
 
     function handleDisconnect(message) {
       if (disconnectHandled || cleanedUp) {
@@ -3343,7 +3400,7 @@ function TerminalWorkspace({
       setReady(false);
       setCanReconnect(true);
       setStatus(message);
-      terminal.writeln(`\r\n[系统] ${message}`);
+      terminal.writeln('\r\n[系统] ' + message);
     }
 
     socket.addEventListener('open', () => {
@@ -3391,7 +3448,7 @@ function TerminalWorkspace({
         setReady(false);
         setCanReconnect(false);
         setStatus(mode === 'command-job' ? '会话已结束' : '连接已关闭');
-        terminal.writeln(`\r\n[系统] ${mode === 'command-job' ? '当前执行会话已结束。' : '连接已关闭，按任意键重连'}`);
+        terminal.writeln('\r\n[系统] ' + (mode === 'command-job' ? '当前执行会话已结束。' : '连接已关闭，按任意键重连'));
       }
     });
 
@@ -3442,7 +3499,7 @@ function TerminalWorkspace({
   }, [commandSuggestion, currentInput, isVisible, isFullscreen, ready]);
 
   return (
-    <div className={`terminal-shell ${isVisible ? '' : 'terminal-shell-hidden'} ${isFullscreen ? 'terminal-shell-fullscreen' : ''}`}>
+    <div className={'terminal-shell ' + (isVisible ? '' : 'terminal-shell-hidden') + ' ' + (isFullscreen ? 'terminal-shell-fullscreen' : '')}>
       {isLiveSession && canReconnect ? <div className="terminal-reconnect-hint">连接失败或关闭后，直接在终端里按任意键即可重连当前会话。</div> : null}
       <div className="terminal-stage">
         {commandSuggestion ? (
@@ -3452,7 +3509,7 @@ function TerminalWorkspace({
             onClick={executeSuggestedCommand}
             onMouseDown={(event) => event.preventDefault()}
             type="button"
-            style={{ top: `${suggestionTop}px`, left: `${suggestionLeft}px` }}
+            style={{ top: String(suggestionTop) + 'px', left: String(suggestionLeft) + 'px' }}
           >
             <CommandIcon />
             <strong>{commandSuggestion.name}</strong>
@@ -3491,9 +3548,9 @@ function TerminalWorkspace({
               }}
               placeholder="这里可以直接输入，回车发送到当前会话"
             />
-            <button className={`ghost ${manualInputBusy ? 'is-loading' : ''}`} type="button" onClick={() => void sendManualCommand(manualInput)} disabled={manualInputBusy}>发送</button>
-            <button className={`ghost ${manualInputBusy ? 'is-loading' : ''}`} type="button" onClick={() => void sendManualCommand('', { appendEnter: true })} disabled={manualInputBusy}>回车</button>
-            <button className={`ghost danger-text-button ${manualInputBusy ? 'is-loading' : ''}`} type="button" onClick={() => void sendManualCommand('\u0003', { appendEnter: false })} disabled={manualInputBusy}>Ctrl+C</button>
+            <button className={'ghost ' + (manualInputBusy ? 'is-loading' : '')} type="button" onClick={() => void sendManualCommand(manualInput)} disabled={manualInputBusy}>发送</button>
+            <button className={'ghost ' + (manualInputBusy ? 'is-loading' : '')} type="button" onClick={() => void sendManualCommand('', { appendEnter: true })} disabled={manualInputBusy}>回车</button>
+            <button className={'ghost danger-text-button ' + (manualInputBusy ? 'is-loading' : '')} type="button" onClick={() => void sendManualCommand('\u0003', { appendEnter: false })} disabled={manualInputBusy}>Ctrl+C</button>
           </div>
         ) : null}
       </div>
@@ -3503,7 +3560,7 @@ function TerminalWorkspace({
 
 function Field({ label, children, className = '' }) {
   return (
-    <label className={`field ${className}`}>
+    <label className={'field ' + className}>
       <span>{label}</span>
       {children}
     </label>
@@ -3513,10 +3570,12 @@ function Field({ label, children, className = '' }) {
 function Dialog({ title, onClose, footer, children, wide = false, xwide = false, className = '' }) {
   return (
     <div className="dialog-backdrop" onClick={onClose}>
-      <div className={`dialog ${wide ? 'wide' : ''} ${xwide ? 'xwide' : ''} ${className}`} onClick={(event) => event.stopPropagation()}>
+      <div className={'dialog ' + (wide ? 'wide' : '') + ' ' + (xwide ? 'xwide' : '') + ' ' + className} onClick={(event) => event.stopPropagation()}>
         <div className="dialog-head">
           <strong>{title}</strong>
-          <button className="icon-button" onClick={onClose}>×</button>
+          <button className="icon-button" type="button" aria-label="关闭" onClick={onClose}>
+            <CloseIcon />
+          </button>
         </div>
         <div className="dialog-body">{children}</div>
         <div className="dialog-footer">{footer}</div>

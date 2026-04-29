@@ -10,11 +10,13 @@ import { Client as SSHClient } from 'ssh2';
 import { SocksClient } from 'socks';
 import { v4 as uuidv4 } from 'uuid';
 
+loadRuntimeEnv();
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-const PORT = Number(process.env.PORT || 3030);
+const PORT = Number(process.env.PORT || 38471);
 const ROOT_DIR = process.cwd();
 const DATA_DIR = path.join(ROOT_DIR, 'data');
 const DIST_DIR = path.join(ROOT_DIR, 'dist');
@@ -75,6 +77,30 @@ const defaultState = {
   proxies: [],
   workspaces: {}
 };
+
+function loadRuntimeEnv() {
+  const envPath = path.join(process.cwd(), '.env');
+  if (!fs.existsSync(envPath)) {
+    return;
+  }
+  const content = fs.readFileSync(envPath, 'utf8');
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) {
+      continue;
+    }
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) {
+      continue;
+    }
+    const [, key, rawValue] = match;
+    if (process.env[key] !== undefined) {
+      continue;
+    }
+    const value = rawValue.trim().replace(/^(['"])(.*)\1$/, '$2');
+    process.env[key] = value;
+  }
+}
 
 ensureStateFile();
 cleanupExpiredSessions();
@@ -1837,7 +1863,7 @@ function normalizeCommand(input = {}) {
 
 function normalizeProxy(input = {}) {
   const now = new Date().toISOString();
-  const type = ['socks5', 'http'].includes(String(input.type || '').trim()) ? input.type : 'socks5';
+  const type = ['socks5', 'http'].includes(String(input.type || '').trim()) ? input.type : 'http';
   return {
     id: input.id || uuidv4(),
     name: String(input.name || '').trim() || '未命名代理',

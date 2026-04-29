@@ -1,0 +1,22 @@
+services:
+  autorun-webssh:
+    build:
+      context: .
+    container_name: autorun-webssh
+    restart: unless-stopped
+    init: true
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-38471}
+      SQLITE_DB_PATH: ${SQLITE_DB_PATH:-/app/data/app.db}
+    ports:
+      - "${PORT:-38471}:${PORT:-38471}"
+    volumes:
+      - ./data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,mode=1777

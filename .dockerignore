@@ -1,0 +1,11 @@
+.git
+.vscode
+.idea
+node_modules
+dist
+data
+backups
+.env
+*.log
+local-run.out
+local-run.err

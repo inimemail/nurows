@@ -5,6 +5,7 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
+import Database from 'better-sqlite3';
 import { WebSocketServer } from 'ws';
 import { Client as SSHClient } from 'ssh2';
 import { SocksClient } from 'socks';
@@ -16,17 +17,29 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
+const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 38471);
 const ROOT_DIR = process.cwd();
 const DATA_DIR = path.join(ROOT_DIR, 'data');
 const DIST_DIR = path.join(ROOT_DIR, 'dist');
-const STATE_FILE = path.join(DATA_DIR, 'state.json');
-const AUTH_FILE = path.join(DATA_DIR, 'auth.json');
-const SECRET_FILE = path.join(DATA_DIR, 'secret.key');
+const LEGACY_STATE_FILE = path.join(DATA_DIR, 'state.json');
+const LEGACY_AUTH_FILE = path.join(DATA_DIR, 'auth.json');
+const LEGACY_SECRET_FILE = path.join(DATA_DIR, 'secret.key');
+const SQLITE_FILE = resolveSqlitePath(process.env.SQLITE_DB_PATH || path.join(DATA_DIR, 'app.db'));
+const SQLITE_KV_TABLE = 'app_kv';
+const STORAGE_KEYS = {
+  auth: 'auth',
+  state: 'state',
+  secret: 'secret'
+};
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const sessions = new Map();
 const authAttempts = new Map();
 const commandJobs = new Map();
+let sqliteDb = null;
+let cachedAuth = null;
+let cachedState = null;
+let cachedSecretHex = '';
 const MAX_AUTH_ATTEMPTS = 6;
 const AUTH_WINDOW_MS = 1000 * 60 * 10;
 const COMMAND_EXIT_MARKER = '__NUROSSH_EXIT__';
@@ -102,7 +115,7 @@ function loadRuntimeEnv() {
   }
 }
 
-ensureStateFile();
+ensureStorage();
 cleanupExpiredSessions();
 
 app.use(cors());
@@ -794,51 +807,149 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   console.log(`WebSSH server running at http://localhost:${PORT}`);
 });
 
-function ensureStateFile() {
+function resolveSqlitePath(targetPath) {
+  if (path.isAbsolute(targetPath)) {
+    return targetPath;
+  }
+  return path.join(ROOT_DIR, targetPath);
+}
+
+function ensureStorage() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
-
-  if (!fs.existsSync(STATE_FILE)) {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(defaultState, null, 2), 'utf8');
+  if (!fs.existsSync(path.dirname(SQLITE_FILE))) {
+    fs.mkdirSync(path.dirname(SQLITE_FILE), { recursive: true });
   }
 
-  if (!fs.existsSync(SECRET_FILE)) {
-    fs.writeFileSync(SECRET_FILE, crypto.randomBytes(32).toString('hex'), 'utf8');
+  const db = getSqliteDb();
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ${SQLITE_KV_TABLE} (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+
+  migrateLegacyStorage();
+}
+
+function getSqliteDb() {
+  if (!sqliteDb) {
+    sqliteDb = new Database(SQLITE_FILE);
+  }
+  return sqliteDb;
+}
+
+function migrateLegacyStorage() {
+  if (dbGetRaw(STORAGE_KEYS.state) === null) {
+    const legacyState = fs.existsSync(LEGACY_STATE_FILE)
+      ? safelyParseJson(fs.readFileSync(LEGACY_STATE_FILE, 'utf8'), defaultState)
+      : defaultState;
+    dbSetJson(STORAGE_KEYS.state, normalizeStateRecord(legacyState));
+  }
+
+  if (dbGetRaw(STORAGE_KEYS.auth) === null) {
+    const legacyAuth = fs.existsSync(LEGACY_AUTH_FILE)
+      ? safelyParseJson(fs.readFileSync(LEGACY_AUTH_FILE, 'utf8'), getDefaultAuthRecord())
+      : getDefaultAuthRecord();
+    dbSetJson(STORAGE_KEYS.auth, normalizeAuthRecord(legacyAuth));
+  }
+
+  if (dbGetRaw(STORAGE_KEYS.secret) === null) {
+    const legacySecret =
+      fs.existsSync(LEGACY_SECRET_FILE)
+        ? String(fs.readFileSync(LEGACY_SECRET_FILE, 'utf8') || '').trim()
+        : '';
+    dbSetRaw(STORAGE_KEYS.secret, legacySecret || crypto.randomBytes(32).toString('hex'));
+  }
+
+  cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
+  cachedAuth = dbGetJson(STORAGE_KEYS.auth, getDefaultAuthRecord(), normalizeAuthRecord);
+  cachedSecretHex = dbGetRaw(STORAGE_KEYS.secret) || crypto.randomBytes(32).toString('hex');
+  if (!dbGetRaw(STORAGE_KEYS.secret)) {
+    dbSetRaw(STORAGE_KEYS.secret, cachedSecretHex);
   }
 }
 
-function readAuth() {
-  if (!fs.existsSync(AUTH_FILE)) {
-    return {
-      configured: false,
-      username: '',
-      salt: '',
-      hash: '',
-      updatedAt: ''
-    };
-  }
+function dbGetRaw(key) {
+  const row = getSqliteDb()
+    .prepare(`SELECT value FROM ${SQLITE_KV_TABLE} WHERE key = ? LIMIT 1`)
+    .get(key);
+  return row?.value ?? null;
+}
 
-  const raw = fs.readFileSync(AUTH_FILE, 'utf8');
-  const parsed = JSON.parse(raw);
+function dbSetRaw(key, value) {
+  const now = new Date().toISOString();
+  getSqliteDb()
+    .prepare(`
+      INSERT INTO ${SQLITE_KV_TABLE} (key, value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = excluded.updated_at
+    `)
+    .run(key, value, now);
+}
+
+function dbGetJson(key, fallback, normalizer = (value) => value) {
+  const raw = dbGetRaw(key);
+  if (raw === null) {
+    return normalizer(structuredClone(fallback));
+  }
+  return normalizer(safelyParseJson(raw, fallback));
+}
+
+function dbSetJson(key, value) {
+  dbSetRaw(key, JSON.stringify(value));
+}
+
+function safelyParseJson(raw, fallback) {
+  try {
+    return JSON.parse(raw);
+  } catch (_error) {
+    return structuredClone(fallback);
+  }
+}
+
+function getDefaultAuthRecord() {
   return {
-    configured: Boolean(parsed.configured),
-    username: parsed.username || '',
-    salt: parsed.salt || '',
-    hash: parsed.hash || '',
-    updatedAt: parsed.updatedAt || ''
+    configured: false,
+    username: '',
+    salt: '',
+    hash: '',
+    updatedAt: ''
   };
 }
 
-function writeAuth(auth) {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+function normalizeAuthRecord(auth) {
+  return {
+    configured: Boolean(auth?.configured),
+    username: auth?.username || '',
+    salt: auth?.salt || '',
+    hash: auth?.hash || '',
+    updatedAt: auth?.updatedAt || ''
+  };
+}
+
+function readAuth() {
+  ensureStorage();
+  if (!cachedAuth) {
+    cachedAuth = dbGetJson(STORAGE_KEYS.auth, getDefaultAuthRecord(), normalizeAuthRecord);
   }
-  fs.writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), 'utf8');
+  return structuredClone(cachedAuth);
+}
+
+function writeAuth(auth) {
+  ensureStorage();
+  cachedAuth = normalizeAuthRecord(auth);
+  dbSetJson(STORAGE_KEYS.auth, cachedAuth);
 }
 
 function deriveEncryptionKey(password, salt) {
@@ -846,8 +957,12 @@ function deriveEncryptionKey(password, salt) {
 }
 
 function getAppSecretKey() {
-  ensureStateFile();
-  return Buffer.from(fs.readFileSync(SECRET_FILE, 'utf8').trim(), 'hex');
+  ensureStorage();
+  if (!cachedSecretHex) {
+    cachedSecretHex = dbGetRaw(STORAGE_KEYS.secret) || crypto.randomBytes(32).toString('hex');
+    dbSetRaw(STORAGE_KEYS.secret, cachedSecretHex);
+  }
+  return Buffer.from(cachedSecretHex, 'hex');
 }
 
 function createAuthRecord(username, password) {
@@ -1060,29 +1175,35 @@ function authGuard(req, res, next) {
   }
 }
 
-function readState() {
-  ensureStateFile();
-  const raw = fs.readFileSync(STATE_FILE, 'utf8');
-  const parsed = JSON.parse(raw);
-
+function normalizeStateRecord(parsed) {
   return {
-    groups: Array.isArray(parsed.groups) && parsed.groups.length ? parsed.groups : defaultState.groups,
-    servers: Array.isArray(parsed.servers) ? parsed.servers : [],
-    commands: Array.isArray(parsed.commands) ? parsed.commands : [],
-    proxies: Array.isArray(parsed.proxies) ? parsed.proxies : [],
-    workspaces: parsed.workspaces && typeof parsed.workspaces === 'object' ? parsed.workspaces : {}
+    groups: Array.isArray(parsed?.groups) && parsed.groups.length ? parsed.groups : defaultState.groups,
+    servers: Array.isArray(parsed?.servers) ? parsed.servers : [],
+    commands: Array.isArray(parsed?.commands) ? parsed.commands : [],
+    proxies: Array.isArray(parsed?.proxies) ? parsed.proxies : [],
+    workspaces: parsed?.workspaces && typeof parsed.workspaces === 'object' ? parsed.workspaces : {}
   };
 }
 
+function readState() {
+  ensureStorage();
+  if (!cachedState) {
+    cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
+  }
+  return structuredClone(cachedState);
+}
+
 function writeState(state) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+  ensureStorage();
+  cachedState = normalizeStateRecord(state);
+  dbSetJson(STORAGE_KEYS.state, cachedState);
 }
 
 function updateState(mutator) {
   const draft = readState();
   const next = mutator(structuredClone(draft));
   writeState(next);
-  return next;
+  return readState();
 }
 
 function sanitizeStateForClient(state, auth = null) {

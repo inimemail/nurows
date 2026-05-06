@@ -13,6 +13,9 @@ SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
 APP_NAME="nurossh"
 DEFAULT_INSTALL_PATH="/opt/${APP_NAME}"
 STATE_FILE="/etc/${APP_NAME}_path"
+CRON_TAG_BEGIN="# NUROSSH_BACKUP_BEGIN"
+CRON_TAG_END="# NUROSSH_BACKUP_END"
+BACKUP_LOG="/var/log/${APP_NAME}_backup.log"
 
 info() { echo -e "\033[32m[INFO]\033[0m $1" >&2; }
 warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
@@ -287,6 +290,10 @@ stop_service() {
   info "服务已停止。"
 }
 
+pause_service() {
+  stop_service
+}
+
 restart_service() {
   require_docker
   require_compose
@@ -356,6 +363,10 @@ backup_service() {
   info "备份已创建：${backup_file}"
 }
 
+do_backup() {
+  backup_service
+}
+
 restore_service() {
   require_docker
   require_compose
@@ -402,6 +413,99 @@ restore_service() {
   print_access_info "${target_dir}/.env"
 }
 
+restore_backup() {
+  restore_service
+}
+
+setup_auto_backup() {
+  require_cmd crontab
+
+  local workdir
+  workdir="$(get_workdir)"
+  if [[ -z "${workdir}" ]]; then
+    err "未检测到已部署实例，无法配置定时备份。"
+    return
+  fi
+
+  local cron_script existing_cron
+  cron_script="${workdir}/cron_backup.sh"
+  existing_cron="$(crontab -l 2>/dev/null | sed -n "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/p" | grep -v '^#' || true)"
+
+  if [[ -n "${existing_cron}" ]]; then
+    echo "当前定时备份任务:"
+    echo "${existing_cron}"
+    local reset_cron
+    read -r -p "是否覆盖现有定时备份任务? (y/N): " reset_cron
+    if [[ ! "${reset_cron}" =~ ^[Yy]$ ]]; then
+      info "保留现有定时备份任务。"
+      return
+    fi
+  fi
+
+  echo "1) 按分钟间隔备份"
+  echo "2) 每天固定时间备份"
+  echo "3) 删除定时备份任务"
+
+  local cron_type
+  read -r -p "请选择 [1/2/3]: " cron_type
+
+  local cron_spec=""
+  if [[ "${cron_type}" == "1" ]]; then
+    local interval
+    read -r -p "分钟间隔 [1,2,3,4,5,6,10,12,15,20,30]: " interval
+    case "${interval}" in
+      1|2|3|4|5|6|10|12|15|20|30) cron_spec="*/${interval} * * * *" ;;
+      *) err "不支持该时间间隔。"; return ;;
+    esac
+  elif [[ "${cron_type}" == "2" ]]; then
+    local cron_time hour minute
+    read -r -p "每天执行时间 (HH:MM): " cron_time
+    if [[ ! "${cron_time}" =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+      err "时间格式不正确。"
+      return
+    fi
+    hour="${cron_time%:*}"
+    minute="${cron_time#*:}"
+    hour="${hour#0}"
+    minute="${minute#0}"
+    [[ -z "${hour}" ]] && hour="0"
+    [[ -z "${minute}" ]] && minute="0"
+    cron_spec="${minute} ${hour} * * *"
+  elif [[ "${cron_type}" == "3" ]]; then
+    local tmp_cron
+    tmp_cron="$(mktemp)"
+    crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "${tmp_cron}" || true
+    crontab "${tmp_cron}" 2>/dev/null || true
+    rm -f "${tmp_cron}" "${cron_script}"
+    info "定时备份任务已删除。"
+    return
+  else
+    err "无效选项。"
+    return
+  fi
+
+  cat > "${cron_script}" <<EOF
+#!/usr/bin/env bash
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
+cd "${workdir}" || exit 1
+bash "${workdir}/manage.sh" run-backup
+EOF
+  chmod +x "${cron_script}"
+
+  local tmp_cron
+  tmp_cron="$(mktemp)"
+  crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "${tmp_cron}" || true
+  cat >> "${tmp_cron}" <<EOF
+${CRON_TAG_BEGIN}
+${cron_spec} bash ${cron_script} >> ${BACKUP_LOG} 2>&1
+${CRON_TAG_END}
+EOF
+  crontab "${tmp_cron}"
+  rm -f "${tmp_cron}"
+
+  info "已设置定时备份: ${cron_spec}"
+}
+
 uninstall_service() {
   require_docker
   require_compose
@@ -428,6 +532,11 @@ uninstall_service() {
   info "卸载完成。"
 }
 
+install_ftp() {
+  require_cmd curl
+  bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
+}
+
 main_menu() {
   if command -v clear >/dev/null 2>&1; then
     clear
@@ -437,49 +546,49 @@ main_menu() {
   workdir="$(get_workdir)"
 
   echo "=================================================="
-  echo "                NuroSSH 管理脚本"
+  echo "              NuroSSH 管理脚本"
   echo "=================================================="
-  echo " 当前部署路径：${workdir:-未部署}"
+  echo " 当前部署路径: ${workdir:-未部署}"
   echo "--------------------------------------------------"
-  echo " 1) 安装部署"
+  echo " 1) 一键部署"
   echo " 2) 升级服务"
   echo " 3) 停止服务"
   echo " 4) 重启服务"
-  echo " 5) 查看状态"
-  echo " 6) 查看日志"
-  echo " 7) 手动备份"
-  echo " 8) 恢复备份"
-  echo " 9) 卸载服务"
+  echo " 5) 手动备份"
+  echo " 6) 恢复备份"
+  echo " 7) 定时备份"
+  echo " 8) 完全卸载"
+  echo " 9) FTP/SFTP 备份工具"
   echo " 0) 退出"
   echo "=================================================="
 
   local choice
-  read -r -p "请选择 [0-9]: " choice
+  read -r -p "请选择操作 [0-9]: " choice
   case "${choice}" in
     1) deploy_service ;;
     2) upgrade_service ;;
-    3) stop_service ;;
+    3) pause_service ;;
     4) restart_service ;;
-    5) status_service ;;
-    6) logs_service ;;
-    7) backup_service ;;
-    8) restore_service ;;
-    9) uninstall_service ;;
-    0) exit 0 ;;
+    5) do_backup ;;
+    6) restore_backup ;;
+    7) setup_auto_backup ;;
+    8) uninstall_service ;;
+    9) install_ftp ;;
+    0) info "再见"; exit 0 ;;
     *) warn "无效选项。" ;;
   esac
 }
 
 dispatch_command() {
   case "${1:-}" in
+    run-backup) do_backup ;;
     install) deploy_service ;;
     upgrade) upgrade_service ;;
-    stop) stop_service ;;
+    stop) pause_service ;;
     restart) restart_service ;;
-    status) status_service ;;
-    logs) logs_service ;;
-    backup) backup_service ;;
-    restore) restore_service ;;
+    backup) do_backup ;;
+    restore) restore_backup ;;
+    cron) setup_auto_backup ;;
     uninstall) uninstall_service ;;
     "")
       while true; do
@@ -489,8 +598,8 @@ dispatch_command() {
       done
       ;;
     *)
-      err "不支持的命令：${1}"
-      echo "可用命令：install | upgrade | stop | restart | status | logs | backup | restore | uninstall"
+      err "不支持的命令: ${1}"
+      echo "可用命令: install | upgrade | stop | restart | backup | restore | cron | uninstall | run-backup"
       exit 1
       ;;
   esac

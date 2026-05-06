@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
@@ -7,8 +7,13 @@ export LANG="C.UTF-8"
 export LC_ALL="C.UTF-8"
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-install.sh}"
-SCRIPT_PATH="$(readlink -f "${SCRIPT_SOURCE}")"
-SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+SCRIPT_PATH="${SCRIPT_SOURCE}"
+if [[ "${SCRIPT_SOURCE}" == /dev/fd/* || "${SCRIPT_SOURCE}" == /proc/*/fd/* ]]; then
+  SCRIPT_DIR="$(pwd)"
+else
+  SCRIPT_PATH="$(readlink -f "${SCRIPT_SOURCE}")"
+  SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+fi
 
 APP_NAME="nurossh"
 DEFAULT_INSTALL_PATH="/opt/${APP_NAME}"
@@ -16,11 +21,21 @@ STATE_FILE="/etc/${APP_NAME}_path"
 CRON_TAG_BEGIN="# NUROSSH_BACKUP_BEGIN"
 CRON_TAG_END="# NUROSSH_BACKUP_END"
 BACKUP_LOG="/var/log/${APP_NAME}_backup.log"
+REPO_ARCHIVE_URL="https://github.com/inimemail/nurows/archive/refs/heads/main.tar.gz"
+TEMP_BUNDLE_ROOT=""
 
 info() { echo -e "\033[32m[INFO]\033[0m $1" >&2; }
 warn() { echo -e "\033[33m[WARN]\033[0m $1" >&2; }
 err() { echo -e "\033[31m[ERROR]\033[0m $1" >&2; }
 die() { echo -e "\033[31m[FATAL]\033[0m $1" >&2; exit 1; }
+
+cleanup_temp_bundle() {
+  if [[ -n "${TEMP_BUNDLE_ROOT}" && -d "${TEMP_BUNDLE_ROOT}" ]]; then
+    rm -rf "${TEMP_BUNDLE_ROOT}"
+  fi
+}
+
+trap cleanup_temp_bundle EXIT
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
@@ -69,7 +84,25 @@ read_env_value() {
   echo "${fallback}"
 }
 
-get_bundle_dir() {
+download_bundle() {
+  require_cmd curl
+  require_cmd tar
+
+  TEMP_BUNDLE_ROOT="$(mktemp -d)"
+  local archive_path="${TEMP_BUNDLE_ROOT}/${APP_NAME}.tar.gz"
+
+  info "正在下载 NuroSSH 源码包..."
+  curl -fsSL "${REPO_ARCHIVE_URL}" -o "${archive_path}"
+  tar -xzf "${archive_path}" -C "${TEMP_BUNDLE_ROOT}"
+
+  local extracted_dir
+  extracted_dir="$(find "${TEMP_BUNDLE_ROOT}" -maxdepth 1 -type d -name 'nurows-*' | head -n 1)"
+  [[ -n "${extracted_dir}" && -f "${extracted_dir}/package.json" && -f "${extracted_dir}/server/index.js" ]] || die "从 GitHub 准备应用源码失败。"
+
+  echo "${extracted_dir}"
+}
+
+get_install_bundle_dir() {
   if [[ -f "${SCRIPT_DIR}/package.json" && -f "${SCRIPT_DIR}/server/index.js" ]]; then
     echo "${SCRIPT_DIR}"
     return
@@ -80,7 +113,42 @@ get_bundle_dir() {
     return
   fi
 
-  die "未找到应用源码目录。"
+  download_bundle
+}
+
+get_upgrade_bundle_dir() {
+  local workdir="$1"
+  local current_app_dir=""
+
+  if [[ -d "${workdir}/app" ]]; then
+    current_app_dir="$(readlink -f "${workdir}/app")"
+  fi
+
+  if [[ -f "${SCRIPT_DIR}/package.json" && -f "${SCRIPT_DIR}/server/index.js" ]]; then
+    local bundled_dir
+    bundled_dir="$(readlink -f "${SCRIPT_DIR}")"
+    if [[ -n "${current_app_dir}" && "${bundled_dir}" == "${current_app_dir}" ]]; then
+      download_bundle
+      return
+    fi
+
+    echo "${SCRIPT_DIR}"
+    return
+  fi
+
+  if [[ -f "${SCRIPT_DIR}/app/package.json" && -f "${SCRIPT_DIR}/app/server/index.js" ]]; then
+    local bundled_app_dir
+    bundled_app_dir="$(readlink -f "${SCRIPT_DIR}/app")"
+    if [[ -n "${current_app_dir}" && "${bundled_app_dir}" == "${current_app_dir}" ]]; then
+      download_bundle
+      return
+    fi
+
+    echo "${SCRIPT_DIR}/app"
+    return
+  fi
+
+  download_bundle
 }
 
 get_workdir() {
@@ -103,7 +171,20 @@ get_workdir() {
 
 copy_manage_script() {
   local install_path="$1"
-  install -m 755 "${SCRIPT_PATH}" "${install_path}/manage.sh"
+  local bundle_dir="${2:-}"
+  local source_script="${SCRIPT_PATH}"
+
+  if [[ -n "${bundle_dir}" && -f "${bundle_dir}/install.sh" ]]; then
+    source_script="${bundle_dir}/install.sh"
+  fi
+
+  if [[ -f "${source_script}" ]]; then
+    install -m 755 "${source_script}" "${install_path}/manage.sh"
+  elif [[ -f "${install_path}/manage.sh" ]]; then
+    chmod 755 "${install_path}/manage.sh"
+  else
+    warn "未找到可复制的管理脚本，已跳过 manage.sh 更新。"
+  fi
 }
 
 sync_app_bundle() {
@@ -215,7 +296,6 @@ deploy_service() {
   require_cmd tar
 
   local bundle_dir install_path input_path input_port port
-  bundle_dir="$(get_bundle_dir)"
 
   read -r -p "安装路径 [默认: ${DEFAULT_INSTALL_PATH}]: " input_path
   install_path="${input_path:-$DEFAULT_INSTALL_PATH}"
@@ -233,12 +313,14 @@ deploy_service() {
   read -r -p "对外端口 [默认: 38471]: " input_port
   port="${input_port:-38471}"
 
+  bundle_dir="$(get_install_bundle_dir)"
+
   mkdir -p "${install_path}/app"
   sync_app_bundle "${bundle_dir}" "${install_path}/app"
   write_compose_file "${install_path}"
   write_runtime_env "${install_path}/.env" "${port}" "0.0.0.0"
   ensure_data_permissions "${install_path}"
-  copy_manage_script "${install_path}"
+  copy_manage_script "${install_path}" "${bundle_dir}"
 
   echo "${install_path}" > "${STATE_FILE}"
 
@@ -259,12 +341,12 @@ upgrade_service() {
   workdir="$(get_workdir)"
   [[ -n "${workdir}" ]] || die "未检测到已部署实例。"
 
-  bundle_dir="$(get_bundle_dir)"
+  bundle_dir="$(get_upgrade_bundle_dir "${workdir}")"
   sync_app_bundle "${bundle_dir}" "${workdir}/app"
   write_compose_file "${workdir}"
   ensure_runtime_env_file "${workdir}"
   ensure_data_permissions "${workdir}"
-  copy_manage_script "${workdir}"
+  copy_manage_script "${workdir}" "${bundle_dir}"
 
   (
     cd "${workdir}" || exit 1
@@ -401,7 +483,7 @@ restore_service() {
   write_compose_file "${target_dir}"
   ensure_runtime_env_file "${target_dir}"
   ensure_data_permissions "${target_dir}"
-  copy_manage_script "${target_dir}"
+  copy_manage_script "${target_dir}" "${target_dir}/app"
 
   echo "${target_dir}" > "${STATE_FILE}"
 

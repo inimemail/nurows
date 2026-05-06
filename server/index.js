@@ -71,22 +71,7 @@ const defaultState = {
     }
   ],
   servers: [],
-  commands: [
-    {
-      id: uuidv4(),
-      name: '查看负载',
-      command: 'uptime && free -m && df -h',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    },
-    {
-      id: uuidv4(),
-      name: 'Docker 状态',
-      command: 'docker ps --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    }
-  ],
+  commands: [],
   proxies: [],
   workspaces: {}
 };

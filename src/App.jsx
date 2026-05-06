@@ -1417,6 +1417,11 @@ export default function App() {
     }
   }
 
+  function handleAuthSubmit(event) {
+    event.preventDefault();
+    void submitAuth(!auth.configured ? 'setup' : 'login');
+  }
+
   async function submitBatchInput() {
     if (!batchInputReady || !commandJobId || !batchInputDialog.awaitingServerIds.length) {
       closeBatchInputDialog();
@@ -1642,7 +1647,7 @@ export default function App() {
             </div>
           </section>
 
-          <section className="auth-form-card">
+          <form className="auth-form-card" onSubmit={handleAuthSubmit}>
             <div className="auth-form-head">
               <strong>{isSetup ? '创建管理员账户' : '登录 NuroSSH'}</strong>
               <span>{isSetup ? '密码至少 4 位' : '输入账号和密码'}</span>
@@ -1703,7 +1708,7 @@ export default function App() {
               >
               {busy[isSetup ? 'setup' : 'login'] ? '处理中...' : (isSetup ? '创建并进入控制台' : '登录')}
             </button>
-          </section>
+          </form>
         </div>
       </div>
     );

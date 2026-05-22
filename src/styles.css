@@ -1277,6 +1277,11 @@ svg {
   width: min(1000px, 100%);
 }
 
+.dialog.import-dialog {
+  width: min(1060px, calc(100vw - 36px));
+  max-height: min(860px, calc(100vh - 36px));
+}
+
 .dialog.xwide {
   width: min(1380px, 100%);
 }
@@ -1342,8 +1347,10 @@ svg {
 
 .import-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 0.95fr);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(220px, 1fr);
   gap: 14px;
+  min-height: min(640px, calc(100vh - 210px));
 }
 
 .import-input-panel {
@@ -1363,6 +1370,21 @@ svg {
 
 .import-input-head span {
   color: var(--text-soft);
+}
+
+.import-input-panel textarea {
+  min-height: 300px;
+}
+
+.import-preview {
+  min-height: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.import-preview .preview-table {
+  flex: 1 1 auto;
 }
 
 .server-picker-layout {
@@ -1836,21 +1858,112 @@ svg {
     font-size: 12px;
   }
 
+  html,
+  body,
+  #root {
+    overflow: auto;
+  }
+
   .console-shell {
+    min-height: 100%;
+    height: auto;
     padding: 8px;
     gap: 8px;
+    overflow: visible;
   }
 
   .console-topbar {
+    min-height: auto;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "brand"
+      "actions"
+      "tabs";
+    align-items: stretch;
+    border-radius: 16px;
     padding: 12px;
+    gap: 10px;
+  }
+
+  .brand-cluster {
+    min-width: 0;
+  }
+
+  .brand-mark {
+    width: 30px;
+    height: 30px;
+    border-radius: 10px;
+  }
+
+  .brand-cluster strong,
+  .brand-cluster span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .top-actions {
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: 38px repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    justify-content: stretch;
   }
 
   .search-shell {
+    grid-column: 1 / -1;
     width: 100%;
+    min-width: 0;
+  }
+
+  .search-shell input {
+    min-height: 38px;
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  .top-actions .ghost,
+  .top-actions .primary,
+  .top-actions .icon-button {
+    min-height: 38px;
+    padding: 8px 10px;
+    border-radius: 10px;
+  }
+
+  .theme-toggle {
+    min-width: 38px;
+    min-height: 38px;
+    padding: 0;
+  }
+
+  .user-pill {
+    min-width: 0;
+    gap: 5px;
+  }
+
+  .user-pill span {
+    display: none;
+  }
+
+  .top-tabs {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    padding: 4px;
+    border-radius: 13px;
+  }
+
+  .top-tab {
+    min-width: 0;
+    min-height: 38px;
+    padding: 8px 6px;
+    gap: 5px;
+  }
+
+  .top-tab span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .top-tabs,
@@ -1862,6 +1975,256 @@ svg {
   .import-layout,
   .preview-row {
     grid-template-columns: 1fr;
+  }
+
+  .top-tabs {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .console-body {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    gap: 8px;
+    position: static;
+  }
+
+  .side-panel {
+    position: static;
+    width: 100%;
+    max-height: min(60vh, 520px);
+    min-height: 0;
+    border-radius: 16px;
+    padding: 12px;
+    transform: none;
+    transition: none;
+  }
+
+  .side-panel:not(.open) {
+    display: none;
+  }
+
+  .side-panel.open {
+    transform: none;
+  }
+
+  .side-head,
+  .workspace-head,
+  .terminal-banner,
+  .result-head {
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .side-head {
+    flex-direction: column;
+  }
+
+  .toolbar {
+    width: 100%;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+
+  .toolbar .ghost,
+  .toolbar .primary {
+    min-height: 36px;
+    padding: 8px 11px;
+  }
+
+  .panel-scroll {
+    max-height: calc(60vh - 96px);
+    overflow: auto;
+  }
+
+  .tree-list {
+    margin-left: 0;
+    padding-left: 9px;
+  }
+
+  .tree-item {
+    align-items: flex-start;
+    padding: 10px;
+  }
+
+  .tree-actions {
+    gap: 6px;
+  }
+
+  .tree-actions .icon-button,
+  .row-actions .icon-button {
+    width: 28px;
+    height: 28px;
+    border-radius: 9px;
+  }
+
+  .main-column {
+    min-height: 0;
+    gap: 8px;
+  }
+
+  .workspace-panel,
+  .command-composer,
+  .command-target-board,
+  .command-result-board,
+  .proxy-hero,
+  .proxy-usage-board,
+  .overview-highlight,
+  .overview-card,
+  .import-preview {
+    border-radius: 16px;
+    padding: 12px;
+  }
+
+  .workspace-panel {
+    min-height: calc(100vh - 170px);
+  }
+
+  .workspace-stage {
+    min-height: 360px;
+    overflow: visible;
+  }
+
+  .overview-shell,
+  .detail-wrap,
+  .proxy-board {
+    height: auto;
+  }
+
+  .overview-grid,
+  .metrics-ribbon {
+    gap: 8px;
+  }
+
+  .metric-tile,
+  .overview-card {
+    min-height: auto;
+    padding: 10px;
+    border-radius: 14px;
+  }
+
+  .hero-actions {
+    gap: 8px;
+  }
+
+  .hero-actions .ghost,
+  .hero-actions .primary {
+    flex: 1 1 130px;
+  }
+
+  .command-board {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    gap: 8px;
+  }
+
+  .command-composer textarea {
+    min-height: 132px;
+  }
+
+  .target-summary {
+    min-height: 140px;
+  }
+
+  .result-list,
+  .usage-list,
+  .target-grid {
+    max-height: none;
+    overflow: visible;
+  }
+
+  .result-card pre,
+  .batch-input-preview {
+    max-height: 220px;
+  }
+
+  .terminal-stage {
+    min-height: 360px;
+  }
+
+  .terminal-root {
+    min-height: 360px;
+    border-radius: 14px;
+    padding: 10px;
+  }
+
+  .terminal-banner {
+    flex-direction: column;
+  }
+
+  .terminal-manual-input {
+    flex-wrap: wrap;
+    padding: 8px;
+  }
+
+  .terminal-manual-input input {
+    flex-basis: 100%;
+  }
+
+  .session-strip-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .session-scroll-button {
+    display: none;
+  }
+
+  .session-strip {
+    padding-right: 0;
+  }
+
+  .dialog-backdrop {
+    align-items: stretch;
+    place-items: stretch;
+    padding: 8px;
+  }
+
+  .dialog {
+    width: 100%;
+    max-height: calc(100vh - 16px);
+    border-radius: 18px;
+  }
+
+  .dialog.import-dialog {
+    width: 100%;
+    max-height: calc(100vh - 16px);
+  }
+
+  .dialog-head,
+  .dialog-footer {
+    padding: 14px;
+  }
+
+  .dialog-body {
+    padding: 0 14px 14px;
+  }
+
+  .dialog-footer {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .import-layout {
+    min-height: 620px;
+    grid-template-rows: auto minmax(220px, 1fr);
+  }
+
+  .import-input-panel textarea {
+    min-height: 320px;
+  }
+
+  .server-picker-layout {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .server-picker-groups,
+  .server-picker-list {
+    height: auto;
+    overflow: visible;
   }
 
   .picker-table-head,

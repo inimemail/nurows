@@ -421,7 +421,12 @@ export default function App() {
   const [runCommandConfirmOpen, setRunCommandConfirmOpen] = useState(false);
   const [temporaryKeywordsDialogOpen, setTemporaryKeywordsDialogOpen] = useState(false);
   const [temporaryInteractiveKeywordsText, setTemporaryInteractiveKeywordsText] = useState('');
-  const [assetDrawerOpen, setAssetDrawerOpen] = useState(true);
+  const [assetDrawerOpen, setAssetDrawerOpen] = useState(() => {
+    if (typeof window === 'undefined') {
+      return true;
+    }
+    return !window.matchMedia('(max-width: 760px)').matches;
+  });
   const [toasts, setToasts] = useState([]);
   const [stateLoaded, setStateLoaded] = useState(false);
 
@@ -1704,6 +1709,12 @@ export default function App() {
     setTerminalFullscreenOpen(false);
   }
 
+  function closeAssetDrawerOnMobile() {
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 760px)').matches) {
+      setAssetDrawerOpen(false);
+    }
+  }
+
   if (auth.loading) {
     return (
       <div className="auth-shell">
@@ -1946,6 +1957,7 @@ export default function App() {
                               className={'tree-item ' + (selectedServerId === serverItem.id ? 'selected' : '')}
                               onClick={() => {
                                 setSelectedServerId(serverItem.id);
+                                closeAssetDrawerOnMobile();
                               }}
                             >
                               <div className="tree-copy">
@@ -1995,6 +2007,7 @@ export default function App() {
                   onClick={() => {
                     setSelectedCommandId(item.id);
                     setCommandText(item.command);
+                    closeAssetDrawerOnMobile();
                   }}
                 >
                   <strong>{item.name}</strong>
@@ -2011,6 +2024,7 @@ export default function App() {
                   className={'stack-card ' + (selectedProxyId === item.id ? 'selected' : '')}
                   onClick={() => {
                     setSelectedProxyId(item.id);
+                    closeAssetDrawerOnMobile();
                   }}
                 >
                   <strong>{item.name}</strong>
@@ -2658,6 +2672,7 @@ export default function App() {
         <Dialog
           title="批量导入服务器"
           wide
+          className="import-dialog"
           onClose={() => setImportDialog({ open: false, text: '', preview: null, confirmOverwrite: false, loading: false })}
           footer={
             <>
@@ -2694,7 +2709,7 @@ export default function App() {
               </div>
               <label className="field field-span">
                 <textarea
-                  rows={12}
+                  rows={10}
                   value={importDialog.text}
                   onChange={(event) => setImportDialog((current) => ({ ...current, text: event.target.value, preview: null, confirmOverwrite: false }))}
                   placeholder={'腾讯云东京 43.165.176.87 22 root Qq135246@\n腾讯云东京 43.165.176.187 22 root Qq135246@'}

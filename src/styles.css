@@ -1656,6 +1656,10 @@ svg {
   display: none;
 }
 
+.mobile-drawer-scrim {
+  display: none;
+}
+
 .auth-shell {
   position: relative;
   width: 100%;
@@ -1982,26 +1986,41 @@ svg {
   }
 
   .console-body {
-    display: flex;
-    flex-direction: column;
+    display: block;
     min-height: 0;
-    gap: 8px;
     position: static;
+  }
+
+  .mobile-drawer-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 19;
+    display: block;
+    opacity: 0;
+    pointer-events: none;
+    background: rgba(8, 15, 28, 0.34);
+    backdrop-filter: blur(3px);
+    transition: opacity 0.2s ease;
+  }
+
+  .mobile-drawer-scrim.open {
+    opacity: 1;
+    pointer-events: auto;
   }
 
   .side-panel {
-    position: static;
-    width: 100%;
-    max-height: min(60vh, 520px);
+    position: fixed;
+    top: 8px;
+    bottom: 8px;
+    left: 8px;
+    z-index: 20;
+    width: min(86vw, 340px);
+    max-height: none;
     min-height: 0;
-    border-radius: 16px;
+    border-radius: 18px;
     padding: 12px;
-    transform: none;
-    transition: none;
-  }
-
-  .side-panel:not(.open) {
-    display: none;
+    transform: translateX(calc(-100% - 14px));
+    transition: transform 0.22s ease;
   }
 
   .side-panel.open {
@@ -2016,7 +2035,8 @@ svg {
     gap: 8px;
   }
 
-  .side-head {
+  .side-head,
+  .workspace-head {
     flex-direction: column;
   }
 

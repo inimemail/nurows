@@ -1874,6 +1874,14 @@ export default function App() {
       </header>
 
       <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '')}>
+        {!workspaceFullscreenActive ? (
+          <button
+            className={'mobile-drawer-scrim ' + (assetDrawerOpen ? 'open' : '')}
+            type="button"
+            aria-label="关闭列表"
+            onClick={() => setAssetDrawerOpen(false)}
+          />
+        ) : null}
         <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '')}>
           <div className="side-head">
             <div>
@@ -2712,7 +2720,7 @@ export default function App() {
                   rows={10}
                   value={importDialog.text}
                   onChange={(event) => setImportDialog((current) => ({ ...current, text: event.target.value, preview: null, confirmOverwrite: false }))}
-                  placeholder={'腾讯云东京 43.165.176.87 22 root Qq135246@\n腾讯云东京 43.165.176.187 22 root Qq135246@'}
+                  placeholder={'server-a 192.0.2.10 22 root password group-a\nserver-b 192.0.2.11 22 root password'}
                 />
               </label>
             </div>
@@ -2758,14 +2766,14 @@ export default function App() {
                 rows={7}
                 value={quickImportDialog.hosts}
                 onChange={(event) => setQuickImportDialog((current) => ({ ...current, hosts: event.target.value }))}
-                placeholder={'43.165.176.87\n43.165.176.187\n43.165.177.72'}
+                placeholder={'192.0.2.10\n192.0.2.11\n192.0.2.12'}
               />
             </label>
             <Field label="统一名称">
               <input
                 value={quickImportDialog.name}
                 onChange={(event) => setQuickImportDialog((current) => ({ ...current, name: event.target.value }))}
-                placeholder="腾讯云东京"
+                placeholder="服务器名称"
               />
             </Field>
             <Field label="端口">

@@ -1346,6 +1346,25 @@ svg {
   gap: 14px;
 }
 
+.import-input-panel {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.import-input-head {
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.import-input-head span {
+  color: var(--text-soft);
+}
+
 .server-picker-layout {
   display: grid;
   grid-template-columns: 290px minmax(0, 1fr);

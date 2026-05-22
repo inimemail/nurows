@@ -44,6 +44,16 @@ const EMPTY_BATCH_INPUT_DIALOG = {
   signature: ''
 };
 
+const EMPTY_QUICK_IMPORT_DIALOG = {
+  open: false,
+  hosts: '',
+  name: '',
+  port: 22,
+  username: 'root',
+  password: '',
+  groupName: ''
+};
+
 const INTERACTIVE_KEYWORDS_STORAGE_KEY = 'nurossh-interactive-keywords';
 const DEFAULT_INTERACTIVE_KEYWORDS = ['请', '请输入', '请选择', '按回车'];
 
@@ -73,6 +83,56 @@ function sanitizeInteractiveKeywords(items, { fallbackToDefault = true } = {}) {
 
 function parseInteractiveKeywordsText(value, options) {
   return sanitizeInteractiveKeywords(String(value || '').split(/\r?\n/), options);
+}
+
+function looksLikeQuickImportHostToken(value) {
+  const token = String(value || '').trim().replace(/^\[|\]$/g, '');
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(token)) {
+    return token.split('.').every((part) => Number(part) >= 0 && Number(part) <= 255);
+  }
+  if (/^[a-z0-9][a-z0-9.-]*\.[a-z0-9-]+$/i.test(token)) {
+    return true;
+  }
+  return token.includes(':') && /^[a-f0-9:]+$/i.test(token);
+}
+
+function parseQuickImportHosts(value) {
+  const seen = new Set();
+  return String(value || '')
+    .split(/\r?\n|[,，;；]+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const tokens = line.match(/[^\s,，|]+/g) || [];
+      return tokens.find(looksLikeQuickImportHostToken) || tokens[0] || '';
+    })
+    .map((host) => host.trim().replace(/^['"]|['"]$/g, ''))
+    .filter(Boolean)
+    .filter((host) => {
+      const key = host.toLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+}
+
+function formatImportField(value) {
+  const text = String(value ?? '').trim();
+  if (!text) {
+    return '';
+  }
+  if (!/[\s,|]/.test(text)) {
+    return text;
+  }
+  if (!text.includes('"')) {
+    return `"${text}"`;
+  }
+  if (!text.includes("'")) {
+    return `'${text}'`;
+  }
+  return `"${text.replace(/"/g, '')}"`;
 }
 
 function readInteractiveKeywords() {
@@ -342,6 +402,7 @@ export default function App() {
     confirmOverwrite: false,
     loading: false
   });
+  const [quickImportDialog, setQuickImportDialog] = useState(EMPTY_QUICK_IMPORT_DIALOG);
   const [serverPickerOpen, setServerPickerOpen] = useState(false);
   const [serverPickerMode, setServerPickerMode] = useState('command');
   const [pickerSearch, setPickerSearch] = useState('');
@@ -1274,6 +1335,49 @@ export default function App() {
     } finally {
       setActionBusy(overwriteDuplicates ? 'applyImportOverwrite' : 'applyImport', false);
     }
+  }
+
+  function closeQuickImportDialog() {
+    setQuickImportDialog(EMPTY_QUICK_IMPORT_DIALOG);
+  }
+
+  function applyQuickImport() {
+    const hosts = parseQuickImportHosts(quickImportDialog.hosts);
+    const name = formatImportField(quickImportDialog.name);
+    const username = formatImportField(quickImportDialog.username || 'root');
+    const password = formatImportField(quickImportDialog.password);
+    const groupName = formatImportField(quickImportDialog.groupName);
+    const port = Number(quickImportDialog.port);
+    const safePort = Number.isFinite(port) && port >= 1 && port <= 65535 ? Math.trunc(port) : 22;
+
+    if (!hosts.length) {
+      toast('请先填写至少一个 IP');
+      return;
+    }
+    if (!name) {
+      toast('请填写统一名称');
+      return;
+    }
+
+    const lines = hosts.map((host) => {
+      const fields = [name, formatImportField(host), safePort, username || 'root'];
+      if (groupName) {
+        fields.push(password || '""', groupName);
+      } else {
+        fields.push(password);
+      }
+      return fields.join(' ');
+    });
+
+    setImportDialog((current) => ({
+      ...current,
+      text: [current.text.trim(), lines.join('\n')].filter(Boolean).join('\n'),
+      preview: null,
+      confirmOverwrite: false,
+      loading: false
+    }));
+    closeQuickImportDialog();
+    toast(`已生成 ${lines.length} 条导入内容`);
   }
 
   function openRunCommandConfirm() {
@@ -2577,15 +2681,26 @@ export default function App() {
           }
         >
           <div className="import-layout">
-            <label className="field field-span">
-              <span>名称 IP 端口 用户名 密码 分组</span>
-              <textarea
-                rows={12}
-                value={importDialog.text}
-                onChange={(event) => setImportDialog((current) => ({ ...current, text: event.target.value }))}
-                placeholder={'hk-node 1.2.3.4 22 root 123456 香港\nsg-prod 8.8.8.8 22 root passw0rd 新加坡'}
-              />
-            </label>
+            <div className="import-input-panel">
+              <div className="import-input-head">
+                <span>名称 IP 端口 用户名 密码 分组</span>
+                <button
+                  className="ghost"
+                  type="button"
+                  onClick={() => setQuickImportDialog((current) => ({ ...current, open: true }))}
+                >
+                  快捷导入
+                </button>
+              </div>
+              <label className="field field-span">
+                <textarea
+                  rows={12}
+                  value={importDialog.text}
+                  onChange={(event) => setImportDialog((current) => ({ ...current, text: event.target.value, preview: null, confirmOverwrite: false }))}
+                  placeholder={'腾讯云东京 43.165.176.87 22 root Qq135246@\n腾讯云东京 43.165.176.187 22 root Qq135246@'}
+                />
+              </label>
+            </div>
             <div className="import-preview surface">
               <div className="workspace-head">
                 <div>
@@ -2606,6 +2721,69 @@ export default function App() {
                 {!importDialog.preview?.items?.length ? <div className="empty-state">导入前会先告诉你哪些条目需要覆盖。</div> : null}
               </div>
             </div>
+          </div>
+        </Dialog>
+      ) : null}
+
+      {quickImportDialog.open ? (
+        <Dialog
+          title="快捷导入"
+          onClose={closeQuickImportDialog}
+          footer={
+            <>
+              <button className="ghost" onClick={closeQuickImportDialog}>取消</button>
+              <button className="primary" onClick={applyQuickImport}>确认填入导入框</button>
+            </>
+          }
+        >
+          <div className="field-grid">
+            <label className="field field-span">
+              <span>IP 列表</span>
+              <textarea
+                rows={7}
+                value={quickImportDialog.hosts}
+                onChange={(event) => setQuickImportDialog((current) => ({ ...current, hosts: event.target.value }))}
+                placeholder={'43.165.176.87\n43.165.176.187\n43.165.177.72'}
+              />
+            </label>
+            <Field label="统一名称">
+              <input
+                value={quickImportDialog.name}
+                onChange={(event) => setQuickImportDialog((current) => ({ ...current, name: event.target.value }))}
+                placeholder="腾讯云东京"
+              />
+            </Field>
+            <Field label="端口">
+              <input
+                type="number"
+                min="1"
+                max="65535"
+                value={quickImportDialog.port}
+                onChange={(event) => setQuickImportDialog((current) => ({ ...current, port: event.target.value }))}
+                placeholder="22"
+              />
+            </Field>
+            <Field label="用户名">
+              <input
+                value={quickImportDialog.username}
+                onChange={(event) => setQuickImportDialog((current) => ({ ...current, username: event.target.value }))}
+                placeholder="root"
+              />
+            </Field>
+            <Field label="密码">
+              <input
+                value={quickImportDialog.password}
+                onChange={(event) => setQuickImportDialog((current) => ({ ...current, password: event.target.value }))}
+                placeholder="所有服务器共用的密码"
+              />
+            </Field>
+            <Field label="分组">
+              <input
+                value={quickImportDialog.groupName}
+                onChange={(event) => setQuickImportDialog((current) => ({ ...current, groupName: event.target.value }))}
+                placeholder="可不填"
+              />
+            </Field>
           </div>
         </Dialog>
       ) : null}

@@ -1689,6 +1689,10 @@ export default function App() {
   }
 
   function closeTerminal(sessionId) {
+    api('/api/terminal-sessions/' + encodeURIComponent(sessionId), {
+      method: 'DELETE',
+      onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
+    }).catch(() => undefined);
     setTerminalSessions((current) => {
       const closingIndex = current.findIndex((item) => item.id === sessionId);
       if (closingIndex === -1) {
@@ -1704,6 +1708,12 @@ export default function App() {
   }
 
   function closeAllTerminals() {
+    for (const session of terminalSessions) {
+      api('/api/terminal-sessions/' + encodeURIComponent(session.id), {
+        method: 'DELETE',
+        onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
+      }).catch(() => undefined);
+    }
     setTerminalSessions([]);
     setActiveTerminalId('');
     setTerminalFullscreenOpen(false);
@@ -3587,7 +3597,7 @@ function TerminalWorkspace({
       if (mode === 'command-job') {
         return '/ws/command-job?jobId=' + encodeURIComponent(session.jobId || '') + '&serverId=' + encodeURIComponent(session.serverId);
       }
-      return '/ws/terminal?serverId=' + encodeURIComponent(session.serverId);
+      return '/ws/terminal?serverId=' + encodeURIComponent(session.serverId) + '&terminalId=' + encodeURIComponent(session.id || session.serverId);
     };
     const createSocket = () => new WebSocket(protocol + '//' + window.location.host + buildSocketPath());
     const socket = createSocket();
@@ -3659,15 +3669,7 @@ function TerminalWorkspace({
     });
 
     socket.addEventListener('close', () => {
-      if (mode === 'command-job' && !disconnectHandled) {
-        disconnectHandled = true;
-        setReady(false);
-        setCanReconnect(false);
-        setStatus('执行会话已结束');
-        terminal.writeln('\r\n[系统] 当前执行会话已结束。');
-        return;
-      }
-      handleDisconnect('连接已关闭，按任意键重连');
+      handleDisconnect(mode === 'command-job' ? '连接已断开，按任意键恢复执行会话' : '连接已关闭，按任意键重连');
     });
 
     socket.addEventListener('error', () => {

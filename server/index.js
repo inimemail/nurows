@@ -33,7 +33,13 @@ const STORAGE_KEYS = {
   secret: 'secret'
 };
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+const SSH_KEEPALIVE_INTERVAL_MS = readDurationMs(process.env.SSH_KEEPALIVE_INTERVAL || process.env.SSH_KEEPALIVE_INTERVAL_MS, 15000);
+const SSH_KEEPALIVE_COUNT_MAX = clampInteger(process.env.SSH_KEEPALIVE_COUNT_MAX, 3, 1, 100);
+const WEBSOCKET_PING_INTERVAL_MS = readDurationMs(process.env.WEBSOCKET_PING_INTERVAL || process.env.WEBSOCKET_PING_INTERVAL_MS, 20000);
+const TERMINAL_REATTACH_GRACE_MS = 1000 * 60 * 60 * 12;
+const TERMINAL_HISTORY_LIMIT = 1000 * 1000;
 const sessions = new Map();
+const terminalSessions = new Map();
 const authAttempts = new Map();
 const commandJobs = new Map();
 let sqliteDb = null;
@@ -344,6 +350,14 @@ app.get('/api/servers/:id/password', (req, res) => {
   } catch (error) {
     res.status(400).json({ error: error.message || '密码无法解密，请重新保存密码' });
   }
+});
+
+app.delete('/api/terminal-sessions/:id', (req, res) => {
+  const runtime = terminalSessions.get(sanitizeTerminalRuntimeId(req.params.id));
+  if (runtime) {
+    closeTerminalRuntime(runtime, true);
+  }
+  res.json({ ok: true });
 });
 
 app.delete('/api/servers/:id', (req, res) => {
@@ -660,11 +674,15 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws, req) => {
+  attachWebSocketHeartbeat(ws);
+
   const url = new URL(req.url || '', 'http://localhost');
   if (url.pathname === '/ws/command-job') {
     handleCommandJobConnection(ws, req);
     return;
   }
+  handleTerminalConnection(ws, req, url);
+  return;
   const serverId = url.searchParams.get('serverId') || '';
   const state = readState();
   const session = getSessionFromRequest(req);
@@ -796,11 +814,288 @@ server.listen(PORT, HOST, () => {
   console.log(`NuroSSH server running at http://localhost:${PORT}`);
 });
 
+function handleTerminalConnection(ws, req, url) {
+  const serverId = url.searchParams.get('serverId') || '';
+  const terminalId = sanitizeTerminalRuntimeId(url.searchParams.get('terminalId') || serverId);
+  const state = readState();
+  const session = getSessionFromRequest(req);
+  const serverItem = state.servers.find((item) => item.id === serverId);
+
+  if (!serverItem) {
+    ws.send(JSON.stringify({ type: 'error', message: '未找到服务器配置' }));
+    ws.close();
+    return;
+  }
+
+  const proxy = state.proxies.find((item) => item.id === serverItem.proxyId) || null;
+  let serverPassword = '';
+  let proxyPassword = '';
+  try {
+    serverPassword = getStoredSecretValue(serverItem, session.encryptionKey);
+    proxyPassword = proxy ? getStoredSecretValue(proxy, session.encryptionKey) : '';
+  } catch (error) {
+    ws.send(JSON.stringify({ type: 'error', message: error.message || '密码无法解密，请重新保存密码' }));
+    ws.close();
+    return;
+  }
+
+  let runtime = terminalSessions.get(terminalId);
+  if (runtime && runtime.serverId !== serverId) {
+    closeTerminalRuntime(runtime, true);
+    runtime = null;
+  }
+  if (!runtime || runtime.closed) {
+    runtime = createTerminalRuntime({
+      id: terminalId,
+      serverId,
+      serverItem,
+      serverPassword,
+      proxy,
+      proxyPassword
+    });
+    terminalSessions.set(terminalId, runtime);
+  }
+
+  attachTerminalClient(runtime, ws);
+}
+
+function createTerminalRuntime({ id, serverId, serverItem, serverPassword, proxy, proxyPassword }) {
+  const ssh = new SSHClient();
+  const runtime = {
+    id,
+    serverId,
+    ssh,
+    shellStream: null,
+    clients: new Set(),
+    history: '',
+    closed: false,
+    closeTimer: null,
+    ready: false,
+    errorMessage: ''
+  };
+
+  const appendOutput = (text) => {
+    runtime.history = `${runtime.history}${text}`.slice(-TERMINAL_HISTORY_LIMIT);
+    broadcastTerminalSession(runtime, { type: 'output', data: text });
+  };
+
+  const markClosed = (message = '') => {
+    if (runtime.closed) {
+      return;
+    }
+    runtime.closed = true;
+    runtime.errorMessage = message;
+    broadcastTerminalSession(runtime, message ? { type: 'error', message } : { type: 'closed' });
+    closeTerminalRuntime(runtime, false);
+  };
+
+  const connectOptions = buildConnectOptions(serverItem, serverPassword);
+  const connect = (socket) => {
+    ssh.connect(socket ? { ...connectOptions, sock: socket } : connectOptions);
+  };
+
+  if (proxy) {
+    createProxySocket({ ...proxy, password: proxyPassword }, serverItem.host, serverItem.port)
+      .then((socket) => connect(socket))
+      .catch((error) => markClosed(`代理连接失败: ${error.message}`));
+  } else {
+    connect(null);
+  }
+
+  ssh.on('ready', () => {
+    ssh.shell(
+      {
+        cols: 120,
+        rows: 36,
+        term: 'xterm-256color'
+      },
+      (error, stream) => {
+        if (error) {
+          markClosed(error.message || '终端打开失败');
+          return;
+        }
+
+        runtime.ready = true;
+        runtime.shellStream = stream;
+        broadcastTerminalSession(runtime, { type: 'ready' });
+
+        stream.on('data', (chunk) => {
+          appendOutput(chunk.toString('utf8'));
+        });
+        stream.stderr?.on('data', (chunk) => {
+          appendOutput(chunk.toString('utf8'));
+        });
+        stream.on('close', () => {
+          runtime.shellStream = null;
+          markClosed();
+        });
+      }
+    );
+  });
+
+  ssh.on('error', (error) => {
+    markClosed(error.message || 'SSH 连接失败');
+  });
+
+  ssh.on('close', () => {
+    markClosed();
+  });
+
+  return runtime;
+}
+
+function attachTerminalClient(runtime, ws) {
+  if (runtime.closeTimer) {
+    clearTimeout(runtime.closeTimer);
+    runtime.closeTimer = null;
+  }
+
+  ws.on('message', (raw) => {
+    if (!runtime.shellStream || runtime.closed) {
+      return;
+    }
+
+    try {
+      const message = JSON.parse(String(raw));
+      if (message.type === 'input') {
+        runtime.shellStream.write(message.data);
+      }
+      if (message.type === 'resize' && Number.isFinite(message.cols) && Number.isFinite(message.rows)) {
+        runtime.shellStream.setWindow(message.rows, message.cols, 0, 0);
+      }
+    } catch (_error) {
+      runtime.shellStream.write(String(raw));
+    }
+  });
+
+  const cleanupClient = () => {
+    runtime.clients.delete(ws);
+    if (!runtime.closed && !runtime.clients.size && !runtime.closeTimer) {
+      runtime.closeTimer = setTimeout(() => {
+        closeTerminalRuntime(runtime, true);
+      }, TERMINAL_REATTACH_GRACE_MS);
+    }
+  };
+  ws.on('close', cleanupClient);
+  ws.on('error', cleanupClient);
+
+  runtime.clients.add(ws);
+  if (runtime.ready) {
+    ws.send(JSON.stringify({ type: 'ready' }));
+  }
+  if (runtime.history) {
+    ws.send(JSON.stringify({ type: 'history', data: runtime.history }));
+  }
+  if (runtime.closed) {
+    ws.send(JSON.stringify(runtime.errorMessage ? { type: 'error', message: runtime.errorMessage } : { type: 'closed' }));
+  }
+}
+
+function closeTerminalRuntime(runtime, notifyClients) {
+  if (runtime.closeTimer) {
+    clearTimeout(runtime.closeTimer);
+    runtime.closeTimer = null;
+  }
+  runtime.closed = true;
+  try {
+    runtime.shellStream?.end();
+  } catch (_error) {
+    // Ignore best-effort cleanup failures.
+  }
+  runtime.shellStream = null;
+  try {
+    runtime.ssh.end();
+  } catch (_error) {
+    // Ignore best-effort cleanup failures.
+  }
+  terminalSessions.delete(runtime.id);
+
+  if (notifyClients) {
+    broadcastTerminalSession(runtime, { type: 'closed' });
+  }
+}
+
+function broadcastTerminalSession(runtime, payload) {
+  for (const client of runtime.clients) {
+    if (client.readyState === client.OPEN) {
+      client.send(JSON.stringify(payload));
+    }
+  }
+}
+
+function sanitizeTerminalRuntimeId(value) {
+  const id = String(value || '').trim();
+  if (/^[A-Za-z0-9:_-]{1,120}$/.test(id)) {
+    return id;
+  }
+  return uuidv4();
+}
+
 function resolveSqlitePath(targetPath) {
   if (path.isAbsolute(targetPath)) {
     return targetPath;
   }
   return path.join(ROOT_DIR, targetPath);
+}
+
+function readDurationMs(value, fallbackMs) {
+  if (value === undefined || value === null || value === '') {
+    return fallbackMs;
+  }
+  const input = String(value).trim();
+  if (/^\d+$/.test(input)) {
+    return Number(input);
+  }
+  const match = input.match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)$/i);
+  if (!match) {
+    return fallbackMs;
+  }
+  const amount = Number(match[1]);
+  const unit = match[2].toLowerCase();
+  const multipliers = {
+    ms: 1,
+    s: 1000,
+    m: 1000 * 60,
+    h: 1000 * 60 * 60,
+    d: 1000 * 60 * 60 * 24
+  };
+  const result = Math.round(amount * multipliers[unit]);
+  return Number.isFinite(result) && result > 0 ? result : fallbackMs;
+}
+
+function clampInteger(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.round(number)));
+}
+
+function attachWebSocketHeartbeat(ws) {
+  if (!WEBSOCKET_PING_INTERVAL_MS) {
+    return;
+  }
+  let alive = true;
+  const markAlive = () => {
+    alive = true;
+  };
+  const timer = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) {
+      clearInterval(timer);
+      return;
+    }
+    if (!alive) {
+      ws.terminate();
+      clearInterval(timer);
+      return;
+    }
+    alive = false;
+    ws.ping();
+  }, WEBSOCKET_PING_INTERVAL_MS);
+
+  ws.on('pong', markAlive);
+  ws.on('close', () => clearInterval(timer));
+  ws.on('error', () => clearInterval(timer));
 }
 
 function ensureStorage() {
@@ -2189,8 +2484,8 @@ function buildConnectOptions(serverItem, password) {
     username: serverItem.username,
     password,
     readyTimeout: 15000,
-    keepaliveInterval: 5000,
-    keepaliveCountMax: 6,
+    keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
+    keepaliveCountMax: SSH_KEEPALIVE_COUNT_MAX,
     tryKeyboard: false
   };
 }
@@ -2213,15 +2508,8 @@ async function execOnServer(serverItem, proxies, command, encryptionKeyHex) {
     };
 
     const connect = (socket) => {
-      const options = {
-        host: serverItem.host,
-        port: serverItem.port,
-        username: serverItem.username,
-        password: serverPassword,
-        readyTimeout: 15000,
-        sock: socket
-      };
-      ssh.connect(socket ? options : { ...options, sock: undefined });
+      const options = buildConnectOptions(serverItem, serverPassword);
+      ssh.connect(socket ? { ...options, sock: socket } : options);
     };
 
     if (proxy) {

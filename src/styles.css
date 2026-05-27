@@ -1496,11 +1496,21 @@ svg {
   border: 1px solid var(--border-card);
   background: var(--card-bg);
   border-radius: 16px;
+  min-height: 62px;
   padding: 12px 14px;
   display: grid;
   grid-template-columns: 52px minmax(240px, 1.2fr) minmax(220px, 1fr) minmax(160px, 0.7fr);
   align-items: center;
   gap: 12px;
+}
+
+.picker-server-row input[type='checkbox'] {
+  width: 34px;
+  height: 34px;
+  margin: 0;
+  justify-self: center;
+  padding: 0;
+  flex: 0 0 auto;
 }
 
 .picker-server-row.selected {

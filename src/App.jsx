@@ -2608,14 +2608,14 @@ export default function App() {
               <div className="picker-table-body">
                 {pickerFilteredServers.length ? (
                   pickerFilteredServers.map((item) => (
-                    <label key={item.id} className={'picker-server-row ' + (pickerSelectedIds.includes(item.id) ? 'selected' : '')}>
+                    <div key={item.id} className={'picker-server-row ' + (pickerSelectedIds.includes(item.id) ? 'selected' : '')}>
                       <input type="checkbox" checked={pickerSelectedIds.includes(item.id)} onChange={() => togglePickerServerChecked(item.id)} />
                       <div>
                         <strong>{item.name}</strong>
                       </div>
                       <span>{item.host}:{item.port}</span>
                       <em>{state.groups.find((group) => group.id === item.groupId)?.name || '默认分组'}</em>
-                    </label>
+                    </div>
                   ))
                 ) : (
                   <div className="empty-state picker-empty">当前条件下没有服务器</div>

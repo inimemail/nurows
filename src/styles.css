@@ -1473,7 +1473,7 @@ svg {
 
 .picker-table-head {
   display: grid;
-  grid-template-columns: 52px minmax(240px, 1.2fr) minmax(220px, 1fr) minmax(160px, 0.7fr);
+  grid-template-columns: 40px minmax(240px, 1.2fr) minmax(220px, 1fr) minmax(160px, 0.7fr);
   gap: 12px;
   padding: 0 14px 8px;
   border-bottom: 1px solid var(--border-card);
@@ -1499,18 +1499,19 @@ svg {
   min-height: 62px;
   padding: 12px 14px;
   display: grid;
-  grid-template-columns: 52px minmax(240px, 1.2fr) minmax(220px, 1fr) minmax(160px, 0.7fr);
+  grid-template-columns: 40px minmax(240px, 1.2fr) minmax(220px, 1fr) minmax(160px, 0.7fr);
   align-items: center;
   gap: 12px;
 }
 
 .picker-server-row input[type='checkbox'] {
-  width: 34px;
-  height: 34px;
+  width: 18px;
+  height: 18px;
   margin: 0;
   justify-self: center;
   padding: 0;
   flex: 0 0 auto;
+  accent-color: var(--accent-solid);
 }
 
 .picker-server-row.selected {

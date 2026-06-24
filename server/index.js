@@ -263,6 +263,7 @@ app.post('/api/workspace', (req, res) => {
 app.post('/api/groups', (req, res) => {
   const group = normalizeGroup(req.body);
   const state = updateState((draft) => {
+    ensureUniqueGroupName(draft, group.name);
     draft.groups.push(group);
     return draft;
   });
@@ -276,7 +277,9 @@ app.put('/api/groups/:id', (req, res) => {
       throw new Error('未找到分组');
     }
 
-    item.name = String(req.body.name || '').trim() || item.name;
+    const nextName = String(req.body.name || '').trim() || item.name;
+    ensureUniqueGroupName(draft, nextName, item.id);
+    item.name = nextName;
     item.note = String(req.body.note || '').trim();
     item.updatedAt = new Date().toISOString();
     return draft;
@@ -2324,25 +2327,36 @@ function ensureProxyExists(state, proxyId) {
   }
 }
 
+function findGroupByName(state, name) {
+  const normalizedName = String(name || '').trim();
+  if (!normalizedName) {
+    return null;
+  }
+  return state.groups.find((group) => group.name === normalizedName) || null;
+}
+
+function ensureUniqueGroupName(state, name, ignoredId = '') {
+  const existingGroup = findGroupByName(state, name);
+  if (existingGroup && existingGroup.id !== ignoredId) {
+    throw new Error('分组名称已存在');
+  }
+}
+
 function ensureGroupByNameOrId(state, groupName, groupId) {
-  const existingById = state.groups.find((group) => group.id === groupId);
-  if (existingById) {
-    return existingById.id;
-  }
-
   const nextName = String(groupName || '').trim();
-  if (!nextName) {
-    return 'group-default';
+  if (nextName) {
+    const existingByName = findGroupByName(state, nextName);
+    if (existingByName) {
+      return existingByName.id;
+    }
+
+    const group = normalizeGroup({ name: nextName });
+    state.groups.push(group);
+    return group.id;
   }
 
-  const existingByName = state.groups.find((group) => group.name === nextName);
-  if (existingByName) {
-    return existingByName.id;
-  }
-
-  const group = normalizeGroup({ name: nextName });
-  state.groups.push(group);
-  return group.id;
+  const existingById = state.groups.find((group) => group.id === groupId);
+  return existingById ? existingById.id : 'group-default';
 }
 
 function getStoredSecretValue(item, encryptionKeyHex) {

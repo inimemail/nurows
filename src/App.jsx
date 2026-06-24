@@ -66,6 +66,7 @@ const TABS = [
 const TERMINAL_SESSIONS_STORAGE_KEY = 'nurossh-terminal-sessions';
 const ACTIVE_TERMINAL_STORAGE_KEY = 'nurossh-active-terminal-id';
 const BATCH_INPUT_SERVER_BUTTON_LIMIT = 12;
+const QUICK_IMPORT_GROUP_SUGGESTION_LIMIT = 8;
 const LOCAL_SHELL_PROMPT_PATTERNS = [
   /^[^@\s]+@[^:\s]+(?::.*)?[#$]\s*$/,
   /^\[[^@\]]+@[^ \]]+[^\]]*\][#$]\s*$/,
@@ -2811,10 +2812,10 @@ export default function App() {
               />
             </Field>
             <Field label="分组">
-              <input
+              <QuickImportGroupPicker
+                groups={state.groups}
                 value={quickImportDialog.groupName}
-                onChange={(event) => setQuickImportDialog((current) => ({ ...current, groupName: event.target.value }))}
-                placeholder="可不填"
+                onChange={(value) => setQuickImportDialog((current) => ({ ...current, groupName: value }))}
               />
             </Field>
           </div>
@@ -3772,6 +3773,46 @@ function Field({ label, children, className = '' }) {
       <span>{label}</span>
       {children}
     </label>
+  );
+}
+
+function QuickImportGroupPicker({ groups, value, onChange }) {
+  const trimmedValue = value.trim();
+  const normalizedValue = trimmedValue.toLowerCase();
+  const filteredGroups = groups
+    .filter((group) => !normalizedValue || group.name.toLowerCase().includes(normalizedValue))
+    .slice(0, QUICK_IMPORT_GROUP_SUGGESTION_LIMIT);
+  const exactGroup = groups.find((group) => group.name.toLowerCase() === normalizedValue);
+
+  return (
+    <div className="quick-group-picker">
+      <input
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder="搜索或输入新分组"
+      />
+      <div className="quick-group-options">
+        {filteredGroups.map((group) => (
+          <button
+            key={group.id}
+            className={'quick-group-option ' + (exactGroup?.id === group.id ? 'active' : '')}
+            type="button"
+            onClick={() => onChange(group.name)}
+          >
+            {group.name}
+          </button>
+        ))}
+        {trimmedValue && !exactGroup ? (
+          <button
+            className="quick-group-option create"
+            type="button"
+            onClick={() => onChange(trimmedValue)}
+          >
+            新建：{trimmedValue}
+          </button>
+        ) : null}
+      </div>
+    </div>
   );
 }
 

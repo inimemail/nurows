@@ -66,7 +66,6 @@ const TABS = [
 const TERMINAL_SESSIONS_STORAGE_KEY = 'nurossh-terminal-sessions';
 const ACTIVE_TERMINAL_STORAGE_KEY = 'nurossh-active-terminal-id';
 const BATCH_INPUT_SERVER_BUTTON_LIMIT = 12;
-const QUICK_IMPORT_GROUP_SUGGESTION_LIMIT = 8;
 const LOCAL_SHELL_PROMPT_PATTERNS = [
   /^[^@\s]+@[^:\s]+(?::.*)?[#$]\s*$/,
   /^\[[^@\]]+@[^ \]]+[^\]]*\][#$]\s*$/,
@@ -1960,7 +1959,7 @@ export default function App() {
                         {group.id !== 'group-default' ? (
                           <button className="icon-button danger" onClick={() => openConfirm({
                             title: '删除分组',
-                            message: '确认删除当前分组吗？分组下服务器会自动回到默认分组。',
+                            message: '确认删除当前分组吗？分组下的服务器也会一起删除。',
                             onConfirm: () => removeGroup(group.id)
                           })}><TrashIcon /></button>
                         ) : null}
@@ -3023,7 +3022,7 @@ function ServerOverview({ selectedServer, state, selectedServerIds, openTerminal
       <div className="surface overview-highlight">
         <span className="label-chip">Workspace</span>
         <strong>{selectedServer ? selectedServer.name : 'NuroSSH'}</strong>
-        <p>{selectedServer ? (selectedServer.host + ':' + selectedServer.port + ' 路 ' + selectedServer.username) : '服务器管理与终端工作台'}</p>
+        <p>{selectedServer ? (selectedServer.host + ':' + selectedServer.port + ' · ' + selectedServer.username) : '服务器管理与终端工作台'}</p>
         <div className="hero-actions">
           {selectedServer ? <button className="primary" onClick={() => openTerminal(selectedServer)}>打开终端</button> : null}
           <button className="ghost" onClick={onCreateServer}>新增服务器</button>
@@ -3777,41 +3776,41 @@ function Field({ label, children, className = '' }) {
 }
 
 function QuickImportGroupPicker({ groups, value, onChange }) {
+  const [open, setOpen] = useState(false);
   const trimmedValue = value.trim();
   const normalizedValue = trimmedValue.toLowerCase();
   const filteredGroups = groups
-    .filter((group) => !normalizedValue || group.name.toLowerCase().includes(normalizedValue))
-    .slice(0, QUICK_IMPORT_GROUP_SUGGESTION_LIMIT);
+    .filter((group) => !normalizedValue || group.name.toLowerCase().includes(normalizedValue));
   const exactGroup = groups.find((group) => group.name.toLowerCase() === normalizedValue);
+  const showOptions = open && filteredGroups.length > 0;
 
   return (
     <div className="quick-group-picker">
       <input
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        placeholder="搜索或输入新分组"
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        placeholder="可不填"
       />
-      <div className="quick-group-options">
-        {filteredGroups.map((group) => (
-          <button
-            key={group.id}
-            className={'quick-group-option ' + (exactGroup?.id === group.id ? 'active' : '')}
-            type="button"
-            onClick={() => onChange(group.name)}
-          >
-            {group.name}
-          </button>
-        ))}
-        {trimmedValue && !exactGroup ? (
-          <button
-            className="quick-group-option create"
-            type="button"
-            onClick={() => onChange(trimmedValue)}
-          >
-            新建：{trimmedValue}
-          </button>
-        ) : null}
-      </div>
+      {showOptions ? (
+        <div className="quick-group-options" role="listbox">
+          {filteredGroups.map((group) => (
+            <button
+              key={group.id}
+              className={'quick-group-option ' + (exactGroup?.id === group.id ? 'active' : '')}
+              type="button"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                onChange(group.name);
+                setOpen(false);
+              }}
+            >
+              {group.name}
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }

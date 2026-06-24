@@ -294,11 +294,7 @@ app.delete('/api/groups/:id', (req, res) => {
     }
 
     draft.groups = draft.groups.filter((group) => group.id !== req.params.id);
-    draft.servers = draft.servers.map((serverItem) =>
-      serverItem.groupId === req.params.id
-        ? { ...serverItem, groupId: 'group-default', updatedAt: new Date().toISOString() }
-        : serverItem
-    );
+    draft.servers = draft.servers.filter((serverItem) => serverItem.groupId !== req.params.id);
     return draft;
   });
   res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });

@@ -1241,20 +1241,29 @@ svg {
 }
 
 .quick-group-picker {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  position: relative;
 }
 
 .quick-group-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  min-height: 32px;
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel-strong) 98%, transparent);
+  box-shadow: var(--elev-shadow);
 }
 
 .quick-group-option {
   min-height: 30px;
+  width: 100%;
   max-width: 100%;
   padding: 6px 10px;
   border-radius: 10px;
@@ -1276,11 +1285,6 @@ svg {
   background: var(--card-active);
   color: var(--text-strong);
   outline: none;
-}
-
-.quick-group-option.create {
-  border-style: dashed;
-  color: var(--accent-text);
 }
 
 .field-span {

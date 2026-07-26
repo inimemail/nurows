@@ -1,6 +1,7 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { parsePerServerInputLines } from '../shared/command-input.js';
 
 const EMPTY_SERVER = {
   id: '',
@@ -765,6 +766,18 @@ export default function App() {
   const batchInputAwaitingResults = batchInputDialog.awaitingServerIds
     .map((serverId) => executionResults.find((item) => item.serverId === serverId))
     .filter(Boolean);
+  const perServerInputPreview = cleanTerminalOutput(
+    batchInputAwaitingResults
+      .map((item, index) => {
+        const body = cleanTerminalOutput([item.stdout, item.stderr].filter(Boolean).join('\n'));
+        return `# ${index + 1}. ${item.name} (${item.host})\n${body || '[暂无日志]'}`;
+      })
+      .join('\n\n')
+  );
+  const perServerInputLines = parsePerServerInputLines(
+    batchInputDialog.value,
+    batchInputDialog.awaitingServerIds.length
+  );
   const visibleBatchInputAwaitingResults = batchInputAwaitingResults.slice(0, BATCH_INPUT_SERVER_BUTTON_LIMIT);
   const hiddenBatchInputAwaitingResultsCount = Math.max(0, batchInputAwaitingResults.length - visibleBatchInputAwaitingResults.length);
   const resolvedCommandResultCount = executionResults.filter((item) => ['done', 'error', 'awaiting_input'].includes(item.status)).length;
@@ -1321,8 +1334,13 @@ export default function App() {
   }
 
   async function applyImport(overwriteDuplicates) {
+    if (!importDialog.preview) {
+      toast('请先预览导入内容');
+      return;
+    }
     const items = importDialog.preview?.items || [];
     if (!items.length) {
+      toast('没有可导入的服务器');
       return;
     }
     try {
@@ -1514,6 +1532,17 @@ export default function App() {
     }));
   }
 
+  function openPerServerInputDialog() {
+    setBatchInputDialog((current) => ({
+      ...current,
+      open: true,
+      mode: batchInputReady ? 'per-server' : 'wait',
+      value: current.mode === 'per-server' ? current.value : '',
+      awaitingServerIds: awaitingInputResults.map((item) => item.serverId),
+      signature: awaitingInputSignature
+    }));
+  }
+
   function chooseBatchInputIndividually(serverId) {
     if (!batchInputReady) {
       return;
@@ -1522,7 +1551,7 @@ export default function App() {
     closeBatchInputDialog();
     if (firstServerId) {
       openResultTerminalByServerId(firstServerId);
-      toast('已切换为逐台输入，继续点击结果卡片即可进入对应服务器会话。');
+      toast('已进入服务器会话，继续点击结果卡片即可处理其他服务器。');
     }
   }
 
@@ -1548,6 +1577,40 @@ export default function App() {
       });
       closeBatchInputDialog();
       toast(`已向 ${data.sent || 0} 台服务器发送输入`);
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      setActionBusy('submitBatchInput', false);
+    }
+  }
+
+  async function submitPerServerInput() {
+    if (!batchInputReady || !commandJobId || !batchInputDialog.awaitingServerIds.length) {
+      closeBatchInputDialog();
+      return;
+    }
+    const lines = parsePerServerInputLines(
+      batchInputDialog.value,
+      batchInputDialog.awaitingServerIds.length
+    );
+    if (lines.length !== batchInputDialog.awaitingServerIds.length) {
+      toast('输入行数与服务器数量不一致');
+      return;
+    }
+    try {
+      setActionBusy('submitBatchInput', true);
+      const data = await api(`/api/commands/jobs/${commandJobId}/input`, {
+        method: 'POST',
+        body: JSON.stringify({
+          inputs: batchInputDialog.awaitingServerIds.map((serverId, index) => ({
+            serverId,
+            data: lines[index]
+          }))
+        }),
+        onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
+      });
+      closeBatchInputDialog();
+      toast(`已向 ${data.sent || 0} 台服务器分别发送输入`);
     } catch (error) {
       toast(error.message);
     } finally {
@@ -2878,7 +2941,15 @@ export default function App() {
 
       {batchInputDialog.open ? (
         <Dialog
-          title={batchInputDialog.mode === 'broadcast' ? '统一输入' : batchInputDialog.mode === 'wait' ? '等待执行结果' : '检测到交互输入'}
+          title={
+            batchInputDialog.mode === 'broadcast'
+              ? '统一输入'
+              : batchInputDialog.mode === 'per-server'
+                ? '按行输入'
+                : batchInputDialog.mode === 'wait'
+                  ? '等待执行结果'
+                  : '检测到交互输入'
+          }
           onClose={closeBatchInputDialog}
           footer={
             batchInputDialog.mode === 'broadcast'
@@ -2894,6 +2965,19 @@ export default function App() {
                   </button>
                 </>
               )
+              : batchInputDialog.mode === 'per-server'
+              ? (
+                <>
+                  <button className="ghost" onClick={closeBatchInputDialog}>取消</button>
+                  <button
+                    className={'primary ' + (busy.submitBatchInput ? 'is-loading' : '')}
+                    onClick={submitPerServerInput}
+                    disabled={busy.submitBatchInput}
+                  >
+                    {busy.submitBatchInput ? '发送中...' : ('分别发送到 ' + batchInputDialog.awaitingServerIds.length + ' 台服务器')}
+                  </button>
+                </>
+              )
               : batchInputDialog.mode === 'wait'
               ? (
                 <>
@@ -2903,7 +2987,8 @@ export default function App() {
               : (
                 <>
                   <button className="ghost" onClick={closeBatchInputDialog}>取消</button>
-                  <button className="ghost" onClick={() => chooseBatchInputIndividually()}>逐台处理</button>
+                  <button className="ghost" onClick={() => chooseBatchInputIndividually()}>进入会话处理</button>
+                  <button className="ghost" onClick={openPerServerInputDialog}>按行输入</button>
                   <button className="primary" onClick={openBroadcastInputDialog}>统一输入</button>
                 </>
               )
@@ -2932,16 +3017,41 @@ export default function App() {
               </Field>
               <div className="confirm-copy">会把这段输入同时发给所有仍在等待输入的服务器。</div>
             </form>
+          ) : batchInputDialog.mode === 'per-server' ? (
+            <form
+              className="field-grid single"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void submitPerServerInput();
+              }}
+            >
+              {perServerInputPreview ? (
+                <Field label="当前等待输入内容">
+                  <AutoScrollPre text={perServerInputPreview} className="batch-input-preview" />
+                </Field>
+              ) : null}
+              <Field label="输入内容">
+                <textarea
+                  rows={5}
+                  value={batchInputDialog.value}
+                  onChange={(event) => setBatchInputDialog((current) => ({ ...current, value: event.target.value }))}
+                  placeholder="一行对应一台服务器，空行表示直接发送一个回车"
+                />
+              </Field>
+              <div className="confirm-copy">
+                目标 {batchInputDialog.awaitingServerIds.length} 台，当前 {perServerInputLines.length} 行。输入行数必须与服务器数量一致。
+              </div>
+            </form>
           ) : batchInputDialog.mode === 'wait' ? (
             <div className="field-grid single">
               <div className="confirm-copy batch-input-progress-copy">
-                当前已出结果 {resolvedCommandResultCount} / {commandProgress.total} 台，剩余 {pendingCommandResultCount} 台还在执行中。全部服务器都有结果后，才可以进入统一输入或逐台处理。失败也会算作已有结果。
+                当前已出结果 {resolvedCommandResultCount} / {commandProgress.total} 台，剩余 {pendingCommandResultCount} 台还在执行中。全部服务器都有结果后，才可以统一输入、按行输入或进入会话处理。失败也会算作已有结果。
               </div>
             </div>
           ) : (
             <div className="field-grid single">
               <div className="confirm-copy">
-                检测到 {batchInputDialog.awaitingServerIds.length} 台服务器正在等待交互输入。当前已出结果 {resolvedCommandResultCount} / {commandProgress.total} 台。你可以统一输入一份内容广播给它们，或者逐台进入真实会话分别处理。
+                检测到 {batchInputDialog.awaitingServerIds.length} 台服务器正在等待交互输入。当前已出结果 {resolvedCommandResultCount} / {commandProgress.total} 台。你可以统一输入、按服务器顺序逐行输入，或者进入真实会话分别处理。
               </div>
               {visibleBatchInputAwaitingResults.length ? (
                 <div className="batch-input-server-list">

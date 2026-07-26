@@ -10,6 +10,7 @@ import { WebSocketServer } from 'ws';
 import { Client as SSHClient } from 'ssh2';
 import { SocksClient } from 'socks';
 import { v4 as uuidv4 } from 'uuid';
+import { hasExactPerServerInputs } from '../shared/command-input.js';
 
 loadRuntimeEnv();
 
@@ -592,6 +593,36 @@ app.post('/api/commands/jobs/:id/input', (req, res) => {
   const job = commandJobs.get(req.params.id);
   if (!job) {
     res.status(404).json({ error: '任务不存在或已过期' });
+    return;
+  }
+
+  if (Array.isArray(req.body.inputs)) {
+    const inputs = req.body.inputs;
+    const resultByServerId = new Map(job.results.map((item) => [item.serverId, item]));
+    const awaitingResults = job.results.filter(
+      (item) => item.status === 'awaiting_input' || item.awaitingInput
+    );
+    const awaitingServerIds = awaitingResults.map((item) => item.serverId);
+
+    if (!hasExactPerServerInputs(inputs, awaitingServerIds)) {
+      res.status(400).json({ error: '输入行数与服务器数量不一致' });
+      return;
+    }
+
+    const targets = inputs.map((item) => ({
+      runtime: job.sessions.get(item.serverId),
+      resultItem: resultByServerId.get(item.serverId),
+      data: normalizeCommandInput(item.data)
+    }));
+    if (targets.some(({ runtime, resultItem }) => !runtime || !resultItem || !runtime.shellStream || runtime.closed)) {
+      res.status(400).json({ error: '当前没有可写入输入的执行会话' });
+      return;
+    }
+
+    for (const target of targets) {
+      writeCommandSessionInput(job, target.runtime, target.resultItem, target.data);
+    }
+    res.json({ ok: true, sent: targets.length });
     return;
   }
 

@@ -10,6 +10,7 @@ RUN npm ci
 COPY index.html vite.config.js ./
 COPY src ./src
 COPY server ./server
+COPY shared ./shared
 COPY .env.example ./.env.example
 
 RUN npm run build && npm prune --omit=dev
@@ -25,6 +26,7 @@ COPY --from=build /app/package.json /app/package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/server ./server
+COPY --from=build /app/shared ./shared
 COPY .env.example ./.env.example
 
 RUN mkdir -p /app/data && chown -R app:app /app

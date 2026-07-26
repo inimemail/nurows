@@ -2216,9 +2216,14 @@ export default function App() {
                       交互规则
                     </button>
                     {awaitingInputResults.length ? (
-                      <button className="ghost" onClick={openBroadcastInputDialog} disabled={!batchInputReady}>
-                        {batchInputReady ? '统一输入' : ('等待结果 ' + resolvedCommandResultCount + '/' + commandProgress.total)}
-                      </button>
+                      <>
+                        <button className="ghost" onClick={openBroadcastInputDialog} disabled={!batchInputReady}>
+                          {batchInputReady ? '统一输入' : ('等待结果 ' + resolvedCommandResultCount + '/' + commandProgress.total)}
+                        </button>
+                        <button className="ghost" onClick={openPerServerInputDialog} disabled={!batchInputReady}>
+                          按行输入
+                        </button>
+                      </>
                     ) : null}
                     <button className={'ghost ' + (busy.clearCommandResults ? 'is-loading' : '')} onClick={clearCommandResults} disabled={!canClearCommandResults || busy.clearCommandResults}>
                       {isCommandRunning ? '取消并清空' : '清空'}

@@ -399,6 +399,10 @@ export default function App() {
   const [automationJobId, setAutomationJobId] = useState('');
   const [automationResults, setAutomationResults] = useState([]);
   const [automationPaused, setAutomationPaused] = useState(false);
+  const [automationExpandedServerId, setAutomationExpandedServerId] = useState('');
+  const [automationInputDialog, setAutomationInputDialog] = useState({ open: false, mode: 'choice', value: '', awaitingServerIds: [] });
+  const [automationEditorOpen, setAutomationEditorOpen] = useState(false);
+  const [telegramDialogOpen, setTelegramDialogOpen] = useState(false);
   const [telegramDraft, setTelegramDraft] = useState({ enabled: false, token: '', userIds: '', allowGroups: true });
   const [executionResults, setExecutionResults] = useState([]);
   const [lastExecutedCommand, setLastExecutedCommand] = useState('');
@@ -704,6 +708,7 @@ export default function App() {
         setAutomationResults(data.results || []);
         if (data.status === 'done') {
           window.clearInterval(timer);
+          api('/api/state').then((nextState) => setState(nextState)).catch(() => undefined);
           toast('自动化任务执行完成');
         }
       } catch (_error) {
@@ -763,6 +768,18 @@ export default function App() {
 
   const automationTasks = state.automationTasks || [];
   const selectedAutomationTask = automationTasks.find((item) => item.id === automationTaskId) || null;
+  const automationCounts = {
+    total: automationResults.length,
+    queued: automationResults.filter((item) => item.status === 'queued').length,
+    running: automationResults.filter((item) => item.status === 'running').length,
+    awaiting: automationResults.filter((item) => item.status === 'awaiting_input' || item.awaitingInput).length,
+    success: automationResults.filter((item) => item.ok && item.status === 'done').length,
+    failed: automationResults.filter((item) => item.status === 'error').length
+  };
+  const automationIsRunning = automationResults.some((item) => ['queued', 'running', 'awaiting_input'].includes(item.status));
+  const automationAwaitingResults = automationResults.filter((item) => item.status === 'awaiting_input' || item.awaitingInput);
+  const automationAwaitingIds = automationAwaitingResults.map((item) => item.serverId);
+  const automationInputLines = parsePerServerInputLines(automationInputDialog.value, automationInputDialog.awaitingServerIds.length);
 
   const activeTerminal = terminalSessions.find((item) => item.id === activeTerminalId) || null;
   const selectedServer = state.servers.find((item) => item.id === selectedServerId) || null;
@@ -1066,12 +1083,21 @@ export default function App() {
       const next = { ...EMPTY_AUTOMATION_TASK, id: '', steps: [{ id: crypto.randomUUID(), type: 'command', label: '主命令', value: '', timeout: 120 }] };
       setAutomationDraft(next);
       setAutomationTaskId('');
+      setAutomationEditorOpen(true);
     }
   }
 
   function selectAutomationTask(item) {
+    if (!item) return;
     setAutomationTaskId(item.id);
     setAutomationDraft({ ...EMPTY_AUTOMATION_TASK, ...item, password: '', steps: item.steps?.length ? item.steps.map((step) => ({ ...step })) : EMPTY_AUTOMATION_TASK.steps });
+  }
+
+
+  function editAutomationTask(item = selectedAutomationTask) {
+    if (!item) { toast('请先选择任务'); return; }
+    selectAutomationTask(item);
+    setAutomationEditorOpen(true);
   }
 
   async function saveAutomationTask() {
@@ -1085,6 +1111,7 @@ export default function App() {
       setState(data.state);
       setAutomationTaskId(data.item?.id || automationDraft.id);
       if (data.item) setAutomationDraft((current) => ({ ...current, ...data.item, password: '' }));
+      setAutomationEditorOpen(false);
       toast('自动化任务已保存');
     } catch (error) { toast(error.message); } finally { setActionBusy('automationSave', false); }
   }
@@ -1118,6 +1145,21 @@ export default function App() {
     } catch (error) { toast(error.message); }
   }
 
+  async function clearAutomationResults() {
+    if (!automationResults.length && !automationJobId) return;
+    try {
+      setActionBusy('clearAutomation', true);
+      if (automationJobId && automationIsRunning) {
+        await api(`/api/automation-jobs/${automationJobId}/cancel`, { method: 'POST' });
+      }
+      setAutomationResults([]);
+      setAutomationJobId('');
+      setAutomationPaused(false);
+      setAutomationExpandedServerId('');
+      toast(automationIsRunning ? '任务已取消并清空' : '执行结果已清空');
+    } catch (error) { toast(error.message); } finally { setActionBusy('clearAutomation', false); }
+  }
+
   async function retryAutomationFailed() {
     if (!automationJobId) return;
     try {
@@ -1143,11 +1185,41 @@ export default function App() {
     } catch (error) { toast(error.message); }
   }
 
+  function openAutomationInputDialog(mode = 'choice') {
+    setAutomationInputDialog({ open: true, mode, value: '', awaitingServerIds: automationAwaitingIds });
+  }
+
+  function closeAutomationInputDialog() {
+    setAutomationInputDialog({ open: false, mode: 'choice', value: '', awaitingServerIds: [] });
+  }
+
+  async function submitAutomationBroadcastInput() {
+    if (!automationJobId || !automationInputDialog.awaitingServerIds.length) return;
+    try {
+      setActionBusy('automationInput', true);
+      const data = await api(`/api/commands/jobs/${automationJobId}/input`, { method: 'POST', body: JSON.stringify({ serverIds: automationInputDialog.awaitingServerIds, data: automationInputDialog.value }) });
+      closeAutomationInputDialog();
+      toast(`已向 ${data.sent || 0} 台主机发送输入`);
+    } catch (error) { toast(error.message); } finally { setActionBusy('automationInput', false); }
+  }
+
+  async function submitAutomationPerServerInput() {
+    if (!automationJobId || !automationInputDialog.awaitingServerIds.length) return;
+    if (automationInputLines.length !== automationInputDialog.awaitingServerIds.length) { toast('输入行数与等待输入主机数量不一致'); return; }
+    try {
+      setActionBusy('automationInput', true);
+      const data = await api(`/api/commands/jobs/${automationJobId}/input`, { method: 'POST', body: JSON.stringify({ inputs: automationInputDialog.awaitingServerIds.map((serverId, index) => ({ serverId, data: automationInputLines[index] })) }) });
+      closeAutomationInputDialog();
+      toast(`已向 ${data.sent || 0} 台主机分别发送输入`);
+    } catch (error) { toast(error.message); } finally { setActionBusy('automationInput', false); }
+  }
+
   async function saveTelegram() {
     try {
       const data = await api('/api/telegram', { method: 'PUT', body: JSON.stringify({ ...telegramDraft, userIds: telegramDraft.userIds.split(/\r?\n|[,，;；]+/).map((item) => item.trim()).filter(Boolean) }) });
       setState(data.state); toast('Telegram 设置已保存');
-    } catch (error) { toast(error.message); }
+      return true;
+    } catch (error) { toast(error.message); return false; }
   }
 
   function openEditor(type, item = null) {
@@ -2123,6 +2195,7 @@ export default function App() {
               ) : null}
               {tab === 'automation' ? (
                 <>
+                  <button className="ghost" onClick={() => editAutomationTask()} disabled={!automationTaskId}>编辑</button>
                   <button className="primary" onClick={() => resetCreateDraft('automation')}>新增</button>
                   <button className="ghost danger-text-button" onClick={() => openConfirm({ title: '删除自动化任务', message: '确认删除当前任务吗？', onConfirm: deleteAutomationTask })} disabled={!automationTaskId}>删除</button>
                 </>
@@ -2237,70 +2310,35 @@ export default function App() {
           {tab === 'automation' ? (
             <div className="panel-scroll stack-list">
               {automationTasks.map((item) => (
-                <button key={item.id} className={'stack-card ' + (automationTaskId === item.id ? 'selected' : '')} onClick={() => { selectAutomationTask(item); closeAssetDrawerOnMobile(); }}><strong>{item.name}</strong><span>{item.concurrency} 并发 · {item.steps?.length || 0} 步</span></button>
+                <button key={item.id} className={'stack-card automation-task-card ' + (automationTaskId === item.id ? 'selected' : '')} onClick={() => { selectAutomationTask(item); closeAssetDrawerOnMobile(); }}><div><span className="automation-task-mark"><AutomationIcon /></span><strong>{item.name}</strong></div><span>{item.steps?.length || 0} 个步骤</span><em>{item.concurrency} 并发</em></button>
               ))}
               {!automationTasks.length ? <div className="empty-line">还没有自动化任务</div> : null}
             </div>
           ) : null}
 
-          {/* automation workspace renders in main column */}
           {tab === 'automation' ? (
             <section className="automation-board">
-              <div className="surface automation-hero">
-                <div className="automation-hero-copy">
-                  <span className="label-chip">高并发 · 临时主机</span>
-                  <h1>自动化任务</h1>
-                  <p>配置一次固定流程，之后只粘贴 IP 即可批量执行。</p>
-                </div>
-                <div className="automation-hero-stat"><strong>{automationDraft.concurrency || 100}</strong><span>并发上限 300</span></div>
+              <div className="automation-page-head">
+                <div><strong>{selectedAutomationTask?.name || '自动化任务'}</strong><span>{selectedAutomationTask ? `${selectedAutomationTask.steps?.length || 0} 个步骤 · 并发 ${selectedAutomationTask.concurrency}` : '选择或新增一个任务'}</span></div>
+                <div className="toolbar"><button className="ghost" onClick={() => setTelegramDialogOpen(true)}><TelegramIcon />机器人设置</button><button className="ghost" onClick={() => editAutomationTask()} disabled={!selectedAutomationTask}><EditIcon />编辑任务</button><button className="primary" onClick={() => resetCreateDraft('automation')}>新增任务</button></div>
               </div>
 
-              <div className="automation-grid">
-                <div className="surface automation-config">
-                  <div className="workspace-head"><div><strong>任务配置</strong><span>SSH 与执行策略</span></div><div className="toolbar"><button className="ghost" onClick={saveAutomationTask} disabled={busy.automationSave}>{busy.automationSave ? '保存中...' : '保存任务'}</button></div></div>
-                  <div className="field-grid automation-fields">
-                    <Field label="任务名称"><input value={automationDraft.name} onChange={(e) => setAutomationDraft((c) => ({ ...c, name: e.target.value }))} placeholder="例如：批量初始化" /></Field>
-                    <Field label="SSH 用户"><input value={automationDraft.username} onChange={(e) => setAutomationDraft((c) => ({ ...c, username: e.target.value }))} /></Field>
-                    <Field label="端口"><input type="number" min="1" max="65535" value={automationDraft.port} onChange={(e) => setAutomationDraft((c) => ({ ...c, port: e.target.value }))} /></Field>
-                    <Field label="密码"><input type="password" value={automationDraft.password} onChange={(e) => setAutomationDraft((c) => ({ ...c, password: e.target.value }))} placeholder={automationDraft.id ? '留空保持原密码' : '任务专用密码'} /></Field>
-                    <Field label="并发数"><input type="number" min="1" max="300" value={automationDraft.concurrency} onChange={(e) => setAutomationDraft((c) => ({ ...c, concurrency: Math.min(300, Math.max(1, Number(e.target.value) || 1)) }))} /></Field>
-                    <Field label="失败重试"><input type="number" min="0" max="5" value={automationDraft.retryCount} onChange={(e) => setAutomationDraft((c) => ({ ...c, retryCount: e.target.value }))} /></Field>
-                    <Field label="连接超时（秒）"><input type="number" min="3" max="120" value={automationDraft.connectTimeout} onChange={(e) => setAutomationDraft((c) => ({ ...c, connectTimeout: e.target.value }))} /></Field>
-                    <Field label="执行超时（秒）"><input type="number" min="1" max="3600" value={automationDraft.stepTimeout} onChange={(e) => setAutomationDraft((c) => ({ ...c, stepTimeout: e.target.value }))} /></Field>
-                    <Field label="代理"><select value={automationDraft.proxyId} onChange={(e) => setAutomationDraft((c) => ({ ...c, proxyId: e.target.value }))}><option value="">直连</option>{state.proxies.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
+              <div className="automation-workspace-grid">
+                <div className="automation-left-column">
+                  <div className="surface automation-summary-panel"><div className="workspace-head"><div><strong>任务摘要</strong><span>当前配置</span></div></div>{selectedAutomationTask ? <div className="automation-summary-list"><div><span>SSH</span><strong>{selectedAutomationTask.username}@目标:{selectedAutomationTask.port}</strong></div><div><span>步骤</span><strong>{selectedAutomationTask.steps?.length || 0}</strong></div><div><span>并发</span><strong>{selectedAutomationTask.concurrency}</strong></div><div><span>代理</span><strong>{state.proxies.find((item) => item.id === selectedAutomationTask.proxyId)?.name || '直连'}</strong></div><div><span>Telegram</span><strong>{selectedAutomationTask.telegramEnabled ? '允许执行' : '未开放'}</strong></div></div> : <div className="empty-state">请选择左侧任务</div>}</div>
+                  {(state.automationRuns || []).length ? <div className="surface automation-history"><div className="workspace-head"><div><strong>最近执行</strong><span>最近 30 次</span></div></div><div className="automation-history-list">{state.automationRuns.slice(0, 10).map((run) => <div key={run.id}><span>{run.taskName}</span><em>{run.total} 台 · 成功 {run.ok} · 失败 {run.error} · {run.status === 'running' ? '执行中' : run.status === 'cancelled' ? '已取消' : '已完成'}</em></div>)}</div></div> : null}
+                </div>
+                <div className="automation-right-column">
+                  <div className="surface automation-run-panel">
+                    <div className="workspace-head"><div><strong>批量执行</strong><span>输入 IP 后启动当前任务</span></div><div className="toolbar"><button className={'primary ' + (busy.automationRun ? 'is-loading' : '')} onClick={runAutomation} disabled={busy.automationRun || !automationTaskId || automationIsRunning}>{busy.automationRun ? '启动中...' : '开始执行'}</button>{automationIsRunning ? <button className="ghost" onClick={toggleAutomationPause}>{automationPaused ? '继续' : '暂停'}</button> : null}</div></div>
+                    {!automationTasks.length ? <div className="empty-state">请先新增自动化任务。</div> : <div className="automation-run-form"><label><span>执行任务</span><select value={automationTaskId} onChange={(e) => selectAutomationTask(automationTasks.find((item) => item.id === e.target.value))}>{automationTasks.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label><span>目标 IP</span><textarea className="automation-hosts" rows={8} value={automationHosts} onChange={(e) => setAutomationHosts(e.target.value)} placeholder="192.168.1.10\n192.168.1.11\n每行一个，也支持逗号分隔" /></label></div>}
                   </div>
-                  <label className="automation-toggle"><input type="checkbox" checked={automationDraft.telegramEnabled} onChange={(e) => setAutomationDraft((c) => ({ ...c, telegramEnabled: e.target.checked }))} /> 允许通过 Telegram 执行此任务</label>
-                  <div className="automation-steps-head"><strong>执行步骤</strong><button className="ghost" onClick={() => setAutomationDraft((c) => ({ ...c, steps: [...c.steps, { id: crypto.randomUUID(), type: 'command', label: '', value: '', timeout: 120 }] }))}>+ 添加步骤</button></div>
-                  <div className="automation-steps">
-                    {automationDraft.steps.map((step, index) => (
-                      <div className="automation-step" key={step.id}>
-                        <span className="step-index">{String(index + 1).padStart(2, '0')}</span>
-                        <select value={step.type} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, type: e.target.value } : s) }))}>
-                          <option value="command">执行命令</option><option value="wait">等待输出</option><option value="input">输入文本</option><option value="enter">按回车</option><option value="delay">延迟</option>
-                        </select>
-                        <input value={step.label || ''} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, label: e.target.value } : s) }))} placeholder="步骤说明（可选）" />
-                        <textarea rows={2} value={step.value} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, value: e.target.value } : s) }))} placeholder={step.type === 'command' ? '例如：apt update' : step.type === 'wait' ? '等待包含文本，例如：Continue' : step.type === 'input' ? '自动输入内容' : step.type === 'delay' ? '延迟秒数' : '按回车无需填写'} />
-                        <button className="icon-button danger" title="删除步骤" onClick={() => setAutomationDraft((c) => ({ ...c, steps: c.steps.length > 1 ? c.steps.filter((s) => s.id !== step.id) : c.steps }))}>×</button>
-                      </div>
-                    ))}
+                  <div className="surface automation-results-panel">
+                    <div className="workspace-head"><div><strong>当前执行进度</strong><span>{automationCounts.total ? `已处理 ${automationCounts.success + automationCounts.failed} / ${automationCounts.total}` : '暂无执行结果'}</span></div><div className="toolbar">{automationAwaitingResults.length ? <><button className="ghost" onClick={() => openAutomationInputDialog('per-server')}>按行输入</button><button className="ghost" onClick={() => openAutomationInputDialog('broadcast')}>统一输入</button></> : null}{automationCounts.failed ? <button className="ghost" onClick={retryAutomationFailed} disabled={automationIsRunning}>重试失败</button> : null}<button className={'ghost ' + (busy.clearAutomation ? 'is-loading' : '')} onClick={clearAutomationResults} disabled={!automationResults.length || busy.clearAutomation}>{automationIsRunning ? '取消并清空' : '清空'}</button></div></div>
+                    {automationResults.length ? <><div className="automation-progress automation-progress-detailed"><div className="total"><strong>{automationCounts.total}</strong><span>总数</span></div><div className="running"><strong>{automationCounts.queued + automationCounts.running}</strong><span>执行中</span></div><div className="awaiting"><strong>{automationCounts.awaiting}</strong><span>等待输入</span></div><div className="success"><strong>{automationCounts.success}</strong><span>成功</span></div><div className="failed"><strong>{automationCounts.failed}</strong><span>失败</span></div></div><div className="automation-progress-track"><span style={{ width: `${automationCounts.total ? ((automationCounts.success + automationCounts.failed) / automationCounts.total) * 100 : 0}%` }} /></div><div className="automation-result-list">{automationResults.map((item) => { const expanded = automationExpandedServerId === item.serverId; const output = cleanTerminalOutput([item.stdout, item.stderr, item.error].filter(Boolean).join('\n')); const statusClass = item.status === 'error' ? 'error' : item.ok ? 'ok' : item.status === 'awaiting_input' ? 'awaiting' : 'running'; return <div key={item.serverId} className={'automation-result-item ' + statusClass}><div className="automation-result-row" onClick={() => setAutomationExpandedServerId(expanded ? '' : item.serverId)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setAutomationExpandedServerId(expanded ? '' : item.serverId); }} role="button" tabIndex={0}><div className="automation-result-host"><i /><span>{item.host}</span></div><div>{item.status === 'awaiting_input' ? <button className="ghost automation-input-button" onClick={(event) => { event.stopPropagation(); const value = window.prompt(`输入发送到 ${item.host}，留空表示回车`, ''); if (value !== null) sendAutomationInput(item.serverId, value); }}>输入</button> : null}<em>{item.status === 'queued' ? '排队' : item.status === 'running' ? '执行中' : item.status === 'awaiting_input' ? '等待输入' : item.ok ? '成功' : '失败'}</em><ChevronIcon collapsed={!expanded} /></div></div>{expanded ? <pre>{output || '暂无日志'}</pre> : null}</div>; })}</div></> : <div className="empty-state automation-result-empty"><span className="automation-empty-icon"><AutomationIcon /></span><strong>等待执行</strong><span>输入目标 IP 并启动任务后，这里显示实时进度。</span></div>}
                   </div>
                 </div>
-
-                <div className="surface automation-run-panel">
-                  <div className="workspace-head"><div><strong>立即执行</strong><span>只需输入 IP</span></div><div className="toolbar"><button className={'primary ' + (busy.automationRun ? 'is-loading' : '')} onClick={runAutomation} disabled={busy.automationRun || !automationTaskId}>{busy.automationRun ? '启动中...' : '开始执行'}</button>{automationJobId ? <><button className="ghost" onClick={toggleAutomationPause}>{automationPaused ? '继续' : '暂停'}</button><button className="ghost" onClick={cancelAutomation}>取消</button></> : null}</div></div>
-                  {!automationTasks.length ? <div className="empty-state">先点击左侧“新增”，配置并保存一个任务。</div> : <select value={automationTaskId} onChange={(e) => selectAutomationTask(automationTasks.find((item) => item.id === e.target.value))}><option value="">选择自动化任务</option>{automationTasks.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>}
-                  <textarea className="automation-hosts" rows={8} value={automationHosts} onChange={(e) => setAutomationHosts(e.target.value)} placeholder="192.168.1.10\n192.168.1.11\n每行一个，也支持逗号分隔" />
-                  {automationJobId ? <><div className="automation-progress"><div><strong>{automationResults.length}</strong><span>台目标</span></div><div><strong>{automationResults.filter((item) => item.ok).length}</strong><span>成功</span></div><div><strong>{automationResults.filter((item) => item.status === 'error').length}</strong><span>失败</span></div></div><div className="automation-result-list">{automationResults.slice(0, 80).map((item) => <div key={item.serverId} className={'automation-result-row ' + (item.status === 'error' ? 'error' : item.ok ? 'ok' : '')}><span>{item.host}</span><div>{item.status === 'awaiting_input' ? <button className="ghost automation-input-button" onClick={() => { const value = window.prompt(`输入发送到 ${item.host}，留空表示回车`, ''); if (value !== null) sendAutomationInput(item.serverId, value); }}>输入</button> : null}<em>{item.status === 'queued' ? '排队' : item.status === 'running' ? '执行中' : item.status === 'awaiting_input' ? '等待输入' : item.ok ? '成功' : '失败'}</em></div></div>)}</div>{automationResults.some((item) => item.status === 'error') ? <button className="ghost" onClick={retryAutomationFailed}>重试失败主机</button> : null}</> : null}
-                  <div className="automation-note">失败主机不会阻塞其他主机；密码、IP 列表和日志均不创建服务器资产。</div>
-                </div>
               </div>
-
-              <div className="surface telegram-panel">
-                <div className="workspace-head"><div><strong>Telegram 机器人</strong><span>私聊和群组均按用户 ID 授权</span></div><button className="ghost" onClick={saveTelegram}>保存设置</button></div>
-                <div className="field-grid automation-fields"><Field label="Bot Token"><input type="password" value={telegramDraft.token} onChange={(e) => setTelegramDraft((c) => ({ ...c, token: e.target.value }))} placeholder={state.telegram?.configured ? '留空保持原 Token' : '粘贴 BotFather Token'} /></Field><Field label="授权用户 ID"><textarea rows={3} value={telegramDraft.userIds} onChange={(e) => setTelegramDraft((c) => ({ ...c, userIds: e.target.value }))} placeholder="每行一个 Telegram user ID" /></Field></div>
-                <div className="telegram-foot"><label><input type="checkbox" checked={telegramDraft.enabled} onChange={(e) => setTelegramDraft((c) => ({ ...c, enabled: e.target.checked }))} /> 启用机器人</label><span>群组中发送者只要属于授权用户 ID，即可通过确认按钮执行任务。</span></div>
-              </div>
-              {(state.automationRuns || []).length ? <div className="surface automation-history"><div className="workspace-head"><div><strong>最近执行</strong><span>最近 30 次</span></div></div><div className="automation-history-list">{state.automationRuns.slice(0, 10).map((run) => <div key={run.id}><span>{run.taskName}</span><em>{run.total} 台 · 成功 {run.ok} · 失败 {run.error} · {run.status === 'running' ? '执行中' : run.status === 'cancelled' ? '已取消' : '已完成'}</em></div>)}</div></div> : null}
             </section>
           ) : null}
 
@@ -2648,6 +2686,60 @@ export default function App() {
               <textarea rows={5} value={serverDraft.note} onChange={(event) => setServerDraft((current) => ({ ...current, note: event.target.value }))} />
             </Field>
           </div>
+        </Dialog>
+      ) : null}
+
+      {automationEditorOpen ? (
+        <Dialog
+          title={automationDraft.id ? '编辑自动化任务' : '新增自动化任务'}
+          xwide
+          onClose={() => setAutomationEditorOpen(false)}
+          footer={
+            <>
+              {automationDraft.id ? <button className="danger-text dialog-danger" onClick={() => openConfirm({ title: '删除自动化任务', message: '确认删除当前任务吗？', onConfirm: async () => { await deleteAutomationTask(); setAutomationEditorOpen(false); } })}>删除任务</button> : <span />}
+              <div className="dialog-actions"><button className="ghost" onClick={() => setAutomationEditorOpen(false)}>取消</button><button className={'primary ' + (busy.automationSave ? 'is-loading' : '')} onClick={saveAutomationTask} disabled={busy.automationSave}>{busy.automationSave ? '保存中...' : '保存任务'}</button></div>
+            </>
+          }
+        >
+          <div className="automation-editor-layout">
+            <section className="automation-editor-basics">
+              <div className="dialog-section-head"><strong>连接与执行</strong><span>保存后执行时只需要输入 IP</span></div>
+              <div className="field-grid automation-fields">
+                <Field label="任务名称"><input value={automationDraft.name} onChange={(e) => setAutomationDraft((c) => ({ ...c, name: e.target.value }))} placeholder="例如：批量初始化" /></Field>
+                <Field label="SSH 用户"><input value={automationDraft.username} onChange={(e) => setAutomationDraft((c) => ({ ...c, username: e.target.value }))} /></Field>
+                <Field label="端口"><input type="number" min="1" max="65535" value={automationDraft.port} onChange={(e) => setAutomationDraft((c) => ({ ...c, port: e.target.value }))} /></Field>
+                <Field label="密码"><input type="password" value={automationDraft.password} onChange={(e) => setAutomationDraft((c) => ({ ...c, password: e.target.value }))} placeholder={automationDraft.id ? '留空保持原密码' : '任务专用密码'} /></Field>
+                <Field label="并发数"><input type="number" min="1" max="300" value={automationDraft.concurrency} onChange={(e) => setAutomationDraft((c) => ({ ...c, concurrency: Math.min(300, Math.max(1, Number(e.target.value) || 1)) }))} /></Field>
+                <Field label="失败重试"><input type="number" min="0" max="5" value={automationDraft.retryCount} onChange={(e) => setAutomationDraft((c) => ({ ...c, retryCount: e.target.value }))} /></Field>
+                <Field label="连接超时（秒）"><input type="number" min="3" max="120" value={automationDraft.connectTimeout} onChange={(e) => setAutomationDraft((c) => ({ ...c, connectTimeout: e.target.value }))} /></Field>
+                <Field label="执行超时（秒）"><input type="number" min="1" max="3600" value={automationDraft.stepTimeout} onChange={(e) => setAutomationDraft((c) => ({ ...c, stepTimeout: e.target.value }))} /></Field>
+                <Field label="代理"><select value={automationDraft.proxyId} onChange={(e) => setAutomationDraft((c) => ({ ...c, proxyId: e.target.value }))}><option value="">直连</option>{state.proxies.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
+              </div>
+              <label className="automation-toggle"><input type="checkbox" checked={automationDraft.telegramEnabled} onChange={(e) => setAutomationDraft((c) => ({ ...c, telegramEnabled: e.target.checked }))} /> 允许通过 Telegram 执行此任务</label>
+            </section>
+            <section className="automation-editor-steps">
+              <div className="automation-steps-head"><div className="dialog-section-head"><strong>执行步骤</strong><span>等待输出后可自动输入或回车</span></div><button className="ghost" onClick={() => setAutomationDraft((c) => ({ ...c, steps: [...c.steps, { id: crypto.randomUUID(), type: 'command', label: '', value: '', timeout: 120 }] }))}>添加步骤</button></div>
+              <div className="automation-steps">{automationDraft.steps.map((step, index) => <div className="automation-step" key={step.id}><span className="step-index">{String(index + 1).padStart(2, '0')}</span><select value={step.type} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, type: e.target.value } : s) }))}><option value="command">执行命令</option><option value="wait">等待输出</option><option value="input">输入文本</option><option value="enter">按回车</option><option value="delay">延迟</option></select><input value={step.label || ''} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, label: e.target.value } : s) }))} placeholder="步骤说明" /><textarea rows={2} value={step.value} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, value: e.target.value } : s) }))} placeholder={step.type === 'command' ? '输入命令' : step.type === 'wait' ? '输入需要等待的文本' : step.type === 'input' ? '输入自动发送内容' : step.type === 'delay' ? '输入延迟秒数' : '无需填写'} /><button className="icon-button danger" title="删除步骤" onClick={() => setAutomationDraft((c) => ({ ...c, steps: c.steps.length > 1 ? c.steps.filter((s) => s.id !== step.id) : c.steps }))}>×</button></div>)}</div>
+            </section>
+          </div>
+        </Dialog>
+      ) : null}
+
+      {telegramDialogOpen ? (
+        <Dialog title="Telegram 机器人设置" wide onClose={() => setTelegramDialogOpen(false)} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setTelegramDialogOpen(false)}>取消</button><button className="primary" onClick={async () => { if (await saveTelegram()) setTelegramDialogOpen(false); }}>保存设置</button></div></>}>
+          <div className="telegram-dialog-copy"><strong>授权与群组执行</strong><span>机器人在私聊和群组内都按发送者用户 ID 判断权限。</span></div>
+          <div className="field-grid telegram-dialog-grid"><Field label="Bot Token"><input type="password" value={telegramDraft.token} onChange={(e) => setTelegramDraft((c) => ({ ...c, token: e.target.value }))} placeholder={state.telegram?.configured ? '留空保持原 Token' : '粘贴 BotFather Token'} /></Field><Field label="授权用户 ID"><textarea rows={6} value={telegramDraft.userIds} onChange={(e) => setTelegramDraft((c) => ({ ...c, userIds: e.target.value }))} placeholder="每行一个 Telegram user ID" /></Field></div>
+          <label className="automation-toggle"><input type="checkbox" checked={telegramDraft.enabled} onChange={(e) => setTelegramDraft((c) => ({ ...c, enabled: e.target.checked }))} /> 启用 Telegram 机器人</label>
+        </Dialog>
+      ) : null}
+
+      {automationInputDialog.open ? (
+        <Dialog
+          title={automationInputDialog.mode === 'per-server' ? '自动化按行输入' : automationInputDialog.mode === 'broadcast' ? '自动化统一输入' : '自动化交互输入'}
+          onClose={closeAutomationInputDialog}
+          footer={automationInputDialog.mode === 'per-server' ? <><button className="ghost" onClick={closeAutomationInputDialog}>取消</button><button className="primary" onClick={submitAutomationPerServerInput} disabled={busy.automationInput}>{busy.automationInput ? '发送中...' : `分别发送到 ${automationInputDialog.awaitingServerIds.length} 台主机`}</button></> : automationInputDialog.mode === 'broadcast' ? <><button className="ghost" onClick={closeAutomationInputDialog}>取消</button><button className="primary" onClick={submitAutomationBroadcastInput} disabled={busy.automationInput}>{busy.automationInput ? '发送中...' : `发送到 ${automationInputDialog.awaitingServerIds.length} 台主机`}</button></> : <><button className="ghost" onClick={closeAutomationInputDialog}>取消</button><button className="ghost" onClick={() => setAutomationInputDialog((current) => ({ ...current, mode: 'per-server' }))}>按行输入</button><button className="primary" onClick={() => setAutomationInputDialog((current) => ({ ...current, mode: 'broadcast' }))}>统一输入</button></>}
+        >
+          {automationInputDialog.mode === 'choice' ? <div className="automation-input-choice"><strong>有 {automationInputDialog.awaitingServerIds.length} 台主机正在等待输入</strong><span>可以统一发送同一内容，也可以按当前主机顺序逐行发送。</span><div className="automation-awaiting-hosts">{automationAwaitingResults.map((item) => <div key={item.serverId}><span>{item.host}</span><em>等待输入</em></div>)}</div></div> : <div className="field-grid single"><Field label="当前等待主机"><AutoScrollPre text={automationAwaitingResults.map((item, index) => `# ${index + 1}  ${item.host}`).join('\n')} className="batch-input-preview" /></Field><Field label={automationInputDialog.mode === 'per-server' ? '输入内容（按主机顺序逐行）' : '输入内容'}><textarea rows={7} autoFocus value={automationInputDialog.value} onChange={(event) => setAutomationInputDialog((current) => ({ ...current, value: event.target.value }))} placeholder={automationInputDialog.mode === 'per-server' ? '一行对应一台主机，空行表示回车' : '留空表示统一发送回车'} /></Field>{automationInputDialog.mode === 'per-server' ? <div className="confirm-copy">当前 {automationInputLines.length} 行，需要 {automationInputDialog.awaitingServerIds.length} 行。</div> : <div className="confirm-copy">这段内容会发送到所有等待输入的主机。</div>}</div>}
         </Dialog>
       ) : null}
 
@@ -4204,6 +4296,10 @@ function CommandIcon() {
 
 function AutomationIcon() {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M5 4h14v4H5zM5 16h14v4H5z"/><path d="M8 8v8M16 8v8M8 12h8"/><circle cx="8" cy="12" r="1.5" fill="currentColor"/></svg>;
+}
+
+function TelegramIcon() {
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="m21 4-3 16-6-5-4 3 1-5 8-6-10 5-4-2z"/><path d="m9 13 9-7"/></svg>;
 }
 
 function ProxyIcon() {

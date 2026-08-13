@@ -829,11 +829,21 @@ svg {
 .automation-task-card > em { grid-column: 2; grid-row: 1 / span 2; align-self: center; padding: 3px 6px; border-radius: 6px; background: var(--button-ghost-bg); color: var(--text-muted); font-size: 10px; font-style: normal; }
 .automation-task-mark { width: 21px; height: 21px; flex: 0 0 auto; display: grid !important; place-items: center; margin: 0 !important; border-radius: 6px; background: var(--accent-soft); color: var(--accent-text) !important; }
 .automation-task-mark svg { width: 12px; height: 12px; }
-.automation-layout { grid-template-columns: 1fr; }
-.automation-layout .automation-aside { position: static; transform: none; width: auto; min-height: 0; display: grid; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); grid-template-areas: "head board" "list board"; gap: 12px; padding: 0; border: 0; background: transparent; box-shadow: none; backdrop-filter: none; }
-.automation-layout .automation-aside .side-head { grid-area: head; padding: 13px 14px; border: 1px solid var(--border-soft); border-radius: 14px; background: var(--panel-bg); }
-.automation-layout .automation-aside > .panel-scroll { grid-area: list; min-height: 0; max-height: none; padding: 8px; border: 1px solid var(--border-soft); border-radius: 14px; background: var(--panel-bg); }
-.automation-layout .automation-aside > .automation-board { grid-area: board; min-width: 0; min-height: 0; max-height: calc(100vh - 96px); }
+.automation-layout { grid-template-columns: 320px minmax(0, 1fr); }
+.automation-layout .automation-aside { position: static; transform: none; width: auto; min-height: 0; }
+.automation-layout .automation-aside .side-head { flex: 0 0 auto; }
+.automation-layout .automation-aside > .panel-scroll { min-height: 0; max-height: none; }
+.automation-layout .main-column { min-width: 0; }
+.automation-kicker { display: block; margin-bottom: 5px; color: var(--accent-text); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.automation-page-head { min-height: 74px; padding: 16px 20px; border-radius: 18px; border: 1px solid var(--border-soft); background: var(--panel-bg); box-shadow: var(--elev-shadow); }
+.automation-page-head .toolbar { flex: 0 0 auto; }
+.automation-title-block strong { font-size: 19px; letter-spacing: 0; }
+.automation-title-block > span:last-child { margin-top: 5px; font-size: 11px; }
+.automation-summary-panel, .automation-history { background: color-mix(in srgb, var(--panel-bg) 94%, var(--accent-soft)); }
+.automation-summary-panel .workspace-head { margin-bottom: 2px; }
+.automation-summary-panel .workspace-head .ghost { min-height: 30px; padding: 6px 9px; }
+.automation-run-empty { min-height: 250px; }
+.automation-run-empty .primary { margin-top: 8px; }
 .automation-editor-layout { display: grid; grid-template-columns: minmax(280px, .7fr) minmax(0, 1.5fr); gap: 18px; }
 .automation-editor-basics { padding: 2px 20px 2px 2px; border-right: 1px solid var(--border-soft); }
 .dialog-section-head strong, .telegram-dialog-copy strong { display: block; color: var(--text-strong); font-size: 13px; }
@@ -1114,7 +1124,7 @@ svg {
 
 .workspace-panel-terminal-fullscreen .terminal-shell-fullscreen .terminal-root {
   padding: 14px 16px 16px;
-  border-radius: 24px;
+  border-radius: 18px;
   border: 1px solid var(--border-card);
   background: var(--terminal-bg);
   box-shadow: var(--elev-shadow);
@@ -1450,6 +1460,9 @@ svg {
 .dialog-footer {
   padding: 18px 20px;
 }
+
+.dialog-head { border-bottom: 1px solid var(--border-soft); }
+.dialog-footer { border-top: 1px solid var(--border-soft); background: color-mix(in srgb, var(--panel-bg) 92%, var(--accent-soft)); }
 
 .dialog-footer {
   align-items: center;
@@ -2343,7 +2356,6 @@ svg {
   .automation-layout .automation-aside .side-head { margin-bottom: 8px; }
   .automation-layout .automation-aside > .panel-scroll { max-height: none; margin-bottom: 8px; }
   .automation-layout .automation-aside > .automation-board { max-height: none; }
-  .automation-layout .main-column { display: none; }
 
   .command-composer textarea {
     min-height: 132px;

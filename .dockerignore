@@ -9,3 +9,5 @@ backups
 *.log
 local-run.out
 local-run.err
+__pycache__
+*.pyc

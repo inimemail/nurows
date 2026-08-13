@@ -2,6 +2,7 @@
 import { Terminal } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { parsePerServerInputLines } from '../shared/command-input.js';
+import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
 
 const EMPTY_SERVER = {
   id: '',
@@ -69,7 +70,10 @@ const TABS = [
   { key: 'servers', label: '服务器', icon: ServerIcon },
   { key: 'commands', label: '命令中心', icon: CommandIcon },
   { key: 'automation', label: '自动化任务', icon: AutomationIcon },
-  { key: 'proxies', label: '代理网络', icon: ProxyIcon }
+  { key: 'proxies', label: '代理网络', icon: ProxyIcon },
+  { key: 'probes', label: '探针管理', icon: ProbeIcon },
+  { key: 'pools', label: '备用 IP 池', icon: PoolIcon },
+  { key: 'dns', label: '解析管理', icon: DnsIcon }
 ];
 
 const TERMINAL_SESSIONS_STORAGE_KEY = 'nurossh-terminal-sessions';
@@ -325,7 +329,7 @@ function readStoredActiveTerminalId() {
 
 function normalizeWorkspacePayload(workspace = {}) {
   return {
-    tab: ['commands', 'automation', 'proxies'].includes(workspace.tab) ? workspace.tab : 'servers',
+    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns'].includes(workspace.tab) ? workspace.tab : 'servers',
     search: typeof workspace.search === 'string' ? workspace.search : '',
     selectedServerId: typeof workspace.selectedServerId === 'string' ? workspace.selectedServerId : '',
     selectedCommandId: typeof workspace.selectedCommandId === 'string' ? workspace.selectedCommandId : '',
@@ -384,7 +388,7 @@ export default function App() {
   });
   const [accountError, setAccountError] = useState('');
 
-  const [state, setState] = useState({ groups: [], servers: [], commands: [], proxies: [], automationTasks: [], telegram: {} });
+  const [state, setState] = useState({ groups: [], servers: [], commands: [], proxies: [], automationTasks: [], telegram: {}, probes: [], probeTargets: [], failoverPolicies: [], incidents: [], ipAssets: [], ipPools: [], ipLeases: [], dnsAccounts: [], dnsZones: [], dnsBindings: [], dnsChanges: [], auditLogs: [], telegramBots: [] });
   const [tab, setTab] = useState('servers');
   const [search, setSearch] = useState('');
   const [busy, setBusy] = useState({});
@@ -1187,6 +1191,10 @@ export default function App() {
 
   function openAutomationInputDialog(mode = 'choice') {
     setAutomationInputDialog({ open: true, mode, value: '', awaitingServerIds: automationAwaitingIds });
+  }
+
+  function openSingleAutomationInputDialog(serverId) {
+    setAutomationInputDialog({ open: true, mode: 'broadcast', value: '', awaitingServerIds: [serverId] });
   }
 
   function closeAutomationInputDialog() {
@@ -2147,7 +2155,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '')}>
+      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns'].includes(tab) ? ' orchestration-layout' : '')}>
         {!workspaceFullscreenActive ? (
           <button
             className={'mobile-drawer-scrim ' + (assetDrawerOpen ? 'open' : '')}
@@ -2156,10 +2164,10 @@ export default function App() {
             onClick={() => setAssetDrawerOpen(false)}
           />
         ) : null}
-        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '')}>
+        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns'].includes(tab) ? ' orchestration-aside' : '')}>
           <div className="side-head">
             <div>
-              <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : '代理列表'}</strong>
+              <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'dns' ? '解析管理' : '代理列表'}</strong>
               <span>
                 {tab === 'servers'
                   ? `${state.servers.length} 台服务器`
@@ -2167,7 +2175,13 @@ export default function App() {
                     ? `${state.commands.length} 条命令`
                     : tab === 'automation'
                       ? `${automationTasks.length} 个任务`
-                    : `${state.proxies.length} 个代理`}
+                    : tab === 'probes'
+                      ? `${state.probes?.length || 0} 个探针`
+                      : tab === 'pools'
+                        ? `${state.ipPools?.length || 0} 个池`
+                        : tab === 'dns'
+                          ? `${state.dnsAccounts?.length || 0} 个账号`
+                          : `${state.proxies.length} 个代理`}
               </span>
             </div>
             <div className="toolbar">
@@ -2334,7 +2348,8 @@ export default function App() {
           ) : null}
         </aside>
 
-          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '')}>
+          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns'].includes(tab) ? ' orchestration-main' : '')}>
+          {['probes', 'pools', 'dns'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
           {tab === 'automation' ? (
             <section className="automation-board">
               <div className="automation-page-head surface">
@@ -2351,7 +2366,7 @@ export default function App() {
                   </div>
                   <div className="surface automation-results-panel">
                     <div className="workspace-head"><div><strong>当前执行进度</strong><span>{automationCounts.total ? `已处理 ${automationCounts.success + automationCounts.failed} / ${automationCounts.total}` : '暂无执行结果'}</span></div><div className="toolbar">{automationAwaitingResults.length ? <><button className="ghost" onClick={() => openAutomationInputDialog('per-server')}>按行输入</button><button className="ghost" onClick={() => openAutomationInputDialog('broadcast')}>统一输入</button></> : null}{automationCounts.failed ? <button className="ghost" onClick={retryAutomationFailed} disabled={automationIsRunning}>重试失败</button> : null}<button className={'ghost ' + (busy.clearAutomation ? 'is-loading' : '')} onClick={clearAutomationResults} disabled={!automationResults.length || busy.clearAutomation}>{automationIsRunning ? '取消并清空' : '清空'}</button></div></div>
-                    {automationResults.length ? <><div className="automation-progress automation-progress-detailed"><div className="total"><strong>{automationCounts.total}</strong><span>总数</span></div><div className="running"><strong>{automationCounts.queued + automationCounts.running}</strong><span>执行中</span></div><div className="awaiting"><strong>{automationCounts.awaiting}</strong><span>等待输入</span></div><div className="success"><strong>{automationCounts.success}</strong><span>成功</span></div><div className="failed"><strong>{automationCounts.failed}</strong><span>失败</span></div></div><div className="automation-progress-track"><span style={{ width: `${automationCounts.total ? ((automationCounts.success + automationCounts.failed) / automationCounts.total) * 100 : 0}%` }} /></div><div className="automation-result-list">{automationResults.map((item) => { const expanded = automationExpandedServerId === item.serverId; const output = cleanTerminalOutput([item.stdout, item.stderr, item.error].filter(Boolean).join('\n')); const statusClass = item.status === 'error' ? 'error' : item.ok ? 'ok' : item.status === 'awaiting_input' ? 'awaiting' : 'running'; return <div key={item.serverId} className={'automation-result-item ' + statusClass}><div className="automation-result-row" onClick={() => setAutomationExpandedServerId(expanded ? '' : item.serverId)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setAutomationExpandedServerId(expanded ? '' : item.serverId); }} role="button" tabIndex={0}><div className="automation-result-host"><i /><span>{item.host}</span></div><div>{item.status === 'awaiting_input' ? <button className="ghost automation-input-button" onClick={(event) => { event.stopPropagation(); const value = window.prompt(`输入发送到 ${item.host}，留空表示回车`, ''); if (value !== null) sendAutomationInput(item.serverId, value); }}>输入</button> : null}<em>{item.status === 'queued' ? '排队' : item.status === 'running' ? '执行中' : item.status === 'awaiting_input' ? '等待输入' : item.ok ? '成功' : '失败'}</em><ChevronIcon collapsed={!expanded} /></div></div>{expanded ? <pre>{output || '暂无日志'}</pre> : null}</div>; })}</div></> : <div className="empty-state automation-result-empty"><span className="automation-empty-icon"><AutomationIcon /></span><strong>等待执行</strong><span>输入目标 IP 并启动任务后，这里显示实时进度。</span></div>}
+                    {automationResults.length ? <><div className="automation-progress automation-progress-detailed"><div className="total"><strong>{automationCounts.total}</strong><span>总数</span></div><div className="running"><strong>{automationCounts.queued + automationCounts.running}</strong><span>执行中</span></div><div className="awaiting"><strong>{automationCounts.awaiting}</strong><span>等待输入</span></div><div className="success"><strong>{automationCounts.success}</strong><span>成功</span></div><div className="failed"><strong>{automationCounts.failed}</strong><span>失败</span></div></div><div className="automation-progress-track"><span style={{ width: `${automationCounts.total ? ((automationCounts.success + automationCounts.failed) / automationCounts.total) * 100 : 0}%` }} /></div><div className="automation-result-list">{automationResults.map((item) => { const expanded = automationExpandedServerId === item.serverId; const output = cleanTerminalOutput([item.stdout, item.stderr, item.error].filter(Boolean).join('\n')); const statusClass = item.status === 'error' ? 'error' : item.ok ? 'ok' : item.status === 'awaiting_input' ? 'awaiting' : 'running'; return <div key={item.serverId} className={'automation-result-item ' + statusClass}><div className="automation-result-row" onClick={() => setAutomationExpandedServerId(expanded ? '' : item.serverId)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setAutomationExpandedServerId(expanded ? '' : item.serverId); }} role="button" tabIndex={0}><div className="automation-result-host"><i /><span>{item.host}</span></div><div>{item.status === 'awaiting_input' ? <button className="ghost automation-input-button" onClick={(event) => { event.stopPropagation(); openSingleAutomationInputDialog(item.serverId); }}>输入</button> : null}<em>{item.status === 'queued' ? '排队' : item.status === 'running' ? '执行中' : item.status === 'awaiting_input' ? '等待输入' : item.ok ? '成功' : '失败'}</em><ChevronIcon collapsed={!expanded} /></div></div>{expanded ? <pre>{output || '暂无日志'}</pre> : null}</div>; })}</div></> : <div className="empty-state automation-result-empty"><span className="automation-empty-icon"><AutomationIcon /></span><strong>等待执行</strong><span>输入目标 IP 并启动任务后，这里显示实时进度。</span></div>}
                   </div>
                   </>}
                 </div>
@@ -4295,6 +4310,18 @@ function CommandIcon() {
 
 function AutomationIcon() {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M5 4h14v4H5zM5 16h14v4H5z"/><path d="M8 8v8M16 8v8M8 12h8"/><circle cx="8" cy="12" r="1.5" fill="currentColor"/></svg>;
+}
+
+function ProbeIcon() {
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4 12h4l2-7 4 14 2-7h4" /><path d="M4 19h16" /></svg>;
+}
+
+function PoolIcon() {
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="16" height="5" rx="1.5" /><rect x="4" y="15" width="16" height="5" rx="1.5" /><path d="M8 9v6M16 9v6" /></svg>;
+}
+
+function DnsIcon() {
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="8" /><path d="M4 12h16M12 4c2 2.2 3 4.9 3 8s-1 5.8-3 8c-2-2.2-3-4.9-3-8s1-5.8 3-8Z" /></svg>;
 }
 
 function TelegramIcon() {

@@ -755,6 +755,12 @@ svg {
 .automation-steps { display: flex; flex-direction: column; gap: 8px; }
 .automation-step { display: grid; grid-template-columns: 30px 120px minmax(110px, .55fr) minmax(160px, 1.6fr) 30px; gap: 8px; align-items: start; padding: 10px; border: 1px solid var(--border-card); border-radius: 12px; background: var(--card-bg); }
 .automation-step textarea { min-height: 42px; resize: vertical; }
+.automation-input-mode { grid-column: 2 / 5; grid-row: 2; min-height: 38px; }
+.automation-step > .icon-button { grid-column: 5; grid-row: 1 / span 2; }
+.automation-step-guide { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; color: var(--text-soft); font-size: 11px; }
+.automation-step-guide code { padding: 4px 7px; border: 1px solid var(--border-card); border-radius: 7px; background: var(--card-bg); color: var(--text-main); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.automation-step-guide i { color: var(--accent-text); font-style: normal; }
+.automation-step-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .step-index { display: grid; place-items: center; min-height: 38px; border-radius: 9px; background: var(--accent-soft); color: var(--accent-text); font-weight: 700; }
 .automation-run-panel { display: flex; flex-direction: column; gap: 12px; }
 .automation-run-form { display: grid; grid-template-columns: minmax(180px, .45fr) minmax(0, 1.55fr); gap: 12px; align-items: stretch; }
@@ -2353,6 +2359,7 @@ svg {
   .automation-step select { grid-column: 2; }
   .automation-step input { grid-column: 2; }
   .automation-step textarea { grid-column: 2; }
+  .automation-input-mode { grid-column: 2; grid-row: 4; }
   .automation-step .icon-button { grid-column: 3; grid-row: 1; }
   .telegram-foot { align-items: flex-start; flex-direction: column; gap: 8px; }
   .automation-editor-layout { grid-template-columns: 1fr; gap: 16px; }

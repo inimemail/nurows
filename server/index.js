@@ -1627,6 +1627,7 @@ function normalizeAutomationTask(input = {}, existing = null) {
         type: ['command', 'wait', 'input', 'enter', 'delay'].includes(step?.type) ? step.type : 'command',
         label: String(step?.label || '').trim(),
         value: String(step?.value ?? ''),
+        inputMode: step?.inputMode === 'per-server' ? 'per-server' : 'broadcast',
         timeout: Math.min(3600, Math.max(1, Number(step?.timeout) || 120)),
         order: index
       }))
@@ -1956,7 +1957,11 @@ function createAutomationJob(task, temporaryServers, command) {
     if (step.type !== 'wait' || !step.value.trim()) return;
     const next = task.steps[index + 1];
     if (next?.type === 'input' || next?.type === 'enter') {
-      job.automationResponders.push({ waitText: step.value.trim(), input: next.type === 'enter' ? '' : next.value });
+      job.automationResponders.push({
+        waitText: step.value.trim(),
+        input: next.type === 'enter' ? '' : next.value,
+        inputMode: next.type === 'input' && next.inputMode === 'per-server' ? 'per-server' : 'broadcast'
+      });
     }
   });
   job.automationInterval = null;
@@ -2327,7 +2332,16 @@ function appendCommandRuntimeOutput(job, runtime, resultItem, text) {
     if (responder && runtime.tailText.toLowerCase().includes(responder.waitText.toLowerCase())) {
       runtime.automationResponderIndex = responderIndex + 1;
       runtime.tailText = '';
-      writeCommandSessionInput(job, runtime, resultItem, normalizeCommandInput(responder.input));
+      if (responder.inputMode === 'per-server') {
+        resultItem.status = 'awaiting_input';
+        resultItem.awaitingInput = true;
+        resultItem.inputRequestCount += 1;
+        runtime.awaitingAutomationResponder = responder;
+        broadcastCommandSession(runtime, { type: 'state', status: resultItem.status, awaitingInput: true, inputMode: 'per-server' });
+        refreshCommandJobStatus(job);
+      } else {
+        writeCommandSessionInput(job, runtime, resultItem, normalizeCommandInput(responder.input));
+      }
     }
   }
 

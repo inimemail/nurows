@@ -43,6 +43,14 @@ const sessions = new Map();
 const terminalSessions = new Map();
 const authAttempts = new Map();
 const commandJobs = new Map();
+const telegramRuntime = {
+  timer: null,
+  offset: 0,
+  token: '',
+  pending: new Map(),
+  progressTimers: new Map(),
+  generation: 0
+};
 let sqliteDb = null;
 let cachedAuth = null;
 let cachedState = null;
@@ -80,6 +88,14 @@ const defaultState = {
   servers: [],
   commands: [],
   proxies: [],
+  automationTasks: [],
+  automationRuns: [],
+  telegram: {
+    enabled: false,
+    tokenEnc: null,
+    userIds: [],
+    allowGroups: true
+  },
   workspaces: {}
 };
 
@@ -397,6 +413,99 @@ app.delete('/api/commands/:id', (req, res) => {
     draft.commands = draft.commands.filter((commandItem) => commandItem.id !== req.params.id);
     return draft;
   });
+  res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
+});
+
+app.post('/api/automation-tasks', (req, res) => {
+  const state = updateState((draft) => {
+    const item = normalizeAutomationTask(req.body);
+    const password = String(req.body.password || '').trim();
+    if (password) item.passwordEnc = encryptSecret(password);
+    draft.automationTasks.push(item);
+    req.createdAutomationTask = item;
+    return draft;
+  });
+  res.json({ ok: true, state: sanitizeStateForClient(state, req.auth), item: sanitizeAutomationTaskForClient(req.createdAutomationTask) });
+});
+
+app.put('/api/automation-tasks/:id', (req, res) => {
+  const state = updateState((draft) => {
+    const item = draft.automationTasks.find((task) => task.id === req.params.id);
+    if (!item) throw new Error('未找到自动化任务');
+    const next = normalizeAutomationTask(req.body, item);
+    const password = String(req.body.password || '').trim();
+    next.passwordEnc = password ? encryptSecret(password) : item.passwordEnc;
+    Object.assign(item, next, { id: item.id, createdAt: item.createdAt });
+    return draft;
+  });
+  res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
+});
+
+app.delete('/api/automation-tasks/:id', (req, res) => {
+  const state = updateState((draft) => {
+    draft.automationTasks = draft.automationTasks.filter((task) => task.id !== req.params.id);
+    return draft;
+  });
+  res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
+});
+
+app.post('/api/automation-tasks/:id/execute', (req, res) => {
+  const state = readState();
+  const task = state.automationTasks.find((item) => item.id === req.params.id);
+  if (!task) { res.status(404).json({ error: '自动化任务不存在' }); return; }
+  const hosts = [...new Set(String(req.body.hosts || '').split(/[\s,，;；]+/).map((item) => item.trim()).filter(Boolean))].slice(0, 5000);
+  if (!hosts.length) { res.status(400).json({ error: '请输入至少一个 IP 或主机地址' }); return; }
+  const password = getStoredSecretValue(task, req.auth.encryptionKey);
+  if (!password) { res.status(400).json({ error: '请先为自动化任务设置 SSH 密码' }); return; }
+  const commandSteps = task.steps.filter((step) => step.type === 'command' && step.value.trim());
+  const command = commandSteps.map((step) => step.value.trim()).join('\n');
+  if (!command) { res.status(400).json({ error: '请至少配置一个命令步骤' }); return; }
+  const job = startAutomationTask(task, hosts, state, req.auth.encryptionKey);
+  res.json({ ok: true, jobId: job.id, taskId: task.id, results: job.results });
+});
+
+app.post('/api/automation-jobs/:id/cancel', (req, res) => {
+  const job = commandJobs.get(req.params.id);
+  if (!job || job.type !== 'automation') { res.status(404).json({ error: '自动化任务不存在或已过期' }); return; }
+  cancelCommandJob(job);
+  res.json({ ok: true, results: job.results });
+});
+
+app.post('/api/automation-jobs/:id/pause', (req, res) => {
+  const job = commandJobs.get(req.params.id);
+  if (!job || job.type !== 'automation') { res.status(404).json({ error: '自动化任务不存在或已过期' }); return; }
+  job.paused = true;
+  res.json({ ok: true, status: 'paused' });
+});
+
+app.post('/api/automation-jobs/:id/resume', (req, res) => {
+  const job = commandJobs.get(req.params.id);
+  if (!job || job.type !== 'automation') { res.status(404).json({ error: '自动化任务不存在或已过期' }); return; }
+  job.paused = false;
+  res.json({ ok: true, status: 'running' });
+});
+
+app.post('/api/automation-jobs/:id/retry-failed', (req, res) => {
+  const previous = commandJobs.get(req.params.id);
+  if (!previous || previous.type !== 'automation') { res.status(404).json({ error: '自动化任务不存在或已过期' }); return; }
+  const hosts = previous.results.filter((item) => item.status === 'error').map((item) => item.host);
+  if (!hosts.length) { res.status(400).json({ error: '没有失败主机' }); return; }
+  const state = readState();
+  const task = state.automationTasks.find((item) => item.id === previous.taskId);
+  if (!task) { res.status(404).json({ error: '自动化配置不存在' }); return; }
+  const job = startAutomationTask(task, hosts, state, req.auth.encryptionKey);
+  res.json({ ok: true, jobId: job.id, results: job.results });
+});
+
+app.put('/api/telegram', (req, res) => {
+  const state = updateState((draft) => {
+    const next = normalizeTelegramSettings({ ...draft.telegram, ...req.body });
+    const token = String(req.body.token || '').trim();
+    next.tokenEnc = token ? encryptSecret(token) : draft.telegram?.tokenEnc || null;
+    draft.telegram = next;
+    return draft;
+  });
+  restartTelegramPolling();
   res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
 });
 
@@ -841,6 +950,7 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, HOST, () => {
+  restartTelegramPolling();
   console.log(`NuroSSH server running at http://localhost:${PORT}`);
 });
 
@@ -1491,7 +1601,65 @@ function normalizeStateRecord(parsed) {
     servers: Array.isArray(parsed?.servers) ? parsed.servers : [],
     commands: Array.isArray(parsed?.commands) ? parsed.commands : [],
     proxies: Array.isArray(parsed?.proxies) ? parsed.proxies : [],
+    automationTasks: Array.isArray(parsed?.automationTasks) ? parsed.automationTasks.map(normalizeAutomationTask) : [],
+    automationRuns: Array.isArray(parsed?.automationRuns) ? parsed.automationRuns.slice(0, 30) : [],
+    telegram: normalizeTelegramSettings(parsed?.telegram),
     workspaces: parsed?.workspaces && typeof parsed.workspaces === 'object' ? parsed.workspaces : {}
+  };
+}
+
+function normalizeTelegramSettings(input = {}) {
+  return {
+    enabled: Boolean(input?.enabled),
+    tokenEnc: input?.tokenEnc || null,
+    userIds: Array.isArray(input?.userIds)
+      ? input.userIds.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 100)
+      : [],
+    allowGroups: input?.allowGroups !== false
+  };
+}
+
+function normalizeAutomationTask(input = {}, existing = null) {
+  const now = new Date().toISOString();
+  const steps = Array.isArray(input.steps)
+    ? input.steps.map((step, index) => ({
+        id: String(step?.id || uuidv4()),
+        type: ['command', 'wait', 'input', 'enter', 'delay'].includes(step?.type) ? step.type : 'command',
+        label: String(step?.label || '').trim(),
+        value: String(step?.value ?? ''),
+        timeout: Math.min(3600, Math.max(1, Number(step?.timeout) || 120)),
+        order: index
+      }))
+    : [];
+  return {
+    id: existing?.id || input.id || uuidv4(),
+    name: String(input.name || '').trim() || '未命名自动化',
+    username: String(input.username || 'root').trim() || 'root',
+    port: clampPort(input.port),
+    passwordEnc: input.passwordEnc || existing?.passwordEnc || null,
+    proxyId: String(input.proxyId || '').trim(),
+    concurrency: Math.min(300, Math.max(1, Number(input.concurrency) || 100)),
+    connectTimeout: Math.min(120, Math.max(3, Number(input.connectTimeout) || 15)),
+    stepTimeout: Math.min(3600, Math.max(1, Number(input.stepTimeout) || 120)),
+    retryCount: Math.min(5, Math.max(0, Number(input.retryCount) || 0)),
+    telegramEnabled: input.telegramEnabled !== false,
+    steps,
+    createdAt: existing?.createdAt || input.createdAt || now,
+    updatedAt: now
+  };
+}
+
+function sanitizeAutomationTaskForClient(item) {
+  const { password, passwordEnc, ...safe } = item || {};
+  return safe;
+}
+
+function sanitizeTelegramForClient(item) {
+  return {
+    enabled: Boolean(item?.enabled),
+    configured: Boolean(item?.tokenEnc),
+    userIds: Array.isArray(item?.userIds) ? item.userIds : [],
+    allowGroups: item?.allowGroups !== false
   };
 }
 
@@ -1522,6 +1690,9 @@ function sanitizeStateForClient(state, auth = null) {
     commands: state.commands,
     servers: state.servers.map(sanitizeServerForClient),
     proxies: state.proxies.map(sanitizeProxyForClient),
+    automationTasks: state.automationTasks.map(sanitizeAutomationTaskForClient),
+    automationRuns: state.automationRuns || [],
+    telegram: sanitizeTelegramForClient(state.telegram),
     workspace: getWorkspaceForUser(state, auth)
   };
 }
@@ -1570,7 +1741,7 @@ function getWorkspaceForUser(state, auth = null) {
     };
   }
   return {
-    tab: source.tab === 'commands' || source.tab === 'proxies' ? source.tab : 'servers',
+    tab: ['commands', 'automation', 'proxies'].includes(source.tab) ? source.tab : 'servers',
     search: typeof source.search === 'string' ? source.search : '',
     selectedServerId: typeof source.selectedServerId === 'string' ? source.selectedServerId : '',
     selectedCommandId: typeof source.selectedCommandId === 'string' ? source.selectedCommandId : '',
@@ -1628,7 +1799,7 @@ function getWorkspaceForUser(state, auth = null) {
 
 function normalizeWorkspaceInput(input = {}) {
   return {
-    tab: input.tab === 'commands' || input.tab === 'proxies' ? input.tab : 'servers',
+    tab: ['commands', 'automation', 'proxies'].includes(input.tab) ? input.tab : 'servers',
     search: typeof input.search === 'string' ? input.search : '',
     selectedServerId: typeof input.selectedServerId === 'string' ? input.selectedServerId : '',
     selectedCommandId: typeof input.selectedCommandId === 'string' ? input.selectedCommandId : '',
@@ -1753,7 +1924,7 @@ async function runCommandJob(job, proxies, encryptionKeyHex) {
 
 function runInteractiveCommandJob(job, proxies, encryptionKeyHex) {
   for (const resultItem of job.results) {
-    const serverItem = readState().servers.find((item) => item.id === resultItem.serverId);
+    const serverItem = job.serverById?.get(resultItem.serverId) || readState().servers.find((item) => item.id === resultItem.serverId);
     if (!serverItem) {
       Object.assign(resultItem, {
         ok: false,
@@ -1767,6 +1938,208 @@ function runInteractiveCommandJob(job, proxies, encryptionKeyHex) {
   }
 
   refreshCommandJobStatus(job);
+}
+
+function createAutomationJob(task, temporaryServers, command) {
+  const waitKeywords = task.steps.filter((step) => step.type === 'wait' && step.value.trim()).map((step) => step.value.trim());
+  const job = createCommandJob(temporaryServers, command, waitKeywords);
+  job.type = 'automation';
+  job.taskId = task.id;
+  job.taskName = task.name;
+  job.concurrency = Math.min(300, Math.max(1, Number(task.concurrency) || 100));
+  job.serverById = new Map(temporaryServers.map((item) => [item.id, item]));
+  job.automationSteps = task.steps;
+  job.retryCount = task.retryCount;
+  job.stepTimeout = task.stepTimeout;
+  job.automationResponders = [];
+  task.steps.forEach((step, index) => {
+    if (step.type !== 'wait' || !step.value.trim()) return;
+    const next = task.steps[index + 1];
+    if (next?.type === 'input' || next?.type === 'enter') {
+      job.automationResponders.push({ waitText: step.value.trim(), input: next.type === 'enter' ? '' : next.value });
+    }
+  });
+  job.automationInterval = null;
+  job.paused = false;
+  job.runRecorded = false;
+  return job;
+}
+
+function startAutomationTask(task, hosts, state, encryptionKeyHex) {
+  const password = getStoredSecretValue(task, encryptionKeyHex);
+  const temporaryServers = hosts.map((host) => ({
+    id: uuidv4(), name: host, host, port: task.port, username: task.username,
+    passwordEnc: encryptSecret(password), proxyId: task.proxyId, connectTimeout: task.connectTimeout
+  }));
+  const command = task.steps
+    .flatMap((step) => {
+      if (step.type === 'command' && step.value.trim()) return [step.value.trim()];
+      if (step.type === 'delay') {
+        const seconds = Math.min(3600, Math.max(0, Number(step.value) || 0));
+        return seconds ? [`sleep ${Math.floor(seconds)}`] : [];
+      }
+      return [];
+    })
+    .join('\n');
+  const job = createAutomationJob(task, temporaryServers, command);
+  commandJobs.set(job.id, job);
+  updateState((draft) => {
+    draft.automationRuns = [{ id: job.id, taskId: task.id, taskName: task.name, total: hosts.length, ok: 0, error: 0, status: 'running', startedAt: job.startedAt, finishedAt: '' }, ...(draft.automationRuns || [])].slice(0, 30);
+    return draft;
+  });
+  runAutomationJob(job, state.proxies, encryptionKeyHex);
+  return job;
+}
+
+function runAutomationJob(job, proxies, encryptionKeyHex) {
+  let active = 0;
+  let cursor = 0;
+  const startMore = () => {
+    if (job.cancelled || job.paused) return;
+    while (active < job.concurrency && cursor < job.results.length) {
+      const resultItem = job.results[cursor++];
+      const serverItem = job.serverById.get(resultItem.serverId);
+      active += 1;
+      resultItem.status = 'running';
+      startInteractiveCommandSession(job, resultItem, serverItem, proxies, encryptionKeyHex);
+    }
+  };
+  job.automationInterval = setInterval(() => {
+    active = job.results.filter((item) => ['running', 'awaiting_input'].includes(item.status)).length;
+    startMore();
+    if (cursor >= job.results.length && job.results.every((item) => ['done', 'error'].includes(item.status))) {
+      clearInterval(job.automationInterval);
+      job.automationInterval = null;
+      refreshCommandJobStatus(job);
+      recordAutomationRun(job);
+    }
+  }, 300);
+  startMore();
+}
+
+function recordAutomationRun(job) {
+  if (job.runRecorded) return;
+  job.runRecorded = true;
+  updateState((draft) => {
+    const record = (draft.automationRuns || []).find((item) => item.id === job.id);
+    if (record) Object.assign(record, { ok: job.results.filter((item) => item.ok).length, error: job.results.filter((item) => item.status === 'error').length, status: job.cancelled ? 'cancelled' : 'done', finishedAt: job.finishedAt || new Date().toISOString() });
+    return draft;
+  });
+}
+
+function telegramAuthorized(settings, from, chat) {
+  const userId = String(from?.id || '');
+  if (!settings?.enabled || !settings?.tokenEnc || !settings.userIds?.includes(userId)) return false;
+  if (chat?.type === 'group' || chat?.type === 'supergroup') return settings.allowGroups !== false;
+  return true;
+}
+
+function telegramApiUrl(token, method) {
+  return `https://api.telegram.org/bot${token}/${method}`;
+}
+
+async function telegramCall(token, method, body = {}) {
+  const response = await fetch(telegramApiUrl(token, method), {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+  });
+  const payload = await response.json();
+  if (!payload.ok) throw new Error(payload.description || 'Telegram API error');
+  return payload.result;
+}
+
+function telegramButtons(tasks, prefix) {
+  return tasks.slice(0, 20).map((task) => ([{ text: task.name, callback_data: `${prefix}:${task.id}` }]));
+}
+
+function telegramSessionKey(chat, from) {
+  return `${String(chat?.id || '')}:${String(from?.id || '')}`;
+}
+
+async function handleTelegramUpdate(update, token) {
+  const state = readState();
+  const settings = state.telegram;
+  const message = update.message;
+  const callback = update.callback_query;
+  const from = message?.from || callback?.from;
+  const chat = message?.chat || callback?.message?.chat;
+  if (!telegramAuthorized(settings, from, chat)) return;
+  const chatId = chat.id;
+  const sessionKey = telegramSessionKey(chat, from);
+  if (callback) {
+    await telegramCall(token, 'answerCallbackQuery', { callback_query_id: callback.id });
+    const [action, value] = String(callback.data || '').split(':');
+    const pending = telegramRuntime.pending.get(sessionKey);
+    if (action === 'task') {
+      const task = state.automationTasks.find((item) => item.id === value && item.telegramEnabled !== false);
+      if (!task) return;
+      telegramRuntime.pending.set(sessionKey, { taskId: task.id, hosts: '', awaitingHosts: true, messageId: callback.message.message_id });
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已选择：${task.name}\n请发送 IP 列表，每行一个。` });
+      return;
+    }
+    if (action === 'confirm' && pending?.hosts) {
+      const task = state.automationTasks.find((item) => item.id === pending.taskId);
+      if (!task) return;
+      const job = startAutomationTask(task, pending.hosts, state, undefined);
+      telegramRuntime.pending.delete(sessionKey);
+      const sent = await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已启动：${task.name}\n总数：${job.results.length}\n并发：${job.concurrency}`, reply_markup: { inline_keyboard: [[{ text: '取消任务', callback_data: `canceljob:${job.id}` }]] } });
+      scheduleTelegramProgress(chatId, sent.message_id, job.id, token);
+      return;
+    }
+    if (action === 'canceljob') {
+      const job = commandJobs.get(value);
+      if (job?.type === 'automation') cancelCommandJob(job);
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: job ? '任务已取消。' : '任务已结束或过期。' });
+      return;
+    }
+    if (action === 'cancel') { telegramRuntime.pending.delete(sessionKey); await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '已取消。' }); }
+    return;
+  }
+  const text = String(message?.text || '').trim();
+  if (/^\/(?:start|run)(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(text) || text === '执行自动化') {
+    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '选择一个自动化任务：', reply_markup: { inline_keyboard: telegramButtons(state.automationTasks.filter((item) => item.telegramEnabled !== false), 'task') } });
+    return;
+  }
+  const pending = telegramRuntime.pending.get(sessionKey);
+  if (pending?.awaitingHosts && text) {
+    const hosts = [...new Set(text.split(/[\s,，;；]+/).filter(Boolean))].slice(0, 5000);
+    pending.hosts = hosts; pending.awaitingHosts = false;
+    telegramRuntime.pending.set(sessionKey, pending);
+    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已接收 ${hosts.length} 个地址，确认执行？`, reply_markup: { inline_keyboard: [[{ text: '确认执行', callback_data: 'confirm:yes' }, { text: '取消', callback_data: 'cancel:no' }]] } });
+  }
+}
+
+function scheduleTelegramProgress(chatId, messageId, jobId, token) {
+  const key = `${chatId}:${messageId}`;
+  if (telegramRuntime.progressTimers.has(key)) clearInterval(telegramRuntime.progressTimers.get(key));
+  const timer = setInterval(async () => {
+    const job = commandJobs.get(jobId);
+    if (!job) { clearInterval(timer); telegramRuntime.progressTimers.delete(key); return; }
+    const counts = { total: job.results.length, ok: job.results.filter((item) => item.ok).length, error: job.results.filter((item) => item.status === 'error').length, running: job.results.filter((item) => ['queued', 'running', 'awaiting_input'].includes(item.status)).length };
+    const title = job.status === 'done' ? (job.cancelled ? '自动化已取消' : '自动化已完成') : '自动化执行中';
+    const text = `${title}\n总数：${counts.total}\n成功：${counts.ok}\n失败：${counts.error}\n执行中：${counts.running}`;
+    try { await telegramCall(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: job.status === 'done' ? { inline_keyboard: [] } : { inline_keyboard: [[{ text: '取消任务', callback_data: `canceljob:${job.id}` }]] } }); } catch (_error) { /* stale message */ }
+    if (job.status === 'done') { clearInterval(timer); telegramRuntime.progressTimers.delete(key); }
+  }, 2500);
+  telegramRuntime.progressTimers.set(key, timer);
+}
+
+function restartTelegramPolling() {
+  telegramRuntime.generation += 1;
+  const generation = telegramRuntime.generation;
+  if (telegramRuntime.timer) { clearTimeout(telegramRuntime.timer); telegramRuntime.timer = null; }
+  const settings = readState().telegram;
+  if (!settings.enabled || !settings.tokenEnc) return;
+  let token = '';
+  try { token = decryptSecret(settings.tokenEnc); } catch (_error) { return; }
+  telegramRuntime.token = token;
+  const poll = async () => {
+    try {
+      const updates = await telegramCall(token, 'getUpdates', { offset: telegramRuntime.offset, timeout: 20, allowed_updates: ['message', 'callback_query'] });
+      for (const update of updates) { telegramRuntime.offset = update.update_id + 1; await handleTelegramUpdate(update, token); }
+    } catch (_error) { /* retry below */ }
+    if (generation === telegramRuntime.generation) telegramRuntime.timer = setTimeout(poll, 1000);
+  };
+  poll();
 }
 
 function startInteractiveCommandSession(job, resultItem, serverItem, proxies, encryptionKeyHex) {
@@ -1795,6 +2168,7 @@ function startInteractiveCommandSession(job, resultItem, serverItem, proxies, en
     clients: new Set(),
     awaitingTimer: null,
     closeTimer: null,
+    executionTimer: null,
     closed: false,
     cancelRequested: false,
     tailText: '',
@@ -1820,6 +2194,10 @@ function startInteractiveCommandSession(job, resultItem, serverItem, proxies, en
     if (runtime.closeTimer) {
       clearTimeout(runtime.closeTimer);
       runtime.closeTimer = null;
+    }
+    if (runtime.executionTimer) {
+      clearTimeout(runtime.executionTimer);
+      runtime.executionTimer = null;
     }
     if (runtime.shellStream) {
       runtime.shellStream.end();
@@ -1862,6 +2240,9 @@ function startInteractiveCommandSession(job, resultItem, serverItem, proxies, en
     connectWithSocket(null);
   }
 
+  runtime.stepTimeout = Math.min(3600, Math.max(1, Number(job.stepTimeout) || 120));
+  resultItem.retryAttempt = Number(resultItem.retryAttempt) || 0;
+
   ssh.on('ready', () => {
     ssh.shell(
       {
@@ -1901,6 +2282,14 @@ function startInteractiveCommandSession(job, resultItem, serverItem, proxies, en
           }
           runtime.commandDispatched = true;
           runtime.shellStream.write(buildInteractiveCommandScript(job.command));
+          if (job.type === 'automation') {
+            runtime.executionTimer = setTimeout(() => {
+              if (!['done', 'error'].includes(resultItem.status)) {
+                markRuntimeError(`执行超时（${runtime.stepTimeout} 秒）`);
+                finalizeRuntime();
+              }
+            }, runtime.stepTimeout * 1000);
+          }
           scheduleAwaitingInputCheck(job, runtime, resultItem);
         }, 120);
       }
@@ -1908,6 +2297,14 @@ function startInteractiveCommandSession(job, resultItem, serverItem, proxies, en
   });
 
   ssh.on('error', (error) => {
+    if (job.type === 'automation' && resultItem.retryAttempt < (Number(job.retryCount) || 0) && !job.cancelled) {
+      resultItem.retryAttempt += 1;
+      resultItem.status = 'running';
+      runtime.closed = true;
+      try { ssh.end(); } catch (_error) { /* best effort */ }
+      setTimeout(() => startInteractiveCommandSession(job, resultItem, serverItem, proxies, encryptionKeyHex), 600 * resultItem.retryAttempt);
+      return;
+    }
     markRuntimeError(error.message || 'SSH 连接失败');
   });
 
@@ -1923,6 +2320,16 @@ function appendCommandRuntimeOutput(job, runtime, resultItem, text) {
   resultItem.stdout += text;
   runtime.tailText = `${runtime.tailText}${stripAnsi(String(text || ''))}`.slice(-1200);
   broadcastCommandSession(runtime, { type: 'output', data: text });
+
+  if (job.type === 'automation' && runtime.shellStream && !runtime.closed) {
+    const responderIndex = Number(runtime.automationResponderIndex) || 0;
+    const responder = job.automationResponders?.[responderIndex];
+    if (responder && runtime.tailText.toLowerCase().includes(responder.waitText.toLowerCase())) {
+      runtime.automationResponderIndex = responderIndex + 1;
+      runtime.tailText = '';
+      writeCommandSessionInput(job, runtime, resultItem, normalizeCommandInput(responder.input));
+    }
+  }
 
   if (tryFinalizeCommandResult(job, runtime, resultItem)) {
     return;
@@ -2031,6 +2438,7 @@ function cancelCommandJob(job) {
       }
     }
   }
+  if (job.type === 'automation') recordAutomationRun(job);
 }
 
 function handleCommandJobConnection(ws, req) {
@@ -2167,6 +2575,10 @@ function finalizeCommandResult(job, runtime, resultItem, exitCode) {
   if (runtime?.awaitingTimer) {
     clearTimeout(runtime.awaitingTimer);
     runtime.awaitingTimer = null;
+  }
+  if (runtime?.executionTimer) {
+    clearTimeout(runtime.executionTimer);
+    runtime.executionTimer = null;
   }
   broadcastCommandSession(runtime, { type: 'history', data: resultItem.stdout });
   broadcastCommandSession(runtime, { type: 'state', status: resultItem.status, awaitingInput: false });
@@ -2524,7 +2936,7 @@ function buildConnectOptions(serverItem, password) {
     port: serverItem.port,
     username: serverItem.username,
     password,
-    readyTimeout: 15000,
+    readyTimeout: Math.min(120000, Math.max(3000, Number(serverItem.connectTimeout) * 1000 || 15000)),
     keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
     keepaliveCountMax: SSH_KEEPALIVE_COUNT_MAX,
     tryKeyboard: false

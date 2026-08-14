@@ -1,1443 +1,295 @@
+diff --git a/probe-agent/install.sh b/probe-agent/install.sh
+index 945c647..be5e35f 100755
+--- a/probe-agent/install.sh
++++ b/probe-agent/install.sh
+@@ -99,3 +99,11 @@ WantedBy=multi-user.target
+ EOF
+ systemctl daemon-reload
+ systemctl enable --now nurossh-probe.service
++sleep 2
++if ! systemctl is-active --quiet nurossh-probe.service; then
++  echo "nurossh-probe.service failed to start" >&2
++  systemctl --no-pager --full status nurossh-probe.service >&2 || true
++  journalctl -u nurossh-probe.service -n 30 --no-pager >&2 || true
++  exit 1
++fi
++echo "nurossh-probe.service is running; registration and heartbeat will appear in the NuroSSH probe list."
+diff --git a/probe-agent/nurossh_probe.py b/probe-agent/nurossh_probe.py
+index 01f5d4c..cc1efa5 100755
+--- a/probe-agent/nurossh_probe.py
++++ b/probe-agent/nurossh_probe.py
+@@ -6,8 +6,10 @@ import os
+ import platform
+ import socket
+ import subprocess
++import sys
+ import time
+ import urllib.request
++from urllib.error import HTTPError
+ from urllib.parse import urlparse
+
+ CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
+@@ -45,7 +47,6 @@ def register(config):
+         "token": config["token"]
+     })
+     config["secret"] = result["agentSecret"]
+-    config.pop("token", None)
+     with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+         json.dump(config, handle)
+     os.chmod(CONFIG_PATH, 0o600)
+@@ -117,7 +118,18 @@ def main():
+                 for target in due:
+                     schedules[target["id"]] = now + max(5, int(target.get("interval", 30)))
+             request(config, "POST", "/probe/heartbeat", {"version": VERSION})
+-        except Exception:
++        except HTTPError as error:
++            if error.code == 401 and config.get("token") and config.get("secret"):
++                config.pop("secret", None)
++                try:
++                    register(config)
++                except Exception as register_error:
++                    print(f"probe registration failed after authentication loss: {register_error}", file=sys.stderr, flush=True)
++            else:
++                print(f"probe request failed with HTTP {error.code}", file=sys.stderr, flush=True)
++            time.sleep(10)
++        except Exception as error:
++            print(f"probe loop error: {error}", file=sys.stderr, flush=True)
+             time.sleep(10)
+         time.sleep(5)
+
+diff --git a/probe-agent/uninstall.sh b/probe-agent/uninstall.sh
+index 618a829..6d01d4f 100755
+--- a/probe-agent/uninstall.sh
++++ b/probe-agent/uninstall.sh
+@@ -1,6 +1,25 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+-systemctl disable --now nurossh-probe.service 2>/dev/null || true
++
++SERVICE="nurossh-probe.service"
++INSTALL_DIR="/opt/nurossh-probe"
++CONFIG_DIR="/etc/nurossh-probe"
++
++if command -v systemctl >/dev/null 2>&1; then
++  systemctl disable --now "$SERVICE" 2>/dev/null || true
++fi
+ rm -f /etc/systemd/system/nurossh-probe.service
+-rm -rf /opt/nurossh-probe /etc/nurossh-probe
+-systemctl daemon-reload
++rm -rf "$INSTALL_DIR" "$CONFIG_DIR"
++if command -v systemctl >/dev/null 2>&1; then
++  systemctl daemon-reload
++  if systemctl is-active --quiet "$SERVICE"; then
++    echo "探针卸载失败：服务仍在运行" >&2
++    systemctl --no-pager --full status "$SERVICE" >&2 || true
++    exit 1
++  fi
++fi
++if [[ -e "$INSTALL_DIR" || -e "$CONFIG_DIR" || -e /etc/systemd/system/$SERVICE ]]; then
++  echo "探针卸载失败：残留文件未清理" >&2
++  exit 1
++fi
++echo "探针卸载完成：服务、程序和配置已删除。"
 diff --git a/server/index.js b/server/index.js
-index 30fb330..c9b24ac 100644
+index c9b24ac..3fdd913 100644
 --- a/server/index.js
 +++ b/server/index.js
-@@ -12,13 +12,21 @@ import { SocksClient } from 'socks';
- import { v4 as uuidv4 } from 'uuid';
- import { hasExactPerServerInputs } from '../shared/command-input.js';
- import {
-+  addIpsToPool,
-+  createPoolWithIps,
-+  createDnsBinding,
-+  dnsRecordLayout,
-+  importIpAssets,
-+  parseIpBatch,
-   normalizeOrchestrationState,
-   orchestrationDefaults,
-   registerOrchestrationRoutes,
-   registerProbePublicRoutes,
-   runIncidentWorkflow,
-   rollbackIncident,
--  sanitizeOrchestrationState
-+  sanitizeOrchestrationState,
-+  setDnsBindingIps,
-+  syncDnsBinding
- } from './orchestration.js';
-
- loadRuntimeEnv();
-@@ -29,6 +37,10 @@ const wss = new WebSocketServer({ noServer: true });
-
- const HOST = process.env.HOST || '0.0.0.0';
- const PORT = Number(process.env.PORT || 38471);
-+const configuredDevServerPort = Number(process.env.VITE_DEV_SERVER_PORT || 5173);
-+const DEV_SERVER_PORT = Number.isInteger(configuredDevServerPort) && configuredDevServerPort > 0 && configuredDevServerPort <= 65535
-+  ? String(configuredDevServerPort)
-+  : '5173';
- const ROOT_DIR = process.cwd();
- const DATA_DIR = path.join(ROOT_DIR, 'data');
- const DIST_DIR = path.join(ROOT_DIR, 'dist');
-@@ -94,7 +106,9 @@ const orchestrationDeps = {
-   executeAutomation: executeAutomationForIncident,
-   waitAutomation: waitForAutomationJob,
-   runIncident: (incidentId, encryptionKey) => runIncidentWorkflow(incidentId, orchestrationDeps, encryptionKey),
--  notifyIncident: notifyIncidentViaTelegram
-+  notifyIncident: notifyIncidentViaTelegram,
-+  onTelegramChanged: () => restartTelegramPolling(),
-+  syncDnsBinding
- };
- orchestrationDeps.allowProbeRegistration = (ip) => {
-   const key = String(ip || 'unknown');
-@@ -161,7 +175,6 @@ function loadRuntimeEnv() {
- ensureStorage();
- cleanupExpiredSessions();
-
--app.use(cors());
- app.use(express.json({ limit: '2mb' }));
- app.use((req, res, next) => {
-   const origin = String(req.headers.origin || '');
-@@ -170,7 +183,9 @@ app.use((req, res, next) => {
-       const expectedHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
-       const allowedOrigins = new Set(String(process.env.ALLOWED_ORIGINS || '').split(',').map((item) => item.trim()).filter(Boolean));
-       const originUrl = new URL(origin);
--      const localDevOrigin = ['localhost', '127.0.0.1', '[::1]'].includes(originUrl.hostname) && originUrl.port === '5173';
-+      const localDevOrigin = process.env.NODE_ENV !== 'production' &&
-+        ['localhost', '127.0.0.1', '[::1]'].includes(originUrl.hostname) &&
-+        originUrl.port === DEV_SERVER_PORT;
-       if (originUrl.host !== expectedHost && !allowedOrigins.has(origin) && !localDevOrigin) {
-         res.status(403).json({ error: '请求来源校验失败' });
-         return;
-@@ -182,6 +197,7 @@ app.use((req, res, next) => {
-   }
-   next();
+@@ -199,8 +199,7 @@ app.use((req, res, next) => {
  });
-+app.use(cors());
+ app.use(cors());
  registerProbePublicRoutes(app, {
-   readState,
-   updateState,
-@@ -505,8 +521,12 @@ app.put('/api/automation-tasks/:id', (req, res) => {
- app.delete('/api/automation-tasks/:id', (req, res) => {
-   const state = updateState((draft) => {
-     draft.automationTasks = draft.automationTasks.filter((task) => task.id !== req.params.id);
-+    for (const bot of draft.telegramBots || []) {
-+      bot.automationTaskIds = (bot.automationTaskIds || []).filter((id) => id !== req.params.id);
-+    }
-     return draft;
-   });
-+  restartTelegramPolling();
-   res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
+-  readState,
+-  updateState,
++  ...orchestrationDeps,
+   onIncidentCreated: (incidentId) => runIncidentWorkflow(incidentId, orchestrationDeps)
  });
-
-@@ -558,18 +578,6 @@ app.post('/api/automation-jobs/:id/retry-failed', (req, res) => {
-   res.json({ ok: true, jobId: job.id, results: job.results });
- });
-
--app.put('/api/telegram', (req, res) => {
--  const state = updateState((draft) => {
--    const next = normalizeTelegramSettings({ ...draft.telegram, ...req.body });
--    const token = String(req.body.token || '').trim();
--    next.tokenEnc = token ? encryptSecret(token) : draft.telegram?.tokenEnc || null;
--    draft.telegram = next;
--    return draft;
--  });
--  restartTelegramPolling();
--  res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
--});
--
- app.post('/api/proxies', (req, res) => {
-   const state = updateState((draft) => {
-     const item = prepareProxyForStorage(req.body, null, req.auth);
-@@ -1673,6 +1681,17 @@ function authGuard(req, res, next) {
-
- function normalizeStateRecord(parsed) {
-   const orchestration = normalizeOrchestrationState(parsed);
-+  const legacyTelegram = normalizeTelegramSettings(parsed?.telegram);
-+  if (!orchestration.telegramBots.length && legacyTelegram.tokenEnc) {
-+    orchestration.telegramBots.push({
-+      id: 'telegram-primary', name: '统一机器人', tokenEnc: legacyTelegram.tokenEnc,
-+      enabled: legacyTelegram.enabled, userIds: legacyTelegram.userIds, groupIds: [], roles: {},
-+      menuScopes: legacyTelegram.menuScopes.length ? legacyTelegram.menuScopes : ['overview', 'probes', 'incidents', 'pools', 'dns', 'automation'],
-+      automationTaskIds: (parsed?.automationTasks || []).map((item) => String(item?.id || '')).filter(Boolean), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
-+    });
-+    legacyTelegram.enabled = false;
-+  }
-+  if (orchestration.telegramBots.length) legacyTelegram.enabled = false;
-   return {
-     groups: Array.isArray(parsed?.groups) && parsed.groups.length ? parsed.groups : defaultState.groups,
-     servers: Array.isArray(parsed?.servers) ? parsed.servers : [],
-@@ -1680,7 +1699,7 @@ function normalizeStateRecord(parsed) {
-     proxies: Array.isArray(parsed?.proxies) ? parsed.proxies : [],
-     automationTasks: Array.isArray(parsed?.automationTasks) ? parsed.automationTasks.map(normalizeAutomationTask) : [],
-     automationRuns: Array.isArray(parsed?.automationRuns) ? parsed.automationRuns.slice(0, 30) : [],
--    telegram: normalizeTelegramSettings(parsed?.telegram),
-+    telegram: legacyTelegram,
-     ...orchestration,
-     workspaces: parsed?.workspaces && typeof parsed.workspaces === 'object' ? parsed.workspaces : {}
-   };
-@@ -1722,7 +1741,6 @@ function normalizeAutomationTask(input = {}, existing = null) {
-     connectTimeout: Math.min(120, Math.max(3, Number(input.connectTimeout) || 15)),
-     stepTimeout: Math.min(3600, Math.max(1, Number(input.stepTimeout) || 120)),
-     retryCount: Math.min(5, Math.max(0, Number(input.retryCount) || 0)),
--    telegramEnabled: input.telegramEnabled !== false,
-     steps,
-     createdAt: existing?.createdAt || input.createdAt || now,
-     updatedAt: now
-@@ -1772,7 +1790,6 @@ function sanitizeStateForClient(state, auth = null) {
-     proxies: state.proxies.map(sanitizeProxyForClient),
-     automationTasks: state.automationTasks.map(sanitizeAutomationTaskForClient),
-     automationRuns: state.automationRuns || [],
--    telegram: sanitizeTelegramForClient(state.telegram),
-     ...sanitizeOrchestrationState(state),
-     workspace: getWorkspaceForUser(state, auth)
-   };
-@@ -2125,14 +2142,12 @@ function notifyIncidentViaTelegram(incidentId) {
-   const state = readState();
-   const incident = state.incidents?.find((item) => item.id === incidentId);
-   if (!incident) return;
--  const configs = [];
--  if (state.telegram?.enabled && state.telegram?.tokenEnc) configs.push({ ...state.telegram, id: 'legacy' });
--  for (const bot of state.telegramBots || []) if (bot.enabled && bot.tokenEnc) configs.push(bot);
-+  const configs = (state.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc);
-   const text = `故障事件：${incident.targetName}\n状态：${incident.status}\n${incident.message || incident.error || ''}`;
-   for (const settings of configs) {
-     let token = '';
-     try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
--    for (const chatId of [...new Set([...(settings.userIds || []), ...(settings.groupIds || [])])]) {
-+    for (const chatId of [...new Set(settings.userIds || [])]) {
-       telegramCall(token, 'sendMessage', { chat_id: chatId, text }).catch(() => {});
-     }
-   }
-@@ -2177,7 +2192,6 @@ function recordAutomationRun(job) {
- function telegramAuthorized(settings, from, chat) {
-   const userId = String(from?.id || '');
-   if (!settings?.enabled || !(settings?.tokenEnc || settings?.configured) || !settings.userIds?.includes(userId)) return false;
--  if ((chat?.type === 'group' || chat?.type === 'supergroup') && settings.groupIds?.length && !settings.groupIds.includes(String(chat.id))) return false;
-   if (chat?.type === 'group' || chat?.type === 'supergroup') return settings.allowGroups !== false;
-   return true;
- }
-@@ -2208,13 +2222,19 @@ function telegramButtons(tasks, prefix) {
-   return tasks.slice(0, 20).map((task) => ([{ text: task.name, callback_data: `${prefix}:${task.id}` }]));
- }
-
-+function telegramAutomationTasks(state, settings) {
-+  const allowed = Array.isArray(settings?.automationTaskIds) ? settings.automationTaskIds : [];
-+  return state.automationTasks.filter((item) => allowed.includes(item.id));
-+}
-+
- function telegramSessionKey(chat, from) {
-   return `${String(chat?.id || '')}:${String(from?.id || '')}`;
- }
-
- async function handleTelegramUpdate(update, token, botSettings = null) {
-   const state = readState();
--  const settings = botSettings || state.telegram;
-+  if (!botSettings) return;
-+  const settings = botSettings;
-   const message = update.message;
-   const callback = update.callback_query;
-   const from = message?.from || callback?.from;
-@@ -2229,14 +2249,83 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
-     if (pending && !telegramPendingIsFresh(pending)) telegramRuntime.pending.delete(sessionKey);
-     if (action === 'menu') {
-       if (value === 'root') return sendTelegramMenu(token, chatId, settings);
--      if (!telegramMenuAllowed(settings, value)) return;
-+      const scope = value === 'assets' ? 'pools' : value === 'runs' ? 'automation' : value;
-+      if (!telegramMenuAllowed(settings, scope)) return;
-       if (value === 'overview') return telegramCall(token, 'sendMessage', { chat_id: chatId, text: telegramOverview(state), reply_markup: telegramOverviewButtons() });
-       if (value === 'incidents') return sendTelegramIncidents(token, chatId, state);
-       if (value === 'probes') return sendTelegramProbes(token, chatId, state);
-+      if (value === 'assets') return sendTelegramAssets(token, chatId, state);
-       if (value === 'pools') return sendTelegramPools(token, chatId, state);
-       if (value === 'dns') return sendTelegramDns(token, chatId, state);
--      if (value === 'automation') return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '选择一个自动化任务：', reply_markup: { inline_keyboard: telegramButtons(state.automationTasks.filter((item) => item.telegramEnabled !== false), 'task') } });
-+      if (value === 'automation') return sendTelegramAutomation(token, chatId, state, settings);
-+      if (value === 'runs') return sendTelegramAutomationRuns(token, chatId, state);
-+    }
-+    if (action === 'asset_add') {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      telegramRuntime.pending.set(sessionKey, { action: 'asset_add', expiresAt: Date.now() + 10 * 60 * 1000 });
-+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '请发送要添加的 IP，每行一个。', reply_markup: telegramCancelButtons('menu:assets') });
-+    }
-+    if (action === 'pool') return sendTelegramPool(token, chatId, state, value);
-+    if (action === 'pool_add') {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      const pool = state.ipPools?.find((item) => item.id === value);
-+      if (!pool) return;
-+      telegramRuntime.pending.set(sessionKey, { action: 'pool_add', poolId: pool.id, expiresAt: Date.now() + 10 * 60 * 1000 });
-+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `向“${pool.name}”添加 IP，每行一个。`, reply_markup: telegramCancelButtons('menu:pools') });
-+    }
-+    if (action === 'pool_create') {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      telegramRuntime.pending.set(sessionKey, { action: 'pool_create_name', expiresAt: Date.now() + 10 * 60 * 1000 });
-+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '请发送新备用池名称。', reply_markup: telegramCancelButtons('menu:pools') });
-+    }
-+    if (action === 'dns') return sendTelegramDnsBinding(token, chatId, state, value);
-+    if (action === 'dns_create') {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      const accounts = (state.dnsAccounts || []).filter((item) => item.enabled !== false && item.credentialsEnc);
-+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: accounts.length ? '选择 DNS 账号：' : '请先在网页配置 DNS 账号。', reply_markup: { inline_keyboard: [...accounts.slice(0, 20).map((item) => ([{ text: item.name, callback_data: `dns_account:${item.id}` }])), [{ text: '返回解析', callback_data: 'menu:dns' }]] } });
-+    }
-+    if (action === 'dns_account') {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      const account = state.dnsAccounts?.find((item) => item.id === value && item.enabled !== false);
-+      if (!account) return;
-+      telegramRuntime.pending.set(sessionKey, { action: 'dns_create_domain', accountId: account.id, expiresAt: Date.now() + 10 * 60 * 1000 });
-+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `账号：${account.name}\n请发送完整域名。`, reply_markup: telegramCancelButtons('menu:dns') });
-+    }
-+    if (action === 'dns_type') {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      const currentPending = telegramRuntime.pending.get(sessionKey);
-+      if (!currentPending || currentPending.action !== 'dns_create_type') return;
-+      currentPending.action = 'dns_create_values'; currentPending.recordType = value; currentPending.expiresAt = Date.now() + 10 * 60 * 1000;
-+      telegramRuntime.pending.set(sessionKey, currentPending);
-+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: ['A', 'AAAA'].includes(value) ? `请发送 ${value} 地址，每行一个。` : value === 'CNAME' ? '请发送一个目标域名。' : `请发送 ${value} 记录值，每行一个。`, reply_markup: telegramCancelButtons('menu:dns') });
-+    }
-+    if (action === 'dns_create_confirm' && pending?.action === 'dns_create_confirm') {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      let binding;
-+      orchestrationDeps.updateState((draft) => {
-+        binding = createDnsBinding(draft, pending.accountId, pending.domain, pending.recordType, pending.values, `telegram:${from.id}`);
-+        return draft;
-+      });
-+      telegramRuntime.pending.delete(sessionKey);
-+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已创建解析\n${binding.domain} · ${binding.recordType}\n记录值：${pending.values.length}`, reply_markup: { inline_keyboard: [[{ text: '立即同步', callback_data: `dns_sync:${binding.id}` }], [{ text: '返回解析', callback_data: 'menu:dns' }]] } });
-+    }
-+    if (action === 'dns_add' || action === 'dns_replace') {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      const binding = state.dnsBindings?.find((item) => item.id === value);
-+      if (!binding) return;
-+      telegramRuntime.pending.set(sessionKey, { action, bindingId: binding.id, expiresAt: Date.now() + 10 * 60 * 1000 });
-+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `${action === 'dns_replace' ? '替换' : '添加'} ${binding.domain} 的 ${binding.recordType} 地址，每行一个。`, reply_markup: telegramCancelButtons('menu:dns') });
-+    }
-+    if (action === 'dns_sync') {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      try {
-+        const result = await syncDnsBinding(value, orchestrationDeps, `telegram:${from.id}`);
-+        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `解析同步完成\n记录值：${result.values.length}\n写入方式：${result.layout === 'recordset' ? '一个记录集包含多个值' : '多条同名记录，每条一个值'}`, reply_markup: telegramBackButtons('menu:dns') });
-+      } catch (error) {
-+        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `解析同步失败\n${error.message}`, reply_markup: telegramBackButtons('menu:dns') });
-+      }
-     }
-+    if (action === 'run') return sendTelegramAutomationRun(token, chatId, state, value);
-     if (action === 'incident') {
-       if (!telegramMenuAllowed(settings, 'incidents')) return;
-       const incident = state.incidents?.find((item) => item.id === value);
-@@ -2261,7 +2350,8 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
-     }
-     if (action === 'task') {
-       if (!telegramMenuAllowed(settings, 'automation')) return;
--      const task = state.automationTasks.find((item) => item.id === value && item.telegramEnabled !== false);
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      const task = telegramAutomationTasks(state, settings).find((item) => item.id === value);
-       if (!task) return;
-       telegramRuntime.pending.set(sessionKey, { taskId: task.id, hosts: '', awaitingHosts: true, messageId: callback.message.message_id, expiresAt: Date.now() + 10 * 60 * 1000 });
-       await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已选择：${task.name}\n请发送 IP 列表，每行一个。` });
-@@ -2277,6 +2367,29 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
-       scheduleTelegramProgress(chatId, sent.message_id, job.id, token);
-       return;
-     }
-+    if (action === 'confirm_write' && pending?.addresses) {
-+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-+      let resultText = '';
-+      orchestrationDeps.updateState((draft) => {
-+        if (pending.action === 'asset_add') {
-+          const result = importIpAssets(draft, pending.addresses, {}, `telegram:${from.id}`);
-+          resultText = `IP 资产已更新\n新增：${result.created}\n复用：${result.reused}`;
-+        } else if (pending.action === 'pool_add') {
-+          const result = addIpsToPool(draft, pending.poolId, pending.addresses, `telegram:${from.id}`);
-+          resultText = `已加入备用池“${result.pool.name}”\n当前 IP：${result.pool.assetIds.length}`;
-+        } else if (pending.action === 'pool_create_ips') {
-+          const result = createPoolWithIps(draft, pending.poolName, pending.addresses, `telegram:${from.id}`);
-+          resultText = `已创建备用池“${result.pool.name}”\nIP 数量：${result.pool.assetIds.length}`;
-+        } else if (pending.action === 'dns_add' || pending.action === 'dns_replace') {
-+          const binding = setDnsBindingIps(draft, pending.bindingId, pending.addresses, pending.action === 'dns_replace' ? 'replace' : 'append', `telegram:${from.id}`);
-+          resultText = `已保存 ${binding.domain}\n待同步地址：${binding.backupIps.length}`;
-+        }
-+        return draft;
-+      });
-+      const dnsBindingId = ['dns_add', 'dns_replace'].includes(pending.action) ? pending.bindingId : '';
-+      telegramRuntime.pending.delete(sessionKey);
-+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: resultText, reply_markup: dnsBindingId ? { inline_keyboard: [[{ text: '立即同步', callback_data: `dns_sync:${dnsBindingId}` }], [{ text: '返回解析', callback_data: 'menu:dns' }]] } : telegramBackButtons(pending.action.startsWith('pool_') ? 'menu:pools' : 'menu:assets') });
-+    }
-     if (action === 'canceljob') {
-       if (!telegramMenuAllowed(settings, 'automation')) return;
-       const job = commandJobs.get(value);
-@@ -2284,7 +2397,7 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
-       await telegramCall(token, 'sendMessage', { chat_id: chatId, text: job ? '任务已取消。' : '任务已结束或过期。' });
-       return;
-     }
--    if (action === 'cancel') { telegramRuntime.pending.delete(sessionKey); await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '已取消。' }); }
-+    if (action === 'cancel') { telegramRuntime.pending.delete(sessionKey); await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '已取消。', reply_markup: telegramBackButtons(`menu:${value || 'root'}`) }); }
-     return;
-   }
-   const text = String(message?.text || '').trim();
-@@ -2294,7 +2407,7 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
-   }
-   if (/^\/(?:run)(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(text) || text === '执行自动化') {
-     if (!telegramMenuAllowed(settings, 'automation')) return;
--    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '选择一个自动化任务：', reply_markup: { inline_keyboard: telegramButtons(state.automationTasks.filter((item) => item.telegramEnabled !== false), 'task') } });
-+    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '选择一个自动化任务：', reply_markup: { inline_keyboard: telegramButtons(telegramAutomationTasks(state, settings), 'task') } });
-     return;
-   }
-   if (text === '/status' || text === '总览') {
-@@ -2332,6 +2445,59 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
-     pending.hosts = hosts; pending.awaitingHosts = false;
-     telegramRuntime.pending.set(sessionKey, pending);
-     await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已接收 ${hosts.length} 个地址，确认执行？`, reply_markup: { inline_keyboard: [[{ text: '确认执行', callback_data: 'confirm:yes' }, { text: '取消', callback_data: 'cancel:no' }]] } });
-+    return;
-+  }
-+  if (pending?.action === 'pool_create_name' && text) {
-+    pending.action = 'pool_create_ips'; pending.poolName = text.slice(0, 200); pending.expiresAt = Date.now() + 10 * 60 * 1000;
-+    telegramRuntime.pending.set(sessionKey, pending);
-+    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `备用池名称：${pending.poolName}\n请发送初始 IP，每行一个。`, reply_markup: telegramCancelButtons('menu:pools') });
-+    return;
-+  }
-+  if (pending?.action === 'dns_create_domain' && text) {
-+    try {
-+      const domain = normalizeTelegramDomain(text);
-+      pending.action = 'dns_create_type'; pending.domain = domain; pending.expiresAt = Date.now() + 10 * 60 * 1000;
-+      telegramRuntime.pending.set(sessionKey, pending);
-+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `域名：${domain}\n选择记录类型：`, reply_markup: { inline_keyboard: [[{ text: 'A', callback_data: 'dns_type:A' }, { text: 'AAAA', callback_data: 'dns_type:AAAA' }], [{ text: 'CNAME', callback_data: 'dns_type:CNAME' }, { text: 'TXT', callback_data: 'dns_type:TXT' }], [{ text: 'NS', callback_data: 'dns_type:NS' }, { text: 'CAA', callback_data: 'dns_type:CAA' }], [{ text: '取消', callback_data: 'cancel:dns' }]] } });
-+    } catch (error) {
-+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: error.message, reply_markup: telegramCancelButtons('menu:dns') });
-+    }
-+    return;
-+  }
-+  if (pending?.action === 'dns_create_values' && text) {
-+    try {
-+      let values;
-+      if (['A', 'AAAA'].includes(pending.recordType)) {
-+        values = parseIpBatch(text);
-+        const family = pending.recordType === 'AAAA' ? 6 : 4;
-+        if (values.some((address) => net.isIP(address) !== family)) throw new Error(`${pending.recordType} 记录的地址类型不匹配`);
-+      } else {
-+        values = [...new Set(text.split(/\n+/).map((item) => item.trim()).filter(Boolean))].slice(0, pending.recordType === 'CNAME' ? 1 : 5000);
-+        if (!values.length) throw new Error('请至少输入一个记录值');
-+        if (pending.recordType === 'CNAME') values[0] = normalizeTelegramDomain(values[0]);
-+      }
-+      pending.values = values; pending.action = 'dns_create_confirm'; pending.expiresAt = Date.now() + 10 * 60 * 1000;
-+      telegramRuntime.pending.set(sessionKey, pending);
-+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `确认新建解析？\n${pending.domain} · ${pending.recordType}\n记录值：${values.length}`, reply_markup: { inline_keyboard: [[{ text: '确认新建', callback_data: 'dns_create_confirm:yes' }, { text: '取消', callback_data: 'cancel:dns' }]] } });
-+    } catch (error) {
-+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: error.message, reply_markup: telegramCancelButtons('menu:dns') });
-+    }
-+    return;
-+  }
-+  if (pending?.action && text) {
-+    try {
-+      const addresses = parseIpBatch(text);
-+      if (['dns_add', 'dns_replace'].includes(pending.action)) {
-+        const binding = state.dnsBindings.find((item) => item.id === pending.bindingId);
-+        const family = binding?.recordType === 'AAAA' ? 6 : 4;
-+        if (!binding || addresses.some((address) => net.isIP(address) !== family)) throw new Error(`${binding?.recordType || 'DNS'} 记录的地址类型不匹配`);
-+      }
-+      pending.addresses = addresses;
-+      telegramRuntime.pending.set(sessionKey, pending);
-+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已识别 ${addresses.length} 个 IP，确认写入？`, reply_markup: { inline_keyboard: [[{ text: '确认写入', callback_data: 'confirm_write:yes' }, { text: '取消', callback_data: 'cancel:root' }]] } });
-+    } catch (error) {
-+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: error.message, reply_markup: telegramCancelButtons('menu:root') });
-+    }
-   }
- }
-
-@@ -2339,8 +2505,9 @@ async function sendTelegramMenu(token, chatId, settings) {
-   const button = (scope, text, callback) => telegramMenuAllowed(settings, scope) ? { text, callback_data: callback } : null;
-   const rows = [
-     [button('overview', '总览', 'menu:overview'), button('incidents', '故障事件', 'menu:incidents')],
--    [button('probes', '探针管理', 'menu:probes'), button('pools', '备用 IP 池', 'menu:pools')],
--    [button('dns', '解析管理', 'menu:dns'), button('automation', '自动化任务', 'menu:automation')]
-+    [button('probes', '探针管理', 'menu:probes'), button('pools', 'IP 资产', 'menu:assets')],
-+    [button('pools', '备用 IP 池', 'menu:pools'), button('dns', '解析管理', 'menu:dns')],
-+    [button('automation', '自动化任务管理', 'menu:automation')]
-   ].map((row) => row.filter(Boolean)).filter((row) => row.length);
-   await telegramCall(token, 'sendMessage', {
-     chat_id: chatId,
-@@ -2373,16 +2540,90 @@ async function sendTelegramProbes(token, chatId, state) {
-   await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '刷新', callback_data: 'menu:probes' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
- }
-
-+async function sendTelegramAssets(token, chatId, state) {
-+  const assets = (state.ipAssets || []).slice(0, 20);
-+  const text = assets.length ? `IP 资产（${state.ipAssets.length}）\n${assets.map((item) => `${item.address} · ${STATUS_LABELS[item.health] || item.health}`).join('\n')}` : '当前没有 IP 资产';
-+  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '批量添加 IP', callback_data: 'asset_add:new' }], [{ text: '刷新', callback_data: 'menu:assets' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
-+}
-+
- async function sendTelegramPools(token, chatId, state) {
-   const pools = (state.ipPools || []).slice(0, 20);
-   const text = pools.length ? `备用 IP 池\n${pools.map((item) => `${item.name} · ${item.assetIds?.length || 0} 个 IP · ${item.allocationMode === 'all' ? '全部取用' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '取一个'}`).join('\n')}` : '当前没有备用 IP 池';
--  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '刷新', callback_data: 'menu:pools' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
-+  const buttons = pools.map((item) => ([{ text: `${item.name} · ${item.assetIds?.length || 0} IP`, callback_data: `pool:${item.id}` }]));
-+  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...buttons, [{ text: '新建备用池', callback_data: 'pool_create:new' }], [{ text: '刷新', callback_data: 'menu:pools' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
-+}
-+
-+async function sendTelegramPool(token, chatId, state, poolId) {
-+  const pool = state.ipPools?.find((item) => item.id === poolId);
-+  if (!pool) return;
-+  const addresses = (pool.assetIds || []).map((id) => state.ipAssets.find((item) => item.id === id)?.address).filter(Boolean);
-+  const text = `备用池：${pool.name}\nIP 数量：${addresses.length}\n取用方式：${pool.allocationMode === 'all' ? '全部取用' : pool.allocationMode === 'count' ? `取 ${pool.allocationCount} 个` : '一次取一个'}\n\n${addresses.slice(0, 30).join('\n') || '暂无 IP'}`;
-+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '批量加入 IP', callback_data: `pool_add:${pool.id}` }], [{ text: '返回备用池', callback_data: 'menu:pools' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
- }
-
- async function sendTelegramDns(token, chatId, state) {
-   const bindings = (state.dnsBindings || []).slice(0, 20);
--  const text = bindings.length ? `解析绑定\n${bindings.map((item) => `${item.name} · ${item.domain} · ${item.recordType}`).join('\n')}` : '当前没有解析绑定';
--  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '刷新', callback_data: 'menu:dns' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
-+  const text = bindings.length ? `解析绑定\n${bindings.map((item) => `${telegramShortText(item.name, 50)} · ${telegramShortText(item.domain, 90)} · ${item.recordType}`).join('\n')}` : '当前没有解析绑定';
-+  const buttons = bindings.map((item) => ([{ text: `${item.domain} · ${item.recordType}`, callback_data: `dns:${item.id}` }]));
-+  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...buttons, [{ text: '新建解析', callback_data: 'dns_create:new' }], [{ text: '刷新', callback_data: 'menu:dns' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
-+}
-+
-+async function sendTelegramDnsBinding(token, chatId, state, bindingId) {
-+  const binding = state.dnsBindings?.find((item) => item.id === bindingId);
-+  if (!binding) return;
-+  const account = state.dnsAccounts?.find((item) => item.id === binding.accountId);
-+  const layout = dnsRecordLayout(account?.provider);
-+  const values = binding.managedValues?.length ? binding.managedValues : binding.backupIps || [];
-+  const text = `解析绑定：${telegramShortText(binding.name, 100)}\n域名：${binding.domain}\n类型：${binding.recordType}\n记录值：${values.length}\n供应商写入：${layout === 'recordset' ? '一个记录集，多值' : '多条同名记录，每条一个值'}\n最近同步：${binding.lastSyncAt ? new Date(binding.lastSyncAt).toLocaleString('zh-CN', { hour12: false }) : '尚未同步'}\n\n${telegramValuePreview(values)}`;
-+  const editRow = ['A', 'AAAA'].includes(binding.recordType) ? [[{ text: '添加 IP', callback_data: `dns_add:${binding.id}` }, { text: '替换全部 IP', callback_data: `dns_replace:${binding.id}` }]] : [];
-+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...editRow, [{ text: '立即同步', callback_data: `dns_sync:${binding.id}` }], [{ text: '返回解析', callback_data: 'menu:dns' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
-+}
-+
-+async function sendTelegramAutomation(token, chatId, state, settings) {
-+  const tasks = telegramAutomationTasks(state, settings);
-+  const buttons = telegramButtons(tasks, 'task');
-+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text: tasks.length ? '自动化任务管理\n选择任务后输入批量 IP 执行。' : '当前没有关联的自动化任务', reply_markup: { inline_keyboard: [...buttons, [{ text: '执行记录', callback_data: 'menu:runs' }], [{ text: '返回菜单', callback_data: 'menu:root' }]] } });
-+}
-+
-+async function sendTelegramAutomationRuns(token, chatId, state) {
-+  const runs = (state.automationRuns || []).slice(0, 20);
-+  const buttons = runs.map((item) => ([{ text: `${item.taskName} · ${STATUS_LABELS[item.status] || item.status}`, callback_data: `run:${item.id}` }]));
-+  const text = runs.length ? `自动化执行记录（${runs.length}）` : '当前没有自动化执行记录';
-+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...buttons, [{ text: '返回任务', callback_data: 'menu:automation' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
-+}
-+
-+async function sendTelegramAutomationRun(token, chatId, state, runId) {
-+  const live = commandJobs.get(runId);
-+  const stored = state.automationRuns?.find((item) => item.id === runId);
-+  if (!live && !stored) return;
-+  const total = live?.results.length ?? stored.total;
-+  const ok = live?.results.filter((item) => item.ok).length ?? stored.ok;
-+  const failed = live?.results.filter((item) => item.status === 'error').length ?? stored.error;
-+  const running = live?.results.filter((item) => ['queued', 'running', 'awaiting_input'].includes(item.status)).length ?? 0;
-+  const text = `自动化：${live?.taskName || stored.taskName}\n状态：${live?.status || stored.status}\n总数：${total}\n成功：${ok}\n失败：${failed}\n执行中：${running}`;
-+  const actions = live && live.status !== 'done' ? [[{ text: '取消任务', callback_data: `canceljob:${live.id}` }]] : [];
-+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...actions, [{ text: '刷新', callback_data: `run:${runId}` }], [{ text: '返回记录', callback_data: 'menu:runs' }]] } });
-+}
-+
-+function telegramBackButtons(callback) { return { inline_keyboard: [[{ text: '返回', callback_data: callback }]] }; }
-+function telegramCancelButtons(section) { return { inline_keyboard: [[{ text: '取消', callback_data: `cancel:${String(section).replace(/^menu:/, '')}` }]] }; }
-+function telegramCanOperate(state, settings, from, chat) { return ['owner', 'admin', 'operator'].includes(resolveTelegramRole(state, settings, from, chat)); }
-+function telegramPermissionDenied(token, chatId) { return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '当前用户没有写入权限。', reply_markup: telegramBackButtons('menu:root') }); }
-+function telegramShortText(value, max) { const text = String(value || ''); return text.length > max ? `${text.slice(0, max - 1)}…` : text; }
-+function telegramValuePreview(values) {
-+  const lines = [];
-+  let length = 0;
-+  for (const value of values || []) {
-+    const line = telegramShortText(value, 240);
-+    if (lines.length >= 20 || length + line.length > 3000) break;
-+    lines.push(line); length += line.length + 1;
-+  }
-+  return lines.join('\n') || '暂无记录值';
-+}
-+function normalizeTelegramDomain(value) {
-+  const domain = String(value || '').trim().toLowerCase().replace(/\.$/, '');
-+  if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(domain)) throw new Error('域名格式不正确');
-+  return domain;
- }
-
- const STATUS_LABELS = { online: '在线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
-@@ -2390,9 +2631,8 @@ const STATUS_LABELS = { online: '在线', pending: '待接入', revoked: '已吊
- function resolveTelegramRole(state, settings, from, chat) {
-   const userId = String(from?.id || '');
-   const botRole = settings.roles?.[userId];
--  const globalIds = state.telegram?.userIds || [];
-   if (botRole) return botRole;
--  if (globalIds.includes(userId)) return 'operator';
-+  if (settings.userIds?.includes(userId)) return 'operator';
-   if (chat && settings.roles?.[String(chat.id)]) return settings.roles[String(chat.id)];
-   return 'viewer';
- }
-@@ -2434,14 +2674,19 @@ function restartTelegramPolling() {
-   const generation = telegramRuntime.generation;
-   if (telegramRuntime.timer) { clearTimeout(telegramRuntime.timer); telegramRuntime.timer = null; }
-   const state = readState();
--  const botConfigs = [];
--  if (state.telegram?.enabled && state.telegram?.tokenEnc) botConfigs.push({ id: 'legacy', ...state.telegram });
--  for (const bot of state.telegramBots || []) if (bot.enabled && bot.tokenEnc) botConfigs.push(bot);
-+  const botConfigs = (state.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc);
-   if (!botConfigs.length) return;
-   const poll = async () => {
-     await Promise.all(botConfigs.map(async (settings) => {
-       let token = '';
-       try { token = decryptSecret(settings.tokenEnc); } catch (_error) { return; }
-+      if (!telegramRuntime.configuredTokens?.has(token)) {
-+        telegramRuntime.configuredTokens ||= new Set();
-+        try {
-+          await configureTelegramMenu(token);
-+          telegramRuntime.configuredTokens.add(token);
-+        } catch (_error) { /* retry on the next poll */ }
-+      }
-       const offset = telegramRuntime.offsets.get(settings.id) || 0;
-       try {
-         const updates = await telegramCall(token, 'getUpdates', { offset, timeout: 4, allowed_updates: ['message', 'callback_query'] });
-@@ -2456,6 +2701,20 @@ function restartTelegramPolling() {
-   poll();
- }
-
-+async function configureTelegramMenu(token) {
-+  const commands = [
-+    { command: 'menu', description: '打开操作菜单' },
-+    { command: 'status', description: '查看系统总览' },
-+    { command: 'run', description: '自动化任务管理' },
-+    { command: 'incidents', description: '故障事件' },
-+    { command: 'probes', description: '探针管理' },
-+    { command: 'pools', description: '备用 IP 池' },
-+    { command: 'dns', description: '解析管理' }
-+  ];
-+  await telegramCall(token, 'setMyCommands', { commands });
-+  await telegramCall(token, 'setChatMenuButton', { menu_button: { type: 'commands' } });
-+}
-+
- function startInteractiveCommandSession(job, resultItem, serverItem, proxies, encryptionKeyHex) {
-   const proxy = proxies.find((item) => item.id === serverItem.proxyId) || null;
-   let serverPassword = '';
+ app.use('/api', authGuard);
 diff --git a/server/orchestration.js b/server/orchestration.js
-index 9a0842a..fba676a 100644
+index fba676a..bbf060e 100644
 --- a/server/orchestration.js
 +++ b/server/orchestration.js
-@@ -27,6 +27,7 @@ const DNS_PROVIDERS = new Set([
-   'edgeone', 'ns1', 'rainyun', 'dynv6', 'vercel', 'spaceship'
- ]);
- const CALLBACK_PROVIDERS = new Set(['callback', 'aliyun_esa', 'baidu', 'namecheap', 'namesilo', 'dynadot', 'dnsla', 'era', 'tndns', 'gcore', 'edgeone', 'ns1', 'rainyun', 'dynv6', 'vercel', 'spaceship']);
-+const DNS_RECORD_TYPES = new Set(['A', 'AAAA', 'CNAME', 'TXT', 'NS', 'CAA']);
-
- export function orchestrationDefaults() {
+@@ -56,7 +56,10 @@ export function sanitizeOrchestrationState(state = {}) {
+   const domain = normalizeOrchestrationState(state);
    return {
-@@ -161,17 +162,32 @@ export function registerProbePublicRoutes(app, deps) {
- }
+     ...domain,
+-    probes: domain.probes.map(({ tokenHash, agentSecretHash, ...item }) => item),
++    probes: domain.probes.map(({ tokenHash, tokenEnc, agentSecretHash, ...item }) => ({
++      ...item,
++      status: item.status === 'online' && (!item.lastSeenAt || Date.now() - Date.parse(item.lastSeenAt) > 90000) ? 'offline' : item.status
++    })),
+     dnsAccounts: domain.dnsAccounts.map(({ credentialsEnc, ...item }) => ({ ...item, configured: Boolean(credentialsEnc) })),
+     telegramBots: domain.telegramBots.map(({ tokenEnc, ...item }) => ({ ...item, configured: Boolean(tokenEnc) })),
+     incidents: domain.incidents.slice(0, 200),
+@@ -79,17 +82,15 @@ export function registerProbePublicRoutes(app, deps) {
+     if (!deps.allowProbeRegistration(req.ip)) return res.status(429).json({ error: '注册请求过于频繁，请稍后再试' });
+     deps.updateState((draft) => {
+       const probe = draft.probes.find((item) => item.id === probeId);
+-      if (!probe || !probe.tokenHash || probe.tokenUsedAt || !safeHashEqual(probe.tokenHash, hashSecret(token))) return draft;
+-      if (probe.tokenExpiresAt && Date.parse(probe.tokenExpiresAt) < Date.now()) return draft;
++      if (!probe || probe.enabled === false || !probe.tokenHash || !safeHashEqual(probe.tokenHash, hashSecret(token))) return draft;
+       agentSecret = randomSecret(32);
+       probe.agentSecretHash = hashSecret(agentSecret);
+-      probe.tokenUsedAt = nowIso();
+       probe.registeredAt = nowIso();
+       probe.status = 'online';
+       probe.lastSeenAt = nowIso();
+       probe.updatedAt = nowIso();
+       found = true;
+-      pushAudit(draft, 'probe.register', 'probe', probe.id, '探针完成一次性注册', 'agent');
++      pushAudit(draft, 'probe.register', 'probe', probe.id, '探针完成注册或重新注册', 'agent');
+       return draft;
+     });
+     if (!found) return res.status(401).json({ error: '注册凭证无效、已使用或已过期' });
+@@ -241,12 +242,13 @@ export function registerOrchestrationRoutes(app, deps) {
+       probe = draft.probes.find((item) => item.id === req.params.id);
+       if (!probe) throw new Error('探针不存在');
+       probe.tokenHash = hashSecret(token);
+-      probe.tokenExpiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
++      probe.tokenEnc = deps.encryptSecret(token);
++      probe.tokenExpiresAt = '';
+       probe.tokenUsedAt = '';
+       probe.agentSecretHash = '';
+       probe.status = 'pending';
+       probe.updatedAt = nowIso();
+-      pushAudit(draft, 'probe.rotate_token', 'probe', probe.id, '重新生成一次性注册凭证', req.auth.username);
++      pushAudit(draft, 'probe.rotate_token', 'probe', probe.id, '轮转探针注册令牌并使旧令牌失效', req.auth.username);
+       return draft;
+     });
+     const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+@@ -254,19 +256,43 @@ export function registerOrchestrationRoutes(app, deps) {
+     const baseUrl = `${publicProto}://${req.get('host')}`;
+     res.json({
+       ok: true,
+-      token,
+-      expiresAt: probe.tokenExpiresAt,
+-      installCommand: `curl -fsSL '${baseUrl}/probe/install.sh' | sudo bash -s -- '${baseUrl}' '${probe.id}'`,
++      installCommand: `curl -fsSL '${baseUrl}/probe/install.sh' | sudo bash -s -- '${baseUrl}' '${probe.id}' '${token}'`,
+       uninstallCommand: `curl -fsSL ${baseUrl}/probe/uninstall.sh | sudo bash`,
+       state: deps.sanitizeState(state, req.auth)
+     });
+   });
 
- export function registerOrchestrationRoutes(app, deps) {
-+  app.post('/api/ip-assets/batch', (req, res) => {
-+    const addresses = parseIpBatch(req.body.addresses);
-+    let result;
++  app.get('/api/probes/:id/install-command', (req, res) => {
++    let token = '';
 +    const state = deps.updateState((draft) => {
-+      result = importIpAssets(draft, addresses, req.body, req.auth.username);
-+      pushAudit(draft, 'ipAssets.batch_create', 'ipAssets', '', `批量导入 ${result.created} 个 IP，复用 ${result.reused} 个`, req.auth.username);
++      const probe = draft.probes.find((item) => item.id === req.params.id);
++      if (!probe) throw new Error('探针不存在');
++      if (probe.tokenEnc) token = deps.decryptSecret(probe.tokenEnc);
++      if (!token) {
++        token = randomSecret(24);
++        probe.tokenHash = hashSecret(token);
++        probe.tokenEnc = deps.encryptSecret(token);
++        probe.updatedAt = nowIso();
++        pushAudit(draft, 'probe.issue_token', 'probe', probe.id, '生成探针长期注册令牌', req.auth.username);
++      }
 +      return draft;
 +    });
-+    res.json({ ok: true, ...result, state: deps.sanitizeState(state, req.auth) });
-+  });
-+
-   app.post('/api/orchestration/:resource', asyncRoute(async (req, res) => {
-     const key = RESOURCE_MAP[req.params.resource];
-     if (!key) return res.status(404).json({ error: '未知资源类型' });
-     let created;
-     const state = deps.updateState((draft) => {
-+      if (key === 'telegramBots' && draft.telegramBots.length) throw new Error('系统只使用一个统一 Telegram 机器人，请编辑现有机器人');
-+      const imported = key === 'ipPools' ? importIpAssets(draft, parseOptionalIpBatch(req.body.newAssetAddresses), req.body.assetDefaults, req.auth.username) : null;
-+      if (imported) req.body.assetIds = [...new Set([...(req.body.assetIds || []), ...imported.assetIds])];
-       created = normalizeResource(key, req.body, null, deps);
-       ensureResourceReferences(draft, key, created);
-       draft[key].push(created);
-       pushAudit(draft, `${key}.create`, key, created.id, `新增 ${created.name || created.address || created.domain || created.id}`, req.auth.username);
-       return draft;
-     });
-+    if (key === 'telegramBots') deps.onTelegramChanged?.();
-     res.json({ ok: true, item: sanitizeResource(key, created), state: deps.sanitizeState(state, req.auth) });
-   }));
-
-@@ -182,12 +198,15 @@ export function registerOrchestrationRoutes(app, deps) {
-     const state = deps.updateState((draft) => {
-       const item = draft[key].find((entry) => entry.id === req.params.id);
-       if (!item) throw new Error('记录不存在');
-+      const imported = key === 'ipPools' ? importIpAssets(draft, parseOptionalIpBatch(req.body.newAssetAddresses), req.body.assetDefaults, req.auth.username) : null;
-+      if (imported) req.body.assetIds = [...new Set([...(req.body.assetIds || []), ...imported.assetIds])];
-       updated = normalizeResource(key, req.body, item, deps);
-       ensureResourceReferences(draft, key, updated);
-       Object.assign(item, updated, { id: item.id, createdAt: item.createdAt });
-       pushAudit(draft, `${key}.update`, key, item.id, `更新 ${item.name || item.address || item.domain || item.id}`, req.auth.username);
-       return draft;
-     });
-+    if (key === 'telegramBots') deps.onTelegramChanged?.();
-     res.json({ ok: true, item: sanitizeResource(key, updated), state: deps.sanitizeState(state, req.auth) });
-   }));
-
-@@ -200,6 +219,7 @@ export function registerOrchestrationRoutes(app, deps) {
-       pushAudit(draft, `${key}.delete`, key, req.params.id, '删除记录', req.auth.username);
-       return draft;
-     });
-+    if (key === 'telegramBots') deps.onTelegramChanged?.();
-     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
-   }));
-
-@@ -229,7 +249,9 @@ export function registerOrchestrationRoutes(app, deps) {
-       pushAudit(draft, 'probe.rotate_token', 'probe', probe.id, '重新生成一次性注册凭证', req.auth.username);
-       return draft;
-     });
--    const baseUrl = `${req.protocol}://${req.get('host')}`;
++    const probe = state.probes.find((item) => item.id === req.params.id);
 +    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
 +    const publicProto = forwardedProto === 'https' || req.secure || (!isLocalRequestHost(req.get('host')) && forwardedProto !== 'http') ? 'https' : 'http';
 +    const baseUrl = `${publicProto}://${req.get('host')}`;
-     res.json({
-       ok: true,
-       token,
-@@ -267,26 +289,8 @@ export function registerOrchestrationRoutes(app, deps) {
-   }));
-
-   app.post('/api/dns-bindings/:id/sync', asyncRoute(async (req, res) => {
--    const state = deps.readState();
--    const binding = state.dnsBindings.find((item) => item.id === req.params.id);
--    if (!binding) return res.status(404).json({ error: '解析绑定不存在' });
--    const values = await resolveBindingSources(binding);
--    if (!values.length) return res.status(400).json({ error: '主来源和备用来源均未解析出可用地址' });
--    const account = state.dnsAccounts.find((item) => item.id === binding.accountId && item.enabled !== false);
--    const zone = state.dnsZones.find((item) => item.id === binding.zoneId && item.enabled !== false);
--    if (!account || !zone) return res.status(400).json({ error: 'DNS 账号或 Zone 不可用' });
--    const credentials = decryptCredentials(account, deps);
--    const before = await getDnsRecord(account, credentials, zone, binding);
--    const after = binding.pruneStale === false ? [...new Set([...before.values, ...values])] : values;
--    const providerRecordIds = await updateDnsRecord(account, credentials, zone, binding, after);
--    const next = deps.updateState((draft) => {
--      const item = draft.dnsBindings.find((entry) => entry.id === binding.id);
--      if (item) Object.assign(item, { managedValues: after, providerRecordIds: providerRecordIds || item.providerRecordIds, lastSyncAt: nowIso(), lastSyncError: '' });
--      draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', bindingId: binding.id, accountId: account.id, zoneId: zone.id, domain: binding.domain, beforeValues: before.values, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' });
--      pushAudit(draft, 'dns.sync', 'dnsBinding', binding.id, `${binding.domain} 同步 ${after.length} 个地址`, req.auth.username);
--      return draft;
--    });
--    res.json({ ok: true, values: after, state: deps.sanitizeState(next, req.auth) });
-+    const result = await syncDnsBinding(req.params.id, deps, req.auth.username);
-+    res.json({ ok: true, ...result, state: deps.sanitizeState(result.state, req.auth) });
-   }));
-
-   app.post('/api/incidents/:id/execute', (req, res) => {
-@@ -309,6 +313,29 @@ export function registerOrchestrationRoutes(app, deps) {
-   }));
- }
-
-+export async function syncDnsBinding(bindingId, deps, actor = 'system') {
-+  const state = deps.readState();
-+  const binding = state.dnsBindings.find((item) => item.id === bindingId);
-+  if (!binding) throw new Error('解析绑定不存在');
-+  const values = await resolveBindingSources(binding);
-+  if (!values.length) throw new Error('主来源和备用来源均未解析出可用地址');
-+  const account = state.dnsAccounts.find((item) => item.id === binding.accountId && item.enabled !== false);
-+  if (!account) throw new Error('DNS 账号不可用');
-+  const credentials = decryptCredentials(account, deps);
-+  const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, binding);
-+  const before = await getDnsRecord(account, credentials, zone, normalizedBinding);
-+  const after = binding.pruneStale === false ? [...new Set([...before.values, ...values])] : values;
-+  const providerRecordIds = await updateDnsRecord(account, credentials, zone, normalizedBinding, after);
-+  const next = deps.updateState((draft) => {
-+    const item = draft.dnsBindings.find((entry) => entry.id === binding.id);
-+    if (item) Object.assign(item, { managedValues: after, providerRecordIds: providerRecordIds || item.providerRecordIds, lastSyncAt: nowIso(), lastSyncError: '' });
-+    draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, beforeValues: before.values, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' });
-+    pushAudit(draft, 'dns.sync', 'dnsBinding', binding.id, `${binding.domain} 同步 ${after.length} 个地址`, actor);
-+    return draft;
++    res.json({
++      ok: true,
++      installCommand: `curl -fsSL '${baseUrl}/probe/install.sh' | sudo bash -s -- '${baseUrl}' '${probe.id}' '${token}'`,
++      uninstallCommand: `curl -fsSL '${baseUrl}/probe/uninstall.sh' | sudo bash`
++    });
 +  });
-+  return { values: after, layout: dnsRecordLayout(account.provider), state: next };
-+}
 +
- export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null) {
-   const executionId = randomSecret(18);
-   let claimed = false;
-@@ -376,18 +403,122 @@ function normalizeResource(key, input = {}, existing = null, deps) {
-     const provider = DNS_PROVIDERS.has(input.provider) ? input.provider : 'huawei';
-     const hasCredentials = credentials && Object.values(credentials).some(Boolean);
-     const preservedCredentials = existing?.provider === provider ? existing.credentialsEnc : null;
--    return { ...base, name: requiredText(input.name, '账号名称'), provider, region: cleanText(input.region, 80), projectId: cleanText(input.projectId, 120), zoneAllowlist: cleanTexts(input.zoneAllowlist, 500), enabled: input.enabled !== false, credentialsEnc: hasCredentials ? deps.encryptSecret(JSON.stringify(credentials)) : preservedCredentials || null, status: existing?.provider === provider ? (existing?.status || 'untested') : 'untested', lastTestAt: existing?.provider === provider ? (existing?.lastTestAt || '') : '', lastError: existing?.provider === provider ? (existing?.lastError || '') : '' };
-+    return { ...base, name: requiredText(input.name, '账号名称'), provider, enabled: input.enabled !== false, credentialsEnc: hasCredentials ? deps.encryptSecret(JSON.stringify(credentials)) : preservedCredentials || null, status: existing?.provider === provider ? (existing?.status || 'untested') : 'untested', lastTestAt: existing?.provider === provider ? (existing?.lastTestAt || '') : '', lastError: existing?.provider === provider ? (existing?.lastError || '') : '' };
-   }
-   if (key === 'dnsZones') return { ...base, name: normalizeDomain(input.name), accountId: cleanId(input.accountId), providerZoneId: cleanText(input.providerZoneId, 200), enabled: input.enabled !== false, lastSyncAt: existing?.lastSyncAt || '', status: existing?.status || 'ready' };
--  if (key === 'dnsBindings') return { ...base, name: requiredText(input.name, '解析绑定名称'), zoneId: cleanId(input.zoneId), accountId: cleanId(input.accountId), domain: normalizeDomain(input.domain), recordName: cleanText(input.recordName, 255) || '@', recordType: ['A', 'AAAA'].includes(input.recordType) ? input.recordType : 'A', providerRecordId: cleanText(input.providerRecordId, 200), providerRecordIds: cleanTexts(input.providerRecordIds, 500), recordLine: cleanText(input.recordLine, 100) || '默认', ttl: clampNumber(input.ttl, 1, 86400, 60), updateMode: ['append', 'managed_replace', 'replace'].includes(input.updateMode) ? input.updateMode : 'managed_replace', managedValues: cleanTexts(input.managedValues, 5000), ddnsSources: normalizeDdnsSources(input.ddnsSources), backupIps: cleanTexts(input.backupIps, 5000), maxActiveIps: clampNumber(input.maxActiveIps, 1, 50, 50), pruneStale: input.pruneStale !== false, healthEnabled: input.healthEnabled !== false, healthInterval: clampNumber(input.healthInterval, 10, 86400, 30), pingCount: clampNumber(input.pingCount, 1, 10, 3), checkRounds: clampNumber(input.checkRounds, 1, 10, 3), roundDelay: clampNumber(input.roundDelay, 0, 60, 2), maxParallel: clampNumber(input.maxParallel, 1, 300, 20), lastSyncAt: existing?.lastSyncAt || '', lastSyncError: existing?.lastSyncError || '', enabled: input.enabled !== false };
-+  if (key === 'dnsBindings') {
-+    const recordType = DNS_RECORD_TYPES.has(input.recordType) ? input.recordType : 'A';
-+    const accountId = cleanId(input.accountId);
-+    const domain = normalizeDomain(input.domain);
-+    const identityChanged = Boolean(existing && (existing.accountId !== accountId || existing.domain !== domain || existing.recordType !== recordType));
-+    const recordValues = cleanRecordValues(input.recordValues, recordType === 'CNAME' ? 1 : 5000);
-+    if (recordType === 'CNAME' && recordValues[0]) recordValues[0] = normalizeDomain(recordValues[0]);
-+    return { ...base, name: requiredText(input.name, '解析绑定名称'), zoneId: identityChanged ? '' : cleanId(input.zoneId), accountId, domain, recordName: identityChanged ? '' : cleanText(input.recordName, 255), recordType, recordValues, providerRecordId: identityChanged ? '' : cleanText(input.providerRecordId, 200), providerRecordIds: identityChanged ? [] : cleanTexts(input.providerRecordIds, 500), recordLine: cleanText(input.recordLine, 100) || '默认', ttl: clampNumber(input.ttl, 1, 86400, 60), updateMode: ['append', 'managed_replace', 'replace'].includes(input.updateMode) ? input.updateMode : 'managed_replace', managedValues: identityChanged ? [] : cleanTexts(input.managedValues, 5000), ddnsSources: normalizeDdnsSources(input.ddnsSources), backupIps: cleanTexts(input.backupIps, 5000), maxActiveIps: clampNumber(input.maxActiveIps, 1, 50, 50), pruneStale: input.pruneStale !== false, healthEnabled: input.healthEnabled !== false, healthInterval: clampNumber(input.healthInterval, 10, 86400, 30), pingCount: clampNumber(input.pingCount, 1, 10, 3), checkRounds: clampNumber(input.checkRounds, 1, 10, 3), roundDelay: clampNumber(input.roundDelay, 0, 60, 2), maxParallel: clampNumber(input.maxParallel, 1, 300, 20), lastSyncAt: identityChanged ? '' : (existing?.lastSyncAt || ''), lastSyncError: '', enabled: input.enabled !== false };
-+  }
-   if (key === 'failoverPolicies') return { ...base, name: requiredText(input.name, '策略名称'), poolIds: cleanIds(input.poolIds, 100), automationTaskId: cleanId(input.automationTaskId), automationHosts: input.automationHosts === 'target' ? 'target' : 'allocated', automationTimeout: clampNumber(input.automationTimeout, 30, 7200, 1800), dnsBindingIds: cleanIds(input.dnsBindingIds, 500), approvalMode: input.approvalMode === 'telegram' ? 'telegram' : 'automatic', autoRollback: input.autoRollback !== false, enabled: input.enabled !== false, businessKey: cleanText(input.businessKey, 100) };
-   if (key === 'telegramBots') {
-     const token = String(input.token || '').trim();
--    return { ...base, name: requiredText(input.name, '机器人名称'), tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: cleanTexts(input.groupIds, 500), roles: normalizeRoles(input.roles), menuScopes: cleanTexts(input.menuScopes, 30), lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
-+    return { ...base, name: '统一机器人', tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: [], roles: normalizeRoles(input.roles), menuScopes: cleanTexts(input.menuScopes, 30), automationTaskIds: cleanIds(input.automationTaskIds, 500), lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
-   }
-   throw new Error('未知资源类型');
+   app.post('/api/probes/:id/revoke', (req, res) => {
+     const state = deps.updateState((draft) => {
+       const probe = draft.probes.find((item) => item.id === req.params.id);
+       if (!probe) throw new Error('探针不存在');
+-      Object.assign(probe, { enabled: false, status: 'revoked', tokenHash: '', agentSecretHash: '', updatedAt: nowIso() });
++      Object.assign(probe, { enabled: false, status: 'revoked', tokenHash: '', tokenEnc: null, agentSecretHash: '', updatedAt: nowIso() });
+       pushAudit(draft, 'probe.revoke', 'probe', probe.id, '吊销探针凭证', req.auth.username);
+       return draft;
+     });
+@@ -394,7 +420,7 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
+ function normalizeResource(key, input = {}, existing = null, deps) {
+   const now = nowIso();
+   const base = { id: existing?.id || cleanId(input.id) || uuidv4(), createdAt: existing?.createdAt || now, updatedAt: now };
+-  if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
++  if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', tokenEnc: existing?.tokenEnc || null, agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
+   if (key === 'probeTargets') return { ...base, name: requiredText(input.name, '目标名称'), address: validateHost(input.address, Boolean(input.allowPrivate)), allowPrivate: Boolean(input.allowPrivate), checkType: input.checkType === 'ping' ? 'ping' : 'tcp', port: clampNumber(input.port, 1, 65535, 443), interval: clampNumber(input.interval, 5, 3600, 30), timeout: clampNumber(input.timeout, 1, 60, 5), failureThreshold: clampNumber(input.failureThreshold, 1, 20, 3), recoveryThreshold: clampNumber(input.recoveryThreshold, 1, 20, 2), quorumMode: ['majority', 'all', 'count'].includes(input.quorumMode) ? input.quorumMode : 'majority', quorumCount: clampNumber(input.quorumCount, 1, 100, 2), probeIds: cleanIds(input.probeIds, 500), policyId: cleanId(input.policyId), enabled: input.enabled !== false, health: existing?.health || 'unknown', observations: existing?.observations || {}, lastCheckAt: existing?.lastCheckAt || '' };
+   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
+   if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random', 'weighted'].includes(input.selectionMode) ? input.selectionMode : 'ordered', sharingMode: ['exclusive', 'target', 'business', 'unlimited', 'limited'].includes(input.sharingMode) ? input.sharingMode : 'exclusive', shareLimit: clampNumber(input.shareLimit, 1, 1000, 1), leaseMinutes: clampNumber(input.leaseMinutes, 1, 525600, 30), cooldownMinutes: clampNumber(input.cooldownMinutes, 0, 10080, 10), enabled: input.enabled !== false, note: cleanText(input.note, 500) };
+@@ -1175,7 +1201,7 @@ function pushAudit(state, action, resourceType, resourceId, summary, actor) {
+ function sanitizeResource(key, item) {
+   if (key === 'dnsAccounts') { const { credentialsEnc, ...safe } = item; return { ...safe, configured: Boolean(credentialsEnc) }; }
+   if (key === 'telegramBots') { const { tokenEnc, ...safe } = item; return { ...safe, configured: Boolean(tokenEnc) }; }
+-  if (key === 'probes') { const { tokenHash, agentSecretHash, ...safe } = item; return safe; }
++  if (key === 'probes') { const { tokenHash, tokenEnc, agentSecretHash, ...safe } = item; return safe; }
+   return item;
  }
 
-+function parseOptionalIpBatch(value) {
-+  if (!String(value || '').trim()) return [];
-+  return parseIpBatch(value);
-+}
-+
-+export function parseIpBatch(value) {
-+  const values = [...new Set(String(value || '').split(/[\s,，;；]+/).map((item) => item.trim()).filter(Boolean))];
-+  if (!values.length) throw new Error('请至少输入一个 IP 地址');
-+  if (values.length > 5000) throw new Error('单次最多导入 5000 个 IP 地址');
-+  const invalid = values.filter((address) => net.isIP(address) === 0);
-+  if (invalid.length) throw new Error(`IP 地址格式不正确：${invalid.slice(0, 10).join('、')}${invalid.length > 10 ? ` 等 ${invalid.length} 个` : ''}`);
-+  return values;
-+}
-+
-+export function dnsRecordLayout(provider) {
-+  return provider === 'huawei' ? 'recordset' : 'individual';
-+}
-+
-+export function importIpAssets(state, addresses, defaults = {}, actor = 'system') {
-+  const assetIds = [];
-+  let created = 0;
-+  let reused = 0;
-+  for (const address of addresses) {
-+    let asset = state.ipAssets.find((item) => item.address === address);
-+    if (asset) {
-+      reused += 1;
-+    } else {
-+      asset = normalizeResource('ipAssets', {
-+        address,
-+        name: address,
-+        region: defaults?.region,
-+        carrier: defaults?.carrier,
-+        labels: defaults?.labels,
-+        health: defaults?.health || 'unknown',
-+        enabled: defaults?.enabled !== false,
-+        note: defaults?.note
-+      });
-+      state.ipAssets.push(asset);
-+      created += 1;
-+    }
-+    assetIds.push(asset.id);
-+  }
-+  if (created) pushAudit(state, 'ipAssets.batch_import', 'ipAssets', '', `创建 ${created} 个 IP 资产`, actor);
-+  return { created, reused, total: addresses.length, assetIds };
-+}
-+
-+export function addIpsToPool(state, poolId, addresses, actor = 'system') {
-+  const pool = state.ipPools.find((item) => item.id === poolId);
-+  if (!pool) throw new Error('备用池不存在');
-+  const imported = importIpAssets(state, addresses, {}, actor);
-+  pool.assetIds = [...new Set([...(pool.assetIds || []), ...imported.assetIds])];
-+  pool.updatedAt = nowIso();
-+  pushAudit(state, 'ipPools.telegram_add', 'ipPools', pool.id, `通过 Telegram 加入 ${addresses.length} 个 IP`, actor);
-+  return { pool, ...imported };
-+}
-+
-+export function createPoolWithIps(state, name, addresses, actor = 'system') {
-+  const imported = importIpAssets(state, addresses, {}, actor);
-+  const pool = normalizeResource('ipPools', { name, assetIds: imported.assetIds, allocationMode: 'one', enabled: true });
-+  state.ipPools.push(pool);
-+  pushAudit(state, 'ipPools.telegram_create', 'ipPools', pool.id, `通过 Telegram 创建备用池并加入 ${addresses.length} 个 IP`, actor);
-+  return { pool, ...imported };
-+}
-+
-+export function setDnsBindingIps(state, bindingId, addresses, mode = 'append', actor = 'system') {
-+  const binding = state.dnsBindings.find((item) => item.id === bindingId);
-+  if (!binding) throw new Error('解析绑定不存在');
-+  if (!['A', 'AAAA'].includes(binding.recordType)) throw new Error('只有 A/AAAA 记录可以添加 IP');
-+  const family = binding.recordType === 'AAAA' ? 6 : 4;
-+  if (addresses.some((address) => net.isIP(address) !== family)) throw new Error(`${binding.recordType} 记录只能使用 IPv${family} 地址`);
-+  binding.backupIps = mode === 'replace' ? [...addresses] : [...new Set([...(binding.backupIps || []), ...addresses])];
-+  binding.updatedAt = nowIso();
-+  pushAudit(state, 'dnsBindings.telegram_ips', 'dnsBindings', binding.id, `通过 Telegram ${mode === 'replace' ? '替换' : '添加'} ${addresses.length} 个 IP`, actor);
-+  return binding;
-+}
-+
-+export function createDnsBinding(state, accountId, domain, recordType, values, actor = 'system') {
-+  const account = state.dnsAccounts.find((item) => item.id === accountId && item.enabled !== false);
-+  if (!account) throw new Error('DNS 账号不存在或已停用');
-+  const type = DNS_RECORD_TYPES.has(recordType) ? recordType : 'A';
-+  const addressRecord = ['A', 'AAAA'].includes(type);
-+  const binding = normalizeResource('dnsBindings', {
-+    name: `${domain} ${type}`,
-+    accountId,
-+    domain,
-+    recordType: type,
-+    backupIps: addressRecord ? values : [],
-+    recordValues: addressRecord ? [] : values,
-+    updateMode: 'replace',
-+    enabled: true
-+  });
-+  state.dnsBindings.push(binding);
-+  pushAudit(state, 'dnsBindings.telegram_create', 'dnsBindings', binding.id, `通过 Telegram 创建 ${binding.domain} ${binding.recordType}`, actor);
-+  return binding;
-+}
-+
- function ensureResourceReferences(state, key, item) {
-   const exists = (collection, id) => !id || state[collection]?.some((entry) => entry.id === id);
-   if (key === 'probeTargets') {
-@@ -396,12 +527,14 @@ function ensureResourceReferences(state, key, item) {
-   }
-   if (key === 'ipPools' && item.assetIds.some((id) => !exists('ipAssets', id))) throw new Error('备用池包含不存在的 IP');
-   if (key === 'dnsZones' && !exists('dnsAccounts', item.accountId)) throw new Error('DNS 账号不存在');
--  if (key === 'dnsBindings' && (!exists('dnsAccounts', item.accountId) || !exists('dnsZones', item.zoneId))) throw new Error('DNS 账号或 Zone 不存在');
-+  if (key === 'dnsBindings' && !exists('dnsAccounts', item.accountId)) throw new Error('DNS 账号不存在');
-   if (key === 'failoverPolicies') {
-     if (item.poolIds.some((id) => !exists('ipPools', id))) throw new Error('关联的备用池不存在');
-     if (item.dnsBindingIds.some((id) => !exists('dnsBindings', id))) throw new Error('关联的解析绑定不存在');
-+    if (item.dnsBindingIds.some((id) => !['A', 'AAAA'].includes(state.dnsBindings.find((entry) => entry.id === id)?.recordType))) throw new Error('故障切换只能关联 A/AAAA 解析');
-     if (!exists('automationTasks', item.automationTaskId)) throw new Error('关联的自动化任务不存在');
-   }
-+  if (key === 'telegramBots' && item.automationTaskIds.some((id) => !exists('automationTasks', id))) throw new Error('机器人包含不存在的自动化任务');
- }
-
- function ensureNotReferenced(state, key, id) {
-@@ -495,22 +628,22 @@ function canLeaseAsset(state, assetId, pool, incident) {
- }
-
- async function applyDnsBinding(binding, allocatedIps, incidentId, deps) {
-+  if (!['A', 'AAAA'].includes(binding.recordType)) throw new Error(`故障切换不能更新 ${binding.recordType} 记录`);
-   const state = deps.readState();
-   const account = state.dnsAccounts.find((item) => item.id === binding.accountId && item.enabled !== false);
--  const zone = state.dnsZones.find((item) => item.id === binding.zoneId && item.enabled !== false);
--  if (!account || !zone) throw new Error(`解析绑定 ${binding.name} 的账号或 Zone 不可用`);
--  if (account.zoneAllowlist?.length && !account.zoneAllowlist.includes(zone.name)) throw new Error(`账号无权操作 Zone ${zone.name}`);
-+  if (!account) throw new Error(`解析绑定 ${binding.name} 的账号不可用`);
-   const credentials = decryptCredentials(account, deps);
--  const before = await getDnsRecord(account, credentials, zone, binding);
-+  const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, binding);
-+  const before = await getDnsRecord(account, credentials, zone, normalizedBinding);
-   const current = before.values || [];
-   let after;
-   if (binding.updateMode === 'append') after = [...new Set([...current, ...allocatedIps])];
-   else if (binding.updateMode === 'managed_replace') after = [...new Set([...current.filter((value) => !binding.managedValues?.includes(value)), ...allocatedIps])];
-   else after = [...new Set(allocatedIps)];
-   if (!after.length) throw new Error(`解析绑定 ${binding.name} 没有可写入 IP`);
--  const providerRecordIds = await updateDnsRecord(account, credentials, zone, binding, after);
-+  const providerRecordIds = await updateDnsRecord(account, credentials, zone, normalizedBinding, after);
-   deps.updateState((draft) => {
--    const change = { id: uuidv4(), incidentId, bindingId: binding.id, accountId: account.id, zoneId: zone.id, domain: binding.domain, beforeValues: current, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' };
-+    const change = { id: uuidv4(), incidentId, bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, beforeValues: current, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' };
-     draft.dnsChanges.unshift(change);
-     const incident = draft.incidents.find((item) => item.id === incidentId);
-     if (incident) incident.dnsChangeIds = [...(incident.dnsChangeIds || []), change.id];
-@@ -535,9 +668,10 @@ export async function rollbackIncident(incidentId, deps, actor) {
-     if (!change) continue;
-     const binding = current.dnsBindings.find((item) => item.id === change.bindingId);
-     const account = current.dnsAccounts.find((item) => item.id === change.accountId);
--    const zone = current.dnsZones.find((item) => item.id === change.zoneId);
--    if (!binding || !account || !zone) continue;
--    const providerRecordIds = await updateDnsRecord(account, decryptCredentials(account, deps), zone, binding, change.beforeValues);
-+    if (!binding || !account) continue;
-+    const credentials = decryptCredentials(account, deps);
-+    const discovered = change.zoneName ? { zone: { id: change.zoneId, name: change.zoneName, providerZoneId: change.providerZoneId }, normalizedBinding: withRecordName(binding, change.zoneName) } : await resolveManagedDnsZone(current, account, credentials, binding);
-+    const providerRecordIds = await updateDnsRecord(account, credentials, discovered.zone, discovered.normalizedBinding, change.beforeValues);
-     deps.updateState((draft) => {
-       const item = draft.dnsChanges.find((entry) => entry.id === change.id);
-       if (item) Object.assign(item, { status: 'rolled_back', rolledBackAt: nowIso() });
-@@ -558,6 +692,7 @@ export async function rollbackIncident(incidentId, deps, actor) {
- async function verifyDnsBindings(bindings, expectedIps) {
-   await new Promise((resolve) => setTimeout(resolve, 800));
-   for (const binding of bindings) {
-+    if (!['A', 'AAAA'].includes(binding.recordType)) continue;
-     const type = binding.recordType === 'AAAA' ? 28 : 1;
-     const response = await fetch(`https://1.1.1.1/dns-query?name=${encodeURIComponent(binding.domain)}&type=${type}`, { headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(8000) });
-     if (!response.ok) throw new Error(`DNS 验证失败：${binding.domain}`);
-@@ -580,7 +715,93 @@ async function testDnsAccount(account, credentials) {
-   throw new Error('不支持的 DNS 服务商');
- }
-
-+async function resolveManagedDnsZone(state, account, credentials, binding) {
-+  const legacy = state.dnsZones.find((item) => item.id === binding.zoneId && item.accountId === account.id && item.enabled !== false);
-+  if (legacy) return { zone: legacy, normalizedBinding: withRecordName(binding, legacy.name) };
-+  const zones = await listProviderZones(account, credentials);
-+  const domain = normalizeDomain(binding.domain);
-+  const matches = zones.filter((zone) => domain === zone.name || domain.endsWith(`.${zone.name}`)).sort((left, right) => right.name.length - left.name.length);
-+  if (!matches.length) throw new Error(`账号中未找到 ${domain} 对应的托管域`);
-+  return { zone: matches[0], normalizedBinding: withRecordName(binding, matches[0].name) };
-+}
-+
-+export function withRecordName(binding, zoneName) {
-+  const domain = normalizeDomain(binding.domain);
-+  const zone = normalizeDomain(zoneName);
-+  const recordName = domain === zone ? '@' : domain.slice(0, -(zone.length + 1));
-+  return { ...binding, recordName };
-+}
-+
-+async function listProviderZones(account, credentials) {
-+  if (account.provider === 'cloudflare') {
-+    const zones = [];
-+    for (let page = 1; page <= 100; page += 1) {
-+      const data = await cloudflareRequest(credentials, 'GET', `/zones?per_page=50&page=${page}`);
-+      zones.push(...(data.result || []));
-+      if (page >= Number(data.result_info?.total_pages || 1) || !(data.result || []).length) break;
-+    }
-+    return zones.map((item) => ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.id) }));
-+  }
-+  if (account.provider === 'huawei') {
-+    const zones = [];
-+    let marker = '';
-+    for (let page = 0; page < 100; page += 1) {
-+      const query = new URLSearchParams({ limit: '500' });
-+      if (marker) query.set('marker', marker);
-+      const data = await huaweiRequest(account, credentials, 'GET', `/v2/zones?${query}`);
-+      const batch = data.zones || [];
-+      zones.push(...batch);
-+      const next = data.links?.next ? new URL(data.links.next, 'https://dns.myhuaweicloud.com').searchParams.get('marker') : '';
-+      if (!next || next === marker || !batch.length) break;
-+      marker = next;
-+    }
-+    return zones.map((item) => ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.id) }));
-+  }
-+  if (account.provider === 'aliyun') {
-+    const zones = [];
-+    for (let page = 1; page <= 100; page += 1) {
-+      const data = await aliyunRequest(credentials, 'DescribeDomains', { PageNumber: page, PageSize: 100 });
-+      const batch = data.Domains?.Domain || [];
-+      zones.push(...batch);
-+      if (zones.length >= Number(data.TotalCount || batch.length) || !batch.length) break;
-+    }
-+    return zones.map((item) => ({ id: '', name: normalizeDomain(item.DomainName), providerZoneId: String(item.DomainId || '') }));
-+  }
-+  if (account.provider === 'tencent') {
-+    const zones = [];
-+    for (let offset = 0; offset < 10000; offset += 100) {
-+      const data = await tencentRequest(credentials, 'DescribeDomainList', { Offset: offset, Limit: 100 });
-+      const batch = data.Response?.DomainList || [];
-+      zones.push(...batch);
-+      if (zones.length >= Number(data.Response?.DomainCountInfo?.AllTotal || batch.length) || !batch.length) break;
-+    }
-+    return zones.map((item) => ({ id: '', name: normalizeDomain(item.Name), providerZoneId: String(item.DomainId || '') }));
-+  }
-+  if (account.provider === 'dnspod') {
-+    const data = await dnspodRequest(credentials, 'Domain.List', { length: 3000 });
-+    return (data.domains || []).map((item) => ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.id || '') }));
-+  }
-+  if (account.provider === 'godaddy') {
-+    const data = await godaddyRequest(credentials, 'GET', '/v1/domains?limit=1000');
-+    return (data || []).map((item) => ({ id: '', name: normalizeDomain(item.domain), providerZoneId: '' }));
-+  }
-+  if (account.provider === 'porkbun') {
-+    const data = await porkbunRequest(credentials, '/api/json/v3/domain/listAll');
-+    return (data.domains || []).map((item) => ({ id: '', name: normalizeDomain(item.domain), providerZoneId: '' }));
-+  }
-+  if (account.provider === 'cloudns') {
-+    const data = await cloudnsRequest(credentials, '/dns/list-zones.json');
-+    return Object.values(data || {}).map((item) => ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.zone || item.id || '') }));
-+  }
-+  if (CALLBACK_PROVIDERS.has(account.provider)) {
-+    const data = await callbackRequest(account, credentials, { action: 'zones', provider: account.provider });
-+    return (data.zones || []).map((item) => typeof item === 'string' ? ({ id: '', name: normalizeDomain(item), providerZoneId: '' }) : ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.id || '') }));
-+  }
-+  return [];
-+}
-+
- async function resolveBindingSources(binding) {
-+  if (!['A', 'AAAA'].includes(binding.recordType)) return cleanRecordValues(binding.recordValues, binding.recordType === 'CNAME' ? 1 : 5000);
-   const family = binding.recordType === 'AAAA' ? 6 : 4;
-   const sources = Array.isArray(binding.ddnsSources) ? binding.ddnsSources : [];
-   const output = [];
-@@ -718,13 +939,6 @@ async function reconcileProviderRecords(recordIds, values, adapter) {
-   return nextIds;
- }
-
--function bindingRecordIds(binding) {
--  const ids = cleanTexts(binding.providerRecordIds, 500);
--  if (!ids.length && binding.providerRecordId) ids.push(cleanText(binding.providerRecordId, 200));
--  if (!ids.length) throw new Error(`解析绑定 ${binding.name} 缺少服务商记录 ID`);
--  return ids;
--}
--
- async function findHuaweiRecordset(account, credentials, zone, binding) {
-   if (binding.providerRecordId) {
-     return huaweiRequest(account, credentials, 'GET', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets/${encodeURIComponent(binding.providerRecordId)}`);
-@@ -732,7 +946,7 @@ async function findHuaweiRecordset(account, credentials, zone, binding) {
-   const query = `?name=${encodeURIComponent(`${binding.domain}.`)}&type=${encodeURIComponent(binding.recordType)}&limit=500`;
-   const data = await huaweiRequest(account, credentials, 'GET', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets${query}`);
-   const matches = (data.recordsets || []).filter((item) => normalizeDomain(item.name) === binding.domain && item.type === binding.recordType);
--  if (matches.length > 1) throw new Error(`华为云存在多个 ${binding.domain} ${binding.recordType} 记录，请填写 Record ID`);
-+  if (matches.length > 1) throw new Error(`华为云存在多个同名 ${binding.recordType} 记录，请先在华为云合并重复记录`);
-   return matches[0] || null;
- }
-
-@@ -745,8 +959,8 @@ async function discoverProviderRecordIds(account, credentials, zone, binding) {
-     return (data.result || []).map((item) => String(item.id));
-   }
-   if (account.provider === 'aliyun') {
--    const data = await aliyunRequest(credentials, 'DescribeDomainRecords', { DomainName: zone.name, RRKeyWord: binding.recordName === '@' ? zone.name : binding.recordName, TypeKeyWord: binding.recordType, PageSize: 500 });
--    return (data.DomainRecords?.Record || []).filter((item) => item.Type === binding.recordType).map((item) => String(item.RecordId));
-+    const data = await aliyunRequest(credentials, 'DescribeSubDomainRecords', { DomainName: zone.name, SubDomain: binding.domain, Type: binding.recordType, PageSize: 500 });
-+    return (data.DomainRecords?.Record || []).filter((item) => item.Type === binding.recordType && normalizeRecordName(item.RR, zone.name) === binding.recordName).map((item) => String(item.RecordId));
-   }
-   if (account.provider === 'dnspod') {
-     const data = await dnspodRequest(credentials, 'Record.List', { domain: zone.name, sub_domain: binding.recordName, record_type: binding.recordType, length: 3000 });
-@@ -914,10 +1128,11 @@ async function callbackRequest(account, credentials, payload) {
-   return result;
- }
-
--function normalizeRecordName(value, zoneName) {
--  const normalized = normalizeDomain(value);
--  const suffix = `.${normalizeDomain(zoneName)}`;
--  if (normalized === normalizeDomain(zoneName)) return '@';
-+export function normalizeRecordName(value, zoneName) {
-+  const normalized = cleanText(value, 253).toLowerCase().replace(/\.$/, '');
-+  const normalizedZone = normalizeDomain(zoneName);
-+  const suffix = `.${normalizedZone}`;
-+  if (normalized === '@' || normalized === normalizedZone) return '@';
-   return normalized.endsWith(suffix) ? normalized.slice(0, -suffix.length) : normalized;
- }
-
-@@ -970,10 +1185,12 @@ function normalizeRoles(input) {
- }
-
- function cleanText(value, max = 200) { return String(value ?? '').trim().slice(0, max); }
-+function isLocalRequestHost(value) { const host = String(value || '').replace(/^\[|\](?::\d+)?$/g, '').split(':')[0].toLowerCase(); return host === 'localhost' || host === '127.0.0.1' || host === '::1' || /^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host); }
- function requiredText(value, label) { const result = cleanText(value, 200); if (!result) throw new Error(`请填写${label}`); return result; }
- function cleanId(value) { return String(value || '').trim().replace(/[^A-Za-z0-9_-]/g, '').slice(0, 100); }
- function cleanIds(value, max) { return [...new Set((Array.isArray(value) ? value : []).map(cleanId).filter(Boolean))].slice(0, max); }
- function cleanTexts(value, max) { return [...new Set((Array.isArray(value) ? value : String(value || '').split(/[\n,，;；]+/)).map((item) => cleanText(item, 255)).filter(Boolean))].slice(0, max); }
-+function cleanRecordValues(value, max) { return [...new Set((Array.isArray(value) ? value : String(value || '').split(/\n+/)).map((item) => cleanText(item, 1000)).filter(Boolean))].slice(0, max); }
- function clampNumber(value, min, max, fallback) { const number = Number(value); return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : fallback; }
- function nowIso() { return new Date().toISOString(); }
- function randomSecret(bytes) { return crypto.randomBytes(bytes).toString('base64url'); }
-@@ -984,7 +1201,7 @@ function hmac(key, value) { return crypto.createHmac('sha256', key).update(value
- function percentEncode(value) { return encodeURIComponent(String(value)).replace(/!/g, '%21').replace(/'/g, '%27').replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\*/g, '%2A'); }
- function configVersion(targets) { return sha256(JSON.stringify(targets)).slice(0, 16); }
- function normalizeDomain(value) { const domain = cleanText(value, 253).toLowerCase().replace(/\.$/, ''); if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(domain)) throw new Error('域名格式不正确'); return domain; }
--function validateIp(value) { const address = cleanText(value, 64); if (!/^((25[0-5]|2[0-4]\d|1?\d?\d)(\.|$)){4}$/.test(address) && !/^[a-f0-9:]+$/i.test(address)) throw new Error('IP 地址格式不正确'); return address; }
-+function validateIp(value) { const address = cleanText(value, 64); if (net.isIP(address) === 0) throw new Error('IP 地址格式不正确'); return address; }
- function validateHost(value, allowPrivate = false) {
-   const host = cleanText(value, 253).replace(/^\[|\]$/g, '');
-   if (!host) throw new Error('请填写检查目标');
-diff --git a/src/App.jsx b/src/App.jsx
-index fff203d..e3f91f5 100644
---- a/src/App.jsx
-+++ b/src/App.jsx
-@@ -25,7 +25,6 @@ const EMPTY_COMMAND = {
- const EMPTY_AUTOMATION_TASK = {
-   id: '', name: '', username: 'root', port: 22, password: '', proxyId: '',
-   concurrency: 100, connectTimeout: 15, stepTimeout: 120, retryCount: 0,
--  telegramEnabled: true,
-   steps: [{ id: crypto.randomUUID(), type: 'command', label: '主命令', value: '', timeout: 120 }]
- };
-
-@@ -73,7 +72,8 @@ const TABS = [
-   { key: 'proxies', label: '代理网络', icon: ProxyIcon },
-   { key: 'probes', label: '探针管理', icon: ProbeIcon },
-   { key: 'pools', label: '备用 IP 池', icon: PoolIcon },
--  { key: 'dns', label: '解析管理', icon: DnsIcon }
-+  { key: 'dns', label: '解析管理', icon: DnsIcon },
-+  { key: 'telegram', label: 'Telegram', icon: TelegramIcon }
- ];
-
- const TERMINAL_SESSIONS_STORAGE_KEY = 'nurossh-terminal-sessions';
-@@ -406,8 +406,6 @@ export default function App() {
-   const [automationExpandedServerId, setAutomationExpandedServerId] = useState('');
-   const [automationInputDialog, setAutomationInputDialog] = useState({ open: false, mode: 'choice', value: '', awaitingServerIds: [] });
-   const [automationEditorOpen, setAutomationEditorOpen] = useState(false);
--  const [telegramDialogOpen, setTelegramDialogOpen] = useState(false);
--  const [telegramDraft, setTelegramDraft] = useState({ enabled: false, token: '', userIds: '', allowGroups: true });
-   const [executionResults, setExecutionResults] = useState([]);
-   const [lastExecutedCommand, setLastExecutedCommand] = useState('');
-   const [commandJobId, setCommandJobId] = useState('');
-@@ -916,7 +914,6 @@ export default function App() {
-       const tasks = Array.isArray(data.automationTasks) ? data.automationTasks : [];
-       setAutomationTaskId((current) => tasks.some((item) => item.id === current) ? current : (tasks[0]?.id || ''));
-       if (tasks[0]) setAutomationDraft((current) => current.id ? current : { ...EMPTY_AUTOMATION_TASK, ...tasks[0], password: '' });
--      setTelegramDraft((current) => ({ ...current, ...(data.telegram || {}), userIds: (data.telegram?.userIds || []).join('\n') }));
-       const serverWorkspace = normalizeWorkspacePayload(data.workspace);
-       const knownServerIds = new Set((data.servers || []).map((item) => item.id));
-       const filteredWorkspaceSessions = serverWorkspace.sessions.filter((item) => knownServerIds.has(item.serverId));
-@@ -1222,14 +1219,6 @@ export default function App() {
-     } catch (error) { toast(error.message); } finally { setActionBusy('automationInput', false); }
-   }
-
--  async function saveTelegram() {
--    try {
--      const data = await api('/api/telegram', { method: 'PUT', body: JSON.stringify({ ...telegramDraft, userIds: telegramDraft.userIds.split(/\r?\n|[,，;；]+/).map((item) => item.trim()).filter(Boolean) }) });
--      setState(data.state); toast('Telegram 设置已保存');
--      return true;
--    } catch (error) { toast(error.message); return false; }
--  }
--
-   function openEditor(type, item = null) {
-     if (type === 'server') {
-       const next = item ? { ...item } : { ...EMPTY_SERVER, groupId: state.groups[0]?.id || 'group-default' };
-@@ -2155,7 +2144,7 @@ export default function App() {
-         </div>
-       </header>
-
--      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns'].includes(tab) ? ' orchestration-layout' : '')}>
-+      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-layout' : '')}>
-         {!workspaceFullscreenActive ? (
-           <button
-             className={'mobile-drawer-scrim ' + (assetDrawerOpen ? 'open' : '')}
-@@ -2164,7 +2153,7 @@ export default function App() {
-             onClick={() => setAssetDrawerOpen(false)}
-           />
-         ) : null}
--        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns'].includes(tab) ? ' orchestration-aside' : '')}>
-+        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-aside' : '')}>
-           <div className="side-head">
-             <div>
-               <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'dns' ? '解析管理' : '代理列表'}</strong>
-@@ -2348,13 +2337,12 @@ export default function App() {
-           ) : null}
-         </aside>
-
--          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns'].includes(tab) ? ' orchestration-main' : '')}>
--          {['probes', 'pools', 'dns'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
-+          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-main' : '')}>
-+          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
-           {tab === 'automation' ? (
-             <section className="automation-board">
-               <div className="automation-page-head surface">
-                 <div className="automation-title-block"><span className="automation-kicker">批量工作台</span><strong>{selectedAutomationTask?.name || '自动化任务'}</strong><span>{selectedAutomationTask ? `${selectedAutomationTask.steps?.length || 0} 个步骤 · 并发 ${selectedAutomationTask.concurrency}` : '从左侧选择一个任务开始执行'}</span></div>
--                <div className="toolbar"><button className="ghost" onClick={() => setTelegramDialogOpen(true)}><TelegramIcon />机器人设置</button></div>
-               </div>
-
-               <div className="automation-workspace-grid">
-@@ -2728,7 +2716,6 @@ export default function App() {
-                 <Field label="执行超时（秒）"><input type="number" min="1" max="3600" value={automationDraft.stepTimeout} onChange={(e) => setAutomationDraft((c) => ({ ...c, stepTimeout: e.target.value }))} /></Field>
-                 <Field label="代理"><select value={automationDraft.proxyId} onChange={(e) => setAutomationDraft((c) => ({ ...c, proxyId: e.target.value }))}><option value="">直连</option>{state.proxies.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
-               </div>
--              <label className="automation-toggle"><input type="checkbox" checked={automationDraft.telegramEnabled} onChange={(e) => setAutomationDraft((c) => ({ ...c, telegramEnabled: e.target.checked }))} /> 允许通过 Telegram 执行此任务</label>
-             </section>
-             <section className="automation-editor-steps">
-               <div className="automation-steps-head"><div className="dialog-section-head"><strong>执行步骤</strong><span>按顺序执行；“等待输出”后紧跟“输入文本”或“按回车”即可自动交互</span></div><div className="automation-step-actions"><button className="ghost" onClick={() => setAutomationDraft((c) => ({ ...c, steps: [...c.steps, { id: crypto.randomUUID(), type: 'command', label: '', value: '', timeout: 120 }] }))}>添加步骤</button><button className="ghost" onClick={() => setAutomationDraft((c) => ({ ...c, steps: [...c.steps, { id: crypto.randomUUID(), type: 'wait', label: '等待提示', value: '', timeout: 120 }, { id: crypto.randomUUID(), type: 'input', label: '自动输入', value: '', timeout: 120 }] }))}>添加等待+输入</button></div></div>
-@@ -2739,14 +2726,6 @@ export default function App() {
-         </Dialog>
-       ) : null}
-
--      {telegramDialogOpen ? (
--        <Dialog title="Telegram 机器人设置" wide onClose={() => setTelegramDialogOpen(false)} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setTelegramDialogOpen(false)}>取消</button><button className="primary" onClick={async () => { if (await saveTelegram()) setTelegramDialogOpen(false); }}>保存设置</button></div></>}>
--          <div className="telegram-dialog-copy"><strong>授权与群组执行</strong><span>机器人在私聊和群组内都按发送者用户 ID 判断权限。</span></div>
--          <div className="field-grid telegram-dialog-grid"><Field label="Bot Token"><input type="password" value={telegramDraft.token} onChange={(e) => setTelegramDraft((c) => ({ ...c, token: e.target.value }))} placeholder={state.telegram?.configured ? '留空保持原 Token' : '粘贴 BotFather Token'} /></Field><Field label="授权用户 ID"><textarea rows={6} value={telegramDraft.userIds} onChange={(e) => setTelegramDraft((c) => ({ ...c, userIds: e.target.value }))} placeholder="每行一个 Telegram user ID" /></Field></div>
--          <label className="automation-toggle"><input type="checkbox" checked={telegramDraft.enabled} onChange={(e) => setTelegramDraft((c) => ({ ...c, enabled: e.target.checked }))} /> 启用 Telegram 机器人</label>
--        </Dialog>
--      ) : null}
--
-       {automationInputDialog.open ? (
-         <Dialog
-           title={automationInputDialog.mode === 'per-server' ? '自动化按行输入' : automationInputDialog.mode === 'broadcast' ? '自动化统一输入' : '自动化交互输入'}
 diff --git a/src/OrchestrationWorkspace.jsx b/src/OrchestrationWorkspace.jsx
-index 5cb154a..68b25f4 100644
+index 68b25f4..78cb7b2 100644
 --- a/src/OrchestrationWorkspace.jsx
 +++ b/src/OrchestrationWorkspace.jsx
-@@ -13,23 +13,25 @@ const EMPTY = {
-   probe: { name: '', region: '', carrier: '', maxConcurrency: 100, enabled: true },
-   target: { name: '', address: '', allowPrivate: false, checkType: 'tcp', port: 443, interval: 30, timeout: 5, failureThreshold: 3, recoveryThreshold: 2, quorumMode: 'majority', quorumCount: 2, probeIds: [], policyId: '', enabled: true },
-   asset: { name: '', address: '', region: '', carrier: '', labels: '', health: 'unknown', enabled: true, note: '' },
--  pool: { name: '', assetIds: [], allocationMode: 'one', allocationCount: 1, selectionMode: 'ordered', sharingMode: 'exclusive', shareLimit: 1, leaseMinutes: 30, cooldownMinutes: 10, enabled: true, note: '' },
--  account: { name: '', provider: 'huawei', region: 'cn-north-4', projectId: '', zoneAllowlist: '', enabled: true, credentials: {} },
--  zone: { name: '', accountId: '', providerZoneId: '', enabled: true },
--  binding: { name: '', zoneId: '', accountId: '', domain: '', recordName: '@', recordType: 'A', providerRecordId: '', recordLine: '默认', ttl: 60, updateMode: 'managed_replace', ddnsSources: [], backupIps: '', maxActiveIps: 50, pruneStale: true, healthEnabled: true, healthInterval: 30, maxParallel: 20, enabled: true },
-+  pool: { name: '', assetIds: [], newAssetAddresses: '', allocationMode: 'one', allocationCount: 1, selectionMode: 'ordered', sharingMode: 'exclusive', shareLimit: 1, leaseMinutes: 30, cooldownMinutes: 10, enabled: true, note: '' },
-+  account: { name: '', provider: 'huawei', enabled: true, credentials: {} },
-+  binding: { name: '', accountId: '', domain: '', recordType: 'A', recordValues: [], recordLine: '默认', ttl: 60, updateMode: 'managed_replace', ddnsSources: [], backupIps: '', maxActiveIps: 50, pruneStale: true, healthEnabled: true, healthInterval: 30, maxParallel: 20, enabled: true },
-   policy: { name: '', poolIds: [], automationTaskId: '', automationHosts: 'allocated', automationTimeout: 1800, dnsBindingIds: [], approvalMode: 'automatic', autoRollback: true, enabled: true, businessKey: '' }
--  ,bot: { name: '', token: '', enabled: true, userIds: '', groupIds: '', rolesText: '', menuScopes: ['overview', 'probes', 'incidents', 'pools', 'dns', 'automation'] }
-+  ,bot: { name: '统一机器人', token: '', enabled: true, userIds: '', rolesText: '', automationTaskIds: [], menuScopes: ['overview', 'probes', 'incidents', 'pools', 'dns', 'automation'] }
+@@ -7,7 +7,7 @@ const PROVIDERS = {
+   dnsla: 'DNSLA', era: '时代互联 / Eranet', tndns: 'Tnethk', gcore: 'Gcore', edgeone: '腾讯 EdgeOne',
+   ns1: 'IBM NS1 Connect', rainyun: '雨云', dynv6: 'Dynv6', vercel: 'Vercel DNS', spaceship: 'Spaceship'
  };
+-const STATUS = { online: '在线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', unknown: '未检测', queued: '等待执行', pending_approval: '待确认', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', succeeded: '已完成', failed: '失败', rolled_back: '已回滚', active: '使用中', locked: '已锁定', released: '已释放' };
++const STATUS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', unknown: '未检测', queued: '等待执行', pending_approval: '待确认', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', succeeded: '已完成', failed: '失败', rolled_back: '已回滚', active: '使用中', locked: '已锁定', released: '已释放' };
 
- export default function OrchestrationWorkspace({ tab, state, api, onState, toast, Dialog }) {
-   const [section, setSection] = useState(tab === 'probes' ? 'nodes' : tab === 'pools' ? 'assets' : 'accounts');
-   const [editor, setEditor] = useState({ open: false, type: '', value: null });
-   const [install, setInstall] = useState(null);
-+  const [assetImport, setAssetImport] = useState({ open: false, addresses: '', region: '', carrier: '', labels: '' });
-   const sections = tab === 'probes'
--    ? [['nodes', '探针节点'], ['targets', '检查目标'], ['policies', '切换策略'], ['incidents', '故障事件'], ['bots', 'Telegram']]
-+    ? [['nodes', '探针节点'], ['targets', '检查目标'], ['policies', '切换策略'], ['incidents', '故障事件']]
-     : tab === 'pools'
-       ? [['assets', 'IP 资产'], ['pools', '备用池'], ['leases', '当前租约']]
--      : [['accounts', '服务商账号'], ['zones', 'DNS Zone'], ['bindings', '解析绑定'], ['changes', '变更记录']];
-+      : tab === 'telegram'
-+        ? [['bots', '机器人配置']]
-+        : [['accounts', '服务商账号'], ['bindings', '解析绑定'], ['changes', '变更记录']];
+ const EMPTY = {
+   probe: { name: '', region: '', carrier: '', maxConcurrency: 100, enabled: true },
+@@ -34,6 +34,21 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
+         : [['accounts', '服务商账号'], ['bindings', '解析绑定'], ['changes', '变更记录']];
    const active = sections.some(([key]) => key === section) ? section : sections[0][0];
 
++  useEffect(() => {
++    if (tab !== 'probes') return undefined;
++    let cancelled = false;
++    const refresh = async () => {
++      try {
++        const data = await api('/api/state');
++        if (!cancelled) onState(data);
++      } catch (_error) {
++        // The main application handles authentication and connectivity errors.
++      }
++    };
++    const timer = window.setInterval(refresh, 10000);
++    return () => { cancelled = true; window.clearInterval(timer); };
++  }, [api, onState, tab]);
++
    const openCreate = (type) => setEditor({ open: true, type, value: structuredClone(EMPTY[type]) });
-@@ -74,20 +76,29 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
-       toast('已执行回滚');
+   const openEdit = (type, value) => setEditor({ open: true, type, value: normalizeDraft(type, value) });
+   const closeEditor = () => setEditor({ open: false, type: '', value: null });
+@@ -55,6 +70,12 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
+       toast('已删除');
      } catch (error) { toast(error.message); }
    };
-+  const importAssets = async () => {
++  const openProbeInstall = async (id) => {
 +    try {
-+      const data = await api('/api/ip-assets/batch', { method: 'POST', body: JSON.stringify(assetImport) });
-+      onState(data.state);
-+      setAssetImport({ open: false, addresses: '', region: '', carrier: '', labels: '' });
-+      toast(`已导入 ${data.created} 个 IP，复用 ${data.reused} 个`);
++      const data = await api(`/api/probes/${id}/install-command`);
++      setInstall(data);
 +    } catch (error) { toast(error.message); }
 +  };
-
-   return (
-     <section className="ops-workspace">
-       <header className="surface ops-header">
--        <div><span className="ops-eyebrow">{tab === 'probes' ? '可用性与故障编排' : tab === 'pools' ? '地址资源与并发租约' : '多云 DNS 控制平面'}</span><strong>{tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : '解析管理'}</strong></div>
-+        <div><span className="ops-eyebrow">{tab === 'probes' ? '可用性与故障编排' : tab === 'pools' ? '地址资源与并发租约' : tab === 'telegram' ? '统一通知与远程操作' : '多云 DNS 控制平面'}</span><strong>{tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'telegram' ? 'Telegram' : '解析管理'}</strong></div>
-         <div className="ops-health"><i /><span>{summary(tab, state)}</span></div>
+   const rotateProbe = async (id) => {
+     try {
+       const data = await api(`/api/probes/${id}/rotate-token`, { method: 'POST' });
+@@ -93,11 +114,11 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
        </header>
        <div className="ops-tabs" role="tablist">{sections.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setSection(key)}>{label}<em>{countFor(key, state)}</em></button>)}</div>
        <div className="surface ops-content">
--        {renderSection(active, { state, openCreate, openEdit, rotateProbe, executeIncident, rollbackIncident, api, onState, toast })}
-+        {renderSection(active, { state, openCreate, openEdit, rotateProbe, executeIncident, rollbackIncident, openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
+-        {renderSection(active, { state, openCreate, openEdit, rotateProbe, executeIncident, rollbackIncident, openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
++        {renderSection(active, { state, openCreate, openEdit, openProbeInstall, rotateProbe, executeIncident, rollbackIncident, openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
        </div>
 
        {editor.open ? <Dialog title={`${editor.value.id ? '编辑' : '新增'}${typeLabel(editor.type)}`} className="ops-editor-dialog" wide={editor.type !== 'target' && editor.type !== 'policy'} xwide={editor.type === 'target' || editor.type === 'policy'} onClose={closeEditor} footer={<><div>{editor.value.id ? <button className="danger-text" onClick={remove}>删除</button> : null}</div><div className="dialog-actions"><button className="ghost" onClick={closeEditor}>取消</button><button className="primary" onClick={save}>保存</button></div></>}>{renderEditor(editor.type, editor.value, (patch) => setEditor((current) => ({ ...current, value: { ...current.value, ...patch } })), state)}</Dialog> : null}
--      {install ? <Dialog title="探针接入" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><label>安装命令</label><pre>{install.installCommand}</pre><label>一次性注册令牌</label><pre>{install.token}</pre><label>卸载命令</label><pre>{install.uninstallCommand}</pre><span>执行安装命令后，在隐藏输入处粘贴令牌。令牌 15 分钟内有效且仅能使用一次。</span></div></Dialog> : null}
-+      {install ? <Dialog title="探针接入" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装命令" value={install.installCommand} toast={toast} /><CommandBlock label="一次性注册令牌" value={install.token} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>执行安装命令后，在隐藏输入处粘贴令牌。令牌 15 分钟内有效且仅能使用一次。</span></div></Dialog> : null}
-+      {assetImport.open ? <Dialog title="批量导入 IP 资产" className="ops-editor-dialog" wide onClose={() => setAssetImport((current) => ({ ...current, open: false }))} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setAssetImport((current) => ({ ...current, open: false }))}>取消</button><button className="primary" onClick={importAssets}>导入</button></div></>}><EditorGrid><Field label="IP 地址" full><textarea className="ops-batch-ip-input" rows="12" value={assetImport.addresses} onChange={(e) => setAssetImport((current) => ({ ...current, addresses: e.target.value }))} placeholder={'每行一个，也支持空格或逗号分隔\n1.1.1.1\n2001:db8::1'} /></Field><Field label="地区（批量设置）"><input value={assetImport.region} onChange={(e) => setAssetImport((current) => ({ ...current, region: e.target.value }))} /></Field><Field label="运营商（批量设置）"><input value={assetImport.carrier} onChange={(e) => setAssetImport((current) => ({ ...current, carrier: e.target.value }))} /></Field><Field label="标签（逗号分隔）" full><input value={assetImport.labels} onChange={(e) => setAssetImport((current) => ({ ...current, labels: e.target.value }))} /></Field></EditorGrid></Dialog> : null}
+-      {install ? <Dialog title="探针接入" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装命令" value={install.installCommand} toast={toast} /><CommandBlock label="一次性注册令牌" value={install.token} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>执行安装命令后，在隐藏输入处粘贴令牌。令牌 15 分钟内有效且仅能使用一次。</span></div></Dialog> : null}
++      {install ? <Dialog title="探针接入" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装命令" value={install.installCommand} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>安装命令已自动包含注册令牌。令牌默认长期有效，点击“接入命令”重新轮转后旧令牌立即失效。</span></div></Dialog> : null}
+       {assetImport.open ? <Dialog title="批量导入 IP 资产" className="ops-editor-dialog" wide onClose={() => setAssetImport((current) => ({ ...current, open: false }))} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setAssetImport((current) => ({ ...current, open: false }))}>取消</button><button className="primary" onClick={importAssets}>导入</button></div></>}><EditorGrid><Field label="IP 地址" full><textarea className="ops-batch-ip-input" rows="12" value={assetImport.addresses} onChange={(e) => setAssetImport((current) => ({ ...current, addresses: e.target.value }))} placeholder={'每行一个，也支持空格或逗号分隔\n1.1.1.1\n2001:db8::1'} /></Field><Field label="地区（批量设置）"><input value={assetImport.region} onChange={(e) => setAssetImport((current) => ({ ...current, region: e.target.value }))} /></Field><Field label="运营商（批量设置）"><input value={assetImport.carrier} onChange={(e) => setAssetImport((current) => ({ ...current, carrier: e.target.value }))} /></Field><Field label="标签（逗号分隔）" full><input value={assetImport.labels} onChange={(e) => setAssetImport((current) => ({ ...current, labels: e.target.value }))} /></Field></EditorGrid></Dialog> : null}
      </section>
    );
- }
-@@ -98,35 +109,37 @@ function renderSection(section, ctx) {
+@@ -105,7 +126,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
+
+ function renderSection(section, ctx) {
+   const { state } = ctx;
+-  if (section === 'nodes') return <DataView title="探针节点" copy="一台探针可承载多个检查目标" action="新增探针" onAction={() => ctx.openCreate('probe')} empty="还没有探针节点">{state.probes?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.region || '未设置地区'} · ${item.carrier || '未设置线路'} · ${item.agentVersion || '未接入'}`} status={STATUS[item.status] || item.status} tone={item.status === 'online' ? 'ok' : 'muted'} actions={<><button className="ghost" onClick={() => ctx.rotateProbe(item.id)}>接入命令</button><button className="ghost" onClick={() => ctx.openEdit('probe', item)}>编辑</button></>} />)}</DataView>;
++  if (section === 'nodes') return <DataView title="探针节点" copy="一台探针可承载多个检查目标" action="新增探针" onAction={() => ctx.openCreate('probe')} empty="还没有探针节点">{state.probes?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.region || '未设置地区'} · ${item.carrier || '未设置线路'} · ${item.agentVersion || '未接入'} · 最后心跳 ${formatTime(item.lastSeenAt)}`} status={STATUS[item.status] || item.status} tone={item.status === 'online' ? 'ok' : 'muted'} actions={<><button className="ghost" onClick={() => ctx.openProbeInstall(item.id)}>安装命令</button><button className="ghost" onClick={() => ctx.rotateProbe(item.id)}>轮转令牌</button><button className="ghost" onClick={() => ctx.openEdit('probe', item)}>编辑</button></>} />)}</DataView>;
    if (section === 'targets') return <DataView title="检查目标" copy="支持 Ping、TCP 和多探针仲裁" action="新增目标" onAction={() => ctx.openCreate('target')} empty="还没有检查目标">{state.probeTargets?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.checkType === 'ping' ? 'PING' : `TCP:${item.port}`} · ${item.address} · ${item.probeIds?.length || 0} 个探针`} status={STATUS[item.health] || item.health} tone={item.health === 'healthy' ? 'ok' : item.health === 'down' ? 'bad' : 'warn'} actions={<button className="ghost" onClick={() => ctx.openEdit('target', item)}>编辑</button>} />)}</DataView>;
    if (section === 'policies') return <DataView title="切换策略" copy="把检查目标、备用池、自动化和 DNS 串成一条可回滚流程" action="新增策略" onAction={() => ctx.openCreate('policy')} empty="还没有切换策略">{state.failoverPolicies?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.poolIds?.length || 0} 个池 · ${item.dnsBindingIds?.length || 0} 条解析 · ${item.approvalMode === 'telegram' ? '需确认' : '自动执行'}`} status={item.enabled ? '已启用' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('policy', item)}>编辑</button>} />)}</DataView>;
    if (section === 'incidents') return <DataView title="故障事件" copy="每个目标只允许一个活动事件，失败可按快照回滚" empty="还没有故障事件">{state.incidents?.map((item) => <Row key={item.id} title={item.targetName} subtitle={`${formatTime(item.startedAt)} · ${item.message || item.error || item.policyName}`} status={STATUS[item.status] || item.status} tone={item.status === 'succeeded' ? 'ok' : item.status === 'failed' ? 'bad' : 'warn'} actions={<>{['pending_approval', 'failed', 'observing'].includes(item.status) ? <button className="primary" onClick={() => ctx.executeIncident(item.id)}>执行</button> : null}{item.dnsChangeIds?.length && item.status !== 'rolled_back' ? <button className="ghost" onClick={() => ctx.rollbackIncident(item.id)}>回滚</button> : null}</>} />)}</DataView>;
--  if (section === 'bots') return <DataView title="Telegram 机器人" copy="多个 Bot 可分别授权用户、群组和菜单范围" action="新增机器人" onAction={() => ctx.openCreate('bot')} empty="还没有 Telegram 机器人">{state.telegramBots?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.userIds?.length || 0} 个用户 · ${item.groupIds?.length || 0} 个群组 · ${item.menuScopes?.length || 0} 个菜单`} status={item.enabled && item.configured ? '运行中' : item.configured ? '已停用' : '未配置 Token'} tone={item.enabled && item.configured ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('bot', item)}>编辑</button>} />)}</DataView>;
--  if (section === 'assets') return <DataView title="IP 资产" copy="一个 IP 可加入多个备用池并服务多个业务" action="新增 IP" onAction={() => ctx.openCreate('asset')} empty="还没有 IP 资产">{state.ipAssets?.map((item) => <Row key={item.id} title={item.name || item.address} subtitle={`${item.address} · ${item.region || '未设置地区'} · ${item.carrier || '未设置线路'}`} status={STATUS[item.health] || item.health} tone={item.health === 'healthy' ? 'ok' : item.health === 'unhealthy' ? 'bad' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('asset', item)}>编辑</button>} />)}</DataView>;
-+  if (section === 'bots') return <DataView title="统一 Telegram 机器人" copy="一个机器人统一管理探针、故障、备用池、解析和多个自动化任务" action={state.telegramBots?.length ? null : '配置机器人'} onAction={() => ctx.openCreate('bot')} empty="还没有配置 Telegram 机器人">{state.telegramBots?.map((item) => <Row key={item.id} title="统一机器人" subtitle={`${item.userIds?.length || 0} 个授权用户 · ${item.automationTaskIds?.length || 0} 个自动化任务`} status={item.enabled && item.configured ? '运行中' : item.configured ? '已停用' : '未配置 Token'} tone={item.enabled && item.configured ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('bot', item)}>编辑</button>} />)}</DataView>;
-+  if (section === 'assets') return <DataView title="IP 资产" copy="支持一次导入最多 5000 个 IPv4 / IPv6，自动去重" action="批量导入 IP" secondaryAction="单个新增" onAction={ctx.openAssetImport} onSecondaryAction={() => ctx.openCreate('asset')} empty="还没有 IP 资产">{state.ipAssets?.map((item) => <Row key={item.id} title={item.name || item.address} subtitle={`${item.address} · ${item.region || '未设置地区'} · ${item.carrier || '未设置线路'}`} status={STATUS[item.health] || item.health} tone={item.health === 'healthy' ? 'ok' : item.health === 'unhealthy' ? 'bad' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('asset', item)}>编辑</button>} />)}</DataView>;
-   if (section === 'pools') return <DataView title="备用池" copy="支持单个、指定数量、全部取用和多种共享策略" action="新增备用池" onAction={() => ctx.openCreate('pool')} empty="还没有备用池">{state.ipPools?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.assetIds?.length || 0} 个 IP · ${allocationLabel(item)} · ${sharingLabel(item.sharingMode)}`} status={item.enabled ? '可分配' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('pool', item)}>编辑</button>} />)}</DataView>;
-   if (section === 'leases') return <DataView title="IP 租约" copy="共享容量与独占锁均由服务端事务校验" empty="还没有租约记录">{state.ipLeases?.map((item) => { const asset = state.ipAssets?.find((entry) => entry.id === item.assetId); const pool = state.ipPools?.find((entry) => entry.id === item.poolId); return <Row key={item.id} title={asset?.address || item.assetId} subtitle={`${pool?.name || '未知池'} · 到期 ${formatTime(item.expiresAt)}`} status={STATUS[item.status] || item.status} tone={item.status === 'active' ? 'ok' : item.status === 'released' ? 'muted' : 'warn'} actions={['active', 'locked'].includes(item.status) ? <button className="ghost" onClick={async () => { const data = await ctx.api(`/api/ip-leases/${item.id}/release`, { method: 'POST' }); ctx.onState(data.state); ctx.toast('租约已释放'); }}>释放</button> : null} />; })}</DataView>;
--  if (section === 'accounts') return <DataView title="服务商账号" copy="支持多个服务商、同服务商多个账号和 Zone 白名单" action="新增账号" onAction={() => ctx.openCreate('account')} empty="还没有 DNS 服务商账号">{state.dnsAccounts?.map((item) => <Row key={item.id} title={item.name} subtitle={`${PROVIDERS[item.provider] || item.provider} · ${item.zoneAllowlist?.length || 0} 个授权 Zone`} status={item.configured ? (item.status === 'healthy' ? '连接正常' : '待测试') : '未配置凭证'} tone={item.status === 'healthy' ? 'ok' : 'warn'} actions={<><button className="ghost" onClick={async () => { try { await ctx.api(`/api/dns-accounts/${item.id}/test`, { method: 'POST' }); ctx.toast('连接测试成功'); } catch (error) { ctx.toast(error.message); } }}>测试</button><button className="ghost" onClick={() => ctx.openEdit('account', item)}>编辑</button></>} />)}</DataView>;
--  if (section === 'zones') return <DataView title="DNS Zone" copy="一个权威 Zone 只绑定一个主写入账号" action="新增 Zone" onAction={() => ctx.openCreate('zone')} empty="还没有 DNS Zone">{state.dnsZones?.map((item) => <Row key={item.id} title={item.name} subtitle={`${state.dnsAccounts?.find((entry) => entry.id === item.accountId)?.name || '未关联账号'} · ${item.providerZoneId || '未填写 Zone ID'}`} status={item.enabled ? '已托管' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('zone', item)}>编辑</button>} />)}</DataView>;
--  if (section === 'bindings') return <DataView title="解析绑定" copy="支持多来源解析、备用域名、备用 IP、A/AAAA、健康检测和失效清理" action="新增解析绑定" onAction={() => ctx.openCreate('binding')} empty="还没有解析绑定">{state.dnsBindings?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.recordType} · ${item.domain} · ${item.ddnsSources?.length || 0} 个来源 · ${item.backupIps?.length || 0} 个备用 IP`} status={item.enabled ? '已启用' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} actions={<><button className="ghost" onClick={async () => { try { const data = await ctx.api(`/api/dns-bindings/${item.id}/sync`, { method: 'POST' }); ctx.onState(data.state); ctx.toast('解析已同步'); } catch (error) { ctx.toast(error.message); } }}>立即同步</button><button className="ghost" onClick={() => ctx.openEdit('binding', item)}>编辑</button></>} />)}</DataView>;
-+  if (section === 'accounts') return <DataView title="服务商账号" copy="保存凭证后，系统按完整域名自动识别托管域和解析记录" action="新增账号" onAction={() => ctx.openCreate('account')} empty="还没有 DNS 服务商账号">{state.dnsAccounts?.map((item) => <Row key={item.id} title={item.name} subtitle={PROVIDERS[item.provider] || item.provider} status={item.configured ? (item.status === 'healthy' ? '连接正常' : '待测试') : '未配置凭证'} tone={item.status === 'healthy' ? 'ok' : 'warn'} actions={<><button className="ghost" onClick={async () => { try { await ctx.api(`/api/dns-accounts/${item.id}/test`, { method: 'POST' }); ctx.toast('连接测试成功'); } catch (error) { ctx.toast(error.message); } }}>测试</button><button className="ghost" onClick={() => ctx.openEdit('account', item)}>编辑</button></>} />)}</DataView>;
-+  if (section === 'bindings') return <DataView title="解析绑定" copy="按完整域名管理 A、AAAA、CNAME、TXT、NS、CAA 记录和多值地址" action="新增解析绑定" onAction={() => ctx.openCreate('binding')} empty="还没有解析绑定">{state.dnsBindings?.map((item) => { const count = ['A', 'AAAA'].includes(item.recordType) ? (item.managedValues?.length || item.backupIps?.length || 0) : (item.recordValues?.length || 0); return <Row key={item.id} title={item.name} subtitle={`${item.recordType} · ${item.domain} · ${count} 个记录值`} status={item.enabled ? '已启用' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} actions={<><button className="ghost" onClick={async () => { try { const data = await ctx.api(`/api/dns-bindings/${item.id}/sync`, { method: 'POST' }); ctx.onState(data.state); ctx.toast(`已同步 ${data.values?.length || 0} 个记录值`); } catch (error) { ctx.toast(error.message); } }}>立即同步</button><button className="ghost" onClick={() => ctx.openEdit('binding', item)}>编辑</button></>} />; })}</DataView>;
-   return <DataView title="DNS 变更" copy="保留变更前后快照，可从故障事件执行整组回滚" empty="还没有 DNS 变更记录">{state.dnsChanges?.map((item) => <Row key={item.id} title={item.domain} subtitle={`${item.beforeValues?.join(', ') || '空'} → ${item.afterValues?.join(', ') || '空'} · ${formatTime(item.createdAt)}`} status={item.status === 'rolled_back' ? '已回滚' : '已应用'} tone={item.status === 'rolled_back' ? 'muted' : 'ok'} />)}</DataView>;
- }
-
--function DataView({ title, copy, action, onAction, empty, children }) {
-+function DataView({ title, copy, action, secondaryAction, onAction, onSecondaryAction, empty, children }) {
-   const items = Array.isArray(children) ? children.filter(Boolean) : children ? [children] : [];
--  return <><div className="ops-content-head"><div><strong>{title}</strong><span>{copy}</span></div>{action ? <button className="primary" onClick={onAction}>{action}</button> : null}</div><div className="ops-list">{items.length ? items : <div className="ops-empty"><strong>{empty}</strong><span>使用右上角操作开始配置。</span></div>}</div></>;
-+  return <><div className="ops-content-head"><div><strong>{title}</strong><span>{copy}</span></div>{action ? <div className="ops-content-actions">{secondaryAction ? <button className="ghost" onClick={onSecondaryAction}>{secondaryAction}</button> : null}<button className="primary" onClick={onAction}>{action}</button></div> : null}</div><div className="ops-list">{items.length ? items : <div className="ops-empty"><strong>{empty}</strong><span>使用右上角操作开始配置。</span></div>}</div></>;
- }
-
- function Row({ title, subtitle, status, tone = 'muted', actions }) {
-   return <article className="ops-row"><div className="ops-row-main"><span className={`ops-dot ${tone}`} /><div><strong>{title}</strong><span>{subtitle}</span></div></div><div className="ops-row-side"><em className={`ops-status ${tone}`}>{status}</em>{actions ? <div className="ops-row-actions">{actions}</div> : null}</div></article>;
- }
-
-+function CommandBlock({ label, value, toast }) {
-+  return <div className="ops-command-block"><div><label>{label}</label><button className="ghost" type="button" onClick={async () => { await navigator.clipboard.writeText(value); toast('已复制'); }}>复制</button></div><pre>{value}</pre></div>;
-+}
-+
- function renderEditor(type, value, patch, state) {
-   if (type === 'probe') return <EditorGrid><Field label="探针名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="地区"><input value={value.region} onChange={(e) => patch({ region: e.target.value })} placeholder="例如：上海" /></Field><Field label="运营商/线路"><input value={value.carrier} onChange={(e) => patch({ carrier: e.target.value })} placeholder="例如：电信" /></Field><Field label="最大检查并发"><input type="number" min="1" max="1000" value={value.maxConcurrency} onChange={(e) => patch({ maxConcurrency: e.target.value })} /></Field><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用探针</Toggle></EditorGrid>;
-   if (type === 'target') return <EditorGrid><Field label="目标名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="地址"><input value={value.address} onChange={(e) => patch({ address: e.target.value })} placeholder="IP 或域名" /></Field><Field label="检查类型"><select value={value.checkType} onChange={(e) => patch({ checkType: e.target.value })}><option value="tcp">TCP</option><option value="ping">Ping</option></select></Field><Field label="TCP 端口"><input type="number" disabled={value.checkType === 'ping'} value={value.port} onChange={(e) => patch({ port: e.target.value })} /></Field><Field label="检查间隔（秒）"><input type="number" value={value.interval} onChange={(e) => patch({ interval: e.target.value })} /></Field><Field label="超时（秒）"><input type="number" value={value.timeout} onChange={(e) => patch({ timeout: e.target.value })} /></Field><Field label="连续失败"><input type="number" value={value.failureThreshold} onChange={(e) => patch({ failureThreshold: e.target.value })} /></Field><Field label="连续恢复"><input type="number" value={value.recoveryThreshold} onChange={(e) => patch({ recoveryThreshold: e.target.value })} /></Field><Field label="仲裁方式"><select value={value.quorumMode} onChange={(e) => patch({ quorumMode: e.target.value })}><option value="majority">多数探针失败</option><option value="all">全部探针失败</option><option value="count">指定数量失败</option></select></Field><Field label="指定数量"><input type="number" value={value.quorumCount} disabled={value.quorumMode !== 'count'} onChange={(e) => patch({ quorumCount: e.target.value })} /></Field><Multi label="负责探针" items={state.probes} value={value.probeIds} onChange={(probeIds) => patch({ probeIds })} /><Field label="切换策略"><select value={value.policyId} onChange={(e) => patch({ policyId: e.target.value })}><option value="">仅监控，不触发</option>{state.failoverPolicies?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Toggle checked={value.allowPrivate} onChange={(allowPrivate) => patch({ allowPrivate })}>允许检查私网地址</Toggle><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用检查</Toggle></EditorGrid>;
-   if (type === 'asset') return <EditorGrid><Field label="资产名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="IP 地址"><input value={value.address} onChange={(e) => patch({ address: e.target.value })} /></Field><Field label="地区"><input value={value.region} onChange={(e) => patch({ region: e.target.value })} /></Field><Field label="运营商"><input value={value.carrier} onChange={(e) => patch({ carrier: e.target.value })} /></Field><Field label="健康状态"><select value={value.health} onChange={(e) => patch({ health: e.target.value })}><option value="unknown">未检测</option><option value="healthy">正常</option><option value="unhealthy">异常</option></select></Field><Field label="标签"><input value={value.labels} onChange={(e) => patch({ labels: e.target.value })} placeholder="逗号分隔" /></Field><Field label="备注" full><textarea value={value.note} onChange={(e) => patch({ note: e.target.value })} /></Field><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>允许加入备用池</Toggle></EditorGrid>;
--  if (type === 'pool') return <EditorGrid><Field label="备用池名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="取用方式"><select value={value.allocationMode} onChange={(e) => patch({ allocationMode: e.target.value })}><option value="one">一次取一个</option><option value="count">取指定数量</option><option value="all">取全部可用 IP</option></select></Field><Field label="取用数量"><input type="number" disabled={value.allocationMode !== 'count'} value={value.allocationCount} onChange={(e) => patch({ allocationCount: e.target.value })} /></Field><Field label="选择顺序"><select value={value.selectionMode} onChange={(e) => patch({ selectionMode: e.target.value })}><option value="ordered">固定顺序</option><option value="random">随机</option><option value="weighted">按权重</option></select></Field><Field label="共享策略"><select value={value.sharingMode} onChange={(e) => patch({ sharingMode: e.target.value })}><option value="exclusive">独占</option><option value="target">同目标共享</option><option value="business">同业务共享</option><option value="limited">限量共享</option><option value="unlimited">完全共享</option></select></Field><Field label="最大引用数"><input type="number" disabled={value.sharingMode !== 'limited'} value={value.shareLimit} onChange={(e) => patch({ shareLimit: e.target.value })} /></Field><Field label="租约（分钟）"><input type="number" value={value.leaseMinutes} onChange={(e) => patch({ leaseMinutes: e.target.value })} /></Field><Field label="冷却（分钟）"><input type="number" value={value.cooldownMinutes} onChange={(e) => patch({ cooldownMinutes: e.target.value })} /></Field><Multi label="IP 资产" items={state.ipAssets} value={value.assetIds} onChange={(assetIds) => patch({ assetIds })} secondary={(item) => item.address} /><Field label="备注" full><textarea value={value.note} onChange={(e) => patch({ note: e.target.value })} /></Field></EditorGrid>;
--  if (type === 'account') return <EditorGrid><Field label="账号名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="服务商"><select value={value.provider} onChange={(e) => patch({ provider: e.target.value, credentials: {} })}>{Object.entries(PROVIDERS).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></Field><Field label="区域"><input value={value.region} onChange={(e) => patch({ region: e.target.value })} /></Field><Field label="Project ID"><input value={value.projectId} onChange={(e) => patch({ projectId: e.target.value })} /></Field>{credentialFields(value, patch)}<Field label="Zone 白名单" full><textarea rows="4" value={value.zoneAllowlist} onChange={(e) => patch({ zoneAllowlist: e.target.value })} placeholder="每行一个允许操作的 Zone" /></Field><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用账号</Toggle></EditorGrid>;
--  if (type === 'zone') return <EditorGrid><Field label="Zone"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} placeholder="example.com" /></Field><Field label="服务商账号"><select value={value.accountId} onChange={(e) => patch({ accountId: e.target.value })}><option value="">请选择</option>{state.dnsAccounts?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="服务商 Zone ID" full><input value={value.providerZoneId} onChange={(e) => patch({ providerZoneId: e.target.value })} /></Field><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用托管</Toggle></EditorGrid>;
-+  if (type === 'pool') return <EditorGrid><Field label="备用池名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="取用方式"><select value={value.allocationMode} onChange={(e) => patch({ allocationMode: e.target.value })}><option value="one">一次取一个</option><option value="count">取指定数量</option><option value="all">取全部可用 IP</option></select></Field><Field label="取用数量"><input type="number" disabled={value.allocationMode !== 'count'} value={value.allocationCount} onChange={(e) => patch({ allocationCount: e.target.value })} /></Field><Field label="选择顺序"><select value={value.selectionMode} onChange={(e) => patch({ selectionMode: e.target.value })}><option value="ordered">固定顺序</option><option value="random">随机</option><option value="weighted">按权重</option></select></Field><Field label="共享策略"><select value={value.sharingMode} onChange={(e) => patch({ sharingMode: e.target.value })}><option value="exclusive">独占</option><option value="target">同目标共享</option><option value="business">同业务共享</option><option value="limited">限量共享</option><option value="unlimited">完全共享</option></select></Field><Field label="最大引用数"><input type="number" disabled={value.sharingMode !== 'limited'} value={value.shareLimit} onChange={(e) => patch({ shareLimit: e.target.value })} /></Field><Field label="租约（分钟）"><input type="number" value={value.leaseMinutes} onChange={(e) => patch({ leaseMinutes: e.target.value })} /></Field><Field label="冷却（分钟）"><input type="number" value={value.cooldownMinutes} onChange={(e) => patch({ cooldownMinutes: e.target.value })} /></Field><Field label="直接批量加入 IP" full><textarea className="ops-batch-ip-input" rows="7" value={value.newAssetAddresses || ''} onChange={(e) => patch({ newAssetAddresses: e.target.value })} placeholder={'每行一个，也支持空格或逗号分隔；不存在的资产会自动创建\n1.1.1.1\n2001:db8::1'} /></Field><Multi label="已有 IP 资产" items={state.ipAssets} value={value.assetIds} onChange={(assetIds) => patch({ assetIds })} secondary={(item) => item.address} searchable selectable /><Field label="备注" full><textarea value={value.note} onChange={(e) => patch({ note: e.target.value })} /></Field></EditorGrid>;
-+  if (type === 'account') return <EditorGrid><Field label="账号名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="服务商"><select value={value.provider} onChange={(e) => patch({ provider: e.target.value, credentials: {} })}>{Object.entries(PROVIDERS).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></Field>{credentialFields(value, patch)}<Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用账号</Toggle></EditorGrid>;
-   if (type === 'binding') return <BindingEditor value={value} patch={patch} state={state} />;
--  if (type === 'bot') return <EditorGrid><Field label="机器人名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="Bot Token"><input type="password" value={value.token} onChange={(e) => patch({ token: e.target.value })} placeholder={value.configured ? '留空保持原 Token' : 'BotFather Token'} /></Field><Field label="授权用户 ID" full><textarea rows="4" value={value.userIds} onChange={(e) => patch({ userIds: e.target.value })} placeholder="每行一个用户 ID" /></Field><Field label="授权群组 ID" full><textarea rows="3" value={value.groupIds} onChange={(e) => patch({ groupIds: e.target.value })} placeholder="每行一个群组 ID；留空允许私聊用户" /></Field><Field label="角色分配" full><textarea rows="5" value={value.rolesText} onChange={(e) => patch({ rolesText: e.target.value })} placeholder={'每行：用户ID=角色\n角色：owner / admin / operator / approver / viewer / auditor'} /></Field><Multi label="允许菜单" items={[['overview','总览'],['probes','探针'],['incidents','故障事件'],['pools','备用池'],['dns','解析管理'],['automation','自动化']].map(([id,name]) => ({ id,name }))} value={value.menuScopes} onChange={(menuScopes) => patch({ menuScopes })} /><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用机器人</Toggle></EditorGrid>;
--  return <EditorGrid><Field label="策略名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="业务标识"><input value={value.businessKey} onChange={(e) => patch({ businessKey: e.target.value })} placeholder="用于同业务共享 IP" /></Field><Multi label="备用池（按顺序兜底）" items={state.ipPools} value={value.poolIds} onChange={(poolIds) => patch({ poolIds })} /><Field label="自动化任务"><select value={value.automationTaskId} onChange={(e) => patch({ automationTaskId: e.target.value })}><option value="">不执行自动化</option>{state.automationTasks?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="自动化目标"><select value={value.automationHosts} onChange={(e) => patch({ automationHosts: e.target.value })}><option value="allocated">分配出来的备用 IP</option><option value="target">故障目标地址</option></select></Field><Field label="任务超时（秒）"><input type="number" value={value.automationTimeout} onChange={(e) => patch({ automationTimeout: e.target.value })} /></Field><Multi label="解析绑定" items={state.dnsBindings} value={value.dnsBindingIds} onChange={(dnsBindingIds) => patch({ dnsBindingIds })} secondary={(item) => item.domain} /><Field label="执行方式"><select value={value.approvalMode} onChange={(e) => patch({ approvalMode: e.target.value })}><option value="automatic">自动执行</option><option value="telegram">Telegram / Web 确认</option></select></Field><Toggle checked={value.autoRollback} onChange={(autoRollback) => patch({ autoRollback })}>失败时自动回滚</Toggle><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用策略</Toggle></EditorGrid>;
-+  if (type === 'bot') return <BotEditor value={value} patch={patch} state={state} />;
-+  return <EditorGrid><Field label="策略名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="业务标识"><input value={value.businessKey} onChange={(e) => patch({ businessKey: e.target.value })} placeholder="用于同业务共享 IP" /></Field><Multi label="备用池（按顺序兜底）" items={state.ipPools} value={value.poolIds} onChange={(poolIds) => patch({ poolIds })} /><Field label="自动化任务"><select value={value.automationTaskId} onChange={(e) => patch({ automationTaskId: e.target.value })}><option value="">不执行自动化</option>{state.automationTasks?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="自动化目标"><select value={value.automationHosts} onChange={(e) => patch({ automationHosts: e.target.value })}><option value="allocated">分配出来的备用 IP</option><option value="target">故障目标地址</option></select></Field><Field label="任务超时（秒）"><input type="number" value={value.automationTimeout} onChange={(e) => patch({ automationTimeout: e.target.value })} /></Field><Multi label="A/AAAA 解析绑定" items={state.dnsBindings?.filter((item) => ['A', 'AAAA'].includes(item.recordType))} value={value.dnsBindingIds} onChange={(dnsBindingIds) => patch({ dnsBindingIds })} secondary={(item) => item.domain} /><Field label="执行方式"><select value={value.approvalMode} onChange={(e) => patch({ approvalMode: e.target.value })}><option value="automatic">自动执行</option><option value="telegram">Telegram / Web 确认</option></select></Field><Toggle checked={value.autoRollback} onChange={(autoRollback) => patch({ autoRollback })}>失败时自动回滚</Toggle><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用策略</Toggle></EditorGrid>;
- }
-
- function credentialFields(value, patch) {
-@@ -137,43 +150,49 @@ function credentialFields(value, patch) {
-   if (value.provider === 'godaddy') return <><Field label="API Key"><input type="password" value={value.credentials?.apiKey || ''} onChange={(e) => update('apiKey', e.target.value)} /></Field><Field label="API Secret"><input type="password" value={value.credentials?.apiSecret || ''} onChange={(e) => update('apiSecret', e.target.value)} /></Field></>;
-   if (value.provider === 'porkbun') return <><Field label="API Key"><input type="password" value={value.credentials?.apiKey || ''} onChange={(e) => update('apiKey', e.target.value)} /></Field><Field label="Secret API Key"><input type="password" value={value.credentials?.secretApiKey || ''} onChange={(e) => update('secretApiKey', e.target.value)} /></Field></>;
-   if (value.provider === 'cloudns') return <><Field label="Auth ID"><input value={value.credentials?.authId || ''} onChange={(e) => update('authId', e.target.value)} /></Field><Field label="Auth Password"><input type="password" value={value.credentials?.authPassword || ''} onChange={(e) => update('authPassword', e.target.value)} /></Field></>;
--  if (value.provider === 'callback' || ['aliyun_esa','baidu','namecheap','namesilo','dynadot','dnsla','era','tndns','gcore','edgeone','ns1','rainyun','dynv6','vercel','spaceship'].includes(value.provider)) return <><Field label="HTTPS API 地址" full><input value={value.credentials?.endpoint || ''} onChange={(e) => update('endpoint', e.target.value)} placeholder="https://example.com/ddns" /></Field><Field label="访问令牌 / API Key" full><input type="password" value={value.credentials?.token || ''} onChange={(e) => update('token', e.target.value)} /></Field><Field label="自定义请求头（JSON）" full><textarea rows="3" value={value.credentials?.headers || ''} onChange={(e) => update('headers', e.target.value)} placeholder='{"Authorization":"Bearer ..."}' /></Field><span className="ops-field-hint">该接口将收到 JSON：domain、recordName、recordType、ttl、values、zone。</span></>;
-+  if (value.provider === 'callback' || ['aliyun_esa','baidu','namecheap','namesilo','dynadot','dnsla','era','tndns','gcore','edgeone','ns1','rainyun','dynv6','vercel','spaceship'].includes(value.provider)) return <><Field label="HTTPS API 地址" full><input value={value.credentials?.endpoint || ''} onChange={(e) => update('endpoint', e.target.value)} placeholder="https://example.com/ddns" /></Field><Field label="访问令牌 / API Key" full><input type="password" value={value.credentials?.token || ''} onChange={(e) => update('token', e.target.value)} /></Field><Field label="自定义请求头（JSON）" full><textarea rows="3" value={value.credentials?.headers || ''} onChange={(e) => update('headers', e.target.value)} placeholder='{"Authorization":"Bearer ..."}' /></Field></>;
-   return <><Field label="Access Key"><input type="password" value={value.credentials?.accessKey || ''} onChange={(e) => update('accessKey', e.target.value)} /></Field><Field label="Secret Key"><input type="password" value={value.credentials?.secretKey || ''} onChange={(e) => update('secretKey', e.target.value)} /></Field></>;
- }
-
-+function BotEditor({ value, patch, state }) {
-+  const features = [['overview','总览'],['probes','探针'],['incidents','故障事件'],['pools','备用池'],['dns','解析管理'],['automation','自动化']].map(([id, name]) => ({ id, name }));
-+  return <EditorGrid><Field label="Bot Token" full><input type="password" value={value.token} onChange={(e) => patch({ token: e.target.value })} placeholder={value.configured ? '留空保持原 Token' : 'BotFather Token'} /></Field><Field label="授权用户 ID" full><textarea rows="5" value={value.userIds} onChange={(e) => patch({ userIds: e.target.value })} placeholder="每行一个用户 ID" /></Field><Field label="角色分配" full><textarea rows="5" value={value.rolesText} onChange={(e) => patch({ rolesText: e.target.value })} placeholder={'每行：用户ID=角色\n角色：owner / admin / operator / approver / viewer / auditor'} /></Field><Multi label="允许功能" items={features} value={value.menuScopes} onChange={(menuScopes) => patch({ menuScopes })} /><Multi label="允许执行的自动化任务" items={state.automationTasks} value={value.automationTaskIds || []} onChange={(automationTaskIds) => patch({ automationTaskIds })} searchable selectable /><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用机器人</Toggle></EditorGrid>;
-+}
-+
- function BindingEditor({ value, patch, state }) {
-   const sources = Array.isArray(value.ddnsSources) ? value.ddnsSources : [];
-+  const addressRecord = ['A', 'AAAA'].includes(value.recordType);
-   const updateSource = (index, next) => patch({ ddnsSources: sources.map((item, current) => current === index ? { ...item, ...next } : item) });
-   return <EditorGrid>
-     <Field label="绑定名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field>
-     <Field label="服务商账号"><select value={value.accountId} onChange={(e) => patch({ accountId: e.target.value })}><option value="">请选择</option>{state.dnsAccounts?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
--    <Field label="DNS Zone"><select value={value.zoneId} onChange={(e) => patch({ zoneId: e.target.value })}><option value="">请选择</option>{state.dnsZones?.filter((item) => !value.accountId || item.accountId === value.accountId).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
--    <Field label="完整域名"><input value={value.domain} onChange={(e) => patch({ domain: e.target.value })} /></Field>
--    <Field label="主机记录"><input value={value.recordName} onChange={(e) => patch({ recordName: e.target.value })} /></Field>
--    <Field label="记录类型"><select value={value.recordType} onChange={(e) => patch({ recordType: e.target.value })}><option>A</option><option>AAAA</option></select></Field>
--    <Field label="服务商 Record ID（可多个）" full><textarea rows="2" value={(value.providerRecordIds || [value.providerRecordId]).filter(Boolean).join('\n')} onChange={(e) => patch({ providerRecordIds: e.target.value.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean) })} placeholder="华为云可留空，其他服务商可填多个 Record ID" /></Field>
-+    <Field label="完整域名" full><input value={value.domain} onChange={(e) => patch({ domain: e.target.value })} placeholder="例如：www.example.com" /></Field>
-+    <Field label="记录类型"><select value={value.recordType} onChange={(e) => patch({ recordType: e.target.value })}><option>A</option><option>AAAA</option><option>CNAME</option><option>TXT</option><option>NS</option><option>CAA</option></select></Field>
-     <Field label="TTL"><input type="number" value={value.ttl} onChange={(e) => patch({ ttl: e.target.value })} /></Field>
--    <Field label="更新方式"><select value={value.updateMode} onChange={(e) => patch({ updateMode: e.target.value })}><option value="append">追加 IP</option><option value="managed_replace">覆盖托管值</option><option value="replace">完全替换</option></select></Field>
--    <div className="ops-multi"><strong>主/备用解析来源</strong><div className="ops-source-list">{sources.map((source, index) => <div className="ops-source-row" key={source.id || index}><input value={source.name || ''} placeholder="来源名称" onChange={(e) => updateSource(index, { name: e.target.value })} /><input value={source.domain || ''} placeholder="主域名" onChange={(e) => updateSource(index, { domain: e.target.value })} /><input value={source.backupDomain || ''} placeholder="备用域名（可选）" onChange={(e) => updateSource(index, { backupDomain: e.target.value })} /><button className="icon-button danger" title="删除来源" onClick={() => patch({ ddnsSources: sources.filter((_, current) => current !== index) })}>×</button></div>)}<button className="ghost" onClick={() => patch({ ddnsSources: [...sources, { id: crypto.randomUUID(), name: '', domain: '', backupDomain: '' }] })}>添加来源</button></div></div>
--    <Field label="固定备用 IP（每行一个）" full><textarea rows="3" value={(value.backupIps || []).join?.('\n') || value.backupIps || ''} onChange={(e) => patch({ backupIps: e.target.value.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean) })} /></Field>
--    <Field label="活动地址上限"><input type="number" min="1" max="50" value={value.maxActiveIps} onChange={(e) => patch({ maxActiveIps: e.target.value })} /></Field>
--    <Field label="健康检测间隔（秒）"><input type="number" value={value.healthInterval} onChange={(e) => patch({ healthInterval: e.target.value })} /></Field>
--    <Field label="检测并发"><input type="number" value={value.maxParallel} onChange={(e) => patch({ maxParallel: e.target.value })} /></Field>
--    <Toggle checked={value.pruneStale} onChange={(pruneStale) => patch({ pruneStale })}>清理失效/过期地址</Toggle><Toggle checked={value.healthEnabled} onChange={(healthEnabled) => patch({ healthEnabled })}>启用健康检测</Toggle><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用解析绑定</Toggle>
-+    {addressRecord ? <Field label="更新方式"><select value={value.updateMode} onChange={(e) => patch({ updateMode: e.target.value })}><option value="append">追加 IP</option><option value="managed_replace">覆盖托管值</option><option value="replace">完全替换</option></select></Field> : null}
-+    {addressRecord ? <><div className="ops-multi"><strong>主/备用解析来源</strong><div className="ops-source-list">{sources.map((source, index) => <div className="ops-source-row" key={source.id || index}><input value={source.name || ''} placeholder="来源名称" onChange={(e) => updateSource(index, { name: e.target.value })} /><input value={source.domain || ''} placeholder="主域名" onChange={(e) => updateSource(index, { domain: e.target.value })} /><input value={source.backupDomain || ''} placeholder="备用域名（可选）" onChange={(e) => updateSource(index, { backupDomain: e.target.value })} /><button className="icon-button danger" title="删除来源" onClick={() => patch({ ddnsSources: sources.filter((_, current) => current !== index) })}>×</button></div>)}<button className="ghost" onClick={() => patch({ ddnsSources: [...sources, { id: crypto.randomUUID(), name: '', domain: '', backupDomain: '' }] })}>添加来源</button></div></div><Field label="固定备用 IP（每行一个）" full><textarea rows="4" value={(value.backupIps || []).join?.('\n') || value.backupIps || ''} onChange={(e) => patch({ backupIps: e.target.value.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean) })} /></Field><Field label="活动地址上限"><input type="number" min="1" max="50" value={value.maxActiveIps} onChange={(e) => patch({ maxActiveIps: e.target.value })} /></Field><Field label="健康检测间隔（秒）"><input type="number" value={value.healthInterval} onChange={(e) => patch({ healthInterval: e.target.value })} /></Field><Field label="检测并发"><input type="number" value={value.maxParallel} onChange={(e) => patch({ maxParallel: e.target.value })} /></Field><Toggle checked={value.pruneStale} onChange={(pruneStale) => patch({ pruneStale })}>清理失效/过期地址</Toggle><Toggle checked={value.healthEnabled} onChange={(healthEnabled) => patch({ healthEnabled })}>启用健康检测</Toggle></> : <Field label={value.recordType === 'CNAME' ? '记录值（单个域名）' : '记录值（每行一个）'} full><textarea rows="7" value={(value.recordValues || []).join?.('\n') || value.recordValues || ''} onChange={(e) => patch({ recordValues: e.target.value.split(/\n+/).map((item) => item.trim()).filter(Boolean) })} /></Field>}
-+    <Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用解析绑定</Toggle>
-   </EditorGrid>;
- }
-
- function EditorGrid({ children }) { return <div className="ops-editor-grid">{children}</div>; }
- function Field({ label, children, full }) { return <label className={full ? 'ops-field full' : 'ops-field'}><span>{label}</span>{children}</label>; }
- function Toggle({ checked, onChange, children }) { return <label className="ops-toggle"><input type="checkbox" checked={Boolean(checked)} onChange={(e) => onChange(e.target.checked)} /><span>{children}</span></label>; }
--function Multi({ label, items = [], value = [], onChange, secondary }) { return <div className="ops-multi"><strong>{label}</strong><div>{items.map((item) => <label key={item.id}><input type="checkbox" checked={value.includes(item.id)} onChange={() => onChange(value.includes(item.id) ? value.filter((id) => id !== item.id) : [...value, item.id])} /><span>{item.name || item.address}<em>{secondary?.(item)}</em></span></label>)}</div></div>; }
--
--function resourceFor(type) { return ({ probe: 'probes', target: 'probe-targets', asset: 'ip-assets', pool: 'ip-pools', account: 'dns-accounts', zone: 'dns-zones', binding: 'dns-bindings', policy: 'failover-policies', bot: 'telegram-bots' })[type]; }
--function typeLabel(type) { return ({ probe: '探针', target: '检查目标', asset: 'IP 资产', pool: '备用池', account: 'DNS 账号', zone: 'DNS Zone', binding: '解析绑定', policy: '切换策略', bot: 'Telegram 机器人' })[type]; }
--function normalizeDraft(type, value) { const draft = { ...structuredClone(EMPTY[type]), ...structuredClone(value) }; if (type === 'asset') draft.labels = (value.labels || []).join(', '); if (type === 'account') { draft.zoneAllowlist = (value.zoneAllowlist || []).join('\n'); draft.credentials = {}; } if (type === 'bot') { draft.token = ''; draft.userIds = (value.userIds || []).join('\n'); draft.groupIds = (value.groupIds || []).join('\n'); draft.rolesText = Object.entries(value.roles || {}).map(([id, role]) => `${id}=${role}`).join('\n'); } return draft; }
--function serializeDraft(type, value) { const draft = structuredClone(value); if (type === 'asset') draft.labels = String(draft.labels || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); if (type === 'account') draft.zoneAllowlist = String(draft.zoneAllowlist || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); if (type === 'bot') { draft.userIds = String(draft.userIds || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); draft.groupIds = String(draft.groupIds || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); draft.roles = Object.fromEntries(String(draft.rolesText || '').split(/\n+/).map((line) => line.split('=').map((part) => part.trim())).filter(([id, role]) => id && role)); } return draft; }
--function countFor(section, state) { return ({ nodes: state.probes, targets: state.probeTargets, policies: state.failoverPolicies, incidents: state.incidents, bots: state.telegramBots, assets: state.ipAssets, pools: state.ipPools, leases: state.ipLeases, accounts: state.dnsAccounts, zones: state.dnsZones, bindings: state.dnsBindings, changes: state.dnsChanges })[section]?.length || 0; }
--function summary(tab, state) { if (tab === 'probes') return `${state.probes?.filter((item) => item.status === 'online').length || 0} 个在线探针 · ${state.incidents?.filter((item) => !['succeeded', 'rolled_back'].includes(item.status)).length || 0} 个活动事件`; if (tab === 'pools') return `${state.ipAssets?.length || 0} 个 IP · ${state.ipLeases?.filter((item) => ['active', 'locked'].includes(item.status)).length || 0} 个活动租约`; return `${state.dnsAccounts?.length || 0} 个账号 · ${state.dnsBindings?.length || 0} 条解析绑定`; }
-+function Multi({ label, items = [], value = [], onChange, secondary, searchable = false, selectable = false }) {
-+  const [query, setQuery] = useState('');
-+  const normalized = query.trim().toLowerCase();
-+  const visibleItems = normalized ? items.filter((item) => [item.name, item.address, secondary?.(item)].some((text) => String(text || '').toLowerCase().includes(normalized))) : items;
-+  const visibleIds = visibleItems.map((item) => item.id);
-+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => value.includes(id));
-+  return <div className="ops-multi"><div className="ops-multi-head"><strong>{label}</strong><span>已选 {value.length} / {items.length}</span></div>{searchable || selectable ? <div className="ops-multi-tools">{searchable ? <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索名称或 IP" /> : null}{selectable ? <><button type="button" className="ghost" disabled={!visibleIds.length} onClick={() => onChange(allVisibleSelected ? value.filter((id) => !visibleIds.includes(id)) : [...new Set([...value, ...visibleIds])])}>{allVisibleSelected ? '取消当前' : '全选当前'}</button><button type="button" className="ghost" disabled={!value.length} onClick={() => onChange([])}>清空</button></> : null}</div> : null}<div className="ops-multi-options">{visibleItems.length ? visibleItems.map((item) => <label key={item.id}><input type="checkbox" checked={value.includes(item.id)} onChange={() => onChange(value.includes(item.id) ? value.filter((id) => id !== item.id) : [...value, item.id])} /><span>{item.name || item.address}<em>{secondary?.(item)}</em></span></label>) : <span className="ops-multi-empty">没有匹配的 IP 资产</span>}</div></div>;
-+}
-+
-+function resourceFor(type) { return ({ probe: 'probes', target: 'probe-targets', asset: 'ip-assets', pool: 'ip-pools', account: 'dns-accounts', binding: 'dns-bindings', policy: 'failover-policies', bot: 'telegram-bots' })[type]; }
-+function typeLabel(type) { return ({ probe: '探针', target: '检查目标', asset: 'IP 资产', pool: '备用池', account: 'DNS 账号', binding: '解析绑定', policy: '切换策略', bot: 'Telegram 机器人' })[type]; }
-+function normalizeDraft(type, value) { const draft = { ...structuredClone(EMPTY[type]), ...structuredClone(value) }; if (type === 'asset') draft.labels = (value.labels || []).join(', '); if (type === 'account') draft.credentials = {}; if (type === 'bot') { draft.name = '统一机器人'; draft.token = ''; draft.userIds = (value.userIds || []).join('\n'); draft.rolesText = Object.entries(value.roles || {}).map(([id, role]) => `${id}=${role}`).join('\n'); } return draft; }
-+function serializeDraft(type, value) { const draft = structuredClone(value); if (type === 'asset') draft.labels = String(draft.labels || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); if (type === 'bot') { draft.name = '统一机器人'; draft.userIds = String(draft.userIds || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); draft.roles = Object.fromEntries(String(draft.rolesText || '').split(/\n+/).map((line) => line.split('=').map((part) => part.trim())).filter(([id, role]) => id && role)); } return draft; }
-+function countFor(section, state) { return ({ nodes: state.probes, targets: state.probeTargets, policies: state.failoverPolicies, incidents: state.incidents, bots: state.telegramBots, assets: state.ipAssets, pools: state.ipPools, leases: state.ipLeases, accounts: state.dnsAccounts, bindings: state.dnsBindings, changes: state.dnsChanges })[section]?.length || 0; }
-+function summary(tab, state) { if (tab === 'probes') return `${state.probes?.filter((item) => item.status === 'online').length || 0} 个在线探针 · ${state.incidents?.filter((item) => !['succeeded', 'rolled_back'].includes(item.status)).length || 0} 个活动事件`; if (tab === 'pools') return `${state.ipAssets?.length || 0} 个 IP · ${state.ipLeases?.filter((item) => ['active', 'locked'].includes(item.status)).length || 0} 个活动租约`; if (tab === 'telegram') return `${state.telegramBots?.filter((item) => item.enabled && item.configured).length || 0} 个运行中机器人`; return `${state.dnsAccounts?.length || 0} 个账号 · ${state.dnsBindings?.length || 0} 条解析绑定`; }
- function allocationLabel(item) { return item.allocationMode === 'all' ? '全部取用' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '一次取一个'; }
- function sharingLabel(mode) { return ({ exclusive: '独占', target: '同目标共享', business: '同业务共享', limited: '限量共享', unlimited: '完全共享' })[mode] || mode; }
- function updateModeLabel(mode) { return ({ append: '追加 IP', managed_replace: '覆盖托管值', replace: '完全替换' })[mode] || mode; }
-diff --git a/src/styles.css b/src/styles.css
-index 3cc0173..598f512 100644
---- a/src/styles.css
-+++ b/src/styles.css
-@@ -220,7 +220,7 @@ svg {
-   border-radius: 20px;
-   background: var(--panel-strong);
-   display: grid;
--  grid-template-columns: auto auto minmax(0, 1fr);
-+  grid-template-columns: auto minmax(0, 1fr) auto;
-   align-items: center;
-   gap: 16px;
-   padding: 0 18px;
-@@ -272,6 +272,9 @@ svg {
-
- .top-tabs {
-   display: inline-flex;
-+  min-width: 0;
-+  max-width: 100%;
-+  overflow-x: auto;
-   gap: 8px;
-   padding: 5px;
-   border-radius: 15px;
-@@ -887,6 +890,7 @@ svg {
- .ops-tabs em { min-width: 18px; padding: 2px 5px; border-radius: 999px; background: var(--button-ghost-bg); color: var(--text-muted); font-size: 10px; font-style: normal; text-align: center; }
- .ops-content { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; padding: 18px; border-radius: 18px; }
- .ops-content-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
-+.ops-content-actions { display: flex; align-items: center; gap: 8px; }
- .ops-content-head strong { display: block; color: var(--text-strong); font-size: 15px; }
- .ops-content-head span { display: block; margin-top: 4px; color: var(--text-soft); font-size: 11px; }
- .ops-list { min-height: 0; flex: 1 1 auto; overflow: auto; padding-top: 8px; }
-@@ -915,18 +919,26 @@ svg {
- .ops-toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--text-main); font-size: 12px; }
- .ops-toggle input { width: auto; }
- .ops-multi { display: flex; flex-direction: column; gap: 8px; }
--.ops-multi > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; max-height: 180px; overflow: auto; padding: 8px; border: 1px solid var(--border-card); border-radius: 10px; background: color-mix(in srgb, var(--card-bg) 65%, transparent); }
-+.ops-multi-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-+.ops-multi-head > span { color: var(--text-muted); font-size: 10px; }
-+.ops-multi-tools { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 7px; }
-+.ops-multi-tools .ghost { min-height: 38px; padding: 8px 11px; }
-+.ops-multi-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; max-height: 220px; overflow: auto; padding: 8px; border: 1px solid var(--border-card); border-radius: 10px; background: color-mix(in srgb, var(--card-bg) 65%, transparent); }
- .ops-multi label { display: flex; align-items: flex-start; gap: 7px; min-width: 0; padding: 7px; border-radius: 8px; color: var(--text-main); font-size: 11px; cursor: pointer; }
- .ops-multi label:hover { background: var(--card-hover); }
- .ops-multi input { width: auto; margin-top: 2px; }
- .ops-multi label span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
- .ops-multi em { display: block; overflow: hidden; color: var(--text-muted); font-size: 10px; font-style: normal; text-overflow: ellipsis; }
-+.ops-multi-empty { grid-column: 1 / -1; padding: 18px; color: var(--text-muted); font-size: 11px; text-align: center; }
-+.ops-batch-ip-input { min-height: 150px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height: 1.6; }
- .ops-source-list { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--border-card); border-radius: 10px; background: color-mix(in srgb, var(--card-bg) 65%, transparent); }
- .ops-source-row { display: grid; grid-template-columns: minmax(100px, .7fr) minmax(150px, 1fr) minmax(150px, 1fr) auto; gap: 7px; align-items: center; }
- .ops-source-row input { min-width: 0; }
- .ops-install { display: flex; flex-direction: column; gap: 8px; }
--.ops-install label { color: var(--text-soft); font-size: 11px; }
--.ops-install pre { margin: 0 0 8px; padding: 11px; overflow: auto; border-radius: 9px; background: var(--terminal-bg); color: #d5e9df; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
-+.ops-install label { color: var(--text-strong); font-size: 11px; font-weight: 600; }
-+.ops-command-block > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-+.ops-command-block .ghost { min-height: 30px; padding: 5px 10px; }
-+.ops-install pre { margin: 6px 0 10px; padding: 13px; overflow: auto; border: 1px solid rgba(126, 231, 178, .22); border-radius: 9px; background: #101a16; color: #e8fff2; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; user-select: text; }
- .ops-install > span { color: var(--text-muted); font-size: 11px; }
-
- .terminal-deck {
-@@ -2534,14 +2546,17 @@ svg {
-   .ops-tabs { position: sticky; top: 0; z-index: 5; }
-   .ops-content { min-height: 420px; overflow: visible; padding: 13px; border-radius: 16px; }
-   .ops-content-head { align-items: stretch; flex-direction: column; }
--  .ops-content-head .primary { width: 100%; }
-+  .ops-content-actions { width: 100%; }
-+  .ops-content-actions .primary, .ops-content-actions .ghost { min-width: 0; flex: 1 1 0; }
-   .ops-list { overflow: visible; }
-   .ops-row { align-items: flex-start; flex-direction: column; gap: 10px; padding: 13px 2px; }
-   .ops-row-side { width: 100%; justify-content: space-between; }
-   .ops-row-actions { min-width: 0; overflow-x: auto; }
-   .ops-editor-grid { grid-template-columns: 1fr; }
-   .ops-field.full, .ops-multi, .ops-toggle { grid-column: 1; }
--  .ops-multi > div { grid-template-columns: 1fr; }
-+  .ops-multi-options { grid-template-columns: 1fr; }
-+  .ops-multi-tools { grid-template-columns: 1fr 1fr; }
-+  .ops-multi-tools input { grid-column: 1 / -1; }
-   .ops-source-row { grid-template-columns: 1fr; }
-
-   .dialog-footer {

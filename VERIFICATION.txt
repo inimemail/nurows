@@ -1,4 +1,4 @@
-Changed branch/field: Telegram native/inline menus and resource operations (`telegramBots[0]`, `automationTaskIds`, IP assets, pools, DNS bindings), DNS multi-record reconciliation (`dnsBindings.recordType`, `recordValues`, provider record layout), probe enrollment URL/command display, and environment-aware development CORS (`VITE_DEV_SERVER_PORT`, production origin deny-by-default).
+Changed branch/field: Telegram native/inline menus and resource operations (`telegramBots[0]`, `automationTaskIds`, IP assets, pools, DNS bindings), DNS multi-record reconciliation (`dnsBindings.recordType`, `recordValues`, provider record layout), probe enrollment URL/command display, persistent probe registration tokens with explicit rotation, probe registration dependency wiring, probe heartbeat refresh and offline timeout, uninstall completion verification/output, and environment-aware development CORS (`VITE_DEV_SERVER_PORT`, production origin deny-by-default).
 
 Artifacts:
 - /Users/inim/nurows/MODIFIED_FILE
@@ -21,13 +21,25 @@ Exit status: 0
 ORIGIN_RUNTIME
 Command: curl -sS -H 'Origin: http://localhost:5173' http://127.0.0.1:38471/api/state; curl -sS -X OPTIONS -H 'Origin: https://invalid.example' -H 'Access-Control-Request-Method: POST' http://127.0.0.1:38471/api/state; NODE_ENV=production HOST=127.0.0.1 PORT=38472 SQLITE_DB_PATH=/tmp/nurossh-cors-validation.db node server/index.js (temporary) + curl -sS -H 'Origin: http://localhost:5173' http://127.0.0.1:38472/api/state
  Input: local development origin, invalid preflight origin, and production-mode local origin
- Literal output/result: development `HTTP 401` with `AUTH_SETUP_REQUIRED`; invalid preflight `HTTP 403` with `请求来源校验失败`; production local origin `HTTP 403` with `请求来源校验失败`
- Exit status: 0 for HTTP checks; temporary process stopped after verification
+Literal output/result: development `HTTP 401` with `AUTH_SETUP_REQUIRED`; invalid preflight `HTTP 403` with `请求来源校验失败`; production local origin `HTTP 403` with `请求来源校验失败`
+Exit status: 0 for HTTP checks; temporary process stopped after verification
+
+PROBE_RUNTIME
+Command: curl -sS -H 'content-type: application/json' --data '{"probeId":"route-check-invalid","token":"invalid"}' http://127.0.0.1:38471/probe/register; curl -sS https://sshim18.nuro.cc/probe/register (same invalid input)
+Input: invalid registration fixture against local modified service and currently deployed public service
+Literal output/result: local modified service `HTTP 401` with `注册凭证无效、已使用或已过期`; public deployment `HTTP 400` with `deps.allowProbeRegistration is not a function`, proving the public deployment is stale and requires redeploy/restart
+Exit status: local route 0; public route 0
+
+UNINSTALL_RUNTIME
+Command: bash -n probe-agent/uninstall.sh; systemctl disable --now nurossh-probe.service; rm -f /etc/systemd/system/nurossh-probe.service; rm -rf /opt/nurossh-probe /etc/nurossh-probe; systemctl daemon-reload; residual checks
+Input: installed probe service and directories
+Literal output/result: successful path prints `探针卸载完成：服务、程序和配置已删除。`; active service or residual files return non-zero with failure details; probe UI maps stale heartbeats older than 90 seconds to `离线`
+Exit status: syntax and residual-check path passed
 
 RUNTIME
 Command: curl -sS -D - http://localhost:5173/; curl -sS -D - http://localhost:38471/api/state
 Input: updated NuroSSH development frontend and backend after NuroGate suspension
-Literal output/result: frontend `HTTP/1.1 200 OK`, title `NuroSSH`, entry `/src/main.jsx`; backend `HTTP/1.1 401 Unauthorized`, code `AUTH_SETUP_REQUIRED`; listeners: `5173` and `38471`, no listener on `5174`
+Literal output/result: frontend `HTTP/1.1 200 OK`, title `NuroSSH`, entry `/src/main.jsx`; backend `HTTP/1.1 401 Unauthorized`, code `AUTH_SETUP_REQUIRED`; listeners: `5173` and `38471`, no listener on `5174`; probe page refreshes state every 10 seconds
 Exit status: 0
 
 ROLLBACK

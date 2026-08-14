@@ -7,7 +7,7 @@ const PROVIDERS = {
   dnsla: 'DNSLA', era: '时代互联 / Eranet', tndns: 'Tnethk', gcore: 'Gcore', edgeone: '腾讯 EdgeOne',
   ns1: 'IBM NS1 Connect', rainyun: '雨云', dynv6: 'Dynv6', vercel: 'Vercel DNS', spaceship: 'Spaceship'
 };
-const STATUS = { online: '在线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', unknown: '未检测', queued: '等待执行', pending_approval: '待确认', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', succeeded: '已完成', failed: '失败', rolled_back: '已回滚', active: '使用中', locked: '已锁定', released: '已释放' };
+const STATUS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', unknown: '未检测', queued: '等待执行', pending_approval: '待确认', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', succeeded: '已完成', failed: '失败', rolled_back: '已回滚', active: '使用中', locked: '已锁定', released: '已释放' };
 
 const EMPTY = {
   probe: { name: '', region: '', carrier: '', maxConcurrency: 100, enabled: true },
@@ -34,6 +34,21 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
         : [['accounts', '服务商账号'], ['bindings', '解析绑定'], ['changes', '变更记录']];
   const active = sections.some(([key]) => key === section) ? section : sections[0][0];
 
+  useEffect(() => {
+    if (tab !== 'probes') return undefined;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const data = await api('/api/state');
+        if (!cancelled) onState(data);
+      } catch (_error) {
+        // The main application handles authentication and connectivity errors.
+      }
+    };
+    const timer = window.setInterval(refresh, 10000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [api, onState, tab]);
+
   const openCreate = (type) => setEditor({ open: true, type, value: structuredClone(EMPTY[type]) });
   const openEdit = (type, value) => setEditor({ open: true, type, value: normalizeDraft(type, value) });
   const closeEditor = () => setEditor({ open: false, type: '', value: null });
@@ -53,6 +68,12 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       onState(data.state);
       closeEditor();
       toast('已删除');
+    } catch (error) { toast(error.message); }
+  };
+  const openProbeInstall = async (id) => {
+    try {
+      const data = await api(`/api/probes/${id}/install-command`);
+      setInstall(data);
     } catch (error) { toast(error.message); }
   };
   const rotateProbe = async (id) => {
@@ -93,11 +114,11 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       </header>
       <div className="ops-tabs" role="tablist">{sections.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setSection(key)}>{label}<em>{countFor(key, state)}</em></button>)}</div>
       <div className="surface ops-content">
-        {renderSection(active, { state, openCreate, openEdit, rotateProbe, executeIncident, rollbackIncident, openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
+        {renderSection(active, { state, openCreate, openEdit, openProbeInstall, rotateProbe, executeIncident, rollbackIncident, openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
       </div>
 
       {editor.open ? <Dialog title={`${editor.value.id ? '编辑' : '新增'}${typeLabel(editor.type)}`} className="ops-editor-dialog" wide={editor.type !== 'target' && editor.type !== 'policy'} xwide={editor.type === 'target' || editor.type === 'policy'} onClose={closeEditor} footer={<><div>{editor.value.id ? <button className="danger-text" onClick={remove}>删除</button> : null}</div><div className="dialog-actions"><button className="ghost" onClick={closeEditor}>取消</button><button className="primary" onClick={save}>保存</button></div></>}>{renderEditor(editor.type, editor.value, (patch) => setEditor((current) => ({ ...current, value: { ...current.value, ...patch } })), state)}</Dialog> : null}
-      {install ? <Dialog title="探针接入" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装命令" value={install.installCommand} toast={toast} /><CommandBlock label="一次性注册令牌" value={install.token} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>执行安装命令后，在隐藏输入处粘贴令牌。令牌 15 分钟内有效且仅能使用一次。</span></div></Dialog> : null}
+      {install ? <Dialog title="探针接入" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装命令" value={install.installCommand} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>安装命令已自动包含注册令牌。令牌默认长期有效，点击“接入命令”重新轮转后旧令牌立即失效。</span></div></Dialog> : null}
       {assetImport.open ? <Dialog title="批量导入 IP 资产" className="ops-editor-dialog" wide onClose={() => setAssetImport((current) => ({ ...current, open: false }))} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setAssetImport((current) => ({ ...current, open: false }))}>取消</button><button className="primary" onClick={importAssets}>导入</button></div></>}><EditorGrid><Field label="IP 地址" full><textarea className="ops-batch-ip-input" rows="12" value={assetImport.addresses} onChange={(e) => setAssetImport((current) => ({ ...current, addresses: e.target.value }))} placeholder={'每行一个，也支持空格或逗号分隔\n1.1.1.1\n2001:db8::1'} /></Field><Field label="地区（批量设置）"><input value={assetImport.region} onChange={(e) => setAssetImport((current) => ({ ...current, region: e.target.value }))} /></Field><Field label="运营商（批量设置）"><input value={assetImport.carrier} onChange={(e) => setAssetImport((current) => ({ ...current, carrier: e.target.value }))} /></Field><Field label="标签（逗号分隔）" full><input value={assetImport.labels} onChange={(e) => setAssetImport((current) => ({ ...current, labels: e.target.value }))} /></Field></EditorGrid></Dialog> : null}
     </section>
   );
@@ -105,7 +126,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
 
 function renderSection(section, ctx) {
   const { state } = ctx;
-  if (section === 'nodes') return <DataView title="探针节点" copy="一台探针可承载多个检查目标" action="新增探针" onAction={() => ctx.openCreate('probe')} empty="还没有探针节点">{state.probes?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.region || '未设置地区'} · ${item.carrier || '未设置线路'} · ${item.agentVersion || '未接入'}`} status={STATUS[item.status] || item.status} tone={item.status === 'online' ? 'ok' : 'muted'} actions={<><button className="ghost" onClick={() => ctx.rotateProbe(item.id)}>接入命令</button><button className="ghost" onClick={() => ctx.openEdit('probe', item)}>编辑</button></>} />)}</DataView>;
+  if (section === 'nodes') return <DataView title="探针节点" copy="一台探针可承载多个检查目标" action="新增探针" onAction={() => ctx.openCreate('probe')} empty="还没有探针节点">{state.probes?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.region || '未设置地区'} · ${item.carrier || '未设置线路'} · ${item.agentVersion || '未接入'} · 最后心跳 ${formatTime(item.lastSeenAt)}`} status={STATUS[item.status] || item.status} tone={item.status === 'online' ? 'ok' : 'muted'} actions={<><button className="ghost" onClick={() => ctx.openProbeInstall(item.id)}>安装命令</button><button className="ghost" onClick={() => ctx.rotateProbe(item.id)}>轮转令牌</button><button className="ghost" onClick={() => ctx.openEdit('probe', item)}>编辑</button></>} />)}</DataView>;
   if (section === 'targets') return <DataView title="检查目标" copy="支持 Ping、TCP 和多探针仲裁" action="新增目标" onAction={() => ctx.openCreate('target')} empty="还没有检查目标">{state.probeTargets?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.checkType === 'ping' ? 'PING' : `TCP:${item.port}`} · ${item.address} · ${item.probeIds?.length || 0} 个探针`} status={STATUS[item.health] || item.health} tone={item.health === 'healthy' ? 'ok' : item.health === 'down' ? 'bad' : 'warn'} actions={<button className="ghost" onClick={() => ctx.openEdit('target', item)}>编辑</button>} />)}</DataView>;
   if (section === 'policies') return <DataView title="切换策略" copy="把检查目标、备用池、自动化和 DNS 串成一条可回滚流程" action="新增策略" onAction={() => ctx.openCreate('policy')} empty="还没有切换策略">{state.failoverPolicies?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.poolIds?.length || 0} 个池 · ${item.dnsBindingIds?.length || 0} 条解析 · ${item.approvalMode === 'telegram' ? '需确认' : '自动执行'}`} status={item.enabled ? '已启用' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('policy', item)}>编辑</button>} />)}</DataView>;
   if (section === 'incidents') return <DataView title="故障事件" copy="每个目标只允许一个活动事件，失败可按快照回滚" empty="还没有故障事件">{state.incidents?.map((item) => <Row key={item.id} title={item.targetName} subtitle={`${formatTime(item.startedAt)} · ${item.message || item.error || item.policyName}`} status={STATUS[item.status] || item.status} tone={item.status === 'succeeded' ? 'ok' : item.status === 'failed' ? 'bad' : 'warn'} actions={<>{['pending_approval', 'failed', 'observing'].includes(item.status) ? <button className="primary" onClick={() => ctx.executeIncident(item.id)}>执行</button> : null}{item.dnsChangeIds?.length && item.status !== 'rolled_back' ? <button className="ghost" onClick={() => ctx.rollbackIncident(item.id)}>回滚</button> : null}</>} />)}</DataView>;

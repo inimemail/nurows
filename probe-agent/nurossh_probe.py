@@ -6,8 +6,10 @@ import os
 import platform
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
@@ -45,7 +47,6 @@ def register(config):
         "token": config["token"]
     })
     config["secret"] = result["agentSecret"]
-    config.pop("token", None)
     with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
         json.dump(config, handle)
     os.chmod(CONFIG_PATH, 0o600)
@@ -117,7 +118,18 @@ def main():
                 for target in due:
                     schedules[target["id"]] = now + max(5, int(target.get("interval", 30)))
             request(config, "POST", "/probe/heartbeat", {"version": VERSION})
-        except Exception:
+        except HTTPError as error:
+            if error.code == 401 and config.get("token") and config.get("secret"):
+                config.pop("secret", None)
+                try:
+                    register(config)
+                except Exception as register_error:
+                    print(f"probe registration failed after authentication loss: {register_error}", file=sys.stderr, flush=True)
+            else:
+                print(f"probe request failed with HTTP {error.code}", file=sys.stderr, flush=True)
+            time.sleep(10)
+        except Exception as error:
+            print(f"probe loop error: {error}", file=sys.stderr, flush=True)
             time.sleep(10)
         time.sleep(5)
 

@@ -99,3 +99,11 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now nurossh-probe.service
+sleep 2
+if ! systemctl is-active --quiet nurossh-probe.service; then
+  echo "nurossh-probe.service failed to start" >&2
+  systemctl --no-pager --full status nurossh-probe.service >&2 || true
+  journalctl -u nurossh-probe.service -n 30 --no-pager >&2 || true
+  exit 1
+fi
+echo "nurossh-probe.service is running; registration and heartbeat will appear in the NuroSSH probe list."

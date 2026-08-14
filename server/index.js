@@ -199,8 +199,7 @@ app.use((req, res, next) => {
 });
 app.use(cors());
 registerProbePublicRoutes(app, {
-  readState,
-  updateState,
+  ...orchestrationDeps,
   onIncidentCreated: (incidentId) => runIncidentWorkflow(incidentId, orchestrationDeps)
 });
 app.use('/api', authGuard);

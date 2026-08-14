@@ -56,7 +56,10 @@ export function sanitizeOrchestrationState(state = {}) {
   const domain = normalizeOrchestrationState(state);
   return {
     ...domain,
-    probes: domain.probes.map(({ tokenHash, agentSecretHash, ...item }) => item),
+    probes: domain.probes.map(({ tokenHash, tokenEnc, agentSecretHash, ...item }) => ({
+      ...item,
+      status: item.status === 'online' && (!item.lastSeenAt || Date.now() - Date.parse(item.lastSeenAt) > 90000) ? 'offline' : item.status
+    })),
     dnsAccounts: domain.dnsAccounts.map(({ credentialsEnc, ...item }) => ({ ...item, configured: Boolean(credentialsEnc) })),
     telegramBots: domain.telegramBots.map(({ tokenEnc, ...item }) => ({ ...item, configured: Boolean(tokenEnc) })),
     incidents: domain.incidents.slice(0, 200),
@@ -79,17 +82,15 @@ export function registerProbePublicRoutes(app, deps) {
     if (!deps.allowProbeRegistration(req.ip)) return res.status(429).json({ error: '注册请求过于频繁，请稍后再试' });
     deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === probeId);
-      if (!probe || !probe.tokenHash || probe.tokenUsedAt || !safeHashEqual(probe.tokenHash, hashSecret(token))) return draft;
-      if (probe.tokenExpiresAt && Date.parse(probe.tokenExpiresAt) < Date.now()) return draft;
+      if (!probe || probe.enabled === false || !probe.tokenHash || !safeHashEqual(probe.tokenHash, hashSecret(token))) return draft;
       agentSecret = randomSecret(32);
       probe.agentSecretHash = hashSecret(agentSecret);
-      probe.tokenUsedAt = nowIso();
       probe.registeredAt = nowIso();
       probe.status = 'online';
       probe.lastSeenAt = nowIso();
       probe.updatedAt = nowIso();
       found = true;
-      pushAudit(draft, 'probe.register', 'probe', probe.id, '探针完成一次性注册', 'agent');
+      pushAudit(draft, 'probe.register', 'probe', probe.id, '探针完成注册或重新注册', 'agent');
       return draft;
     });
     if (!found) return res.status(401).json({ error: '注册凭证无效、已使用或已过期' });
@@ -241,12 +242,13 @@ export function registerOrchestrationRoutes(app, deps) {
       probe = draft.probes.find((item) => item.id === req.params.id);
       if (!probe) throw new Error('探针不存在');
       probe.tokenHash = hashSecret(token);
-      probe.tokenExpiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      probe.tokenEnc = deps.encryptSecret(token);
+      probe.tokenExpiresAt = '';
       probe.tokenUsedAt = '';
       probe.agentSecretHash = '';
       probe.status = 'pending';
       probe.updatedAt = nowIso();
-      pushAudit(draft, 'probe.rotate_token', 'probe', probe.id, '重新生成一次性注册凭证', req.auth.username);
+      pushAudit(draft, 'probe.rotate_token', 'probe', probe.id, '轮转探针注册令牌并使旧令牌失效', req.auth.username);
       return draft;
     });
     const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
@@ -254,11 +256,35 @@ export function registerOrchestrationRoutes(app, deps) {
     const baseUrl = `${publicProto}://${req.get('host')}`;
     res.json({
       ok: true,
-      token,
-      expiresAt: probe.tokenExpiresAt,
-      installCommand: `curl -fsSL '${baseUrl}/probe/install.sh' | sudo bash -s -- '${baseUrl}' '${probe.id}'`,
+      installCommand: `curl -fsSL '${baseUrl}/probe/install.sh' | sudo bash -s -- '${baseUrl}' '${probe.id}' '${token}'`,
       uninstallCommand: `curl -fsSL ${baseUrl}/probe/uninstall.sh | sudo bash`,
       state: deps.sanitizeState(state, req.auth)
+    });
+  });
+
+  app.get('/api/probes/:id/install-command', (req, res) => {
+    let token = '';
+    const state = deps.updateState((draft) => {
+      const probe = draft.probes.find((item) => item.id === req.params.id);
+      if (!probe) throw new Error('探针不存在');
+      if (probe.tokenEnc) token = deps.decryptSecret(probe.tokenEnc);
+      if (!token) {
+        token = randomSecret(24);
+        probe.tokenHash = hashSecret(token);
+        probe.tokenEnc = deps.encryptSecret(token);
+        probe.updatedAt = nowIso();
+        pushAudit(draft, 'probe.issue_token', 'probe', probe.id, '生成探针长期注册令牌', req.auth.username);
+      }
+      return draft;
+    });
+    const probe = state.probes.find((item) => item.id === req.params.id);
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const publicProto = forwardedProto === 'https' || req.secure || (!isLocalRequestHost(req.get('host')) && forwardedProto !== 'http') ? 'https' : 'http';
+    const baseUrl = `${publicProto}://${req.get('host')}`;
+    res.json({
+      ok: true,
+      installCommand: `curl -fsSL '${baseUrl}/probe/install.sh' | sudo bash -s -- '${baseUrl}' '${probe.id}' '${token}'`,
+      uninstallCommand: `curl -fsSL '${baseUrl}/probe/uninstall.sh' | sudo bash`
     });
   });
 
@@ -266,7 +292,7 @@ export function registerOrchestrationRoutes(app, deps) {
     const state = deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === req.params.id);
       if (!probe) throw new Error('探针不存在');
-      Object.assign(probe, { enabled: false, status: 'revoked', tokenHash: '', agentSecretHash: '', updatedAt: nowIso() });
+      Object.assign(probe, { enabled: false, status: 'revoked', tokenHash: '', tokenEnc: null, agentSecretHash: '', updatedAt: nowIso() });
       pushAudit(draft, 'probe.revoke', 'probe', probe.id, '吊销探针凭证', req.auth.username);
       return draft;
     });
@@ -394,7 +420,7 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
 function normalizeResource(key, input = {}, existing = null, deps) {
   const now = nowIso();
   const base = { id: existing?.id || cleanId(input.id) || uuidv4(), createdAt: existing?.createdAt || now, updatedAt: now };
-  if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
+  if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', tokenEnc: existing?.tokenEnc || null, agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
   if (key === 'probeTargets') return { ...base, name: requiredText(input.name, '目标名称'), address: validateHost(input.address, Boolean(input.allowPrivate)), allowPrivate: Boolean(input.allowPrivate), checkType: input.checkType === 'ping' ? 'ping' : 'tcp', port: clampNumber(input.port, 1, 65535, 443), interval: clampNumber(input.interval, 5, 3600, 30), timeout: clampNumber(input.timeout, 1, 60, 5), failureThreshold: clampNumber(input.failureThreshold, 1, 20, 3), recoveryThreshold: clampNumber(input.recoveryThreshold, 1, 20, 2), quorumMode: ['majority', 'all', 'count'].includes(input.quorumMode) ? input.quorumMode : 'majority', quorumCount: clampNumber(input.quorumCount, 1, 100, 2), probeIds: cleanIds(input.probeIds, 500), policyId: cleanId(input.policyId), enabled: input.enabled !== false, health: existing?.health || 'unknown', observations: existing?.observations || {}, lastCheckAt: existing?.lastCheckAt || '' };
   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
   if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random', 'weighted'].includes(input.selectionMode) ? input.selectionMode : 'ordered', sharingMode: ['exclusive', 'target', 'business', 'unlimited', 'limited'].includes(input.sharingMode) ? input.sharingMode : 'exclusive', shareLimit: clampNumber(input.shareLimit, 1, 1000, 1), leaseMinutes: clampNumber(input.leaseMinutes, 1, 525600, 30), cooldownMinutes: clampNumber(input.cooldownMinutes, 0, 10080, 10), enabled: input.enabled !== false, note: cleanText(input.note, 500) };
@@ -1175,7 +1201,7 @@ function pushAudit(state, action, resourceType, resourceId, summary, actor) {
 function sanitizeResource(key, item) {
   if (key === 'dnsAccounts') { const { credentialsEnc, ...safe } = item; return { ...safe, configured: Boolean(credentialsEnc) }; }
   if (key === 'telegramBots') { const { tokenEnc, ...safe } = item; return { ...safe, configured: Boolean(tokenEnc) }; }
-  if (key === 'probes') { const { tokenHash, agentSecretHash, ...safe } = item; return safe; }
+  if (key === 'probes') { const { tokenHash, tokenEnc, agentSecretHash, ...safe } = item; return safe; }
   return item;
 }
 

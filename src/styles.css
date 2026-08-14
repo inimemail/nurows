@@ -891,6 +891,8 @@ svg {
 .ops-content { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; padding: 18px; border-radius: 18px; }
 .ops-content-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
 .ops-content-actions { display: flex; align-items: center; gap: 8px; }
+.ops-usage-filters { width: min(520px, 52vw); display: grid; grid-template-columns: minmax(220px, 1fr) 150px; gap: 8px; }
+.ops-usage-filters input, .ops-usage-filters select { min-height: 40px; }
 .ops-content-head strong { display: block; color: var(--text-strong); font-size: 15px; }
 .ops-content-head span { display: block; margin-top: 4px; color: var(--text-soft); font-size: 11px; }
 .ops-list { min-height: 0; flex: 1 1 auto; overflow: auto; padding-top: 8px; }
@@ -2551,6 +2553,7 @@ svg {
   .ops-content-head { align-items: stretch; flex-direction: column; }
   .ops-content-actions { width: 100%; }
   .ops-content-actions .primary, .ops-content-actions .ghost { min-width: 0; flex: 1 1 0; }
+  .ops-usage-filters { width: 100%; grid-template-columns: 1fr; }
   .ops-list { overflow: visible; }
   .ops-row { align-items: flex-start; flex-direction: column; gap: 10px; padding: 13px 2px; }
   .ops-row-side { width: 100%; justify-content: space-between; }

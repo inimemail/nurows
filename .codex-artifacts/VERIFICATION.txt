@@ -1,7 +1,8 @@
 Changed branch/field
-- Automation task and server list cards: event.detail === 3 opens a create dialog with identifiers cleared.
-- Automation steps: ctrl_c and finish are accepted, persisted, and dispatched after a matching wait step.
-- Automation progress: latest host is expanded by default and the result list scrolls to the newest output.
+- IP pool UI/backend: removed lease and cooldown configuration and hidden lease management view.
+- Incident success path: allocated IP assets are deleted and removed from every pool reference.
+- Incident failure path: allocated assets remain available after internal locks are released.
+- IP usage history: processing, consumed, failed, and rolled-back attempts remain searchable after asset deletion.
 
 Artifacts
 - MODIFIED_FILE: .codex-artifacts/MODIFIED_FILE
@@ -16,14 +17,14 @@ Literal result: tests 19, pass 19, fail 0
 Exit status: 0
 
 MODIFIED
-Command: npm test && npm run build && node --check server/index.js && git diff --check
+Command: npm test && npm run build && node --check server/orchestration.js && git diff --check
 Input: current working tree
-Literal result: tests 19, pass 19, fail 0; vite build completed; syntax check passed; diff check passed after progress auto-expand/auto-scroll change
+Literal result: tests 25, pass 25, fail 0; vite build completed; syntax check passed; diff check passed
 Exit status: 0
 
 ROLLBACK
 Command: .codex-artifacts/ROLLBACK.sh .codex-artifacts/ROLLBACK_TEST_COPY .codex-artifacts/BASELINE_FILE
-Input: independent copy of MODIFIED_FILE
+Input: independent copy of modified server/orchestration.js
 Literal result: restored baseline hash on independent copy
 Exit status: 0
 

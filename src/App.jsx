@@ -388,7 +388,7 @@ export default function App() {
   });
   const [accountError, setAccountError] = useState('');
 
-  const [state, setState] = useState({ groups: [], servers: [], commands: [], proxies: [], automationTasks: [], telegram: {}, probes: [], probeTargets: [], failoverPolicies: [], incidents: [], ipAssets: [], ipPools: [], ipLeases: [], dnsAccounts: [], dnsZones: [], dnsBindings: [], dnsChanges: [], auditLogs: [], telegramBots: [] });
+  const [state, setState] = useState({ groups: [], servers: [], commands: [], proxies: [], automationTasks: [], telegram: {}, probes: [], probeTargets: [], failoverPolicies: [], incidents: [], ipAssets: [], ipPools: [], ipLeases: [], ipUsageRecords: [], dnsAccounts: [], dnsZones: [], dnsBindings: [], dnsChanges: [], auditLogs: [], telegramBots: [] });
   const [tab, setTab] = useState('servers');
   const [search, setSearch] = useState('');
   const [busy, setBusy] = useState({});

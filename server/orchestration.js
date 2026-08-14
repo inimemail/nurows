@@ -28,6 +28,7 @@ const DNS_PROVIDERS = new Set([
 ]);
 const CALLBACK_PROVIDERS = new Set(['callback', 'aliyun_esa', 'baidu', 'namecheap', 'namesilo', 'dynadot', 'dnsla', 'era', 'tndns', 'gcore', 'edgeone', 'ns1', 'rainyun', 'dynv6', 'vercel', 'spaceship']);
 const DNS_RECORD_TYPES = new Set(['A', 'AAAA', 'CNAME', 'TXT', 'NS', 'CAA']);
+const ALLOCATION_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function orchestrationDefaults() {
   return {
@@ -41,6 +42,7 @@ export function orchestrationDefaults() {
     failoverPolicies: [],
     incidents: [],
     ipLeases: [],
+    ipUsageRecords: [],
     dnsChanges: [],
     auditLogs: [],
     telegramBots: []
@@ -49,7 +51,11 @@ export function orchestrationDefaults() {
 
 export function normalizeOrchestrationState(parsed = {}) {
   const defaults = orchestrationDefaults();
-  return Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
+  const normalized = Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
+  normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, ...pool }) => pool);
+  normalized.ipLeases = normalized.ipLeases.filter((lease) => lease.status !== 'released');
+  normalized.ipUsageRecords = normalized.ipUsageRecords.slice(0, 5000);
+  return normalized;
 }
 
 export function sanitizeOrchestrationState(state = {}) {
@@ -63,6 +69,7 @@ export function sanitizeOrchestrationState(state = {}) {
     dnsAccounts: domain.dnsAccounts.map(({ credentialsEnc, ...item }) => ({ ...item, configured: Boolean(credentialsEnc) })),
     telegramBots: domain.telegramBots.map(({ tokenEnc, tokenHash, ...item }) => ({ ...item, configured: Boolean(tokenEnc) })),
     incidents: domain.incidents.slice(0, 200),
+    ipUsageRecords: domain.ipUsageRecords.slice(0, 5000),
     dnsChanges: domain.dnsChanges.slice(0, 300),
     auditLogs: domain.auditLogs.slice(0, 500)
   };
@@ -203,6 +210,12 @@ export function registerOrchestrationRoutes(app, deps) {
       updated = normalizeResource(key, req.body, item, deps);
       ensureResourceReferences(draft, key, updated, deps);
       Object.assign(item, updated, { id: item.id, createdAt: item.createdAt });
+      if (key === 'ipPools') {
+        delete item.sharingMode;
+        delete item.shareLimit;
+        delete item.leaseMinutes;
+        delete item.cooldownMinutes;
+      }
       pushAudit(draft, `${key}.update`, key, item.id, `更新 ${item.name || item.address || item.domain || item.id}`, req.auth.username);
       return draft;
     });
@@ -227,8 +240,8 @@ export function registerOrchestrationRoutes(app, deps) {
     const state = deps.updateState((draft) => {
       const lease = draft.ipLeases.find((item) => item.id === req.params.id);
       if (!lease) throw new Error('租约不存在');
-      Object.assign(lease, { status: 'released', releasedAt: nowIso() });
-      pushAudit(draft, 'ip_lease.release', 'ipLease', lease.id, '手动释放 IP 租约', req.auth.username);
+      draft.ipLeases = draft.ipLeases.filter((item) => item.id !== lease.id);
+      pushAudit(draft, 'ip_lease.release', 'ipLease', lease.id, '手动释放备用 IP', req.auth.username);
       return draft;
     });
     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
@@ -406,7 +419,10 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
   try {
     const allocated = allocateIpsForIncident(incidentId, deps);
     if (!allocated.length && policy.poolIds?.length) throw new Error('备用 IP 池没有满足策略的可用 IP');
-    deps.updateState((draft) => updateIncident(draft, incidentId, { allocatedIps: allocated.map((item) => item.address), leaseIds: allocated.map((item) => item.leaseId) }));
+    deps.updateState((draft) => {
+      startIpUsageRecords(draft, incidentId, allocated);
+      return updateIncident(draft, incidentId, { allocatedIps: allocated.map((item) => item.address), leaseIds: allocated.map((item) => item.leaseId) });
+    });
 
     if (policy.automationTaskId) {
       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'automating', message: '正在执行自动化任务' }));
@@ -428,9 +444,11 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
     }
 
     deps.updateState((draft) => {
-      for (const lease of draft.ipLeases.filter((item) => item.incidentId === incidentId)) lease.status = 'active';
+      const consumed = consumeIncidentIpAssets(draft, incidentId);
+      const currentIncident = draft.incidents.find((item) => item.id === incidentId);
+      finalizeIpUsageRecords(draft, incidentId, 'consumed', '', currentIncident?.leaseIds);
       updateIncident(draft, incidentId, { status: 'succeeded', message: '故障切换完成', executionId: '', finishedAt: nowIso() });
-      pushAudit(draft, 'incident.succeeded', 'incident', incidentId, '自动故障切换完成', 'system');
+      pushAudit(draft, 'incident.succeeded', 'incident', incidentId, `自动故障切换完成，已消耗 ${consumed.addresses.length} 个备用 IP`, 'system');
       return draft;
     });
     deps.notifyIncident?.(incidentId);
@@ -447,7 +465,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
   if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', tokenEnc: existing?.tokenEnc || null, agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
   if (key === 'probeTargets') return { ...base, name: requiredText(input.name, '目标名称'), address: validateHost(input.address, Boolean(input.allowPrivate)), allowPrivate: Boolean(input.allowPrivate), checkType: input.checkType === 'ping' ? 'ping' : 'tcp', port: clampNumber(input.port, 1, 65535, 443), interval: clampNumber(input.interval, 5, 3600, 30), timeout: clampNumber(input.timeout, 1, 60, 5), failureThreshold: clampNumber(input.failureThreshold, 1, 20, 3), recoveryThreshold: clampNumber(input.recoveryThreshold, 1, 20, 2), quorumMode: ['majority', 'all', 'count'].includes(input.quorumMode) ? input.quorumMode : 'majority', quorumCount: clampNumber(input.quorumCount, 1, 100, 2), probeIds: cleanIds(input.probeIds, 500), policyId: cleanId(input.policyId), enabled: input.enabled !== false, health: existing?.health || 'unknown', observations: existing?.observations || {}, lastCheckAt: existing?.lastCheckAt || '' };
   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
-  if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random', 'weighted'].includes(input.selectionMode) ? input.selectionMode : 'ordered', sharingMode: ['exclusive', 'target', 'business', 'unlimited', 'limited'].includes(input.sharingMode) ? input.sharingMode : 'exclusive', shareLimit: clampNumber(input.shareLimit, 1, 1000, 1), leaseMinutes: clampNumber(input.leaseMinutes, 1, 525600, 30), cooldownMinutes: clampNumber(input.cooldownMinutes, 0, 10080, 10), enabled: input.enabled !== false, note: cleanText(input.note, 500) };
+  if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, note: cleanText(input.note, 500) };
   if (key === 'dnsAccounts') {
     const provider = DNS_PROVIDERS.has(input.provider) ? input.provider : 'huawei';
     const supplied = input.credentials && typeof input.credentials === 'object' ? input.credentials : {};
@@ -671,11 +689,11 @@ function allocateIpsForIncident(incidentId, deps) {
       const pool = draft.ipPools.find((item) => item.id === poolId && item.enabled !== false);
       if (!pool) continue;
       let candidates = pool.assetIds.map((id) => draft.ipAssets.find((item) => item.id === id)).filter((item) => item?.enabled !== false && item.health !== 'unhealthy');
-      candidates = candidates.filter((asset) => !alreadySelected.has(asset.id) && canLeaseAsset(draft, asset.id, pool, incident));
+      candidates = candidates.filter((asset) => !alreadySelected.has(asset.id) && canAllocateAsset(draft, asset.id));
       if (pool.selectionMode === 'random') candidates.sort(() => Math.random() - 0.5);
       const count = Math.min(candidates.length, desired - allocated.length);
       for (const asset of candidates.slice(0, count)) {
-        const lease = { id: uuidv4(), assetId: asset.id, poolId: pool.id, incidentId, targetId: incident.targetId, businessKey: policy.businessKey || '', status: 'locked', createdAt: nowIso(), expiresAt: new Date(Date.now() + pool.leaseMinutes * 60000).toISOString(), releasedAt: '' };
+        const lease = { id: uuidv4(), assetId: asset.id, poolId: pool.id, incidentId, targetId: incident.targetId, status: 'locked', createdAt: nowIso(), expiresAt: new Date(Date.now() + ALLOCATION_LOCK_TTL_MS).toISOString(), releasedAt: '' };
         draft.ipLeases.push(lease);
         allocated.push({ address: asset.address, assetId: asset.id, leaseId: lease.id, poolId: pool.id });
         alreadySelected.add(asset.id);
@@ -686,16 +704,80 @@ function allocateIpsForIncident(incidentId, deps) {
   return allocated;
 }
 
-function canLeaseAsset(state, assetId, pool, incident) {
+function canAllocateAsset(state, assetId) {
   const active = state.ipLeases.filter((lease) => lease.assetId === assetId && ['locked', 'active'].includes(lease.status) && Date.parse(lease.expiresAt) > Date.now());
-  if (pool.sharingMode === 'unlimited') return true;
-  if (pool.sharingMode === 'limited') return active.length < pool.shareLimit;
-  if (pool.sharingMode === 'target') return !active.some((lease) => lease.targetId !== incident.targetId);
-  if (pool.sharingMode === 'business') {
-    const businessKey = state.failoverPolicies.find((item) => item.id === incident.policyId)?.businessKey || '';
-    return !active.some((lease) => lease.businessKey !== businessKey);
-  }
   return active.length === 0;
+}
+
+export function consumeIncidentIpAssets(state, incidentId) {
+  const incidentLeases = state.ipLeases.filter((lease) => lease.incidentId === incidentId);
+  const assetIds = new Set(incidentLeases.map((lease) => lease.assetId).filter(Boolean));
+  const addresses = state.ipAssets.filter((asset) => assetIds.has(asset.id)).map((asset) => asset.address);
+  state.ipAssets = state.ipAssets.filter((asset) => !assetIds.has(asset.id));
+  for (const pool of state.ipPools) {
+    pool.assetIds = (pool.assetIds || []).filter((assetId) => !assetIds.has(assetId));
+  }
+  state.ipLeases = state.ipLeases.filter((lease) => lease.incidentId !== incidentId && !assetIds.has(lease.assetId));
+  return { assetIds: [...assetIds], addresses };
+}
+
+export function releaseIncidentIpLocks(state, incidentId) {
+  const previousCount = state.ipLeases.length;
+  state.ipLeases = state.ipLeases.filter((lease) => lease.incidentId !== incidentId);
+  return previousCount - state.ipLeases.length;
+}
+
+export function startIpUsageRecords(state, incidentId, allocated = []) {
+  state.ipUsageRecords ||= [];
+  const incident = state.incidents.find((item) => item.id === incidentId);
+  const policy = state.failoverPolicies.find((item) => item.id === incident?.policyId);
+  const target = state.probeTargets.find((item) => item.id === incident?.targetId);
+  const automationTask = state.automationTasks?.find((item) => item.id === policy?.automationTaskId);
+  const bindings = (state.dnsBindings || [])
+    .filter((item) => policy?.dnsBindingIds?.includes(item.id))
+    .map((item) => ({ id: item.id, domain: item.domain, recordType: item.recordType }));
+  const existingLeaseIds = new Set(state.ipUsageRecords.map((item) => item.leaseId));
+  const records = allocated
+    .filter((item) => item.leaseId && !existingLeaseIds.has(item.leaseId))
+    .map((item) => {
+      const pool = state.ipPools.find((entry) => entry.id === item.poolId);
+      return {
+        id: uuidv4(),
+        leaseId: item.leaseId,
+        assetId: item.assetId,
+        address: item.address,
+        poolId: item.poolId,
+        poolName: pool?.name || '',
+        incidentId,
+        targetId: incident?.targetId || '',
+        targetName: target?.name || incident?.targetName || '',
+        policyId: incident?.policyId || '',
+        policyName: policy?.name || incident?.policyName || '',
+        automationTaskId: policy?.automationTaskId || '',
+        automationTaskName: automationTask?.name || '',
+        bindings,
+        status: 'processing',
+        startedAt: nowIso(),
+        finishedAt: '',
+        error: ''
+      };
+    });
+  state.ipUsageRecords = [...records, ...state.ipUsageRecords].slice(0, 5000);
+  return records;
+}
+
+export function finalizeIpUsageRecords(state, incidentId, status, error = '', leaseIds = null) {
+  state.ipUsageRecords ||= [];
+  const finishedAt = nowIso();
+  const allowedLeaseIds = Array.isArray(leaseIds) && leaseIds.length ? new Set(leaseIds) : null;
+  let updated = 0;
+  for (const record of state.ipUsageRecords) {
+    if (record.incidentId !== incidentId || !['processing', 'rolled_back'].includes(record.status)) continue;
+    if (allowedLeaseIds && !allowedLeaseIds.has(record.leaseId)) continue;
+    Object.assign(record, { status, error: cleanText(error, 1000), finishedAt });
+    updated += 1;
+  }
+  return updated;
 }
 
 async function applyDnsBinding(binding, allocatedIps, incidentId, deps) {
@@ -732,7 +814,7 @@ export async function rollbackIncident(incidentId, deps, actor) {
   const state = deps.readState();
   const incident = state.incidents.find((item) => item.id === incidentId);
   if (!incident) throw new Error('故障事件不存在');
-  deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'rolling_back', message: '正在回滚 DNS 与租约' }));
+  deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'rolling_back', message: '正在回滚 DNS 并释放备用 IP' }));
   for (const changeId of [...(incident.dnsChangeIds || [])].reverse()) {
     const current = deps.readState();
     const change = current.dnsChanges.find((item) => item.id === changeId && item.status === 'applied');
@@ -752,9 +834,10 @@ export async function rollbackIncident(incidentId, deps, actor) {
     });
   }
   const next = deps.updateState((draft) => {
-    for (const lease of draft.ipLeases.filter((item) => item.incidentId === incidentId)) Object.assign(lease, { status: 'released', releasedAt: nowIso() });
+    releaseIncidentIpLocks(draft, incidentId);
+    finalizeIpUsageRecords(draft, incidentId, 'rolled_back', '', incident.leaseIds);
     updateIncident(draft, incidentId, { status: 'rolled_back', message: '已回滚', executionId: '', finishedAt: nowIso() });
-    pushAudit(draft, 'incident.rollback', 'incident', incidentId, '回滚 DNS 变更并释放 IP 租约', actor);
+    pushAudit(draft, 'incident.rollback', 'incident', incidentId, '回滚 DNS 变更并释放备用 IP', actor);
     return draft;
   });
   return { incident: next.incidents.find((item) => item.id === incidentId) };
@@ -1225,8 +1308,10 @@ function updateIncident(state, id, patch) {
 
 function failIncident(deps, id, message) {
   deps.updateState((draft) => {
+    const incident = draft.incidents.find((item) => item.id === id);
     updateIncident(draft, id, { status: 'failed', error: cleanText(message, 1000), message: '执行失败', executionId: '', finishedAt: nowIso() });
-    for (const lease of draft.ipLeases.filter((item) => item.incidentId === id && item.status === 'locked')) Object.assign(lease, { status: 'released', releasedAt: nowIso() });
+    releaseIncidentIpLocks(draft, id);
+    finalizeIpUsageRecords(draft, id, 'failed', message, incident?.leaseIds);
     pushAudit(draft, 'incident.failed', 'incident', id, cleanText(message, 500), 'system');
     return draft;
   });

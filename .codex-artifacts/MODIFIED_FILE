@@ -25,8 +25,10 @@ const ACTIVE_INCIDENT_STATES = new Set([
   'observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'
 ]);
 const RUNNING_INCIDENT_STATES = new Set(['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back']);
-const TARGET_CHECK_ROUNDS = 3;
-const TARGET_ATTEMPTS_PER_ROUND = 3;
+const DEFAULT_TARGET_CHECK_ROUNDS = 3;
+const DEFAULT_TARGET_ATTEMPTS_PER_ROUND = 3;
+const MAX_TARGET_CHECK_ROUNDS = 10;
+const MAX_TARGET_ATTEMPTS_PER_ROUND = 10;
 
 const DNS_PROVIDERS = new Set([
   'huawei', 'aliyun', 'tencent', 'dnspod', 'cloudflare', 'godaddy', 'porkbun', 'cloudns', 'callback',
@@ -62,8 +64,8 @@ export function normalizeOrchestrationState(parsed = {}) {
   normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, ...pool }) => pool);
   normalized.probeTargets = normalized.probeTargets.map(({ quorumMode, quorumCount, failureThreshold, recoveryThreshold, ...target }) => ({
     ...target,
-    checkRounds: TARGET_CHECK_ROUNDS,
-    attemptsPerRound: TARGET_ATTEMPTS_PER_ROUND,
+    checkRounds: clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS),
+    attemptsPerRound: clampNumber(target.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND),
     observations: Object.fromEntries(Object.entries(target.observations || {}).map(([probeId, observation]) => {
       const { failures, successes, ...current } = observation || {};
       return [probeId, current];
@@ -158,17 +160,19 @@ export function registerProbePublicRoutes(app, deps) {
         target.observations ||= {};
         const ok = Boolean(raw.ok);
         const checkedAt = nowIso();
+        const checkRounds = clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS);
+        const attemptsPerRound = clampNumber(target.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND);
         target.observations[auth.probe.id] = {
           ok,
           latencyMs: clampNumber(raw.latencyMs, 0, 600000, 0),
           error: cleanText(raw.error, 300),
           checkedAt,
-          rounds: clampNumber(raw.rounds, 0, TARGET_CHECK_ROUNDS, 0),
-          attemptsPerRound: clampNumber(raw.attemptsPerRound, 0, TARGET_ATTEMPTS_PER_ROUND, 0),
-          roundsCompleted: clampNumber(raw.roundsCompleted, 0, TARGET_CHECK_ROUNDS, 0),
-          attempts: clampNumber(raw.attempts, 0, TARGET_CHECK_ROUNDS * TARGET_ATTEMPTS_PER_ROUND, 0),
-          successfulRound: clampNumber(raw.successfulRound, 0, TARGET_CHECK_ROUNDS, 0),
-          successfulAttempt: clampNumber(raw.successfulAttempt, 0, TARGET_ATTEMPTS_PER_ROUND, 0),
+          rounds: clampNumber(raw.rounds, 0, checkRounds, 0),
+          attemptsPerRound: clampNumber(raw.attemptsPerRound, 0, attemptsPerRound, 0),
+          roundsCompleted: clampNumber(raw.roundsCompleted, 0, checkRounds, 0),
+          attempts: clampNumber(raw.attempts, 0, checkRounds * attemptsPerRound, 0),
+          successfulRound: clampNumber(raw.successfulRound, 0, checkRounds, 0),
+          successfulAttempt: clampNumber(raw.successfulAttempt, 0, attemptsPerRound, 0),
           resolvedAddresses: cleanTexts(raw.resolvedAddresses, 20)
         };
         target.updatedAt = nowIso();
@@ -182,7 +186,7 @@ export function registerProbePublicRoutes(app, deps) {
             const incident = createIncident(target, policy, auth.probe.id);
             draft.incidents.unshift(incident);
             createdIncidentIds.push(incident.id);
-            pushAudit(draft, 'incident.created', 'incident', incident.id, `${target.name} 所有探针完成 3×3 检查且全部失败`, 'probe');
+            pushAudit(draft, 'incident.created', 'incident', incident.id, `${target.name} 所有探针完成 ${checkRounds}×${attemptsPerRound} 检查且全部失败`, 'probe');
           }
         }
       }
@@ -646,8 +650,12 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     const checkType = input.checkType === 'tcp' ? 'tcp' : 'ping';
     const port = clampNumber(input.port, 1, 65535, 443);
     const probeIds = cleanIds(input.probeIds, 500);
+    const checkRounds = clampNumber(input.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS);
+    const attemptsPerRound = clampNumber(input.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND);
     const identityChanged = Boolean(existing && (
       existing.address !== address || existing.checkType !== checkType || Number(existing.port) !== port ||
+      Number(existing.checkRounds || DEFAULT_TARGET_CHECK_ROUNDS) !== checkRounds ||
+      Number(existing.attemptsPerRound || DEFAULT_TARGET_ATTEMPTS_PER_ROUND) !== attemptsPerRound ||
       JSON.stringify([...(existing.probeIds || [])].sort()) !== JSON.stringify([...probeIds].sort())
     ));
     return {
@@ -659,8 +667,8 @@ function normalizeResource(key, input = {}, existing = null, deps) {
       port,
       interval: clampNumber(input.interval, 5, 3600, 30),
       timeout: clampNumber(input.timeout, 1, 60, 5),
-      checkRounds: TARGET_CHECK_ROUNDS,
-      attemptsPerRound: TARGET_ATTEMPTS_PER_ROUND,
+      checkRounds,
+      attemptsPerRound,
       probeIds,
       policyId: cleanId(input.policyId),
       enabled: input.enabled !== false,
@@ -855,8 +863,10 @@ function authenticateProbe(req, state) {
 export function evaluateTargetHealth(target, probes) {
   const assignedProbeIds = (target.probeIds || []).filter((probeId) => probes.some((probe) => probe.id === probeId && probe.enabled !== false));
   const now = Date.now();
+  const checkRounds = clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS);
+  const attemptsPerRound = clampNumber(target.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND);
   const intervalMs = Math.max(5000, Number(target.interval || 30) * 1000);
-  const checkWindowMs = Math.max(15000, Number(target.timeout || 5) * TARGET_CHECK_ROUNDS * 1000 + (TARGET_CHECK_ROUNDS - 1) * 1000);
+  const checkWindowMs = Math.max(15000, Number(target.timeout || 5) * checkRounds * 1000 + (checkRounds - 1) * 1000);
   const freshnessMs = intervalMs + checkWindowMs + 10000;
   const maxRoundSkewMs = intervalMs + checkWindowMs;
   const observations = Object.entries(target.observations || {}).filter(([probeId, observation]) => {
@@ -866,11 +876,11 @@ export function evaluateTargetHealth(target, probes) {
   const completeRound = assignedProbeIds.length > 0 && observations.length === assignedProbeIds.length;
   const checkedTimes = observations.map(([, item]) => Date.parse(item.checkedAt));
   const alignedRound = completeRound && Math.max(...checkedTimes) - Math.min(...checkedTimes) <= maxRoundSkewMs;
-  const completedThreeByThree = (item) => item.rounds === TARGET_CHECK_ROUNDS &&
-    item.attemptsPerRound === TARGET_ATTEMPTS_PER_ROUND &&
-    item.roundsCompleted === TARGET_CHECK_ROUNDS &&
-    item.attempts === TARGET_CHECK_ROUNDS * TARGET_ATTEMPTS_PER_ROUND;
-  const failed = alignedRound && observations.every(([, item]) => !item.ok && completedThreeByThree(item));
+  const completedConfiguredCheck = (item) => item.rounds === checkRounds &&
+    item.attemptsPerRound === attemptsPerRound &&
+    item.roundsCompleted === checkRounds &&
+    item.attempts === checkRounds * attemptsPerRound;
+  const failed = alignedRound && observations.every(([, item]) => !item.ok && completedConfiguredCheck(item));
   const healthy = alignedRound && observations.some(([, item]) => item.ok);
   return { failed, health: failed ? 'down' : healthy ? 'healthy' : 'observing' };
 }

@@ -43,6 +43,18 @@ class ProbeCheckWindowTests(unittest.TestCase):
         self.assertEqual(result["attempts"], 9)
         self.assertEqual(result["successfulRound"], 0)
 
+    def test_uses_target_specific_round_and_attempt_counts(self):
+        target = {**self.target, "checkRounds": 2, "attemptsPerRound": 2}
+        with mock.patch.object(PROBE, "validate_target_address", return_value={"203.0.113.10"}), \
+                mock.patch.object(PROBE, "check_attempt", return_value=(False, "failed")), \
+                mock.patch.object(PROBE.time, "sleep", return_value=None):
+            result = PROBE.check_target(target)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["rounds"], 2)
+        self.assertEqual(result["attemptsPerRound"], 2)
+        self.assertEqual(result["attempts"], 4)
+
     def test_retries_temporary_dns_resolution_failures(self):
         resolutions = [OSError("dns failed"), {"203.0.113.10"}]
         with mock.patch.object(PROBE, "validate_target_address", side_effect=resolutions) as resolver, \

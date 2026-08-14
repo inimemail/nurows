@@ -13,9 +13,11 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.1.0"
-CHECK_ROUNDS = 3
-ATTEMPTS_PER_ROUND = 3
+VERSION = "1.2.0"
+DEFAULT_CHECK_ROUNDS = 3
+DEFAULT_ATTEMPTS_PER_ROUND = 3
+MAX_CHECK_ROUNDS = 10
+MAX_ATTEMPTS_PER_ROUND = 10
 ROUND_DELAY_SECONDS = 1
 
 
@@ -102,19 +104,27 @@ def check_target(target):
         timeout = max(1.0, float(target.get("timeout", 5)))
     except (TypeError, ValueError):
         timeout = 5.0
+    try:
+        check_rounds = min(MAX_CHECK_ROUNDS, max(1, int(target.get("checkRounds", DEFAULT_CHECK_ROUNDS))))
+    except (TypeError, ValueError):
+        check_rounds = DEFAULT_CHECK_ROUNDS
+    try:
+        attempts_per_round = min(MAX_ATTEMPTS_PER_ROUND, max(1, int(target.get("attemptsPerRound", DEFAULT_ATTEMPTS_PER_ROUND))))
+    except (TypeError, ValueError):
+        attempts_per_round = DEFAULT_ATTEMPTS_PER_ROUND
     attempts_run = 0
     rounds_completed = 0
     addresses = None
     last_error = "check failed"
-    for round_index in range(1, CHECK_ROUNDS + 1):
+    for round_index in range(1, check_rounds + 1):
         round_deadline = time.monotonic() + timeout
-        for attempt_index in range(1, ATTEMPTS_PER_ROUND + 1):
+        for attempt_index in range(1, attempts_per_round + 1):
             attempts_run += 1
             try:
                 if addresses is None:
                     addresses = validate_target_address(target["address"], bool(target.get("allowPrivate")))
                 remaining = round_deadline - time.monotonic()
-                attempts_left = ATTEMPTS_PER_ROUND - attempt_index + 1
+                attempts_left = attempts_per_round - attempt_index + 1
                 if remaining <= 0:
                     raise TimeoutError("round timeout")
                 ok, error = check_attempt(target, addresses, remaining / attempts_left)
@@ -122,7 +132,7 @@ def check_target(target):
                     return {
                         "targetId": target["id"], "ok": True,
                         "latencyMs": round((time.monotonic() - started) * 1000, 2), "error": "",
-                        "rounds": CHECK_ROUNDS, "attemptsPerRound": ATTEMPTS_PER_ROUND,
+                        "rounds": check_rounds, "attemptsPerRound": attempts_per_round,
                         "roundsCompleted": round_index, "attempts": attempts_run,
                         "successfulRound": round_index, "successfulAttempt": attempt_index,
                         "resolvedAddresses": sorted(addresses)
@@ -132,13 +142,13 @@ def check_target(target):
                 addresses = None
                 last_error = str(error) or error.__class__.__name__
         rounds_completed = round_index
-        if round_index < CHECK_ROUNDS:
+        if round_index < check_rounds:
             time.sleep(ROUND_DELAY_SECONDS)
     return {
         "targetId": target["id"], "ok": False,
         "latencyMs": round((time.monotonic() - started) * 1000, 2),
-        "error": f"3 rounds x 3 attempts failed: {last_error}"[:200],
-        "rounds": CHECK_ROUNDS, "attemptsPerRound": ATTEMPTS_PER_ROUND,
+        "error": f"{check_rounds} rounds x {attempts_per_round} attempts failed: {last_error}"[:200],
+        "rounds": check_rounds, "attemptsPerRound": attempts_per_round,
         "roundsCompleted": rounds_completed, "attempts": attempts_run,
         "successfulRound": 0, "successfulAttempt": 0,
         "resolvedAddresses": sorted(addresses or [])

@@ -1,276 +1,288 @@
---- .codex-artifacts/BASELINE_FILE	2026-08-14 18:51:58
-+++ .codex-artifacts/MODIFIED_FILE	2026-08-14 21:54:23
-@@ -24,6 +24,9 @@
- const ACTIVE_INCIDENT_STATES = new Set([
+diff --git a/probe-agent/install.sh b/probe-agent/install.sh
+index be5e35f..e560cd8 100755
+--- a/probe-agent/install.sh
++++ b/probe-agent/install.sh
+@@ -98,7 +98,8 @@ ReadWritePaths=$CONFIG_DIR
+ WantedBy=multi-user.target
+ EOF
+ systemctl daemon-reload
+-systemctl enable --now nurossh-probe.service
++systemctl enable nurossh-probe.service >/dev/null
++systemctl restart nurossh-probe.service
+ sleep 2
+ if ! systemctl is-active --quiet nurossh-probe.service; then
+   echo "nurossh-probe.service failed to start" >&2
+diff --git a/probe-agent/nurossh_probe.py b/probe-agent/nurossh_probe.py
+index af3009e..c9de051 100755
+--- a/probe-agent/nurossh_probe.py
++++ b/probe-agent/nurossh_probe.py
+@@ -13,9 +13,11 @@ from urllib.error import HTTPError
+ from urllib.parse import urlparse
+
+ CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
+-VERSION = "1.1.0"
+-CHECK_ROUNDS = 3
+-ATTEMPTS_PER_ROUND = 3
++VERSION = "1.2.0"
++DEFAULT_CHECK_ROUNDS = 3
++DEFAULT_ATTEMPTS_PER_ROUND = 3
++MAX_CHECK_ROUNDS = 10
++MAX_ATTEMPTS_PER_ROUND = 10
+ ROUND_DELAY_SECONDS = 1
+
+
+@@ -102,19 +104,27 @@ def check_target(target):
+         timeout = max(1.0, float(target.get("timeout", 5)))
+     except (TypeError, ValueError):
+         timeout = 5.0
++    try:
++        check_rounds = min(MAX_CHECK_ROUNDS, max(1, int(target.get("checkRounds", DEFAULT_CHECK_ROUNDS))))
++    except (TypeError, ValueError):
++        check_rounds = DEFAULT_CHECK_ROUNDS
++    try:
++        attempts_per_round = min(MAX_ATTEMPTS_PER_ROUND, max(1, int(target.get("attemptsPerRound", DEFAULT_ATTEMPTS_PER_ROUND))))
++    except (TypeError, ValueError):
++        attempts_per_round = DEFAULT_ATTEMPTS_PER_ROUND
+     attempts_run = 0
+     rounds_completed = 0
+     addresses = None
+     last_error = "check failed"
+-    for round_index in range(1, CHECK_ROUNDS + 1):
++    for round_index in range(1, check_rounds + 1):
+         round_deadline = time.monotonic() + timeout
+-        for attempt_index in range(1, ATTEMPTS_PER_ROUND + 1):
++        for attempt_index in range(1, attempts_per_round + 1):
+             attempts_run += 1
+             try:
+                 if addresses is None:
+                     addresses = validate_target_address(target["address"], bool(target.get("allowPrivate")))
+                 remaining = round_deadline - time.monotonic()
+-                attempts_left = ATTEMPTS_PER_ROUND - attempt_index + 1
++                attempts_left = attempts_per_round - attempt_index + 1
+                 if remaining <= 0:
+                     raise TimeoutError("round timeout")
+                 ok, error = check_attempt(target, addresses, remaining / attempts_left)
+@@ -122,7 +132,7 @@ def check_target(target):
+                     return {
+                         "targetId": target["id"], "ok": True,
+                         "latencyMs": round((time.monotonic() - started) * 1000, 2), "error": "",
+-                        "rounds": CHECK_ROUNDS, "attemptsPerRound": ATTEMPTS_PER_ROUND,
++                        "rounds": check_rounds, "attemptsPerRound": attempts_per_round,
+                         "roundsCompleted": round_index, "attempts": attempts_run,
+                         "successfulRound": round_index, "successfulAttempt": attempt_index,
+                         "resolvedAddresses": sorted(addresses)
+@@ -132,13 +142,13 @@ def check_target(target):
+                 addresses = None
+                 last_error = str(error) or error.__class__.__name__
+         rounds_completed = round_index
+-        if round_index < CHECK_ROUNDS:
++        if round_index < check_rounds:
+             time.sleep(ROUND_DELAY_SECONDS)
+     return {
+         "targetId": target["id"], "ok": False,
+         "latencyMs": round((time.monotonic() - started) * 1000, 2),
+-        "error": f"3 rounds x 3 attempts failed: {last_error}"[:200],
+-        "rounds": CHECK_ROUNDS, "attemptsPerRound": ATTEMPTS_PER_ROUND,
++        "error": f"{check_rounds} rounds x {attempts_per_round} attempts failed: {last_error}"[:200],
++        "rounds": check_rounds, "attemptsPerRound": attempts_per_round,
+         "roundsCompleted": rounds_completed, "attempts": attempts_run,
+         "successfulRound": 0, "successfulAttempt": 0,
+         "resolvedAddresses": sorted(addresses or [])
+diff --git a/server/orchestration.js b/server/orchestration.js
+index 8a2c677..7f59628 100644
+--- a/server/orchestration.js
++++ b/server/orchestration.js
+@@ -25,8 +25,10 @@ const ACTIVE_INCIDENT_STATES = new Set([
    'observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'
  ]);
-+const RUNNING_INCIDENT_STATES = new Set(['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back']);
-+const TARGET_CHECK_ROUNDS = 3;
-+const TARGET_ATTEMPTS_PER_ROUND = 3;
+ const RUNNING_INCIDENT_STATES = new Set(['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back']);
+-const TARGET_CHECK_ROUNDS = 3;
+-const TARGET_ATTEMPTS_PER_ROUND = 3;
++const DEFAULT_TARGET_CHECK_ROUNDS = 3;
++const DEFAULT_TARGET_ATTEMPTS_PER_ROUND = 3;
++const MAX_TARGET_CHECK_ROUNDS = 10;
++const MAX_TARGET_ATTEMPTS_PER_ROUND = 10;
 
  const DNS_PROVIDERS = new Set([
    'huawei', 'aliyun', 'tencent', 'dnspod', 'cloudflare', 'godaddy', 'porkbun', 'cloudns', 'callback',
-@@ -57,7 +60,15 @@
-   const defaults = orchestrationDefaults();
-   const normalized = Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
+@@ -62,8 +64,8 @@ export function normalizeOrchestrationState(parsed = {}) {
    normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, ...pool }) => pool);
--  normalized.probeTargets = normalized.probeTargets.map(({ quorumMode, quorumCount, ...target }) => target);
-+  normalized.probeTargets = normalized.probeTargets.map(({ quorumMode, quorumCount, failureThreshold, recoveryThreshold, ...target }) => ({
-+    ...target,
-+    checkRounds: TARGET_CHECK_ROUNDS,
-+    attemptsPerRound: TARGET_ATTEMPTS_PER_ROUND,
-+    observations: Object.fromEntries(Object.entries(target.observations || {}).map(([probeId, observation]) => {
-+      const { failures, successes, ...current } = observation || {};
-+      return [probeId, current];
-+    }))
-+  }));
-   normalized.incidents = normalized.incidents.map((incident) => {
-     const legacyNoIp = incident.status === 'failed' && /备用\s*IP|备用地址|没有可用 IP/i.test(`${incident.error || ''} ${incident.message || ''}`);
-     return legacyNoIp ? { ...incident, status: 'waiting_for_ip', message: '等待备用 IP', error: '', executionId: '', recheckRequestedAt: '' } : incident;
-@@ -145,20 +156,25 @@
-         const target = draft.probeTargets.find((item) => item.id === cleanId(raw.targetId) && item.probeIds?.includes(auth.probe.id));
-         if (!target) continue;
+   normalized.probeTargets = normalized.probeTargets.map(({ quorumMode, quorumCount, failureThreshold, recoveryThreshold, ...target }) => ({
+     ...target,
+-    checkRounds: TARGET_CHECK_ROUNDS,
+-    attemptsPerRound: TARGET_ATTEMPTS_PER_ROUND,
++    checkRounds: clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS),
++    attemptsPerRound: clampNumber(target.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND),
+     observations: Object.fromEntries(Object.entries(target.observations || {}).map(([probeId, observation]) => {
+       const { failures, successes, ...current } = observation || {};
+       return [probeId, current];
+@@ -158,17 +160,19 @@ export function registerProbePublicRoutes(app, deps) {
          target.observations ||= {};
--        const previous = target.observations[auth.probe.id] || { failures: 0, successes: 0 };
          const ok = Boolean(raw.ok);
-+        const checkedAt = nowIso();
+         const checkedAt = nowIso();
++        const checkRounds = clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS);
++        const attemptsPerRound = clampNumber(target.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND);
          target.observations[auth.probe.id] = {
            ok,
            latencyMs: clampNumber(raw.latencyMs, 0, 600000, 0),
            error: cleanText(raw.error, 300),
--          checkedAt: nowIso(),
--          failures: ok ? 0 : Number(previous.failures || 0) + 1,
--          successes: ok ? Number(previous.successes || 0) + 1 : 0
-+          checkedAt,
-+          rounds: clampNumber(raw.rounds, 0, TARGET_CHECK_ROUNDS, 0),
-+          attemptsPerRound: clampNumber(raw.attemptsPerRound, 0, TARGET_ATTEMPTS_PER_ROUND, 0),
-+          roundsCompleted: clampNumber(raw.roundsCompleted, 0, TARGET_CHECK_ROUNDS, 0),
-+          attempts: clampNumber(raw.attempts, 0, TARGET_CHECK_ROUNDS * TARGET_ATTEMPTS_PER_ROUND, 0),
-+          successfulRound: clampNumber(raw.successfulRound, 0, TARGET_CHECK_ROUNDS, 0),
-+          successfulAttempt: clampNumber(raw.successfulAttempt, 0, TARGET_ATTEMPTS_PER_ROUND, 0),
-+          resolvedAddresses: cleanTexts(raw.resolvedAddresses, 20)
+           checkedAt,
+-          rounds: clampNumber(raw.rounds, 0, TARGET_CHECK_ROUNDS, 0),
+-          attemptsPerRound: clampNumber(raw.attemptsPerRound, 0, TARGET_ATTEMPTS_PER_ROUND, 0),
+-          roundsCompleted: clampNumber(raw.roundsCompleted, 0, TARGET_CHECK_ROUNDS, 0),
+-          attempts: clampNumber(raw.attempts, 0, TARGET_CHECK_ROUNDS * TARGET_ATTEMPTS_PER_ROUND, 0),
+-          successfulRound: clampNumber(raw.successfulRound, 0, TARGET_CHECK_ROUNDS, 0),
+-          successfulAttempt: clampNumber(raw.successfulAttempt, 0, TARGET_ATTEMPTS_PER_ROUND, 0),
++          rounds: clampNumber(raw.rounds, 0, checkRounds, 0),
++          attemptsPerRound: clampNumber(raw.attemptsPerRound, 0, attemptsPerRound, 0),
++          roundsCompleted: clampNumber(raw.roundsCompleted, 0, checkRounds, 0),
++          attempts: clampNumber(raw.attempts, 0, checkRounds * attemptsPerRound, 0),
++          successfulRound: clampNumber(raw.successfulRound, 0, checkRounds, 0),
++          successfulAttempt: clampNumber(raw.successfulAttempt, 0, attemptsPerRound, 0),
+           resolvedAddresses: cleanTexts(raw.resolvedAddresses, 20)
          };
          target.updatedAt = nowIso();
-         const transition = evaluateTargetHealth(target, draft.probes);
-         target.health = transition.health;
--        target.lastCheckAt = nowIso();
-+        target.lastCheckAt = checkedAt;
-         if (transition.failed && target.policyId) {
-           const active = draft.incidents.some((item) => item.targetId === target.id && (ACTIVE_INCIDENT_STATES.has(item.status) || (item.status === 'failed' && target.health === 'down')));
-           const policy = draft.failoverPolicies.find((item) => item.id === target.policyId && item.enabled !== false);
-@@ -166,7 +182,7 @@
+@@ -182,7 +186,7 @@ export function registerProbePublicRoutes(app, deps) {
              const incident = createIncident(target, policy, auth.probe.id);
              draft.incidents.unshift(incident);
              createdIncidentIds.push(incident.id);
--            pushAudit(draft, 'incident.created', 'incident', incident.id, `${target.name} 达到故障阈值`, 'probe');
-+            pushAudit(draft, 'incident.created', 'incident', incident.id, `${target.name} 所有探针完成 3×3 检查且全部失败`, 'probe');
+-            pushAudit(draft, 'incident.created', 'incident', incident.id, `${target.name} 所有探针完成 3×3 检查且全部失败`, 'probe');
++            pushAudit(draft, 'incident.created', 'incident', incident.id, `${target.name} 所有探针完成 ${checkRounds}×${attemptsPerRound} 检查且全部失败`, 'probe');
            }
          }
        }
-@@ -228,6 +244,10 @@
-         delete item.leaseMinutes;
-         delete item.cooldownMinutes;
-       }
-+      if (key === 'probeTargets') {
-+        delete item.failureThreshold;
-+        delete item.recoveryThreshold;
-+      }
-       pushAudit(draft, `${key}.update`, key, item.id, `更新 ${item.name || item.address || item.domain || item.id}`, req.auth.username);
-       return draft;
-     });
-@@ -381,6 +401,38 @@
-     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
-   });
-
-+  app.delete('/api/incidents/:id', (req, res) => {
-+    let removed = false;
-+    const state = deps.updateState((draft) => {
-+      const incident = draft.incidents.find((item) => item.id === req.params.id);
-+      if (!incident) throw new Error('故障事件不存在');
-+      if (incident.executionId || RUNNING_INCIDENT_STATES.has(incident.status)) throw new Error('事件正在执行，结束后才能删除');
-+      draft.ipLeases = draft.ipLeases.filter((lease) => lease.incidentId !== incident.id);
-+      draft.incidents = draft.incidents.filter((item) => item.id !== incident.id);
-+      pushAudit(draft, 'incident.delete', 'incident', incident.id, `删除故障事件 ${incident.targetName || incident.id}`, req.auth.username);
-+      removed = true;
-+      return draft;
-+    });
-+    res.json({ ok: true, removed, state: deps.sanitizeState(state, req.auth) });
-+  });
-+
-+  app.delete('/api/incidents', (req, res) => {
-+    let removed = 0;
-+    let kept = 0;
-+    const state = deps.updateState((draft) => {
-+      const removableIds = new Set(draft.incidents
-+        .filter((item) => !item.executionId && !RUNNING_INCIDENT_STATES.has(item.status))
-+        .map((item) => item.id));
-+      removed = removableIds.size;
-+      kept = draft.incidents.length - removed;
-+      draft.ipLeases = draft.ipLeases.filter((lease) => !removableIds.has(lease.incidentId));
-+      draft.incidents = draft.incidents.filter((item) => !removableIds.has(item.id));
-+      pushAudit(draft, 'incident.clear', 'incident', '', `清理 ${removed} 条故障事件，保留 ${kept} 条执行中事件`, req.auth.username);
-+      return draft;
-+    });
-+    res.json({ ok: true, removed, kept, state: deps.sanitizeState(state, req.auth) });
-+  });
-+
-   app.post('/api/incidents/:id/execute', (req, res) => {
-     const state = deps.updateState((draft) => {
-       const incident = draft.incidents.find((item) => item.id === req.params.id);
-@@ -441,6 +493,12 @@
-   const policy = snapshot.failoverPolicies.find((item) => item.id === incident.policyId);
-   const target = snapshot.probeTargets.find((item) => item.id === incident.targetId);
-   if (!policy || !target) return failIncident(deps, incidentId, '关联策略或目标不存在');
-+  const initialHealth = evaluateTargetHealth(target, snapshot.probes || []).health;
-+  if (initialHealth !== 'down') {
-+    settleIncidentForTargetHealth(deps, incidentId, initialHealth);
-+    deps.notifyIncident?.(incidentId);
-+    return;
-+  }
-   try {
-     const allocated = allocateIpsForIncident(incidentId, deps);
-     // A failover incident must not run against the original host when no
-@@ -486,6 +544,15 @@
-     }
-     deps.updateState((draft) => updateIncident(draft, incidentId, { allocatedIps: allocatedForExecution.map((item) => item.address), leaseIds: allocatedForExecution.map((item) => item.leaseId) }));
-
-+    snapshot = deps.readState();
-+    const latestTarget = snapshot.probeTargets.find((item) => item.id === incident.targetId);
-+    const latestHealth = latestTarget ? evaluateTargetHealth(latestTarget, snapshot.probes || []).health : 'observing';
-+    if (latestHealth !== 'down') {
-+      settleIncidentForTargetHealth(deps, incidentId, latestHealth);
-+      deps.notifyIncident?.(incidentId);
-+      return;
-+    }
-+
-     if (policy.automationTaskId) {
-       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'automating', message: '正在执行自动化任务' }));
-       const hosts = policy.automationHosts === 'target' ? [target.address] : allocatedForExecution.map((item) => item.address);
-@@ -523,7 +590,11 @@
-
- export function retryWaitingIpIncidents(deps, encryptionKey = null) {
-   let state = deps.readState();
--  const recovered = state.incidents.filter((incident) => incident.status === 'waiting_for_ip' && state.probeTargets.find((target) => target.id === incident.targetId)?.health === 'healthy');
-+  const recovered = state.incidents.filter((incident) => {
-+    if (!['waiting_for_ip', 'observing', 'pending_approval'].includes(incident.status)) return false;
-+    const target = state.probeTargets.find((item) => item.id === incident.targetId);
-+    return target?.health === 'healthy' && targetCompletedCheckSince(target, state.probes || [], incident.recheckRequestedAt);
-+  });
-   if (recovered.length) {
-     deps.updateState((draft) => {
-       for (const incident of recovered) updateIncident(draft, incident.id, { status: 'recovered', message: '目标已恢复，无需切换', executionId: '', finishedAt: nowIso() });
-@@ -533,7 +604,8 @@
-   }
-   const waiting = state.incidents.filter((item) => {
-     const target = state.probeTargets.find((entry) => entry.id === item.targetId);
--    const freshRecheck = item.recheckRequestedAt && Date.parse(target?.lastCheckAt || 0) >= Date.parse(item.recheckRequestedAt);
-+    const freshRecheck = targetCompletedCheckSince(target, state.probes || [], item.recheckRequestedAt);
-+    if (item.status === 'observing') return target?.health === 'down';
-     return item.status === 'waiting_for_ip' && target?.health === 'down' && freshRecheck && hasAvailableIpForIncident(item, state);
-   });
-   for (const incident of waiting) runIncidentWorkflow(incident.id, deps, encryptionKey);
-@@ -557,11 +629,47 @@
-   return requested;
- }
-
-+function targetCompletedCheckSince(target, probes, requestedAt) {
-+  if (!target || !requestedAt) return true;
-+  const requestedTime = Date.parse(requestedAt);
-+  if (!Number.isFinite(requestedTime)) return false;
-+  const assignedProbeIds = (target.probeIds || []).filter((probeId) => probes.some((probe) => probe.id === probeId && probe.enabled !== false));
-+  return assignedProbeIds.length > 0 && assignedProbeIds.every((probeId) => Date.parse(target.observations?.[probeId]?.checkedAt || 0) >= requestedTime);
-+}
-+
- function normalizeResource(key, input = {}, existing = null, deps) {
-   const now = nowIso();
-   const base = { id: existing?.id || cleanId(input.id) || uuidv4(), createdAt: existing?.createdAt || now, updatedAt: now };
-   if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', tokenEnc: existing?.tokenEnc || null, agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
--  if (key === 'probeTargets') return { ...base, name: requiredText(input.name, '目标名称'), address: validateHost(input.address, Boolean(input.allowPrivate)), allowPrivate: Boolean(input.allowPrivate), checkType: input.checkType === 'tcp' ? 'tcp' : 'ping', port: clampNumber(input.port, 1, 65535, 443), interval: clampNumber(input.interval, 5, 3600, 30), timeout: clampNumber(input.timeout, 1, 60, 5), failureThreshold: clampNumber(input.failureThreshold, 1, 20, 3), recoveryThreshold: clampNumber(input.recoveryThreshold, 1, 20, 2), probeIds: cleanIds(input.probeIds, 500), policyId: cleanId(input.policyId), enabled: input.enabled !== false, health: existing?.health || 'unknown', observations: existing?.observations || {}, lastCheckAt: existing?.lastCheckAt || '', checkNowAt: existing?.checkNowAt || '' };
-+  if (key === 'probeTargets') {
-+    const address = validateHost(input.address, Boolean(input.allowPrivate));
-+    const checkType = input.checkType === 'tcp' ? 'tcp' : 'ping';
-+    const port = clampNumber(input.port, 1, 65535, 443);
-+    const probeIds = cleanIds(input.probeIds, 500);
-+    const identityChanged = Boolean(existing && (
-+      existing.address !== address || existing.checkType !== checkType || Number(existing.port) !== port ||
-+      JSON.stringify([...(existing.probeIds || [])].sort()) !== JSON.stringify([...probeIds].sort())
-+    ));
-+    return {
-+      ...base,
-+      name: requiredText(input.name, '目标名称'),
-+      address,
-+      allowPrivate: Boolean(input.allowPrivate),
-+      checkType,
-+      port,
-+      interval: clampNumber(input.interval, 5, 3600, 30),
-+      timeout: clampNumber(input.timeout, 1, 60, 5),
-+      checkRounds: TARGET_CHECK_ROUNDS,
-+      attemptsPerRound: TARGET_ATTEMPTS_PER_ROUND,
-+      probeIds,
-+      policyId: cleanId(input.policyId),
-+      enabled: input.enabled !== false,
-+      health: identityChanged ? 'unknown' : (existing?.health || 'unknown'),
-+      observations: identityChanged ? {} : (existing?.observations || {}),
-+      lastCheckAt: identityChanged ? '' : (existing?.lastCheckAt || ''),
-+      checkNowAt: identityChanged ? now : (existing?.checkNowAt || '')
-+    };
-+  }
-   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
-   if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, note: cleanText(input.note, 500) };
-   if (key === 'dnsAccounts') {
-@@ -746,12 +854,24 @@
-
+@@ -646,8 +650,12 @@ function normalizeResource(key, input = {}, existing = null, deps) {
+     const checkType = input.checkType === 'tcp' ? 'tcp' : 'ping';
+     const port = clampNumber(input.port, 1, 65535, 443);
+     const probeIds = cleanIds(input.probeIds, 500);
++    const checkRounds = clampNumber(input.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS);
++    const attemptsPerRound = clampNumber(input.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND);
+     const identityChanged = Boolean(existing && (
+       existing.address !== address || existing.checkType !== checkType || Number(existing.port) !== port ||
++      Number(existing.checkRounds || DEFAULT_TARGET_CHECK_ROUNDS) !== checkRounds ||
++      Number(existing.attemptsPerRound || DEFAULT_TARGET_ATTEMPTS_PER_ROUND) !== attemptsPerRound ||
+       JSON.stringify([...(existing.probeIds || [])].sort()) !== JSON.stringify([...probeIds].sort())
+     ));
+     return {
+@@ -659,8 +667,8 @@ function normalizeResource(key, input = {}, existing = null, deps) {
+       port,
+       interval: clampNumber(input.interval, 5, 3600, 30),
+       timeout: clampNumber(input.timeout, 1, 60, 5),
+-      checkRounds: TARGET_CHECK_ROUNDS,
+-      attemptsPerRound: TARGET_ATTEMPTS_PER_ROUND,
++      checkRounds,
++      attemptsPerRound,
+       probeIds,
+       policyId: cleanId(input.policyId),
+       enabled: input.enabled !== false,
+@@ -855,8 +863,10 @@ function authenticateProbe(req, state) {
  export function evaluateTargetHealth(target, probes) {
    const assignedProbeIds = (target.probeIds || []).filter((probeId) => probes.some((probe) => probe.id === probeId && probe.enabled !== false));
-+  const now = Date.now();
-+  const intervalMs = Math.max(5000, Number(target.interval || 30) * 1000);
-+  const checkWindowMs = Math.max(15000, Number(target.timeout || 5) * TARGET_CHECK_ROUNDS * 1000 + (TARGET_CHECK_ROUNDS - 1) * 1000);
-+  const freshnessMs = intervalMs + checkWindowMs + 10000;
-+  const maxRoundSkewMs = intervalMs + checkWindowMs;
+   const now = Date.now();
++  const checkRounds = clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS);
++  const attemptsPerRound = clampNumber(target.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND);
+   const intervalMs = Math.max(5000, Number(target.interval || 30) * 1000);
+-  const checkWindowMs = Math.max(15000, Number(target.timeout || 5) * TARGET_CHECK_ROUNDS * 1000 + (TARGET_CHECK_ROUNDS - 1) * 1000);
++  const checkWindowMs = Math.max(15000, Number(target.timeout || 5) * checkRounds * 1000 + (checkRounds - 1) * 1000);
+   const freshnessMs = intervalMs + checkWindowMs + 10000;
+   const maxRoundSkewMs = intervalMs + checkWindowMs;
    const observations = Object.entries(target.observations || {}).filter(([probeId, observation]) => {
--    return assignedProbeIds.includes(probeId) && Date.now() - Date.parse(observation.checkedAt || 0) < Math.max(120000, target.interval * 4000);
-+    const checkedAt = Date.parse(observation.checkedAt || 0);
-+    return assignedProbeIds.includes(probeId) && Number.isFinite(checkedAt) && now - checkedAt >= 0 && now - checkedAt <= freshnessMs;
-   });
+@@ -866,11 +876,11 @@ export function evaluateTargetHealth(target, probes) {
    const completeRound = assignedProbeIds.length > 0 && observations.length === assignedProbeIds.length;
--  const failed = completeRound && observations.every(([, item]) => !item.ok && item.failures >= target.failureThreshold);
--  const healthy = completeRound && observations.some(([, item]) => item.ok && item.successes >= target.recoveryThreshold);
-+  const checkedTimes = observations.map(([, item]) => Date.parse(item.checkedAt));
-+  const alignedRound = completeRound && Math.max(...checkedTimes) - Math.min(...checkedTimes) <= maxRoundSkewMs;
-+  const completedThreeByThree = (item) => item.rounds === TARGET_CHECK_ROUNDS &&
-+    item.attemptsPerRound === TARGET_ATTEMPTS_PER_ROUND &&
-+    item.roundsCompleted === TARGET_CHECK_ROUNDS &&
-+    item.attempts === TARGET_CHECK_ROUNDS * TARGET_ATTEMPTS_PER_ROUND;
-+  const failed = alignedRound && observations.every(([, item]) => !item.ok && completedThreeByThree(item));
-+  const healthy = alignedRound && observations.some(([, item]) => item.ok);
+   const checkedTimes = observations.map(([, item]) => Date.parse(item.checkedAt));
+   const alignedRound = completeRound && Math.max(...checkedTimes) - Math.min(...checkedTimes) <= maxRoundSkewMs;
+-  const completedThreeByThree = (item) => item.rounds === TARGET_CHECK_ROUNDS &&
+-    item.attemptsPerRound === TARGET_ATTEMPTS_PER_ROUND &&
+-    item.roundsCompleted === TARGET_CHECK_ROUNDS &&
+-    item.attempts === TARGET_CHECK_ROUNDS * TARGET_ATTEMPTS_PER_ROUND;
+-  const failed = alignedRound && observations.every(([, item]) => !item.ok && completedThreeByThree(item));
++  const completedConfiguredCheck = (item) => item.rounds === checkRounds &&
++    item.attemptsPerRound === attemptsPerRound &&
++    item.roundsCompleted === checkRounds &&
++    item.attempts === checkRounds * attemptsPerRound;
++  const failed = alignedRound && observations.every(([, item]) => !item.ok && completedConfiguredCheck(item));
+   const healthy = alignedRound && observations.some(([, item]) => item.ok);
    return { failed, health: failed ? 'down' : healthy ? 'healthy' : 'observing' };
  }
+diff --git a/src/OrchestrationWorkspace.jsx b/src/OrchestrationWorkspace.jsx
+index ea71b21..cfd5718 100644
+--- a/src/OrchestrationWorkspace.jsx
++++ b/src/OrchestrationWorkspace.jsx
+@@ -153,7 +153,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
+       </div>
 
-@@ -1455,6 +1575,27 @@
-   return state;
- }
+       {editor.open ? <Dialog title={`${editor.value.id ? '编辑' : '新增'}${typeLabel(editor.type)}`} className="ops-editor-dialog" wide={editor.type !== 'target' && editor.type !== 'policy'} xwide={editor.type === 'target' || editor.type === 'policy'} onClose={closeEditor} footer={<><div>{editor.value.id ? <button className="danger-text" onClick={remove}>删除</button> : null}</div><div className="dialog-actions"><button className="ghost" onClick={closeEditor}>取消</button><button className="primary" onClick={save}>保存</button></div></>}>{renderEditor(editor.type, editor.value, (patch) => setEditor((current) => ({ ...current, value: { ...current.value, ...patch } })), state, api, toast)}</Dialog> : null}
+-      {install ? <Dialog title="探针接入" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装命令" value={install.installCommand} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>安装命令已自动包含注册令牌。令牌默认长期有效，点击“接入命令”重新轮转后旧令牌立即失效。</span></div></Dialog> : null}
++      {install ? <Dialog title="探针安装 / 升级" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装 / 升级命令" value={install.installCommand} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>重复执行安装命令会下载最新代理并重启探针服务，现有长期注册令牌继续使用。</span></div></Dialog> : null}
+       {assetImport.open ? <Dialog title="批量导入 IP 资产" className="ops-editor-dialog" wide onClose={() => setAssetImport((current) => ({ ...current, open: false }))} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setAssetImport((current) => ({ ...current, open: false }))}>取消</button><button className="primary" onClick={importAssets}>导入</button></div></>}><EditorGrid><Field label="IP 地址" full><textarea className="ops-batch-ip-input" rows="12" value={assetImport.addresses} onChange={(e) => setAssetImport((current) => ({ ...current, addresses: e.target.value }))} placeholder={'每行一个，也支持空格或逗号分隔\n1.1.1.1\n2001:db8::1'} /></Field><Field label="地区（选填，批量设置）"><input value={assetImport.region} onChange={(e) => setAssetImport((current) => ({ ...current, region: e.target.value }))} /></Field><Field label="运营商（选填，批量设置）"><input value={assetImport.carrier} onChange={(e) => setAssetImport((current) => ({ ...current, carrier: e.target.value }))} /></Field><Field label="标签（选填，逗号分隔）" full><input value={assetImport.labels} onChange={(e) => setAssetImport((current) => ({ ...current, labels: e.target.value }))} /></Field></EditorGrid></Dialog> : null}
+       {incidentCleanup.open ? <Dialog title={incidentCleanup.all ? '清理故障事件' : '删除故障事件'} onClose={() => !incidentCleanup.busy && setIncidentCleanup({ open: false, id: '', all: false, busy: false })} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={incidentCleanup.busy} onClick={() => setIncidentCleanup({ open: false, id: '', all: false, busy: false })}>取消</button><button className="primary danger-action" disabled={incidentCleanup.busy} onClick={confirmIncidentCleanup}>{incidentCleanup.busy ? '清理中...' : '确认清理'}</button></div></>}><div className="confirm-copy">{incidentCleanup.all ? '将清理全部非执行中的故障事件，正在运行的自动化、DNS 更新和回滚事件会自动保留。' : '将删除这条故障事件；IP 使用记录、DNS 变更记录和审计记录仍会保留。'}</div></Dialog> : null}
+     </section>
+@@ -162,8 +162,8 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
 
-+function settleIncidentForTargetHealth(deps, id, health) {
-+  deps.updateState((draft) => {
-+    const incident = draft.incidents.find((item) => item.id === id);
-+    if (!incident) return draft;
-+    const recovered = health === 'healthy';
-+    releaseIncidentIpLocks(draft, id);
-+    finalizeIpUsageRecords(draft, id, 'rolled_back', recovered ? '目标已恢复，未执行切换' : '目标检查证据不足，等待重新确认', incident.leaseIds);
-+    updateIncident(draft, id, {
-+      status: recovered ? 'recovered' : 'observing',
-+      message: recovered ? '目标已恢复，无需切换' : '等待重新确认目标故障',
-+      error: '',
-+      executionId: '',
-+      allocatedIps: [],
-+      leaseIds: [],
-+      finishedAt: recovered ? nowIso() : ''
-+    });
-+    pushAudit(draft, recovered ? 'incident.recovered' : 'incident.recheck_wait', 'incident', id, recovered ? '执行前 3×3 检查结果已恢复，取消切换' : '执行前检查证据不足，暂停切换并等待重新确认', 'system');
-+    return draft;
-+  });
-+}
+ function renderSection(section, ctx) {
+   const { state } = ctx;
+-  if (section === 'nodes') return <DataView title="探针节点" copy="一台探针可承载多个检查目标" action="新增探针" onAction={() => ctx.openCreate('probe')} empty="还没有探针节点">{state.probes?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.region || '未设置地区'} · ${item.carrier || '未设置线路'} · ${probeVersionLabel(item.agentVersion)} · 最后心跳 ${formatTime(item.lastSeenAt)}`} status={STATUS[item.status] || item.status} tone={item.status === 'online' ? 'ok' : 'muted'} actions={<><button className="ghost" onClick={() => ctx.openProbeInstall(item.id)}>安装命令</button><button className="ghost" onClick={() => ctx.rotateProbe(item.id)}>轮转令牌</button><button className="ghost" onClick={() => ctx.openEdit('probe', item)}>编辑</button></>} />)}</DataView>;
+-  if (section === 'targets') return <DataView title="检查目标" copy="每次 3 轮、每轮 3 次；任一探针任意一次成功即正常" action="新增目标" onAction={() => ctx.openCreate('target')} empty="还没有检查目标">{state.probeTargets?.map((item) => <Row key={item.id} title={item.name} subtitle={targetSubtitle(item)} status={STATUS[item.health] || item.health} tone={item.health === 'healthy' ? 'ok' : item.health === 'down' ? 'bad' : 'warn'} onTripleClick={() => ctx.duplicateRecord('target', item)} actions={<><button className="ghost" onClick={() => ctx.checkTargetNow(item.id)}>立即检查</button><button className="ghost" onClick={() => ctx.openEdit('target', item)}>编辑</button></>} />)}</DataView>;
++  if (section === 'nodes') return <DataView title="探针节点" copy="一台探针可承载多个检查目标" action="新增探针" onAction={() => ctx.openCreate('probe')} empty="还没有探针节点">{state.probes?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.region || '未设置地区'} · ${item.carrier || '未设置线路'} · ${probeVersionLabel(item.agentVersion)} · 最后心跳 ${formatTime(item.lastSeenAt)}`} status={STATUS[item.status] || item.status} tone={item.status === 'online' ? 'ok' : 'muted'} actions={<><button className="ghost" onClick={() => ctx.openProbeInstall(item.id)}>{probeVersionCurrent(item.agentVersion) || !item.agentVersion ? '安装命令' : '升级命令'}</button><button className="ghost" onClick={() => ctx.rotateProbe(item.id)}>轮转令牌</button><button className="ghost" onClick={() => ctx.openEdit('probe', item)}>编辑</button></>} />)}</DataView>;
++  if (section === 'targets') return <DataView title="检查目标" copy="轮数和每轮次数按目标配置；任一探针任意一次成功即正常" action="新增目标" onAction={() => ctx.openCreate('target')} empty="还没有检查目标">{state.probeTargets?.map((item) => <Row key={item.id} title={item.name} subtitle={targetSubtitle(item)} status={STATUS[item.health] || item.health} tone={item.health === 'healthy' ? 'ok' : item.health === 'down' ? 'bad' : 'warn'} onTripleClick={() => ctx.duplicateRecord('target', item)} actions={<><button className="ghost" onClick={() => ctx.checkTargetNow(item.id)}>立即检查</button><button className="ghost" onClick={() => ctx.openEdit('target', item)}>编辑</button></>} />)}</DataView>;
+   if (section === 'policies') return <DataView title="切换策略" copy="把检查目标、备用池、自动化和 DNS 串成一条可回滚流程" action="新增策略" onAction={() => ctx.openCreate('policy')} empty="还没有切换策略">{state.failoverPolicies?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.poolIds?.length || 0} 个池 · ${item.dnsBindingIds?.length || 0} 条解析 · ${item.approvalMode === 'telegram' ? '需确认' : '自动执行'}`} status={item.enabled ? '已启用' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} onTripleClick={() => ctx.duplicateRecord('policy', item)} actions={<button className="ghost" onClick={() => ctx.openEdit('policy', item)}>编辑</button>} />)}</DataView>;
+   if (section === 'incidents') return <DataView title="故障事件" copy="无备用 IP 时保持等待，补入后重新确认故障并预检候选 IP" dangerAction={state.incidents?.length ? '清理全部' : ''} onDangerAction={ctx.requestIncidentClear} empty="还没有故障事件">{state.incidents?.map((item) => { const deletable = !item.executionId && !['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'].includes(item.status); return <Row key={item.id} title={item.targetName} subtitle={`${formatTime(item.startedAt)} · ${item.message || item.error || item.policyName}`} status={STATUS[item.status] || item.status} tone={['succeeded', 'recovered'].includes(item.status) ? 'ok' : item.status === 'failed' ? 'bad' : 'warn'} actions={<>{['pending_approval', 'failed', 'observing'].includes(item.status) ? <button className="primary" onClick={() => ctx.executeIncident(item.id)}>执行</button> : null}{item.dnsChangeIds?.length && item.status !== 'rolled_back' ? <button className="ghost" onClick={() => ctx.rollbackIncident(item.id)}>回滚</button> : null}{deletable ? <button className="ghost danger-text-button" onClick={() => ctx.requestIncidentDelete(item.id)}>删除</button> : null}</>} />; })}</DataView>;
+   if (section === 'bots') return <DataView title="Telegram 机器人" copy="每个机器人可独立配置授权用户、菜单功能和关联任务" action="新增机器人" onAction={() => ctx.openCreate('bot')} empty="还没有配置 Telegram 机器人">{state.telegramBots?.map((item) => <Row key={item.id} title={item.name || '未命名机器人'} subtitle={`${item.userIds?.length || 0} 个授权用户 · ${item.automationTaskIds?.length || 0} 个自动化任务`} status={item.enabled && item.configured ? '运行中' : item.configured ? '已停用' : '未配置 Token'} tone={item.enabled && item.configured ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('bot', item)}>编辑</button>} />)}</DataView>;
+@@ -204,7 +204,7 @@ function CommandBlock({ label, value, toast }) {
+
+ function renderEditor(type, value, patch, state, api, toast) {
+   if (type === 'probe') return <EditorGrid><Field label="探针名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="地区"><input value={value.region} onChange={(e) => patch({ region: e.target.value })} placeholder="例如：上海" /></Field><Field label="运营商/线路"><input value={value.carrier} onChange={(e) => patch({ carrier: e.target.value })} placeholder="例如：电信" /></Field><Field label="最大检查并发"><input type="number" min="1" max="1000" value={value.maxConcurrency} onChange={(e) => patch({ maxConcurrency: e.target.value })} /></Field><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用探针</Toggle></EditorGrid>;
+-  if (type === 'target') return <EditorGrid><Field label="目标名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="地址"><input value={value.address} onChange={(e) => patch({ address: e.target.value })} placeholder="IP 或域名" /></Field><Field label="检查类型"><select value={value.checkType} onChange={(e) => patch({ checkType: e.target.value })}><option value="ping">Ping</option><option value="tcp">TCPing</option></select></Field>{value.checkType === 'tcp' ? <Field label="TCP 端口"><input type="number" min="1" max="65535" value={value.port} onChange={(e) => patch({ port: e.target.value })} /></Field> : null}<Field label="检查间隔（秒）"><input type="number" min="5" max="3600" value={value.interval} onChange={(e) => patch({ interval: e.target.value })} /></Field><Field label="每轮超时（秒）"><input type="number" min="1" max="60" value={value.timeout} onChange={(e) => patch({ timeout: e.target.value })} /></Field><Multi label="负责探针（任意一个成功即正常）" items={state.probes} value={value.probeIds} onChange={(probeIds) => patch({ probeIds })} /><Field label="切换策略"><select value={value.policyId} onChange={(e) => patch({ policyId: e.target.value })}><option value="">仅监控，不触发</option>{state.failoverPolicies?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Toggle checked={value.allowPrivate} onChange={(allowPrivate) => patch({ allowPrivate })}>允许检查私网地址</Toggle><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用检查</Toggle></EditorGrid>;
++  if (type === 'target') return <EditorGrid><Field label="目标名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="地址"><input value={value.address} onChange={(e) => patch({ address: e.target.value })} placeholder="IP 或域名" /></Field><Field label="检查类型"><select value={value.checkType} onChange={(e) => patch({ checkType: e.target.value })}><option value="ping">Ping</option><option value="tcp">TCPing</option></select></Field>{value.checkType === 'tcp' ? <Field label="TCP 端口"><input type="number" min="1" max="65535" value={value.port} onChange={(e) => patch({ port: e.target.value })} /></Field> : null}<Field label="检查间隔（秒）"><input type="number" min="5" max="3600" value={value.interval} onChange={(e) => patch({ interval: e.target.value })} /></Field><Field label="每轮超时（秒）"><input type="number" min="1" max="60" value={value.timeout} onChange={(e) => patch({ timeout: e.target.value })} /></Field><Field label="检查轮数"><input type="number" min="1" max="10" value={value.checkRounds} onChange={(e) => patch({ checkRounds: e.target.value })} /></Field><Field label="每轮次数"><input type="number" min="1" max="10" value={value.attemptsPerRound} onChange={(e) => patch({ attemptsPerRound: e.target.value })} /></Field><Multi label="负责探针（任意一个成功即正常）" items={state.probes} value={value.probeIds} onChange={(probeIds) => patch({ probeIds })} /><Field label="切换策略"><select value={value.policyId} onChange={(e) => patch({ policyId: e.target.value })}><option value="">仅监控，不触发</option>{state.failoverPolicies?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Toggle checked={value.allowPrivate} onChange={(allowPrivate) => patch({ allowPrivate })}>允许检查私网地址</Toggle><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用检查</Toggle></EditorGrid>;
+   if (type === 'asset') return <EditorGrid><Field label="资产名称（选填）"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="IP 地址"><input value={value.address} onChange={(e) => patch({ address: e.target.value })} /></Field><Field label="地区（选填）"><input value={value.region} onChange={(e) => patch({ region: e.target.value })} /></Field><Field label="运营商（选填）"><input value={value.carrier} onChange={(e) => patch({ carrier: e.target.value })} /></Field><Field label="健康状态"><select value={value.health} onChange={(e) => patch({ health: e.target.value })}><option value="unknown">未检测</option><option value="healthy">正常</option><option value="unhealthy">异常</option></select></Field><Field label="标签（选填）"><input value={value.labels} onChange={(e) => patch({ labels: e.target.value })} placeholder="逗号分隔" /></Field><Field label="备注（选填）" full><textarea value={value.note} onChange={(e) => patch({ note: e.target.value })} /></Field><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>允许加入备用池</Toggle></EditorGrid>;
+   if (type === 'pool') return <EditorGrid><Field label="备用池名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="取用方式"><select value={value.allocationMode} onChange={(e) => patch({ allocationMode: e.target.value })}><option value="one">一次取一个</option><option value="count">取指定数量</option><option value="all">取全部可用 IP</option></select></Field><Field label="取用数量"><input type="number" disabled={value.allocationMode !== 'count'} value={value.allocationCount} onChange={(e) => patch({ allocationCount: e.target.value })} /></Field><Field label="选择顺序"><select value={value.selectionMode} onChange={(e) => patch({ selectionMode: e.target.value })}><option value="ordered">固定顺序</option><option value="random">随机</option></select></Field><Field label="直接批量加入 IP" full><textarea className="ops-batch-ip-input" rows="7" value={value.newAssetAddresses || ''} onChange={(e) => patch({ newAssetAddresses: e.target.value })} placeholder={'每行一个，也支持空格或逗号分隔；不存在的资产会自动创建\n1.1.1.1\n2001:db8::1'} /></Field><Multi label="已有 IP 资产" items={state.ipAssets} value={value.assetIds} onChange={(assetIds) => patch({ assetIds })} secondary={(item) => item.address} searchable selectable /><Field label="备注（选填）" full><textarea value={value.note} onChange={(e) => patch({ note: e.target.value })} /></Field></EditorGrid>;
+   if (type === 'account') return <AccountEditor value={value} patch={patch} api={api} toast={toast} />;
+@@ -326,7 +326,8 @@ function countFor(section, state) { return ({ nodes: state.probes, targets: stat
+ function summary(tab, state) { if (tab === 'probes') return `${state.probes?.filter((item) => item.status === 'online').length || 0} 个在线探针 · ${state.incidents?.filter((item) => !['succeeded', 'recovered', 'rolled_back'].includes(item.status)).length || 0} 个活动事件`; if (tab === 'pools') return `${state.ipAssets?.length || 0} 个可用 IP · ${state.ipUsageRecords?.length || 0} 条使用记录`; if (tab === 'telegram') return `${state.telegramBots?.filter((item) => item.enabled && item.configured).length || 0} 个运行中机器人`; return `${state.dnsAccounts?.length || 0} 个账号 · ${state.dnsBindings?.length || 0} 条解析绑定`; }
+ function allocationLabel(item) { return item.allocationMode === 'all' ? '全部取用' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '一次取一个'; }
+ function assetSubtitle(item) { return [item.name && item.name !== item.address ? item.address : '', item.region, item.carrier].filter(Boolean).join(' · '); }
+-function targetSubtitle(item) { const observations = Object.values(item.observations || {}).sort((a, b) => Date.parse(b.checkedAt || 0) - Date.parse(a.checkedAt || 0)); const latest = observations[0]; const result = !latest ? '尚未检查' : latest.ok ? `第 ${latest.successfulRound || 1} 轮第 ${latest.successfulAttempt || 1} 次成功` : latest.attempts === 9 ? '9 次全部失败' : '等待探针升级'; return `${item.checkType === 'ping' ? 'PING' : `TCP:${item.port}`} · ${item.address || '未填写地址'} · ${item.probeIds?.length || 0} 个探针 · 3轮×3次 · ${result} · ${formatTime(item.lastCheckAt)}`; }
+-function probeVersionLabel(version) { const parts = String(version || '').split('.').map(Number); const current = parts[0] > 1 || (parts[0] === 1 && parts[1] >= 1); return version ? `${version}${current ? '' : '（需升级）'}` : '未接入'; }
++function targetSubtitle(item) { const rounds = Number(item.checkRounds) || 3; const perRound = Number(item.attemptsPerRound) || 3; const expectedAttempts = rounds * perRound; const observations = Object.values(item.observations || {}).sort((a, b) => Date.parse(b.checkedAt || 0) - Date.parse(a.checkedAt || 0)); const latest = observations[0]; const result = !latest ? '尚未检查' : latest.ok ? `第 ${latest.successfulRound || 1} 轮第 ${latest.successfulAttempt || 1} 次成功` : latest.attempts === expectedAttempts ? `${expectedAttempts} 次全部失败` : '等待探针升级'; return `${item.checkType === 'ping' ? 'PING' : `TCP:${item.port}`} · ${item.address || '未填写地址'} · ${item.probeIds?.length || 0} 个探针 · ${rounds}轮×${perRound}次 · ${result} · ${formatTime(item.lastCheckAt)}`; }
++function probeVersionCurrent(version) { const parts = String(version || '').split('.').map(Number); return parts[0] > 1 || (parts[0] === 1 && (parts[1] > 2 || (parts[1] === 2 && (parts[2] || 0) >= 0))); }
++function probeVersionLabel(version) { return version ? `${version}${probeVersionCurrent(version) ? '' : '（需升级）'}` : '未接入'; }
+ function updateModeLabel(mode) { return ({ append: '追加 IP', managed_replace: '覆盖托管值', replace: '完全替换' })[mode] || mode; }
+ function formatTime(value) { if (!value) return '-'; return new Date(value).toLocaleString('zh-CN', { hour12: false }); }
+diff --git a/test/ip-assets.test.js b/test/ip-assets.test.js
+index dce27f9..d711c50 100644
+--- a/test/ip-assets.test.js
++++ b/test/ip-assets.test.js
+@@ -177,6 +177,10 @@ test('uses all assigned probes for a round, with any success winning the round',
+     p1: failedCheck,
+     p2: failedCheck
+   } }, probes), { failed: true, health: 'down' });
++  assert.deepEqual(evaluateTargetHealth({ ...base, checkRounds: 2, attemptsPerRound: 2, observations: {
++    p1: { ok: false, rounds: 2, attemptsPerRound: 2, roundsCompleted: 2, attempts: 4, checkedAt },
++    p2: { ok: false, rounds: 2, attemptsPerRound: 2, roundsCompleted: 2, attempts: 4, checkedAt }
++  } }, probes), { failed: true, health: 'down' });
+ });
+
+ test('does not trigger failover from legacy or stale single-attempt failures', () => {
+diff --git a/test/test_probe_agent.py b/test/test_probe_agent.py
+index 4fc734a..9aae4aa 100644
+--- a/test/test_probe_agent.py
++++ b/test/test_probe_agent.py
+@@ -43,6 +43,18 @@ class ProbeCheckWindowTests(unittest.TestCase):
+         self.assertEqual(result["attempts"], 9)
+         self.assertEqual(result["successfulRound"], 0)
+
++    def test_uses_target_specific_round_and_attempt_counts(self):
++        target = {**self.target, "checkRounds": 2, "attemptsPerRound": 2}
++        with mock.patch.object(PROBE, "validate_target_address", return_value={"203.0.113.10"}), \
++                mock.patch.object(PROBE, "check_attempt", return_value=(False, "failed")), \
++                mock.patch.object(PROBE.time, "sleep", return_value=None):
++            result = PROBE.check_target(target)
 +
- function failIncident(deps, id, message) {
-   deps.updateState((draft) => {
-     const incident = draft.incidents.find((item) => item.id === id);
++        self.assertFalse(result["ok"])
++        self.assertEqual(result["rounds"], 2)
++        self.assertEqual(result["attemptsPerRound"], 2)
++        self.assertEqual(result["attempts"], 4)
++
+     def test_retries_temporary_dns_resolution_failures(self):
+         resolutions = [OSError("dns failed"), {"203.0.113.10"}]
+         with mock.patch.object(PROBE, "validate_target_address", side_effect=resolutions) as resolver, \

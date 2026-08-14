@@ -177,6 +177,10 @@ test('uses all assigned probes for a round, with any success winning the round',
     p1: failedCheck,
     p2: failedCheck
   } }, probes), { failed: true, health: 'down' });
+  assert.deepEqual(evaluateTargetHealth({ ...base, checkRounds: 2, attemptsPerRound: 2, observations: {
+    p1: { ok: false, rounds: 2, attemptsPerRound: 2, roundsCompleted: 2, attempts: 4, checkedAt },
+    p2: { ok: false, rounds: 2, attemptsPerRound: 2, roundsCompleted: 2, attempts: 4, checkedAt }
+  } }, probes), { failed: true, health: 'down' });
 });
 
 test('does not trigger failover from legacy or stale single-attempt failures', () => {

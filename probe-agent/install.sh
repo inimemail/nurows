@@ -98,7 +98,8 @@ ReadWritePaths=$CONFIG_DIR
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now nurossh-probe.service
+systemctl enable nurossh-probe.service >/dev/null
+systemctl restart nurossh-probe.service
 sleep 2
 if ! systemctl is-active --quiet nurossh-probe.service; then
   echo "nurossh-probe.service failed to start" >&2

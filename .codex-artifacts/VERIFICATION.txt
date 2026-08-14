@@ -1,51 +1,33 @@
 Changed branch/field
-- IP pool UI/backend: removed lease and cooldown configuration and hidden lease management view.
-- Incident success path: allocated IP assets are deleted and removed from every pool reference.
-- Incident failure path: allocated assets remain available after internal locks are released.
-- IP usage history: processing, consumed, failed, and rolled-back attempts remain searchable after asset deletion.
-- Probe target checks: Ping is the default, TCP port is shown only for TCPing, all assigned probes complete a round, any success wins, and all failures trigger the failure threshold.
-- Incident without an available replacement IP: status remains waiting_for_ip and is retried only after an eligible asset is added or becomes available.
-- Waiting incident recovery: adding an IP requests an immediate target recheck; a recovered target closes the incident without consuming an IP.
-- Replacement IP preflight: each allocated IP is Ping-checked three times; unusable addresses are discarded, audited, recorded, and replaced from the pool.
-- Legacy no-IP failures are normalized to waiting_for_ip so they no longer generate repeated execution failures.
-- Incident cleanup: individual deletion and bulk cleanup remove idle/history rows and associated idle leases while preserving running automation, DNS, verification, and rollback work.
-- Automation progress log: expanded per-host output uses the auto-scroll renderer so the inner log scrollbar follows the newest output.
-- Target/policy/DNS account/DNS binding rows: triple-click opens a copy dialog with identity fields cleared while reusable configuration is retained.
-- Automation step ordering: each step has a drag handle; dropping before another step updates the draft array and numbering, and up/down controls cover touch devices.
-- Probe target check window: every interval runs three rounds with three Ping/TCP attempts per round; the first success ends the check and only nine failures produce a failed observation.
-- Probe aggregation: any assigned probe success keeps the target healthy; all assigned probes must submit fresh complete 3x3 failures before failover is eligible.
-- Incident execution guard: target health is re-evaluated before allocation and immediately before automation/DNS side effects; recovery or incomplete evidence releases IP locks and stops execution.
-- Waiting-IP recheck: all assigned probes must report after the recheck request, preventing old successes from being combined with new failures.
-- Probe target UI: legacy consecutive failure/recovery fields are removed; 3x3 evidence and agent upgrade state are visible.
+- Branch: main (working tree only; no commit created).
+- Probe target fields: checkRounds and attemptsPerRound are configurable per target, default to 3, and are clamped to 1-10.
+- Probe execution: every round shares the configured timeout; any successful attempt ends the check, while every configured attempt must fail before a failed report is accepted.
+- Probe aggregation: all assigned probes must submit fresh, complete evidence for the target's configured rounds and attempts before failover is eligible.
+- Probe upgrade: agent version is 1.2.0; rerunning the generated install/upgrade command downloads the current agent and restarts nurossh-probe.service while reusing the long-lived registration token.
+- UI: target create/edit dialog exposes check rounds and attempts per round; target rows show the configured dimensions; probes below 1.2.0 show an upgrade action.
 
 Artifacts
-- MODIFIED_FILE: .codex-artifacts/MODIFIED_FILE
-- DIFF_FILE: .codex-artifacts/DIFF_FILE
-- VERIFICATION.txt: .codex-artifacts/VERIFICATION.txt
-- ROLLBACK.sh: .codex-artifacts/ROLLBACK.sh
+- MODIFIED_FILE: /Users/inim/nurows/.codex-artifacts/MODIFIED_FILE
+- DIFF_FILE: /Users/inim/nurows/.codex-artifacts/DIFF_FILE
+- VERIFICATION.txt: /Users/inim/nurows/.codex-artifacts/VERIFICATION.txt
+- ROLLBACK.sh: /Users/inim/nurows/.codex-artifacts/ROLLBACK.sh
 
 BASELINE
-Command: npm test
-Input: working tree before the 3x3 probe check change
-Literal result: tests 31, pass 31, fail 0
+Command: npm test && python3 -m unittest discover -s test -p 'test_probe_agent.py' -v && npm run build && node --check server/orchestration.js && node --check server/index.js && python3 -m py_compile probe-agent/nurossh_probe.py && bash -n install.sh probe-agent/install.sh probe-agent/uninstall.sh && docker compose config >/dev/null
+Input: independent git-archive copy of HEAD before the configurable-check and probe-upgrade working-tree changes, with the workspace node_modules linked read-only for the build.
+Literal result: Node tests 34, pass 34, fail 0; Python probe tests 3, OK; vite build succeeded; Node syntax, Python compilation, shell syntax, and Docker Compose config passed.
 Exit status: 0
 
 MODIFIED
 Command: npm test && python3 -m unittest discover -s test -p 'test_probe_agent.py' -v && npm run build && node --check server/orchestration.js && node --check server/index.js && python3 -m py_compile probe-agent/nurossh_probe.py && bash -n install.sh probe-agent/install.sh probe-agent/uninstall.sh && docker compose config >/dev/null && git diff --check
-Input: current working tree
-Literal result: Node tests 34, pass 34, fail 0; Python probe tests 3, OK; vite build succeeded; both Node syntax checks, Python compilation, shell syntax, Docker Compose config, and diff check passed
-Exit status: 0
-
-UI smoke check
-Command: curl -sS http://127.0.0.1:5173/
-Input: local Vite development page
-Literal result: returned the NuroSSH HTML shell with `/src/main.jsx` and the mobile viewport meta tag
+Input: /Users/inim/nurows current working tree.
+Literal result: Node tests 34, pass 34, fail 0; Python probe tests 4, OK; vite build succeeded; Node syntax, Python compilation, shell syntax, Docker Compose config, and git diff check passed. Vite emitted only its existing 500 kB chunk-size warning.
 Exit status: 0
 
 ROLLBACK
-Command: .codex-artifacts/ROLLBACK.sh .codex-artifacts/ROLLBACK_TEST_COPY .codex-artifacts/BASELINE_FILE
-Input: independent copy of modified server/orchestration.js
+Command: /Users/inim/nurows/.codex-artifacts/ROLLBACK.sh /Users/inim/nurows/.codex-artifacts/ROLLBACK_TEST_COPY /Users/inim/nurows/.codex-artifacts/BASELINE_FILE
+Input: independent copy of modified server/orchestration.js and the preserved HEAD version of that file.
 Literal result: restored baseline hash on independent copy
 Exit status: 0
 
-Restored behavior/status: rollback test copy matches BASELINE_FILE; working tree remains on the modified branch.
+Restored behavior/status: ROLLBACK_TEST_COPY matches BASELINE_FILE byte-for-byte and restores fixed 3x3 target validation for the selected rollback artifact; the working tree remains modified with configurable checks and probe version 1.2.0.

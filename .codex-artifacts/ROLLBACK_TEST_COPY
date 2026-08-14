@@ -24,6 +24,9 @@ const RESOURCE_MAP = {
 const ACTIVE_INCIDENT_STATES = new Set([
   'observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'
 ]);
+const RUNNING_INCIDENT_STATES = new Set(['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back']);
+const TARGET_CHECK_ROUNDS = 3;
+const TARGET_ATTEMPTS_PER_ROUND = 3;
 
 const DNS_PROVIDERS = new Set([
   'huawei', 'aliyun', 'tencent', 'dnspod', 'cloudflare', 'godaddy', 'porkbun', 'cloudns', 'callback',
@@ -57,7 +60,15 @@ export function normalizeOrchestrationState(parsed = {}) {
   const defaults = orchestrationDefaults();
   const normalized = Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
   normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, ...pool }) => pool);
-  normalized.probeTargets = normalized.probeTargets.map(({ quorumMode, quorumCount, ...target }) => target);
+  normalized.probeTargets = normalized.probeTargets.map(({ quorumMode, quorumCount, failureThreshold, recoveryThreshold, ...target }) => ({
+    ...target,
+    checkRounds: TARGET_CHECK_ROUNDS,
+    attemptsPerRound: TARGET_ATTEMPTS_PER_ROUND,
+    observations: Object.fromEntries(Object.entries(target.observations || {}).map(([probeId, observation]) => {
+      const { failures, successes, ...current } = observation || {};
+      return [probeId, current];
+    }))
+  }));
   normalized.incidents = normalized.incidents.map((incident) => {
     const legacyNoIp = incident.status === 'failed' && /备用\s*IP|备用地址|没有可用 IP/i.test(`${incident.error || ''} ${incident.message || ''}`);
     return legacyNoIp ? { ...incident, status: 'waiting_for_ip', message: '等待备用 IP', error: '', executionId: '', recheckRequestedAt: '' } : incident;
@@ -145,20 +156,25 @@ export function registerProbePublicRoutes(app, deps) {
         const target = draft.probeTargets.find((item) => item.id === cleanId(raw.targetId) && item.probeIds?.includes(auth.probe.id));
         if (!target) continue;
         target.observations ||= {};
-        const previous = target.observations[auth.probe.id] || { failures: 0, successes: 0 };
         const ok = Boolean(raw.ok);
+        const checkedAt = nowIso();
         target.observations[auth.probe.id] = {
           ok,
           latencyMs: clampNumber(raw.latencyMs, 0, 600000, 0),
           error: cleanText(raw.error, 300),
-          checkedAt: nowIso(),
-          failures: ok ? 0 : Number(previous.failures || 0) + 1,
-          successes: ok ? Number(previous.successes || 0) + 1 : 0
+          checkedAt,
+          rounds: clampNumber(raw.rounds, 0, TARGET_CHECK_ROUNDS, 0),
+          attemptsPerRound: clampNumber(raw.attemptsPerRound, 0, TARGET_ATTEMPTS_PER_ROUND, 0),
+          roundsCompleted: clampNumber(raw.roundsCompleted, 0, TARGET_CHECK_ROUNDS, 0),
+          attempts: clampNumber(raw.attempts, 0, TARGET_CHECK_ROUNDS * TARGET_ATTEMPTS_PER_ROUND, 0),
+          successfulRound: clampNumber(raw.successfulRound, 0, TARGET_CHECK_ROUNDS, 0),
+          successfulAttempt: clampNumber(raw.successfulAttempt, 0, TARGET_ATTEMPTS_PER_ROUND, 0),
+          resolvedAddresses: cleanTexts(raw.resolvedAddresses, 20)
         };
         target.updatedAt = nowIso();
         const transition = evaluateTargetHealth(target, draft.probes);
         target.health = transition.health;
-        target.lastCheckAt = nowIso();
+        target.lastCheckAt = checkedAt;
         if (transition.failed && target.policyId) {
           const active = draft.incidents.some((item) => item.targetId === target.id && (ACTIVE_INCIDENT_STATES.has(item.status) || (item.status === 'failed' && target.health === 'down')));
           const policy = draft.failoverPolicies.find((item) => item.id === target.policyId && item.enabled !== false);
@@ -166,7 +182,7 @@ export function registerProbePublicRoutes(app, deps) {
             const incident = createIncident(target, policy, auth.probe.id);
             draft.incidents.unshift(incident);
             createdIncidentIds.push(incident.id);
-            pushAudit(draft, 'incident.created', 'incident', incident.id, `${target.name} 达到故障阈值`, 'probe');
+            pushAudit(draft, 'incident.created', 'incident', incident.id, `${target.name} 所有探针完成 3×3 检查且全部失败`, 'probe');
           }
         }
       }
@@ -227,6 +243,10 @@ export function registerOrchestrationRoutes(app, deps) {
         delete item.shareLimit;
         delete item.leaseMinutes;
         delete item.cooldownMinutes;
+      }
+      if (key === 'probeTargets') {
+        delete item.failureThreshold;
+        delete item.recoveryThreshold;
       }
       pushAudit(draft, `${key}.update`, key, item.id, `更新 ${item.name || item.address || item.domain || item.id}`, req.auth.username);
       return draft;
@@ -381,6 +401,38 @@ export function registerOrchestrationRoutes(app, deps) {
     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
   });
 
+  app.delete('/api/incidents/:id', (req, res) => {
+    let removed = false;
+    const state = deps.updateState((draft) => {
+      const incident = draft.incidents.find((item) => item.id === req.params.id);
+      if (!incident) throw new Error('故障事件不存在');
+      if (incident.executionId || RUNNING_INCIDENT_STATES.has(incident.status)) throw new Error('事件正在执行，结束后才能删除');
+      draft.ipLeases = draft.ipLeases.filter((lease) => lease.incidentId !== incident.id);
+      draft.incidents = draft.incidents.filter((item) => item.id !== incident.id);
+      pushAudit(draft, 'incident.delete', 'incident', incident.id, `删除故障事件 ${incident.targetName || incident.id}`, req.auth.username);
+      removed = true;
+      return draft;
+    });
+    res.json({ ok: true, removed, state: deps.sanitizeState(state, req.auth) });
+  });
+
+  app.delete('/api/incidents', (req, res) => {
+    let removed = 0;
+    let kept = 0;
+    const state = deps.updateState((draft) => {
+      const removableIds = new Set(draft.incidents
+        .filter((item) => !item.executionId && !RUNNING_INCIDENT_STATES.has(item.status))
+        .map((item) => item.id));
+      removed = removableIds.size;
+      kept = draft.incidents.length - removed;
+      draft.ipLeases = draft.ipLeases.filter((lease) => !removableIds.has(lease.incidentId));
+      draft.incidents = draft.incidents.filter((item) => !removableIds.has(item.id));
+      pushAudit(draft, 'incident.clear', 'incident', '', `清理 ${removed} 条故障事件，保留 ${kept} 条执行中事件`, req.auth.username);
+      return draft;
+    });
+    res.json({ ok: true, removed, kept, state: deps.sanitizeState(state, req.auth) });
+  });
+
   app.post('/api/incidents/:id/execute', (req, res) => {
     const state = deps.updateState((draft) => {
       const incident = draft.incidents.find((item) => item.id === req.params.id);
@@ -441,6 +493,12 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
   const policy = snapshot.failoverPolicies.find((item) => item.id === incident.policyId);
   const target = snapshot.probeTargets.find((item) => item.id === incident.targetId);
   if (!policy || !target) return failIncident(deps, incidentId, '关联策略或目标不存在');
+  const initialHealth = evaluateTargetHealth(target, snapshot.probes || []).health;
+  if (initialHealth !== 'down') {
+    settleIncidentForTargetHealth(deps, incidentId, initialHealth);
+    deps.notifyIncident?.(incidentId);
+    return;
+  }
   try {
     const allocated = allocateIpsForIncident(incidentId, deps);
     // A failover incident must not run against the original host when no
@@ -486,6 +544,15 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
     }
     deps.updateState((draft) => updateIncident(draft, incidentId, { allocatedIps: allocatedForExecution.map((item) => item.address), leaseIds: allocatedForExecution.map((item) => item.leaseId) }));
 
+    snapshot = deps.readState();
+    const latestTarget = snapshot.probeTargets.find((item) => item.id === incident.targetId);
+    const latestHealth = latestTarget ? evaluateTargetHealth(latestTarget, snapshot.probes || []).health : 'observing';
+    if (latestHealth !== 'down') {
+      settleIncidentForTargetHealth(deps, incidentId, latestHealth);
+      deps.notifyIncident?.(incidentId);
+      return;
+    }
+
     if (policy.automationTaskId) {
       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'automating', message: '正在执行自动化任务' }));
       const hosts = policy.automationHosts === 'target' ? [target.address] : allocatedForExecution.map((item) => item.address);
@@ -523,7 +590,11 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
 
 export function retryWaitingIpIncidents(deps, encryptionKey = null) {
   let state = deps.readState();
-  const recovered = state.incidents.filter((incident) => incident.status === 'waiting_for_ip' && state.probeTargets.find((target) => target.id === incident.targetId)?.health === 'healthy');
+  const recovered = state.incidents.filter((incident) => {
+    if (!['waiting_for_ip', 'observing', 'pending_approval'].includes(incident.status)) return false;
+    const target = state.probeTargets.find((item) => item.id === incident.targetId);
+    return target?.health === 'healthy' && targetCompletedCheckSince(target, state.probes || [], incident.recheckRequestedAt);
+  });
   if (recovered.length) {
     deps.updateState((draft) => {
       for (const incident of recovered) updateIncident(draft, incident.id, { status: 'recovered', message: '目标已恢复，无需切换', executionId: '', finishedAt: nowIso() });
@@ -533,7 +604,8 @@ export function retryWaitingIpIncidents(deps, encryptionKey = null) {
   }
   const waiting = state.incidents.filter((item) => {
     const target = state.probeTargets.find((entry) => entry.id === item.targetId);
-    const freshRecheck = item.recheckRequestedAt && Date.parse(target?.lastCheckAt || 0) >= Date.parse(item.recheckRequestedAt);
+    const freshRecheck = targetCompletedCheckSince(target, state.probes || [], item.recheckRequestedAt);
+    if (item.status === 'observing') return target?.health === 'down';
     return item.status === 'waiting_for_ip' && target?.health === 'down' && freshRecheck && hasAvailableIpForIncident(item, state);
   });
   for (const incident of waiting) runIncidentWorkflow(incident.id, deps, encryptionKey);
@@ -557,11 +629,47 @@ export function requestWaitingIncidentRechecks(deps) {
   return requested;
 }
 
+function targetCompletedCheckSince(target, probes, requestedAt) {
+  if (!target || !requestedAt) return true;
+  const requestedTime = Date.parse(requestedAt);
+  if (!Number.isFinite(requestedTime)) return false;
+  const assignedProbeIds = (target.probeIds || []).filter((probeId) => probes.some((probe) => probe.id === probeId && probe.enabled !== false));
+  return assignedProbeIds.length > 0 && assignedProbeIds.every((probeId) => Date.parse(target.observations?.[probeId]?.checkedAt || 0) >= requestedTime);
+}
+
 function normalizeResource(key, input = {}, existing = null, deps) {
   const now = nowIso();
   const base = { id: existing?.id || cleanId(input.id) || uuidv4(), createdAt: existing?.createdAt || now, updatedAt: now };
   if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', tokenEnc: existing?.tokenEnc || null, agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
-  if (key === 'probeTargets') return { ...base, name: requiredText(input.name, '目标名称'), address: validateHost(input.address, Boolean(input.allowPrivate)), allowPrivate: Boolean(input.allowPrivate), checkType: input.checkType === 'tcp' ? 'tcp' : 'ping', port: clampNumber(input.port, 1, 65535, 443), interval: clampNumber(input.interval, 5, 3600, 30), timeout: clampNumber(input.timeout, 1, 60, 5), failureThreshold: clampNumber(input.failureThreshold, 1, 20, 3), recoveryThreshold: clampNumber(input.recoveryThreshold, 1, 20, 2), probeIds: cleanIds(input.probeIds, 500), policyId: cleanId(input.policyId), enabled: input.enabled !== false, health: existing?.health || 'unknown', observations: existing?.observations || {}, lastCheckAt: existing?.lastCheckAt || '', checkNowAt: existing?.checkNowAt || '' };
+  if (key === 'probeTargets') {
+    const address = validateHost(input.address, Boolean(input.allowPrivate));
+    const checkType = input.checkType === 'tcp' ? 'tcp' : 'ping';
+    const port = clampNumber(input.port, 1, 65535, 443);
+    const probeIds = cleanIds(input.probeIds, 500);
+    const identityChanged = Boolean(existing && (
+      existing.address !== address || existing.checkType !== checkType || Number(existing.port) !== port ||
+      JSON.stringify([...(existing.probeIds || [])].sort()) !== JSON.stringify([...probeIds].sort())
+    ));
+    return {
+      ...base,
+      name: requiredText(input.name, '目标名称'),
+      address,
+      allowPrivate: Boolean(input.allowPrivate),
+      checkType,
+      port,
+      interval: clampNumber(input.interval, 5, 3600, 30),
+      timeout: clampNumber(input.timeout, 1, 60, 5),
+      checkRounds: TARGET_CHECK_ROUNDS,
+      attemptsPerRound: TARGET_ATTEMPTS_PER_ROUND,
+      probeIds,
+      policyId: cleanId(input.policyId),
+      enabled: input.enabled !== false,
+      health: identityChanged ? 'unknown' : (existing?.health || 'unknown'),
+      observations: identityChanged ? {} : (existing?.observations || {}),
+      lastCheckAt: identityChanged ? '' : (existing?.lastCheckAt || ''),
+      checkNowAt: identityChanged ? now : (existing?.checkNowAt || '')
+    };
+  }
   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
   if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, note: cleanText(input.note, 500) };
   if (key === 'dnsAccounts') {
@@ -746,12 +854,24 @@ function authenticateProbe(req, state) {
 
 export function evaluateTargetHealth(target, probes) {
   const assignedProbeIds = (target.probeIds || []).filter((probeId) => probes.some((probe) => probe.id === probeId && probe.enabled !== false));
+  const now = Date.now();
+  const intervalMs = Math.max(5000, Number(target.interval || 30) * 1000);
+  const checkWindowMs = Math.max(15000, Number(target.timeout || 5) * TARGET_CHECK_ROUNDS * 1000 + (TARGET_CHECK_ROUNDS - 1) * 1000);
+  const freshnessMs = intervalMs + checkWindowMs + 10000;
+  const maxRoundSkewMs = intervalMs + checkWindowMs;
   const observations = Object.entries(target.observations || {}).filter(([probeId, observation]) => {
-    return assignedProbeIds.includes(probeId) && Date.now() - Date.parse(observation.checkedAt || 0) < Math.max(120000, target.interval * 4000);
+    const checkedAt = Date.parse(observation.checkedAt || 0);
+    return assignedProbeIds.includes(probeId) && Number.isFinite(checkedAt) && now - checkedAt >= 0 && now - checkedAt <= freshnessMs;
   });
   const completeRound = assignedProbeIds.length > 0 && observations.length === assignedProbeIds.length;
-  const failed = completeRound && observations.every(([, item]) => !item.ok && item.failures >= target.failureThreshold);
-  const healthy = completeRound && observations.some(([, item]) => item.ok && item.successes >= target.recoveryThreshold);
+  const checkedTimes = observations.map(([, item]) => Date.parse(item.checkedAt));
+  const alignedRound = completeRound && Math.max(...checkedTimes) - Math.min(...checkedTimes) <= maxRoundSkewMs;
+  const completedThreeByThree = (item) => item.rounds === TARGET_CHECK_ROUNDS &&
+    item.attemptsPerRound === TARGET_ATTEMPTS_PER_ROUND &&
+    item.roundsCompleted === TARGET_CHECK_ROUNDS &&
+    item.attempts === TARGET_CHECK_ROUNDS * TARGET_ATTEMPTS_PER_ROUND;
+  const failed = alignedRound && observations.every(([, item]) => !item.ok && completedThreeByThree(item));
+  const healthy = alignedRound && observations.some(([, item]) => item.ok);
   return { failed, health: failed ? 'down' : healthy ? 'healthy' : 'observing' };
 }
 
@@ -1453,6 +1573,27 @@ function updateIncident(state, id, patch) {
   const incident = state.incidents.find((item) => item.id === id);
   if (incident) Object.assign(incident, patch, { updatedAt: nowIso() });
   return state;
+}
+
+function settleIncidentForTargetHealth(deps, id, health) {
+  deps.updateState((draft) => {
+    const incident = draft.incidents.find((item) => item.id === id);
+    if (!incident) return draft;
+    const recovered = health === 'healthy';
+    releaseIncidentIpLocks(draft, id);
+    finalizeIpUsageRecords(draft, id, 'rolled_back', recovered ? '目标已恢复，未执行切换' : '目标检查证据不足，等待重新确认', incident.leaseIds);
+    updateIncident(draft, id, {
+      status: recovered ? 'recovered' : 'observing',
+      message: recovered ? '目标已恢复，无需切换' : '等待重新确认目标故障',
+      error: '',
+      executionId: '',
+      allocatedIps: [],
+      leaseIds: [],
+      finishedAt: recovered ? nowIso() : ''
+    });
+    pushAudit(draft, recovered ? 'incident.recovered' : 'incident.recheck_wait', 'incident', id, recovered ? '执行前 3×3 检查结果已恢复，取消切换' : '执行前检查证据不足，暂停切换并等待重新确认', 'system');
+    return draft;
+  });
 }
 
 function failIncident(deps, id, message) {

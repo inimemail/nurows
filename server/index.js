@@ -12,13 +12,21 @@ import { SocksClient } from 'socks';
 import { v4 as uuidv4 } from 'uuid';
 import { hasExactPerServerInputs } from '../shared/command-input.js';
 import {
+  addIpsToPool,
+  createPoolWithIps,
+  createDnsBinding,
+  dnsRecordLayout,
+  importIpAssets,
+  parseIpBatch,
   normalizeOrchestrationState,
   orchestrationDefaults,
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
   runIncidentWorkflow,
   rollbackIncident,
-  sanitizeOrchestrationState
+  sanitizeOrchestrationState,
+  setDnsBindingIps,
+  syncDnsBinding
 } from './orchestration.js';
 
 loadRuntimeEnv();
@@ -29,6 +37,10 @@ const wss = new WebSocketServer({ noServer: true });
 
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 38471);
+const configuredDevServerPort = Number(process.env.VITE_DEV_SERVER_PORT || 5173);
+const DEV_SERVER_PORT = Number.isInteger(configuredDevServerPort) && configuredDevServerPort > 0 && configuredDevServerPort <= 65535
+  ? String(configuredDevServerPort)
+  : '5173';
 const ROOT_DIR = process.cwd();
 const DATA_DIR = path.join(ROOT_DIR, 'data');
 const DIST_DIR = path.join(ROOT_DIR, 'dist');
@@ -94,7 +106,9 @@ const orchestrationDeps = {
   executeAutomation: executeAutomationForIncident,
   waitAutomation: waitForAutomationJob,
   runIncident: (incidentId, encryptionKey) => runIncidentWorkflow(incidentId, orchestrationDeps, encryptionKey),
-  notifyIncident: notifyIncidentViaTelegram
+  notifyIncident: notifyIncidentViaTelegram,
+  onTelegramChanged: () => restartTelegramPolling(),
+  syncDnsBinding
 };
 orchestrationDeps.allowProbeRegistration = (ip) => {
   const key = String(ip || 'unknown');
@@ -161,7 +175,6 @@ function loadRuntimeEnv() {
 ensureStorage();
 cleanupExpiredSessions();
 
-app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
   const origin = String(req.headers.origin || '');
@@ -170,7 +183,9 @@ app.use((req, res, next) => {
       const expectedHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
       const allowedOrigins = new Set(String(process.env.ALLOWED_ORIGINS || '').split(',').map((item) => item.trim()).filter(Boolean));
       const originUrl = new URL(origin);
-      const localDevOrigin = ['localhost', '127.0.0.1', '[::1]'].includes(originUrl.hostname) && originUrl.port === '5173';
+      const localDevOrigin = process.env.NODE_ENV !== 'production' &&
+        ['localhost', '127.0.0.1', '[::1]'].includes(originUrl.hostname) &&
+        originUrl.port === DEV_SERVER_PORT;
       if (originUrl.host !== expectedHost && !allowedOrigins.has(origin) && !localDevOrigin) {
         res.status(403).json({ error: '请求来源校验失败' });
         return;
@@ -182,6 +197,7 @@ app.use((req, res, next) => {
   }
   next();
 });
+app.use(cors());
 registerProbePublicRoutes(app, {
   readState,
   updateState,
@@ -505,8 +521,12 @@ app.put('/api/automation-tasks/:id', (req, res) => {
 app.delete('/api/automation-tasks/:id', (req, res) => {
   const state = updateState((draft) => {
     draft.automationTasks = draft.automationTasks.filter((task) => task.id !== req.params.id);
+    for (const bot of draft.telegramBots || []) {
+      bot.automationTaskIds = (bot.automationTaskIds || []).filter((id) => id !== req.params.id);
+    }
     return draft;
   });
+  restartTelegramPolling();
   res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
 });
 
@@ -556,18 +576,6 @@ app.post('/api/automation-jobs/:id/retry-failed', (req, res) => {
   if (!task) { res.status(404).json({ error: '自动化配置不存在' }); return; }
   const job = startAutomationTask(task, hosts, state, req.auth.encryptionKey);
   res.json({ ok: true, jobId: job.id, results: job.results });
-});
-
-app.put('/api/telegram', (req, res) => {
-  const state = updateState((draft) => {
-    const next = normalizeTelegramSettings({ ...draft.telegram, ...req.body });
-    const token = String(req.body.token || '').trim();
-    next.tokenEnc = token ? encryptSecret(token) : draft.telegram?.tokenEnc || null;
-    draft.telegram = next;
-    return draft;
-  });
-  restartTelegramPolling();
-  res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
 });
 
 app.post('/api/proxies', (req, res) => {
@@ -1673,6 +1681,17 @@ function authGuard(req, res, next) {
 
 function normalizeStateRecord(parsed) {
   const orchestration = normalizeOrchestrationState(parsed);
+  const legacyTelegram = normalizeTelegramSettings(parsed?.telegram);
+  if (!orchestration.telegramBots.length && legacyTelegram.tokenEnc) {
+    orchestration.telegramBots.push({
+      id: 'telegram-primary', name: '统一机器人', tokenEnc: legacyTelegram.tokenEnc,
+      enabled: legacyTelegram.enabled, userIds: legacyTelegram.userIds, groupIds: [], roles: {},
+      menuScopes: legacyTelegram.menuScopes.length ? legacyTelegram.menuScopes : ['overview', 'probes', 'incidents', 'pools', 'dns', 'automation'],
+      automationTaskIds: (parsed?.automationTasks || []).map((item) => String(item?.id || '')).filter(Boolean), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    });
+    legacyTelegram.enabled = false;
+  }
+  if (orchestration.telegramBots.length) legacyTelegram.enabled = false;
   return {
     groups: Array.isArray(parsed?.groups) && parsed.groups.length ? parsed.groups : defaultState.groups,
     servers: Array.isArray(parsed?.servers) ? parsed.servers : [],
@@ -1680,7 +1699,7 @@ function normalizeStateRecord(parsed) {
     proxies: Array.isArray(parsed?.proxies) ? parsed.proxies : [],
     automationTasks: Array.isArray(parsed?.automationTasks) ? parsed.automationTasks.map(normalizeAutomationTask) : [],
     automationRuns: Array.isArray(parsed?.automationRuns) ? parsed.automationRuns.slice(0, 30) : [],
-    telegram: normalizeTelegramSettings(parsed?.telegram),
+    telegram: legacyTelegram,
     ...orchestration,
     workspaces: parsed?.workspaces && typeof parsed.workspaces === 'object' ? parsed.workspaces : {}
   };
@@ -1722,7 +1741,6 @@ function normalizeAutomationTask(input = {}, existing = null) {
     connectTimeout: Math.min(120, Math.max(3, Number(input.connectTimeout) || 15)),
     stepTimeout: Math.min(3600, Math.max(1, Number(input.stepTimeout) || 120)),
     retryCount: Math.min(5, Math.max(0, Number(input.retryCount) || 0)),
-    telegramEnabled: input.telegramEnabled !== false,
     steps,
     createdAt: existing?.createdAt || input.createdAt || now,
     updatedAt: now
@@ -1772,7 +1790,6 @@ function sanitizeStateForClient(state, auth = null) {
     proxies: state.proxies.map(sanitizeProxyForClient),
     automationTasks: state.automationTasks.map(sanitizeAutomationTaskForClient),
     automationRuns: state.automationRuns || [],
-    telegram: sanitizeTelegramForClient(state.telegram),
     ...sanitizeOrchestrationState(state),
     workspace: getWorkspaceForUser(state, auth)
   };
@@ -2125,14 +2142,12 @@ function notifyIncidentViaTelegram(incidentId) {
   const state = readState();
   const incident = state.incidents?.find((item) => item.id === incidentId);
   if (!incident) return;
-  const configs = [];
-  if (state.telegram?.enabled && state.telegram?.tokenEnc) configs.push({ ...state.telegram, id: 'legacy' });
-  for (const bot of state.telegramBots || []) if (bot.enabled && bot.tokenEnc) configs.push(bot);
+  const configs = (state.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc);
   const text = `故障事件：${incident.targetName}\n状态：${incident.status}\n${incident.message || incident.error || ''}`;
   for (const settings of configs) {
     let token = '';
     try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
-    for (const chatId of [...new Set([...(settings.userIds || []), ...(settings.groupIds || [])])]) {
+    for (const chatId of [...new Set(settings.userIds || [])]) {
       telegramCall(token, 'sendMessage', { chat_id: chatId, text }).catch(() => {});
     }
   }
@@ -2177,7 +2192,6 @@ function recordAutomationRun(job) {
 function telegramAuthorized(settings, from, chat) {
   const userId = String(from?.id || '');
   if (!settings?.enabled || !(settings?.tokenEnc || settings?.configured) || !settings.userIds?.includes(userId)) return false;
-  if ((chat?.type === 'group' || chat?.type === 'supergroup') && settings.groupIds?.length && !settings.groupIds.includes(String(chat.id))) return false;
   if (chat?.type === 'group' || chat?.type === 'supergroup') return settings.allowGroups !== false;
   return true;
 }
@@ -2208,13 +2222,19 @@ function telegramButtons(tasks, prefix) {
   return tasks.slice(0, 20).map((task) => ([{ text: task.name, callback_data: `${prefix}:${task.id}` }]));
 }
 
+function telegramAutomationTasks(state, settings) {
+  const allowed = Array.isArray(settings?.automationTaskIds) ? settings.automationTaskIds : [];
+  return state.automationTasks.filter((item) => allowed.includes(item.id));
+}
+
 function telegramSessionKey(chat, from) {
   return `${String(chat?.id || '')}:${String(from?.id || '')}`;
 }
 
 async function handleTelegramUpdate(update, token, botSettings = null) {
   const state = readState();
-  const settings = botSettings || state.telegram;
+  if (!botSettings) return;
+  const settings = botSettings;
   const message = update.message;
   const callback = update.callback_query;
   const from = message?.from || callback?.from;
@@ -2229,14 +2249,83 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
     if (pending && !telegramPendingIsFresh(pending)) telegramRuntime.pending.delete(sessionKey);
     if (action === 'menu') {
       if (value === 'root') return sendTelegramMenu(token, chatId, settings);
-      if (!telegramMenuAllowed(settings, value)) return;
+      const scope = value === 'assets' ? 'pools' : value === 'runs' ? 'automation' : value;
+      if (!telegramMenuAllowed(settings, scope)) return;
       if (value === 'overview') return telegramCall(token, 'sendMessage', { chat_id: chatId, text: telegramOverview(state), reply_markup: telegramOverviewButtons() });
       if (value === 'incidents') return sendTelegramIncidents(token, chatId, state);
       if (value === 'probes') return sendTelegramProbes(token, chatId, state);
+      if (value === 'assets') return sendTelegramAssets(token, chatId, state);
       if (value === 'pools') return sendTelegramPools(token, chatId, state);
       if (value === 'dns') return sendTelegramDns(token, chatId, state);
-      if (value === 'automation') return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '选择一个自动化任务：', reply_markup: { inline_keyboard: telegramButtons(state.automationTasks.filter((item) => item.telegramEnabled !== false), 'task') } });
+      if (value === 'automation') return sendTelegramAutomation(token, chatId, state, settings);
+      if (value === 'runs') return sendTelegramAutomationRuns(token, chatId, state);
     }
+    if (action === 'asset_add') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      telegramRuntime.pending.set(sessionKey, { action: 'asset_add', expiresAt: Date.now() + 10 * 60 * 1000 });
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '请发送要添加的 IP，每行一个。', reply_markup: telegramCancelButtons('menu:assets') });
+    }
+    if (action === 'pool') return sendTelegramPool(token, chatId, state, value);
+    if (action === 'pool_add') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      const pool = state.ipPools?.find((item) => item.id === value);
+      if (!pool) return;
+      telegramRuntime.pending.set(sessionKey, { action: 'pool_add', poolId: pool.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `向“${pool.name}”添加 IP，每行一个。`, reply_markup: telegramCancelButtons('menu:pools') });
+    }
+    if (action === 'pool_create') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      telegramRuntime.pending.set(sessionKey, { action: 'pool_create_name', expiresAt: Date.now() + 10 * 60 * 1000 });
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '请发送新备用池名称。', reply_markup: telegramCancelButtons('menu:pools') });
+    }
+    if (action === 'dns') return sendTelegramDnsBinding(token, chatId, state, value);
+    if (action === 'dns_create') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      const accounts = (state.dnsAccounts || []).filter((item) => item.enabled !== false && item.credentialsEnc);
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: accounts.length ? '选择 DNS 账号：' : '请先在网页配置 DNS 账号。', reply_markup: { inline_keyboard: [...accounts.slice(0, 20).map((item) => ([{ text: item.name, callback_data: `dns_account:${item.id}` }])), [{ text: '返回解析', callback_data: 'menu:dns' }]] } });
+    }
+    if (action === 'dns_account') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      const account = state.dnsAccounts?.find((item) => item.id === value && item.enabled !== false);
+      if (!account) return;
+      telegramRuntime.pending.set(sessionKey, { action: 'dns_create_domain', accountId: account.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `账号：${account.name}\n请发送完整域名。`, reply_markup: telegramCancelButtons('menu:dns') });
+    }
+    if (action === 'dns_type') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      const currentPending = telegramRuntime.pending.get(sessionKey);
+      if (!currentPending || currentPending.action !== 'dns_create_type') return;
+      currentPending.action = 'dns_create_values'; currentPending.recordType = value; currentPending.expiresAt = Date.now() + 10 * 60 * 1000;
+      telegramRuntime.pending.set(sessionKey, currentPending);
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: ['A', 'AAAA'].includes(value) ? `请发送 ${value} 地址，每行一个。` : value === 'CNAME' ? '请发送一个目标域名。' : `请发送 ${value} 记录值，每行一个。`, reply_markup: telegramCancelButtons('menu:dns') });
+    }
+    if (action === 'dns_create_confirm' && pending?.action === 'dns_create_confirm') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      let binding;
+      orchestrationDeps.updateState((draft) => {
+        binding = createDnsBinding(draft, pending.accountId, pending.domain, pending.recordType, pending.values, `telegram:${from.id}`);
+        return draft;
+      });
+      telegramRuntime.pending.delete(sessionKey);
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已创建解析\n${binding.domain} · ${binding.recordType}\n记录值：${pending.values.length}`, reply_markup: { inline_keyboard: [[{ text: '立即同步', callback_data: `dns_sync:${binding.id}` }], [{ text: '返回解析', callback_data: 'menu:dns' }]] } });
+    }
+    if (action === 'dns_add' || action === 'dns_replace') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      const binding = state.dnsBindings?.find((item) => item.id === value);
+      if (!binding) return;
+      telegramRuntime.pending.set(sessionKey, { action, bindingId: binding.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `${action === 'dns_replace' ? '替换' : '添加'} ${binding.domain} 的 ${binding.recordType} 地址，每行一个。`, reply_markup: telegramCancelButtons('menu:dns') });
+    }
+    if (action === 'dns_sync') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      try {
+        const result = await syncDnsBinding(value, orchestrationDeps, `telegram:${from.id}`);
+        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `解析同步完成\n记录值：${result.values.length}\n写入方式：${result.layout === 'recordset' ? '一个记录集包含多个值' : '多条同名记录，每条一个值'}`, reply_markup: telegramBackButtons('menu:dns') });
+      } catch (error) {
+        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `解析同步失败\n${error.message}`, reply_markup: telegramBackButtons('menu:dns') });
+      }
+    }
+    if (action === 'run') return sendTelegramAutomationRun(token, chatId, state, value);
     if (action === 'incident') {
       if (!telegramMenuAllowed(settings, 'incidents')) return;
       const incident = state.incidents?.find((item) => item.id === value);
@@ -2261,7 +2350,8 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
     }
     if (action === 'task') {
       if (!telegramMenuAllowed(settings, 'automation')) return;
-      const task = state.automationTasks.find((item) => item.id === value && item.telegramEnabled !== false);
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      const task = telegramAutomationTasks(state, settings).find((item) => item.id === value);
       if (!task) return;
       telegramRuntime.pending.set(sessionKey, { taskId: task.id, hosts: '', awaitingHosts: true, messageId: callback.message.message_id, expiresAt: Date.now() + 10 * 60 * 1000 });
       await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已选择：${task.name}\n请发送 IP 列表，每行一个。` });
@@ -2277,6 +2367,29 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
       scheduleTelegramProgress(chatId, sent.message_id, job.id, token);
       return;
     }
+    if (action === 'confirm_write' && pending?.addresses) {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      let resultText = '';
+      orchestrationDeps.updateState((draft) => {
+        if (pending.action === 'asset_add') {
+          const result = importIpAssets(draft, pending.addresses, {}, `telegram:${from.id}`);
+          resultText = `IP 资产已更新\n新增：${result.created}\n复用：${result.reused}`;
+        } else if (pending.action === 'pool_add') {
+          const result = addIpsToPool(draft, pending.poolId, pending.addresses, `telegram:${from.id}`);
+          resultText = `已加入备用池“${result.pool.name}”\n当前 IP：${result.pool.assetIds.length}`;
+        } else if (pending.action === 'pool_create_ips') {
+          const result = createPoolWithIps(draft, pending.poolName, pending.addresses, `telegram:${from.id}`);
+          resultText = `已创建备用池“${result.pool.name}”\nIP 数量：${result.pool.assetIds.length}`;
+        } else if (pending.action === 'dns_add' || pending.action === 'dns_replace') {
+          const binding = setDnsBindingIps(draft, pending.bindingId, pending.addresses, pending.action === 'dns_replace' ? 'replace' : 'append', `telegram:${from.id}`);
+          resultText = `已保存 ${binding.domain}\n待同步地址：${binding.backupIps.length}`;
+        }
+        return draft;
+      });
+      const dnsBindingId = ['dns_add', 'dns_replace'].includes(pending.action) ? pending.bindingId : '';
+      telegramRuntime.pending.delete(sessionKey);
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: resultText, reply_markup: dnsBindingId ? { inline_keyboard: [[{ text: '立即同步', callback_data: `dns_sync:${dnsBindingId}` }], [{ text: '返回解析', callback_data: 'menu:dns' }]] } : telegramBackButtons(pending.action.startsWith('pool_') ? 'menu:pools' : 'menu:assets') });
+    }
     if (action === 'canceljob') {
       if (!telegramMenuAllowed(settings, 'automation')) return;
       const job = commandJobs.get(value);
@@ -2284,7 +2397,7 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
       await telegramCall(token, 'sendMessage', { chat_id: chatId, text: job ? '任务已取消。' : '任务已结束或过期。' });
       return;
     }
-    if (action === 'cancel') { telegramRuntime.pending.delete(sessionKey); await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '已取消。' }); }
+    if (action === 'cancel') { telegramRuntime.pending.delete(sessionKey); await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '已取消。', reply_markup: telegramBackButtons(`menu:${value || 'root'}`) }); }
     return;
   }
   const text = String(message?.text || '').trim();
@@ -2294,7 +2407,7 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
   }
   if (/^\/(?:run)(?:@[A-Za-z0-9_]+)?(?:\s|$)/.test(text) || text === '执行自动化') {
     if (!telegramMenuAllowed(settings, 'automation')) return;
-    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '选择一个自动化任务：', reply_markup: { inline_keyboard: telegramButtons(state.automationTasks.filter((item) => item.telegramEnabled !== false), 'task') } });
+    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '选择一个自动化任务：', reply_markup: { inline_keyboard: telegramButtons(telegramAutomationTasks(state, settings), 'task') } });
     return;
   }
   if (text === '/status' || text === '总览') {
@@ -2332,6 +2445,59 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
     pending.hosts = hosts; pending.awaitingHosts = false;
     telegramRuntime.pending.set(sessionKey, pending);
     await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已接收 ${hosts.length} 个地址，确认执行？`, reply_markup: { inline_keyboard: [[{ text: '确认执行', callback_data: 'confirm:yes' }, { text: '取消', callback_data: 'cancel:no' }]] } });
+    return;
+  }
+  if (pending?.action === 'pool_create_name' && text) {
+    pending.action = 'pool_create_ips'; pending.poolName = text.slice(0, 200); pending.expiresAt = Date.now() + 10 * 60 * 1000;
+    telegramRuntime.pending.set(sessionKey, pending);
+    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `备用池名称：${pending.poolName}\n请发送初始 IP，每行一个。`, reply_markup: telegramCancelButtons('menu:pools') });
+    return;
+  }
+  if (pending?.action === 'dns_create_domain' && text) {
+    try {
+      const domain = normalizeTelegramDomain(text);
+      pending.action = 'dns_create_type'; pending.domain = domain; pending.expiresAt = Date.now() + 10 * 60 * 1000;
+      telegramRuntime.pending.set(sessionKey, pending);
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `域名：${domain}\n选择记录类型：`, reply_markup: { inline_keyboard: [[{ text: 'A', callback_data: 'dns_type:A' }, { text: 'AAAA', callback_data: 'dns_type:AAAA' }], [{ text: 'CNAME', callback_data: 'dns_type:CNAME' }, { text: 'TXT', callback_data: 'dns_type:TXT' }], [{ text: 'NS', callback_data: 'dns_type:NS' }, { text: 'CAA', callback_data: 'dns_type:CAA' }], [{ text: '取消', callback_data: 'cancel:dns' }]] } });
+    } catch (error) {
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: error.message, reply_markup: telegramCancelButtons('menu:dns') });
+    }
+    return;
+  }
+  if (pending?.action === 'dns_create_values' && text) {
+    try {
+      let values;
+      if (['A', 'AAAA'].includes(pending.recordType)) {
+        values = parseIpBatch(text);
+        const family = pending.recordType === 'AAAA' ? 6 : 4;
+        if (values.some((address) => net.isIP(address) !== family)) throw new Error(`${pending.recordType} 记录的地址类型不匹配`);
+      } else {
+        values = [...new Set(text.split(/\n+/).map((item) => item.trim()).filter(Boolean))].slice(0, pending.recordType === 'CNAME' ? 1 : 5000);
+        if (!values.length) throw new Error('请至少输入一个记录值');
+        if (pending.recordType === 'CNAME') values[0] = normalizeTelegramDomain(values[0]);
+      }
+      pending.values = values; pending.action = 'dns_create_confirm'; pending.expiresAt = Date.now() + 10 * 60 * 1000;
+      telegramRuntime.pending.set(sessionKey, pending);
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `确认新建解析？\n${pending.domain} · ${pending.recordType}\n记录值：${values.length}`, reply_markup: { inline_keyboard: [[{ text: '确认新建', callback_data: 'dns_create_confirm:yes' }, { text: '取消', callback_data: 'cancel:dns' }]] } });
+    } catch (error) {
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: error.message, reply_markup: telegramCancelButtons('menu:dns') });
+    }
+    return;
+  }
+  if (pending?.action && text) {
+    try {
+      const addresses = parseIpBatch(text);
+      if (['dns_add', 'dns_replace'].includes(pending.action)) {
+        const binding = state.dnsBindings.find((item) => item.id === pending.bindingId);
+        const family = binding?.recordType === 'AAAA' ? 6 : 4;
+        if (!binding || addresses.some((address) => net.isIP(address) !== family)) throw new Error(`${binding?.recordType || 'DNS'} 记录的地址类型不匹配`);
+      }
+      pending.addresses = addresses;
+      telegramRuntime.pending.set(sessionKey, pending);
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已识别 ${addresses.length} 个 IP，确认写入？`, reply_markup: { inline_keyboard: [[{ text: '确认写入', callback_data: 'confirm_write:yes' }, { text: '取消', callback_data: 'cancel:root' }]] } });
+    } catch (error) {
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: error.message, reply_markup: telegramCancelButtons('menu:root') });
+    }
   }
 }
 
@@ -2339,8 +2505,9 @@ async function sendTelegramMenu(token, chatId, settings) {
   const button = (scope, text, callback) => telegramMenuAllowed(settings, scope) ? { text, callback_data: callback } : null;
   const rows = [
     [button('overview', '总览', 'menu:overview'), button('incidents', '故障事件', 'menu:incidents')],
-    [button('probes', '探针管理', 'menu:probes'), button('pools', '备用 IP 池', 'menu:pools')],
-    [button('dns', '解析管理', 'menu:dns'), button('automation', '自动化任务', 'menu:automation')]
+    [button('probes', '探针管理', 'menu:probes'), button('pools', 'IP 资产', 'menu:assets')],
+    [button('pools', '备用 IP 池', 'menu:pools'), button('dns', '解析管理', 'menu:dns')],
+    [button('automation', '自动化任务管理', 'menu:automation')]
   ].map((row) => row.filter(Boolean)).filter((row) => row.length);
   await telegramCall(token, 'sendMessage', {
     chat_id: chatId,
@@ -2373,16 +2540,90 @@ async function sendTelegramProbes(token, chatId, state) {
   await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '刷新', callback_data: 'menu:probes' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
 }
 
+async function sendTelegramAssets(token, chatId, state) {
+  const assets = (state.ipAssets || []).slice(0, 20);
+  const text = assets.length ? `IP 资产（${state.ipAssets.length}）\n${assets.map((item) => `${item.address} · ${STATUS_LABELS[item.health] || item.health}`).join('\n')}` : '当前没有 IP 资产';
+  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '批量添加 IP', callback_data: 'asset_add:new' }], [{ text: '刷新', callback_data: 'menu:assets' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+}
+
 async function sendTelegramPools(token, chatId, state) {
   const pools = (state.ipPools || []).slice(0, 20);
   const text = pools.length ? `备用 IP 池\n${pools.map((item) => `${item.name} · ${item.assetIds?.length || 0} 个 IP · ${item.allocationMode === 'all' ? '全部取用' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '取一个'}`).join('\n')}` : '当前没有备用 IP 池';
-  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '刷新', callback_data: 'menu:pools' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+  const buttons = pools.map((item) => ([{ text: `${item.name} · ${item.assetIds?.length || 0} IP`, callback_data: `pool:${item.id}` }]));
+  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...buttons, [{ text: '新建备用池', callback_data: 'pool_create:new' }], [{ text: '刷新', callback_data: 'menu:pools' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+}
+
+async function sendTelegramPool(token, chatId, state, poolId) {
+  const pool = state.ipPools?.find((item) => item.id === poolId);
+  if (!pool) return;
+  const addresses = (pool.assetIds || []).map((id) => state.ipAssets.find((item) => item.id === id)?.address).filter(Boolean);
+  const text = `备用池：${pool.name}\nIP 数量：${addresses.length}\n取用方式：${pool.allocationMode === 'all' ? '全部取用' : pool.allocationMode === 'count' ? `取 ${pool.allocationCount} 个` : '一次取一个'}\n\n${addresses.slice(0, 30).join('\n') || '暂无 IP'}`;
+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '批量加入 IP', callback_data: `pool_add:${pool.id}` }], [{ text: '返回备用池', callback_data: 'menu:pools' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
 }
 
 async function sendTelegramDns(token, chatId, state) {
   const bindings = (state.dnsBindings || []).slice(0, 20);
-  const text = bindings.length ? `解析绑定\n${bindings.map((item) => `${item.name} · ${item.domain} · ${item.recordType}`).join('\n')}` : '当前没有解析绑定';
-  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '刷新', callback_data: 'menu:dns' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+  const text = bindings.length ? `解析绑定\n${bindings.map((item) => `${telegramShortText(item.name, 50)} · ${telegramShortText(item.domain, 90)} · ${item.recordType}`).join('\n')}` : '当前没有解析绑定';
+  const buttons = bindings.map((item) => ([{ text: `${item.domain} · ${item.recordType}`, callback_data: `dns:${item.id}` }]));
+  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...buttons, [{ text: '新建解析', callback_data: 'dns_create:new' }], [{ text: '刷新', callback_data: 'menu:dns' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+}
+
+async function sendTelegramDnsBinding(token, chatId, state, bindingId) {
+  const binding = state.dnsBindings?.find((item) => item.id === bindingId);
+  if (!binding) return;
+  const account = state.dnsAccounts?.find((item) => item.id === binding.accountId);
+  const layout = dnsRecordLayout(account?.provider);
+  const values = binding.managedValues?.length ? binding.managedValues : binding.backupIps || [];
+  const text = `解析绑定：${telegramShortText(binding.name, 100)}\n域名：${binding.domain}\n类型：${binding.recordType}\n记录值：${values.length}\n供应商写入：${layout === 'recordset' ? '一个记录集，多值' : '多条同名记录，每条一个值'}\n最近同步：${binding.lastSyncAt ? new Date(binding.lastSyncAt).toLocaleString('zh-CN', { hour12: false }) : '尚未同步'}\n\n${telegramValuePreview(values)}`;
+  const editRow = ['A', 'AAAA'].includes(binding.recordType) ? [[{ text: '添加 IP', callback_data: `dns_add:${binding.id}` }, { text: '替换全部 IP', callback_data: `dns_replace:${binding.id}` }]] : [];
+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...editRow, [{ text: '立即同步', callback_data: `dns_sync:${binding.id}` }], [{ text: '返回解析', callback_data: 'menu:dns' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+}
+
+async function sendTelegramAutomation(token, chatId, state, settings) {
+  const tasks = telegramAutomationTasks(state, settings);
+  const buttons = telegramButtons(tasks, 'task');
+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text: tasks.length ? '自动化任务管理\n选择任务后输入批量 IP 执行。' : '当前没有关联的自动化任务', reply_markup: { inline_keyboard: [...buttons, [{ text: '执行记录', callback_data: 'menu:runs' }], [{ text: '返回菜单', callback_data: 'menu:root' }]] } });
+}
+
+async function sendTelegramAutomationRuns(token, chatId, state) {
+  const runs = (state.automationRuns || []).slice(0, 20);
+  const buttons = runs.map((item) => ([{ text: `${item.taskName} · ${STATUS_LABELS[item.status] || item.status}`, callback_data: `run:${item.id}` }]));
+  const text = runs.length ? `自动化执行记录（${runs.length}）` : '当前没有自动化执行记录';
+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...buttons, [{ text: '返回任务', callback_data: 'menu:automation' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+}
+
+async function sendTelegramAutomationRun(token, chatId, state, runId) {
+  const live = commandJobs.get(runId);
+  const stored = state.automationRuns?.find((item) => item.id === runId);
+  if (!live && !stored) return;
+  const total = live?.results.length ?? stored.total;
+  const ok = live?.results.filter((item) => item.ok).length ?? stored.ok;
+  const failed = live?.results.filter((item) => item.status === 'error').length ?? stored.error;
+  const running = live?.results.filter((item) => ['queued', 'running', 'awaiting_input'].includes(item.status)).length ?? 0;
+  const text = `自动化：${live?.taskName || stored.taskName}\n状态：${live?.status || stored.status}\n总数：${total}\n成功：${ok}\n失败：${failed}\n执行中：${running}`;
+  const actions = live && live.status !== 'done' ? [[{ text: '取消任务', callback_data: `canceljob:${live.id}` }]] : [];
+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...actions, [{ text: '刷新', callback_data: `run:${runId}` }], [{ text: '返回记录', callback_data: 'menu:runs' }]] } });
+}
+
+function telegramBackButtons(callback) { return { inline_keyboard: [[{ text: '返回', callback_data: callback }]] }; }
+function telegramCancelButtons(section) { return { inline_keyboard: [[{ text: '取消', callback_data: `cancel:${String(section).replace(/^menu:/, '')}` }]] }; }
+function telegramCanOperate(state, settings, from, chat) { return ['owner', 'admin', 'operator'].includes(resolveTelegramRole(state, settings, from, chat)); }
+function telegramPermissionDenied(token, chatId) { return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '当前用户没有写入权限。', reply_markup: telegramBackButtons('menu:root') }); }
+function telegramShortText(value, max) { const text = String(value || ''); return text.length > max ? `${text.slice(0, max - 1)}…` : text; }
+function telegramValuePreview(values) {
+  const lines = [];
+  let length = 0;
+  for (const value of values || []) {
+    const line = telegramShortText(value, 240);
+    if (lines.length >= 20 || length + line.length > 3000) break;
+    lines.push(line); length += line.length + 1;
+  }
+  return lines.join('\n') || '暂无记录值';
+}
+function normalizeTelegramDomain(value) {
+  const domain = String(value || '').trim().toLowerCase().replace(/\.$/, '');
+  if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(domain)) throw new Error('域名格式不正确');
+  return domain;
 }
 
 const STATUS_LABELS = { online: '在线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
@@ -2390,9 +2631,8 @@ const STATUS_LABELS = { online: '在线', pending: '待接入', revoked: '已吊
 function resolveTelegramRole(state, settings, from, chat) {
   const userId = String(from?.id || '');
   const botRole = settings.roles?.[userId];
-  const globalIds = state.telegram?.userIds || [];
   if (botRole) return botRole;
-  if (globalIds.includes(userId)) return 'operator';
+  if (settings.userIds?.includes(userId)) return 'operator';
   if (chat && settings.roles?.[String(chat.id)]) return settings.roles[String(chat.id)];
   return 'viewer';
 }
@@ -2434,14 +2674,19 @@ function restartTelegramPolling() {
   const generation = telegramRuntime.generation;
   if (telegramRuntime.timer) { clearTimeout(telegramRuntime.timer); telegramRuntime.timer = null; }
   const state = readState();
-  const botConfigs = [];
-  if (state.telegram?.enabled && state.telegram?.tokenEnc) botConfigs.push({ id: 'legacy', ...state.telegram });
-  for (const bot of state.telegramBots || []) if (bot.enabled && bot.tokenEnc) botConfigs.push(bot);
+  const botConfigs = (state.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc);
   if (!botConfigs.length) return;
   const poll = async () => {
     await Promise.all(botConfigs.map(async (settings) => {
       let token = '';
       try { token = decryptSecret(settings.tokenEnc); } catch (_error) { return; }
+      if (!telegramRuntime.configuredTokens?.has(token)) {
+        telegramRuntime.configuredTokens ||= new Set();
+        try {
+          await configureTelegramMenu(token);
+          telegramRuntime.configuredTokens.add(token);
+        } catch (_error) { /* retry on the next poll */ }
+      }
       const offset = telegramRuntime.offsets.get(settings.id) || 0;
       try {
         const updates = await telegramCall(token, 'getUpdates', { offset, timeout: 4, allowed_updates: ['message', 'callback_query'] });
@@ -2454,6 +2699,20 @@ function restartTelegramPolling() {
     if (generation === telegramRuntime.generation) telegramRuntime.timer = setTimeout(poll, 1000);
   };
   poll();
+}
+
+async function configureTelegramMenu(token) {
+  const commands = [
+    { command: 'menu', description: '打开操作菜单' },
+    { command: 'status', description: '查看系统总览' },
+    { command: 'run', description: '自动化任务管理' },
+    { command: 'incidents', description: '故障事件' },
+    { command: 'probes', description: '探针管理' },
+    { command: 'pools', description: '备用 IP 池' },
+    { command: 'dns', description: '解析管理' }
+  ];
+  await telegramCall(token, 'setMyCommands', { commands });
+  await telegramCall(token, 'setChatMenuButton', { menu_button: { type: 'commands' } });
 }
 
 function startInteractiveCommandSession(job, resultItem, serverItem, proxies, encryptionKeyHex) {

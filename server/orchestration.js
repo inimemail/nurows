@@ -27,6 +27,7 @@ const DNS_PROVIDERS = new Set([
   'edgeone', 'ns1', 'rainyun', 'dynv6', 'vercel', 'spaceship'
 ]);
 const CALLBACK_PROVIDERS = new Set(['callback', 'aliyun_esa', 'baidu', 'namecheap', 'namesilo', 'dynadot', 'dnsla', 'era', 'tndns', 'gcore', 'edgeone', 'ns1', 'rainyun', 'dynv6', 'vercel', 'spaceship']);
+const DNS_RECORD_TYPES = new Set(['A', 'AAAA', 'CNAME', 'TXT', 'NS', 'CAA']);
 
 export function orchestrationDefaults() {
   return {
@@ -161,17 +162,32 @@ export function registerProbePublicRoutes(app, deps) {
 }
 
 export function registerOrchestrationRoutes(app, deps) {
+  app.post('/api/ip-assets/batch', (req, res) => {
+    const addresses = parseIpBatch(req.body.addresses);
+    let result;
+    const state = deps.updateState((draft) => {
+      result = importIpAssets(draft, addresses, req.body, req.auth.username);
+      pushAudit(draft, 'ipAssets.batch_create', 'ipAssets', '', `批量导入 ${result.created} 个 IP，复用 ${result.reused} 个`, req.auth.username);
+      return draft;
+    });
+    res.json({ ok: true, ...result, state: deps.sanitizeState(state, req.auth) });
+  });
+
   app.post('/api/orchestration/:resource', asyncRoute(async (req, res) => {
     const key = RESOURCE_MAP[req.params.resource];
     if (!key) return res.status(404).json({ error: '未知资源类型' });
     let created;
     const state = deps.updateState((draft) => {
+      if (key === 'telegramBots' && draft.telegramBots.length) throw new Error('系统只使用一个统一 Telegram 机器人，请编辑现有机器人');
+      const imported = key === 'ipPools' ? importIpAssets(draft, parseOptionalIpBatch(req.body.newAssetAddresses), req.body.assetDefaults, req.auth.username) : null;
+      if (imported) req.body.assetIds = [...new Set([...(req.body.assetIds || []), ...imported.assetIds])];
       created = normalizeResource(key, req.body, null, deps);
       ensureResourceReferences(draft, key, created);
       draft[key].push(created);
       pushAudit(draft, `${key}.create`, key, created.id, `新增 ${created.name || created.address || created.domain || created.id}`, req.auth.username);
       return draft;
     });
+    if (key === 'telegramBots') deps.onTelegramChanged?.();
     res.json({ ok: true, item: sanitizeResource(key, created), state: deps.sanitizeState(state, req.auth) });
   }));
 
@@ -182,12 +198,15 @@ export function registerOrchestrationRoutes(app, deps) {
     const state = deps.updateState((draft) => {
       const item = draft[key].find((entry) => entry.id === req.params.id);
       if (!item) throw new Error('记录不存在');
+      const imported = key === 'ipPools' ? importIpAssets(draft, parseOptionalIpBatch(req.body.newAssetAddresses), req.body.assetDefaults, req.auth.username) : null;
+      if (imported) req.body.assetIds = [...new Set([...(req.body.assetIds || []), ...imported.assetIds])];
       updated = normalizeResource(key, req.body, item, deps);
       ensureResourceReferences(draft, key, updated);
       Object.assign(item, updated, { id: item.id, createdAt: item.createdAt });
       pushAudit(draft, `${key}.update`, key, item.id, `更新 ${item.name || item.address || item.domain || item.id}`, req.auth.username);
       return draft;
     });
+    if (key === 'telegramBots') deps.onTelegramChanged?.();
     res.json({ ok: true, item: sanitizeResource(key, updated), state: deps.sanitizeState(state, req.auth) });
   }));
 
@@ -200,6 +219,7 @@ export function registerOrchestrationRoutes(app, deps) {
       pushAudit(draft, `${key}.delete`, key, req.params.id, '删除记录', req.auth.username);
       return draft;
     });
+    if (key === 'telegramBots') deps.onTelegramChanged?.();
     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
   }));
 
@@ -229,7 +249,9 @@ export function registerOrchestrationRoutes(app, deps) {
       pushAudit(draft, 'probe.rotate_token', 'probe', probe.id, '重新生成一次性注册凭证', req.auth.username);
       return draft;
     });
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const publicProto = forwardedProto === 'https' || req.secure || (!isLocalRequestHost(req.get('host')) && forwardedProto !== 'http') ? 'https' : 'http';
+    const baseUrl = `${publicProto}://${req.get('host')}`;
     res.json({
       ok: true,
       token,
@@ -267,26 +289,8 @@ export function registerOrchestrationRoutes(app, deps) {
   }));
 
   app.post('/api/dns-bindings/:id/sync', asyncRoute(async (req, res) => {
-    const state = deps.readState();
-    const binding = state.dnsBindings.find((item) => item.id === req.params.id);
-    if (!binding) return res.status(404).json({ error: '解析绑定不存在' });
-    const values = await resolveBindingSources(binding);
-    if (!values.length) return res.status(400).json({ error: '主来源和备用来源均未解析出可用地址' });
-    const account = state.dnsAccounts.find((item) => item.id === binding.accountId && item.enabled !== false);
-    const zone = state.dnsZones.find((item) => item.id === binding.zoneId && item.enabled !== false);
-    if (!account || !zone) return res.status(400).json({ error: 'DNS 账号或 Zone 不可用' });
-    const credentials = decryptCredentials(account, deps);
-    const before = await getDnsRecord(account, credentials, zone, binding);
-    const after = binding.pruneStale === false ? [...new Set([...before.values, ...values])] : values;
-    const providerRecordIds = await updateDnsRecord(account, credentials, zone, binding, after);
-    const next = deps.updateState((draft) => {
-      const item = draft.dnsBindings.find((entry) => entry.id === binding.id);
-      if (item) Object.assign(item, { managedValues: after, providerRecordIds: providerRecordIds || item.providerRecordIds, lastSyncAt: nowIso(), lastSyncError: '' });
-      draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', bindingId: binding.id, accountId: account.id, zoneId: zone.id, domain: binding.domain, beforeValues: before.values, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' });
-      pushAudit(draft, 'dns.sync', 'dnsBinding', binding.id, `${binding.domain} 同步 ${after.length} 个地址`, req.auth.username);
-      return draft;
-    });
-    res.json({ ok: true, values: after, state: deps.sanitizeState(next, req.auth) });
+    const result = await syncDnsBinding(req.params.id, deps, req.auth.username);
+    res.json({ ok: true, ...result, state: deps.sanitizeState(result.state, req.auth) });
   }));
 
   app.post('/api/incidents/:id/execute', (req, res) => {
@@ -307,6 +311,29 @@ export function registerOrchestrationRoutes(app, deps) {
     const result = await rollbackIncident(req.params.id, deps, req.auth.username);
     res.json({ ok: true, ...result, state: deps.sanitizeState(deps.readState(), req.auth) });
   }));
+}
+
+export async function syncDnsBinding(bindingId, deps, actor = 'system') {
+  const state = deps.readState();
+  const binding = state.dnsBindings.find((item) => item.id === bindingId);
+  if (!binding) throw new Error('解析绑定不存在');
+  const values = await resolveBindingSources(binding);
+  if (!values.length) throw new Error('主来源和备用来源均未解析出可用地址');
+  const account = state.dnsAccounts.find((item) => item.id === binding.accountId && item.enabled !== false);
+  if (!account) throw new Error('DNS 账号不可用');
+  const credentials = decryptCredentials(account, deps);
+  const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, binding);
+  const before = await getDnsRecord(account, credentials, zone, normalizedBinding);
+  const after = binding.pruneStale === false ? [...new Set([...before.values, ...values])] : values;
+  const providerRecordIds = await updateDnsRecord(account, credentials, zone, normalizedBinding, after);
+  const next = deps.updateState((draft) => {
+    const item = draft.dnsBindings.find((entry) => entry.id === binding.id);
+    if (item) Object.assign(item, { managedValues: after, providerRecordIds: providerRecordIds || item.providerRecordIds, lastSyncAt: nowIso(), lastSyncError: '' });
+    draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, beforeValues: before.values, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' });
+    pushAudit(draft, 'dns.sync', 'dnsBinding', binding.id, `${binding.domain} 同步 ${after.length} 个地址`, actor);
+    return draft;
+  });
+  return { values: after, layout: dnsRecordLayout(account.provider), state: next };
 }
 
 export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null) {
@@ -376,16 +403,120 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     const provider = DNS_PROVIDERS.has(input.provider) ? input.provider : 'huawei';
     const hasCredentials = credentials && Object.values(credentials).some(Boolean);
     const preservedCredentials = existing?.provider === provider ? existing.credentialsEnc : null;
-    return { ...base, name: requiredText(input.name, '账号名称'), provider, region: cleanText(input.region, 80), projectId: cleanText(input.projectId, 120), zoneAllowlist: cleanTexts(input.zoneAllowlist, 500), enabled: input.enabled !== false, credentialsEnc: hasCredentials ? deps.encryptSecret(JSON.stringify(credentials)) : preservedCredentials || null, status: existing?.provider === provider ? (existing?.status || 'untested') : 'untested', lastTestAt: existing?.provider === provider ? (existing?.lastTestAt || '') : '', lastError: existing?.provider === provider ? (existing?.lastError || '') : '' };
+    return { ...base, name: requiredText(input.name, '账号名称'), provider, enabled: input.enabled !== false, credentialsEnc: hasCredentials ? deps.encryptSecret(JSON.stringify(credentials)) : preservedCredentials || null, status: existing?.provider === provider ? (existing?.status || 'untested') : 'untested', lastTestAt: existing?.provider === provider ? (existing?.lastTestAt || '') : '', lastError: existing?.provider === provider ? (existing?.lastError || '') : '' };
   }
   if (key === 'dnsZones') return { ...base, name: normalizeDomain(input.name), accountId: cleanId(input.accountId), providerZoneId: cleanText(input.providerZoneId, 200), enabled: input.enabled !== false, lastSyncAt: existing?.lastSyncAt || '', status: existing?.status || 'ready' };
-  if (key === 'dnsBindings') return { ...base, name: requiredText(input.name, '解析绑定名称'), zoneId: cleanId(input.zoneId), accountId: cleanId(input.accountId), domain: normalizeDomain(input.domain), recordName: cleanText(input.recordName, 255) || '@', recordType: ['A', 'AAAA'].includes(input.recordType) ? input.recordType : 'A', providerRecordId: cleanText(input.providerRecordId, 200), providerRecordIds: cleanTexts(input.providerRecordIds, 500), recordLine: cleanText(input.recordLine, 100) || '默认', ttl: clampNumber(input.ttl, 1, 86400, 60), updateMode: ['append', 'managed_replace', 'replace'].includes(input.updateMode) ? input.updateMode : 'managed_replace', managedValues: cleanTexts(input.managedValues, 5000), ddnsSources: normalizeDdnsSources(input.ddnsSources), backupIps: cleanTexts(input.backupIps, 5000), maxActiveIps: clampNumber(input.maxActiveIps, 1, 50, 50), pruneStale: input.pruneStale !== false, healthEnabled: input.healthEnabled !== false, healthInterval: clampNumber(input.healthInterval, 10, 86400, 30), pingCount: clampNumber(input.pingCount, 1, 10, 3), checkRounds: clampNumber(input.checkRounds, 1, 10, 3), roundDelay: clampNumber(input.roundDelay, 0, 60, 2), maxParallel: clampNumber(input.maxParallel, 1, 300, 20), lastSyncAt: existing?.lastSyncAt || '', lastSyncError: existing?.lastSyncError || '', enabled: input.enabled !== false };
+  if (key === 'dnsBindings') {
+    const recordType = DNS_RECORD_TYPES.has(input.recordType) ? input.recordType : 'A';
+    const accountId = cleanId(input.accountId);
+    const domain = normalizeDomain(input.domain);
+    const identityChanged = Boolean(existing && (existing.accountId !== accountId || existing.domain !== domain || existing.recordType !== recordType));
+    const recordValues = cleanRecordValues(input.recordValues, recordType === 'CNAME' ? 1 : 5000);
+    if (recordType === 'CNAME' && recordValues[0]) recordValues[0] = normalizeDomain(recordValues[0]);
+    return { ...base, name: requiredText(input.name, '解析绑定名称'), zoneId: identityChanged ? '' : cleanId(input.zoneId), accountId, domain, recordName: identityChanged ? '' : cleanText(input.recordName, 255), recordType, recordValues, providerRecordId: identityChanged ? '' : cleanText(input.providerRecordId, 200), providerRecordIds: identityChanged ? [] : cleanTexts(input.providerRecordIds, 500), recordLine: cleanText(input.recordLine, 100) || '默认', ttl: clampNumber(input.ttl, 1, 86400, 60), updateMode: ['append', 'managed_replace', 'replace'].includes(input.updateMode) ? input.updateMode : 'managed_replace', managedValues: identityChanged ? [] : cleanTexts(input.managedValues, 5000), ddnsSources: normalizeDdnsSources(input.ddnsSources), backupIps: cleanTexts(input.backupIps, 5000), maxActiveIps: clampNumber(input.maxActiveIps, 1, 50, 50), pruneStale: input.pruneStale !== false, healthEnabled: input.healthEnabled !== false, healthInterval: clampNumber(input.healthInterval, 10, 86400, 30), pingCount: clampNumber(input.pingCount, 1, 10, 3), checkRounds: clampNumber(input.checkRounds, 1, 10, 3), roundDelay: clampNumber(input.roundDelay, 0, 60, 2), maxParallel: clampNumber(input.maxParallel, 1, 300, 20), lastSyncAt: identityChanged ? '' : (existing?.lastSyncAt || ''), lastSyncError: '', enabled: input.enabled !== false };
+  }
   if (key === 'failoverPolicies') return { ...base, name: requiredText(input.name, '策略名称'), poolIds: cleanIds(input.poolIds, 100), automationTaskId: cleanId(input.automationTaskId), automationHosts: input.automationHosts === 'target' ? 'target' : 'allocated', automationTimeout: clampNumber(input.automationTimeout, 30, 7200, 1800), dnsBindingIds: cleanIds(input.dnsBindingIds, 500), approvalMode: input.approvalMode === 'telegram' ? 'telegram' : 'automatic', autoRollback: input.autoRollback !== false, enabled: input.enabled !== false, businessKey: cleanText(input.businessKey, 100) };
   if (key === 'telegramBots') {
     const token = String(input.token || '').trim();
-    return { ...base, name: requiredText(input.name, '机器人名称'), tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: cleanTexts(input.groupIds, 500), roles: normalizeRoles(input.roles), menuScopes: cleanTexts(input.menuScopes, 30), lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
+    return { ...base, name: '统一机器人', tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: [], roles: normalizeRoles(input.roles), menuScopes: cleanTexts(input.menuScopes, 30), automationTaskIds: cleanIds(input.automationTaskIds, 500), lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
   }
   throw new Error('未知资源类型');
+}
+
+function parseOptionalIpBatch(value) {
+  if (!String(value || '').trim()) return [];
+  return parseIpBatch(value);
+}
+
+export function parseIpBatch(value) {
+  const values = [...new Set(String(value || '').split(/[\s,，;；]+/).map((item) => item.trim()).filter(Boolean))];
+  if (!values.length) throw new Error('请至少输入一个 IP 地址');
+  if (values.length > 5000) throw new Error('单次最多导入 5000 个 IP 地址');
+  const invalid = values.filter((address) => net.isIP(address) === 0);
+  if (invalid.length) throw new Error(`IP 地址格式不正确：${invalid.slice(0, 10).join('、')}${invalid.length > 10 ? ` 等 ${invalid.length} 个` : ''}`);
+  return values;
+}
+
+export function dnsRecordLayout(provider) {
+  return provider === 'huawei' ? 'recordset' : 'individual';
+}
+
+export function importIpAssets(state, addresses, defaults = {}, actor = 'system') {
+  const assetIds = [];
+  let created = 0;
+  let reused = 0;
+  for (const address of addresses) {
+    let asset = state.ipAssets.find((item) => item.address === address);
+    if (asset) {
+      reused += 1;
+    } else {
+      asset = normalizeResource('ipAssets', {
+        address,
+        name: address,
+        region: defaults?.region,
+        carrier: defaults?.carrier,
+        labels: defaults?.labels,
+        health: defaults?.health || 'unknown',
+        enabled: defaults?.enabled !== false,
+        note: defaults?.note
+      });
+      state.ipAssets.push(asset);
+      created += 1;
+    }
+    assetIds.push(asset.id);
+  }
+  if (created) pushAudit(state, 'ipAssets.batch_import', 'ipAssets', '', `创建 ${created} 个 IP 资产`, actor);
+  return { created, reused, total: addresses.length, assetIds };
+}
+
+export function addIpsToPool(state, poolId, addresses, actor = 'system') {
+  const pool = state.ipPools.find((item) => item.id === poolId);
+  if (!pool) throw new Error('备用池不存在');
+  const imported = importIpAssets(state, addresses, {}, actor);
+  pool.assetIds = [...new Set([...(pool.assetIds || []), ...imported.assetIds])];
+  pool.updatedAt = nowIso();
+  pushAudit(state, 'ipPools.telegram_add', 'ipPools', pool.id, `通过 Telegram 加入 ${addresses.length} 个 IP`, actor);
+  return { pool, ...imported };
+}
+
+export function createPoolWithIps(state, name, addresses, actor = 'system') {
+  const imported = importIpAssets(state, addresses, {}, actor);
+  const pool = normalizeResource('ipPools', { name, assetIds: imported.assetIds, allocationMode: 'one', enabled: true });
+  state.ipPools.push(pool);
+  pushAudit(state, 'ipPools.telegram_create', 'ipPools', pool.id, `通过 Telegram 创建备用池并加入 ${addresses.length} 个 IP`, actor);
+  return { pool, ...imported };
+}
+
+export function setDnsBindingIps(state, bindingId, addresses, mode = 'append', actor = 'system') {
+  const binding = state.dnsBindings.find((item) => item.id === bindingId);
+  if (!binding) throw new Error('解析绑定不存在');
+  if (!['A', 'AAAA'].includes(binding.recordType)) throw new Error('只有 A/AAAA 记录可以添加 IP');
+  const family = binding.recordType === 'AAAA' ? 6 : 4;
+  if (addresses.some((address) => net.isIP(address) !== family)) throw new Error(`${binding.recordType} 记录只能使用 IPv${family} 地址`);
+  binding.backupIps = mode === 'replace' ? [...addresses] : [...new Set([...(binding.backupIps || []), ...addresses])];
+  binding.updatedAt = nowIso();
+  pushAudit(state, 'dnsBindings.telegram_ips', 'dnsBindings', binding.id, `通过 Telegram ${mode === 'replace' ? '替换' : '添加'} ${addresses.length} 个 IP`, actor);
+  return binding;
+}
+
+export function createDnsBinding(state, accountId, domain, recordType, values, actor = 'system') {
+  const account = state.dnsAccounts.find((item) => item.id === accountId && item.enabled !== false);
+  if (!account) throw new Error('DNS 账号不存在或已停用');
+  const type = DNS_RECORD_TYPES.has(recordType) ? recordType : 'A';
+  const addressRecord = ['A', 'AAAA'].includes(type);
+  const binding = normalizeResource('dnsBindings', {
+    name: `${domain} ${type}`,
+    accountId,
+    domain,
+    recordType: type,
+    backupIps: addressRecord ? values : [],
+    recordValues: addressRecord ? [] : values,
+    updateMode: 'replace',
+    enabled: true
+  });
+  state.dnsBindings.push(binding);
+  pushAudit(state, 'dnsBindings.telegram_create', 'dnsBindings', binding.id, `通过 Telegram 创建 ${binding.domain} ${binding.recordType}`, actor);
+  return binding;
 }
 
 function ensureResourceReferences(state, key, item) {
@@ -396,12 +527,14 @@ function ensureResourceReferences(state, key, item) {
   }
   if (key === 'ipPools' && item.assetIds.some((id) => !exists('ipAssets', id))) throw new Error('备用池包含不存在的 IP');
   if (key === 'dnsZones' && !exists('dnsAccounts', item.accountId)) throw new Error('DNS 账号不存在');
-  if (key === 'dnsBindings' && (!exists('dnsAccounts', item.accountId) || !exists('dnsZones', item.zoneId))) throw new Error('DNS 账号或 Zone 不存在');
+  if (key === 'dnsBindings' && !exists('dnsAccounts', item.accountId)) throw new Error('DNS 账号不存在');
   if (key === 'failoverPolicies') {
     if (item.poolIds.some((id) => !exists('ipPools', id))) throw new Error('关联的备用池不存在');
     if (item.dnsBindingIds.some((id) => !exists('dnsBindings', id))) throw new Error('关联的解析绑定不存在');
+    if (item.dnsBindingIds.some((id) => !['A', 'AAAA'].includes(state.dnsBindings.find((entry) => entry.id === id)?.recordType))) throw new Error('故障切换只能关联 A/AAAA 解析');
     if (!exists('automationTasks', item.automationTaskId)) throw new Error('关联的自动化任务不存在');
   }
+  if (key === 'telegramBots' && item.automationTaskIds.some((id) => !exists('automationTasks', id))) throw new Error('机器人包含不存在的自动化任务');
 }
 
 function ensureNotReferenced(state, key, id) {
@@ -495,22 +628,22 @@ function canLeaseAsset(state, assetId, pool, incident) {
 }
 
 async function applyDnsBinding(binding, allocatedIps, incidentId, deps) {
+  if (!['A', 'AAAA'].includes(binding.recordType)) throw new Error(`故障切换不能更新 ${binding.recordType} 记录`);
   const state = deps.readState();
   const account = state.dnsAccounts.find((item) => item.id === binding.accountId && item.enabled !== false);
-  const zone = state.dnsZones.find((item) => item.id === binding.zoneId && item.enabled !== false);
-  if (!account || !zone) throw new Error(`解析绑定 ${binding.name} 的账号或 Zone 不可用`);
-  if (account.zoneAllowlist?.length && !account.zoneAllowlist.includes(zone.name)) throw new Error(`账号无权操作 Zone ${zone.name}`);
+  if (!account) throw new Error(`解析绑定 ${binding.name} 的账号不可用`);
   const credentials = decryptCredentials(account, deps);
-  const before = await getDnsRecord(account, credentials, zone, binding);
+  const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, binding);
+  const before = await getDnsRecord(account, credentials, zone, normalizedBinding);
   const current = before.values || [];
   let after;
   if (binding.updateMode === 'append') after = [...new Set([...current, ...allocatedIps])];
   else if (binding.updateMode === 'managed_replace') after = [...new Set([...current.filter((value) => !binding.managedValues?.includes(value)), ...allocatedIps])];
   else after = [...new Set(allocatedIps)];
   if (!after.length) throw new Error(`解析绑定 ${binding.name} 没有可写入 IP`);
-  const providerRecordIds = await updateDnsRecord(account, credentials, zone, binding, after);
+  const providerRecordIds = await updateDnsRecord(account, credentials, zone, normalizedBinding, after);
   deps.updateState((draft) => {
-    const change = { id: uuidv4(), incidentId, bindingId: binding.id, accountId: account.id, zoneId: zone.id, domain: binding.domain, beforeValues: current, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' };
+    const change = { id: uuidv4(), incidentId, bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, beforeValues: current, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' };
     draft.dnsChanges.unshift(change);
     const incident = draft.incidents.find((item) => item.id === incidentId);
     if (incident) incident.dnsChangeIds = [...(incident.dnsChangeIds || []), change.id];
@@ -535,9 +668,10 @@ export async function rollbackIncident(incidentId, deps, actor) {
     if (!change) continue;
     const binding = current.dnsBindings.find((item) => item.id === change.bindingId);
     const account = current.dnsAccounts.find((item) => item.id === change.accountId);
-    const zone = current.dnsZones.find((item) => item.id === change.zoneId);
-    if (!binding || !account || !zone) continue;
-    const providerRecordIds = await updateDnsRecord(account, decryptCredentials(account, deps), zone, binding, change.beforeValues);
+    if (!binding || !account) continue;
+    const credentials = decryptCredentials(account, deps);
+    const discovered = change.zoneName ? { zone: { id: change.zoneId, name: change.zoneName, providerZoneId: change.providerZoneId }, normalizedBinding: withRecordName(binding, change.zoneName) } : await resolveManagedDnsZone(current, account, credentials, binding);
+    const providerRecordIds = await updateDnsRecord(account, credentials, discovered.zone, discovered.normalizedBinding, change.beforeValues);
     deps.updateState((draft) => {
       const item = draft.dnsChanges.find((entry) => entry.id === change.id);
       if (item) Object.assign(item, { status: 'rolled_back', rolledBackAt: nowIso() });
@@ -558,6 +692,7 @@ export async function rollbackIncident(incidentId, deps, actor) {
 async function verifyDnsBindings(bindings, expectedIps) {
   await new Promise((resolve) => setTimeout(resolve, 800));
   for (const binding of bindings) {
+    if (!['A', 'AAAA'].includes(binding.recordType)) continue;
     const type = binding.recordType === 'AAAA' ? 28 : 1;
     const response = await fetch(`https://1.1.1.1/dns-query?name=${encodeURIComponent(binding.domain)}&type=${type}`, { headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw new Error(`DNS 验证失败：${binding.domain}`);
@@ -580,7 +715,93 @@ async function testDnsAccount(account, credentials) {
   throw new Error('不支持的 DNS 服务商');
 }
 
+async function resolveManagedDnsZone(state, account, credentials, binding) {
+  const legacy = state.dnsZones.find((item) => item.id === binding.zoneId && item.accountId === account.id && item.enabled !== false);
+  if (legacy) return { zone: legacy, normalizedBinding: withRecordName(binding, legacy.name) };
+  const zones = await listProviderZones(account, credentials);
+  const domain = normalizeDomain(binding.domain);
+  const matches = zones.filter((zone) => domain === zone.name || domain.endsWith(`.${zone.name}`)).sort((left, right) => right.name.length - left.name.length);
+  if (!matches.length) throw new Error(`账号中未找到 ${domain} 对应的托管域`);
+  return { zone: matches[0], normalizedBinding: withRecordName(binding, matches[0].name) };
+}
+
+export function withRecordName(binding, zoneName) {
+  const domain = normalizeDomain(binding.domain);
+  const zone = normalizeDomain(zoneName);
+  const recordName = domain === zone ? '@' : domain.slice(0, -(zone.length + 1));
+  return { ...binding, recordName };
+}
+
+async function listProviderZones(account, credentials) {
+  if (account.provider === 'cloudflare') {
+    const zones = [];
+    for (let page = 1; page <= 100; page += 1) {
+      const data = await cloudflareRequest(credentials, 'GET', `/zones?per_page=50&page=${page}`);
+      zones.push(...(data.result || []));
+      if (page >= Number(data.result_info?.total_pages || 1) || !(data.result || []).length) break;
+    }
+    return zones.map((item) => ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.id) }));
+  }
+  if (account.provider === 'huawei') {
+    const zones = [];
+    let marker = '';
+    for (let page = 0; page < 100; page += 1) {
+      const query = new URLSearchParams({ limit: '500' });
+      if (marker) query.set('marker', marker);
+      const data = await huaweiRequest(account, credentials, 'GET', `/v2/zones?${query}`);
+      const batch = data.zones || [];
+      zones.push(...batch);
+      const next = data.links?.next ? new URL(data.links.next, 'https://dns.myhuaweicloud.com').searchParams.get('marker') : '';
+      if (!next || next === marker || !batch.length) break;
+      marker = next;
+    }
+    return zones.map((item) => ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.id) }));
+  }
+  if (account.provider === 'aliyun') {
+    const zones = [];
+    for (let page = 1; page <= 100; page += 1) {
+      const data = await aliyunRequest(credentials, 'DescribeDomains', { PageNumber: page, PageSize: 100 });
+      const batch = data.Domains?.Domain || [];
+      zones.push(...batch);
+      if (zones.length >= Number(data.TotalCount || batch.length) || !batch.length) break;
+    }
+    return zones.map((item) => ({ id: '', name: normalizeDomain(item.DomainName), providerZoneId: String(item.DomainId || '') }));
+  }
+  if (account.provider === 'tencent') {
+    const zones = [];
+    for (let offset = 0; offset < 10000; offset += 100) {
+      const data = await tencentRequest(credentials, 'DescribeDomainList', { Offset: offset, Limit: 100 });
+      const batch = data.Response?.DomainList || [];
+      zones.push(...batch);
+      if (zones.length >= Number(data.Response?.DomainCountInfo?.AllTotal || batch.length) || !batch.length) break;
+    }
+    return zones.map((item) => ({ id: '', name: normalizeDomain(item.Name), providerZoneId: String(item.DomainId || '') }));
+  }
+  if (account.provider === 'dnspod') {
+    const data = await dnspodRequest(credentials, 'Domain.List', { length: 3000 });
+    return (data.domains || []).map((item) => ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.id || '') }));
+  }
+  if (account.provider === 'godaddy') {
+    const data = await godaddyRequest(credentials, 'GET', '/v1/domains?limit=1000');
+    return (data || []).map((item) => ({ id: '', name: normalizeDomain(item.domain), providerZoneId: '' }));
+  }
+  if (account.provider === 'porkbun') {
+    const data = await porkbunRequest(credentials, '/api/json/v3/domain/listAll');
+    return (data.domains || []).map((item) => ({ id: '', name: normalizeDomain(item.domain), providerZoneId: '' }));
+  }
+  if (account.provider === 'cloudns') {
+    const data = await cloudnsRequest(credentials, '/dns/list-zones.json');
+    return Object.values(data || {}).map((item) => ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.zone || item.id || '') }));
+  }
+  if (CALLBACK_PROVIDERS.has(account.provider)) {
+    const data = await callbackRequest(account, credentials, { action: 'zones', provider: account.provider });
+    return (data.zones || []).map((item) => typeof item === 'string' ? ({ id: '', name: normalizeDomain(item), providerZoneId: '' }) : ({ id: '', name: normalizeDomain(item.name), providerZoneId: String(item.id || '') }));
+  }
+  return [];
+}
+
 async function resolveBindingSources(binding) {
+  if (!['A', 'AAAA'].includes(binding.recordType)) return cleanRecordValues(binding.recordValues, binding.recordType === 'CNAME' ? 1 : 5000);
   const family = binding.recordType === 'AAAA' ? 6 : 4;
   const sources = Array.isArray(binding.ddnsSources) ? binding.ddnsSources : [];
   const output = [];
@@ -718,13 +939,6 @@ async function reconcileProviderRecords(recordIds, values, adapter) {
   return nextIds;
 }
 
-function bindingRecordIds(binding) {
-  const ids = cleanTexts(binding.providerRecordIds, 500);
-  if (!ids.length && binding.providerRecordId) ids.push(cleanText(binding.providerRecordId, 200));
-  if (!ids.length) throw new Error(`解析绑定 ${binding.name} 缺少服务商记录 ID`);
-  return ids;
-}
-
 async function findHuaweiRecordset(account, credentials, zone, binding) {
   if (binding.providerRecordId) {
     return huaweiRequest(account, credentials, 'GET', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets/${encodeURIComponent(binding.providerRecordId)}`);
@@ -732,7 +946,7 @@ async function findHuaweiRecordset(account, credentials, zone, binding) {
   const query = `?name=${encodeURIComponent(`${binding.domain}.`)}&type=${encodeURIComponent(binding.recordType)}&limit=500`;
   const data = await huaweiRequest(account, credentials, 'GET', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets${query}`);
   const matches = (data.recordsets || []).filter((item) => normalizeDomain(item.name) === binding.domain && item.type === binding.recordType);
-  if (matches.length > 1) throw new Error(`华为云存在多个 ${binding.domain} ${binding.recordType} 记录，请填写 Record ID`);
+  if (matches.length > 1) throw new Error(`华为云存在多个同名 ${binding.recordType} 记录，请先在华为云合并重复记录`);
   return matches[0] || null;
 }
 
@@ -745,8 +959,8 @@ async function discoverProviderRecordIds(account, credentials, zone, binding) {
     return (data.result || []).map((item) => String(item.id));
   }
   if (account.provider === 'aliyun') {
-    const data = await aliyunRequest(credentials, 'DescribeDomainRecords', { DomainName: zone.name, RRKeyWord: binding.recordName === '@' ? zone.name : binding.recordName, TypeKeyWord: binding.recordType, PageSize: 500 });
-    return (data.DomainRecords?.Record || []).filter((item) => item.Type === binding.recordType).map((item) => String(item.RecordId));
+    const data = await aliyunRequest(credentials, 'DescribeSubDomainRecords', { DomainName: zone.name, SubDomain: binding.domain, Type: binding.recordType, PageSize: 500 });
+    return (data.DomainRecords?.Record || []).filter((item) => item.Type === binding.recordType && normalizeRecordName(item.RR, zone.name) === binding.recordName).map((item) => String(item.RecordId));
   }
   if (account.provider === 'dnspod') {
     const data = await dnspodRequest(credentials, 'Record.List', { domain: zone.name, sub_domain: binding.recordName, record_type: binding.recordType, length: 3000 });
@@ -914,10 +1128,11 @@ async function callbackRequest(account, credentials, payload) {
   return result;
 }
 
-function normalizeRecordName(value, zoneName) {
-  const normalized = normalizeDomain(value);
-  const suffix = `.${normalizeDomain(zoneName)}`;
-  if (normalized === normalizeDomain(zoneName)) return '@';
+export function normalizeRecordName(value, zoneName) {
+  const normalized = cleanText(value, 253).toLowerCase().replace(/\.$/, '');
+  const normalizedZone = normalizeDomain(zoneName);
+  const suffix = `.${normalizedZone}`;
+  if (normalized === '@' || normalized === normalizedZone) return '@';
   return normalized.endsWith(suffix) ? normalized.slice(0, -suffix.length) : normalized;
 }
 
@@ -970,10 +1185,12 @@ function normalizeRoles(input) {
 }
 
 function cleanText(value, max = 200) { return String(value ?? '').trim().slice(0, max); }
+function isLocalRequestHost(value) { const host = String(value || '').replace(/^\[|\](?::\d+)?$/g, '').split(':')[0].toLowerCase(); return host === 'localhost' || host === '127.0.0.1' || host === '::1' || /^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host); }
 function requiredText(value, label) { const result = cleanText(value, 200); if (!result) throw new Error(`请填写${label}`); return result; }
 function cleanId(value) { return String(value || '').trim().replace(/[^A-Za-z0-9_-]/g, '').slice(0, 100); }
 function cleanIds(value, max) { return [...new Set((Array.isArray(value) ? value : []).map(cleanId).filter(Boolean))].slice(0, max); }
 function cleanTexts(value, max) { return [...new Set((Array.isArray(value) ? value : String(value || '').split(/[\n,，;；]+/)).map((item) => cleanText(item, 255)).filter(Boolean))].slice(0, max); }
+function cleanRecordValues(value, max) { return [...new Set((Array.isArray(value) ? value : String(value || '').split(/\n+/)).map((item) => cleanText(item, 1000)).filter(Boolean))].slice(0, max); }
 function clampNumber(value, min, max, fallback) { const number = Number(value); return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.round(number))) : fallback; }
 function nowIso() { return new Date().toISOString(); }
 function randomSecret(bytes) { return crypto.randomBytes(bytes).toString('base64url'); }
@@ -984,7 +1201,7 @@ function hmac(key, value) { return crypto.createHmac('sha256', key).update(value
 function percentEncode(value) { return encodeURIComponent(String(value)).replace(/!/g, '%21').replace(/'/g, '%27').replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\*/g, '%2A'); }
 function configVersion(targets) { return sha256(JSON.stringify(targets)).slice(0, 16); }
 function normalizeDomain(value) { const domain = cleanText(value, 253).toLowerCase().replace(/\.$/, ''); if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(domain)) throw new Error('域名格式不正确'); return domain; }
-function validateIp(value) { const address = cleanText(value, 64); if (!/^((25[0-5]|2[0-4]\d|1?\d?\d)(\.|$)){4}$/.test(address) && !/^[a-f0-9:]+$/i.test(address)) throw new Error('IP 地址格式不正确'); return address; }
+function validateIp(value) { const address = cleanText(value, 64); if (net.isIP(address) === 0) throw new Error('IP 地址格式不正确'); return address; }
 function validateHost(value, allowPrivate = false) {
   const host = cleanText(value, 253).replace(/^\[|\]$/g, '');
   if (!host) throw new Error('请填写检查目标');

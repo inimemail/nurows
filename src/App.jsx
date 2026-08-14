@@ -25,7 +25,6 @@ const EMPTY_COMMAND = {
 const EMPTY_AUTOMATION_TASK = {
   id: '', name: '', username: 'root', port: 22, password: '', proxyId: '',
   concurrency: 100, connectTimeout: 15, stepTimeout: 120, retryCount: 0,
-  telegramEnabled: true,
   steps: [{ id: crypto.randomUUID(), type: 'command', label: '主命令', value: '', timeout: 120 }]
 };
 
@@ -73,7 +72,8 @@ const TABS = [
   { key: 'proxies', label: '代理网络', icon: ProxyIcon },
   { key: 'probes', label: '探针管理', icon: ProbeIcon },
   { key: 'pools', label: '备用 IP 池', icon: PoolIcon },
-  { key: 'dns', label: '解析管理', icon: DnsIcon }
+  { key: 'dns', label: '解析管理', icon: DnsIcon },
+  { key: 'telegram', label: 'Telegram', icon: TelegramIcon }
 ];
 
 const TERMINAL_SESSIONS_STORAGE_KEY = 'nurossh-terminal-sessions';
@@ -406,8 +406,6 @@ export default function App() {
   const [automationExpandedServerId, setAutomationExpandedServerId] = useState('');
   const [automationInputDialog, setAutomationInputDialog] = useState({ open: false, mode: 'choice', value: '', awaitingServerIds: [] });
   const [automationEditorOpen, setAutomationEditorOpen] = useState(false);
-  const [telegramDialogOpen, setTelegramDialogOpen] = useState(false);
-  const [telegramDraft, setTelegramDraft] = useState({ enabled: false, token: '', userIds: '', allowGroups: true });
   const [executionResults, setExecutionResults] = useState([]);
   const [lastExecutedCommand, setLastExecutedCommand] = useState('');
   const [commandJobId, setCommandJobId] = useState('');
@@ -916,7 +914,6 @@ export default function App() {
       const tasks = Array.isArray(data.automationTasks) ? data.automationTasks : [];
       setAutomationTaskId((current) => tasks.some((item) => item.id === current) ? current : (tasks[0]?.id || ''));
       if (tasks[0]) setAutomationDraft((current) => current.id ? current : { ...EMPTY_AUTOMATION_TASK, ...tasks[0], password: '' });
-      setTelegramDraft((current) => ({ ...current, ...(data.telegram || {}), userIds: (data.telegram?.userIds || []).join('\n') }));
       const serverWorkspace = normalizeWorkspacePayload(data.workspace);
       const knownServerIds = new Set((data.servers || []).map((item) => item.id));
       const filteredWorkspaceSessions = serverWorkspace.sessions.filter((item) => knownServerIds.has(item.serverId));
@@ -1220,14 +1217,6 @@ export default function App() {
       closeAutomationInputDialog();
       toast(`已向 ${data.sent || 0} 台主机分别发送输入`);
     } catch (error) { toast(error.message); } finally { setActionBusy('automationInput', false); }
-  }
-
-  async function saveTelegram() {
-    try {
-      const data = await api('/api/telegram', { method: 'PUT', body: JSON.stringify({ ...telegramDraft, userIds: telegramDraft.userIds.split(/\r?\n|[,，;；]+/).map((item) => item.trim()).filter(Boolean) }) });
-      setState(data.state); toast('Telegram 设置已保存');
-      return true;
-    } catch (error) { toast(error.message); return false; }
   }
 
   function openEditor(type, item = null) {
@@ -2155,7 +2144,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns'].includes(tab) ? ' orchestration-layout' : '')}>
+      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-layout' : '')}>
         {!workspaceFullscreenActive ? (
           <button
             className={'mobile-drawer-scrim ' + (assetDrawerOpen ? 'open' : '')}
@@ -2164,7 +2153,7 @@ export default function App() {
             onClick={() => setAssetDrawerOpen(false)}
           />
         ) : null}
-        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns'].includes(tab) ? ' orchestration-aside' : '')}>
+        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-aside' : '')}>
           <div className="side-head">
             <div>
               <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'dns' ? '解析管理' : '代理列表'}</strong>
@@ -2348,13 +2337,12 @@ export default function App() {
           ) : null}
         </aside>
 
-          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns'].includes(tab) ? ' orchestration-main' : '')}>
-          {['probes', 'pools', 'dns'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
+          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-main' : '')}>
+          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
           {tab === 'automation' ? (
             <section className="automation-board">
               <div className="automation-page-head surface">
                 <div className="automation-title-block"><span className="automation-kicker">批量工作台</span><strong>{selectedAutomationTask?.name || '自动化任务'}</strong><span>{selectedAutomationTask ? `${selectedAutomationTask.steps?.length || 0} 个步骤 · 并发 ${selectedAutomationTask.concurrency}` : '从左侧选择一个任务开始执行'}</span></div>
-                <div className="toolbar"><button className="ghost" onClick={() => setTelegramDialogOpen(true)}><TelegramIcon />机器人设置</button></div>
               </div>
 
               <div className="automation-workspace-grid">
@@ -2728,7 +2716,6 @@ export default function App() {
                 <Field label="执行超时（秒）"><input type="number" min="1" max="3600" value={automationDraft.stepTimeout} onChange={(e) => setAutomationDraft((c) => ({ ...c, stepTimeout: e.target.value }))} /></Field>
                 <Field label="代理"><select value={automationDraft.proxyId} onChange={(e) => setAutomationDraft((c) => ({ ...c, proxyId: e.target.value }))}><option value="">直连</option>{state.proxies.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
               </div>
-              <label className="automation-toggle"><input type="checkbox" checked={automationDraft.telegramEnabled} onChange={(e) => setAutomationDraft((c) => ({ ...c, telegramEnabled: e.target.checked }))} /> 允许通过 Telegram 执行此任务</label>
             </section>
             <section className="automation-editor-steps">
               <div className="automation-steps-head"><div className="dialog-section-head"><strong>执行步骤</strong><span>按顺序执行；“等待输出”后紧跟“输入文本”或“按回车”即可自动交互</span></div><div className="automation-step-actions"><button className="ghost" onClick={() => setAutomationDraft((c) => ({ ...c, steps: [...c.steps, { id: crypto.randomUUID(), type: 'command', label: '', value: '', timeout: 120 }] }))}>添加步骤</button><button className="ghost" onClick={() => setAutomationDraft((c) => ({ ...c, steps: [...c.steps, { id: crypto.randomUUID(), type: 'wait', label: '等待提示', value: '', timeout: 120 }, { id: crypto.randomUUID(), type: 'input', label: '自动输入', value: '', timeout: 120 }] }))}>添加等待+输入</button></div></div>
@@ -2736,14 +2723,6 @@ export default function App() {
               <div className="automation-steps">{automationDraft.steps.map((step, index) => <div className={'automation-step automation-step-' + step.type} key={step.id}><span className="step-index">{String(index + 1).padStart(2, '0')}</span><select value={step.type} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, type: e.target.value, inputMode: e.target.value === 'input' ? (s.inputMode || 'broadcast') : s.inputMode } : s) }))}><option value="command">执行命令</option><option value="wait">等待输出</option><option value="input">输入文本</option><option value="enter">按回车</option><option value="delay">延迟</option></select><input value={step.label || ''} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, label: e.target.value } : s) }))} placeholder={step.type === 'wait' ? '等待说明（例如密码提示）' : '步骤说明'} /><textarea rows={2} value={step.value} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, value: e.target.value } : s) }))} placeholder={step.type === 'command' ? '输入命令，例如 passwd' : step.type === 'wait' ? '输入需要匹配的输出文本，例如 Password:' : step.type === 'input' ? '统一模式填固定内容；按行模式可留空，执行时逐台填写' : step.type === 'delay' ? '输入延迟秒数' : '此步骤自动发送回车，无需填写'} />{step.type === 'input' ? <select className="automation-input-mode" value={step.inputMode || 'broadcast'} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, inputMode: e.target.value } : s) }))}><option value="broadcast">统一输入（自动发送同一内容）</option><option value="per-server">按行输入（每台 IP 一行）</option></select> : null}<button className="icon-button danger" title="删除步骤" onClick={() => setAutomationDraft((c) => ({ ...c, steps: c.steps.length > 1 ? c.steps.filter((s) => s.id !== step.id) : c.steps }))}>×</button></div>)}</div>
             </section>
           </div>
-        </Dialog>
-      ) : null}
-
-      {telegramDialogOpen ? (
-        <Dialog title="Telegram 机器人设置" wide onClose={() => setTelegramDialogOpen(false)} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setTelegramDialogOpen(false)}>取消</button><button className="primary" onClick={async () => { if (await saveTelegram()) setTelegramDialogOpen(false); }}>保存设置</button></div></>}>
-          <div className="telegram-dialog-copy"><strong>授权与群组执行</strong><span>机器人在私聊和群组内都按发送者用户 ID 判断权限。</span></div>
-          <div className="field-grid telegram-dialog-grid"><Field label="Bot Token"><input type="password" value={telegramDraft.token} onChange={(e) => setTelegramDraft((c) => ({ ...c, token: e.target.value }))} placeholder={state.telegram?.configured ? '留空保持原 Token' : '粘贴 BotFather Token'} /></Field><Field label="授权用户 ID"><textarea rows={6} value={telegramDraft.userIds} onChange={(e) => setTelegramDraft((c) => ({ ...c, userIds: e.target.value }))} placeholder="每行一个 Telegram user ID" /></Field></div>
-          <label className="automation-toggle"><input type="checkbox" checked={telegramDraft.enabled} onChange={(e) => setTelegramDraft((c) => ({ ...c, enabled: e.target.checked }))} /> 启用 Telegram 机器人</label>
         </Dialog>
       ) : null}
 

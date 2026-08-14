@@ -24,6 +24,7 @@ const RESOURCE_MAP = {
 const ACTIVE_INCIDENT_STATES = new Set([
   'observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'
 ]);
+const RUNNING_INCIDENT_STATES = new Set(['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back']);
 
 const DNS_PROVIDERS = new Set([
   'huawei', 'aliyun', 'tencent', 'dnspod', 'cloudflare', 'godaddy', 'porkbun', 'cloudns', 'callback',
@@ -379,6 +380,38 @@ export function registerOrchestrationRoutes(app, deps) {
       return draft;
     });
     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
+  });
+
+  app.delete('/api/incidents/:id', (req, res) => {
+    let removed = false;
+    const state = deps.updateState((draft) => {
+      const incident = draft.incidents.find((item) => item.id === req.params.id);
+      if (!incident) throw new Error('故障事件不存在');
+      if (incident.executionId || RUNNING_INCIDENT_STATES.has(incident.status)) throw new Error('事件正在执行，结束后才能删除');
+      draft.ipLeases = draft.ipLeases.filter((lease) => lease.incidentId !== incident.id);
+      draft.incidents = draft.incidents.filter((item) => item.id !== incident.id);
+      pushAudit(draft, 'incident.delete', 'incident', incident.id, `删除故障事件 ${incident.targetName || incident.id}`, req.auth.username);
+      removed = true;
+      return draft;
+    });
+    res.json({ ok: true, removed, state: deps.sanitizeState(state, req.auth) });
+  });
+
+  app.delete('/api/incidents', (req, res) => {
+    let removed = 0;
+    let kept = 0;
+    const state = deps.updateState((draft) => {
+      const removableIds = new Set(draft.incidents
+        .filter((item) => !item.executionId && !RUNNING_INCIDENT_STATES.has(item.status))
+        .map((item) => item.id));
+      removed = removableIds.size;
+      kept = draft.incidents.length - removed;
+      draft.ipLeases = draft.ipLeases.filter((lease) => !removableIds.has(lease.incidentId));
+      draft.incidents = draft.incidents.filter((item) => !removableIds.has(item.id));
+      pushAudit(draft, 'incident.clear', 'incident', '', `清理 ${removed} 条故障事件，保留 ${kept} 条执行中事件`, req.auth.username);
+      return draft;
+    });
+    res.json({ ok: true, removed, kept, state: deps.sanitizeState(state, req.auth) });
   });
 
   app.post('/api/incidents/:id/execute', (req, res) => {

@@ -8,7 +8,10 @@ Changed branch/field
 - Waiting incident recovery: adding an IP requests an immediate target recheck; a recovered target closes the incident without consuming an IP.
 - Replacement IP preflight: each allocated IP is Ping-checked three times; unusable addresses are discarded, audited, recorded, and replaced from the pool.
 - Legacy no-IP failures are normalized to waiting_for_ip so they no longer generate repeated execution failures.
+- Incident cleanup: individual deletion and bulk cleanup remove idle/history rows and associated idle leases while preserving running automation, DNS, verification, and rollback work.
+- Automation progress log: expanded per-host output uses the auto-scroll renderer so the inner log scrollbar follows the newest output.
 - Target/policy/DNS account/DNS binding rows: triple-click opens a copy dialog with identity fields cleared while reusable configuration is retained.
+- Automation step ordering: each step has a drag handle; dropping before another step updates the draft array and numbering, and up/down controls cover touch devices.
 
 Artifacts
 - MODIFIED_FILE: .codex-artifacts/MODIFIED_FILE
@@ -23,9 +26,15 @@ Literal result: tests 19, pass 19, fail 0
 Exit status: 0
 
 MODIFIED
-Command: npm test && npm run build && node --check server/orchestration.js && node --check server/index.js && python3 -m py_compile probe-agent/nurossh_probe.py && bash -n install.sh probe-agent/install.sh && docker compose config >/dev/null && git diff --check
+Command: npm test && npm run build && node --check server/orchestration.js && node --check server/index.js && python3 -m py_compile probe-agent/nurossh_probe.py && rm -rf probe-agent/__pycache__ && git diff --check
 Input: current working tree
-Literal result: tests 30, pass 30, fail 0; vite build succeeded; both Node syntax checks passed; Python and shell compilation passed; Docker Compose config passed; diff check passed
+Literal result: tests 31, pass 31, fail 0; vite build succeeded; both Node syntax checks passed; Python compilation passed; diff check passed
+Exit status: 0
+
+UI smoke check
+Command: curl -sS http://127.0.0.1:5173/
+Input: local Vite development page
+Literal result: returned the NuroSSH HTML shell with `/src/main.jsx` and the mobile viewport meta tag
 Exit status: 0
 
 ROLLBACK

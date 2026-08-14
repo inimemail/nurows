@@ -756,10 +756,17 @@ svg {
 .automation-toggle { display: inline-flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--text-main); }
 .automation-toggle input { width: auto; }
 .automation-steps { display: flex; flex-direction: column; gap: 8px; }
-.automation-step { display: grid; grid-template-columns: 30px 120px minmax(110px, .55fr) minmax(160px, 1.6fr) 30px; gap: 8px; align-items: start; padding: 10px; border: 1px solid var(--border-card); border-radius: 12px; background: var(--card-bg); }
+.automation-step { display: grid; grid-template-columns: 30px 30px 120px minmax(110px, .55fr) minmax(160px, 1.6fr) 100px; gap: 8px; align-items: start; padding: 10px; border: 1px solid var(--border-card); border-radius: 12px; background: var(--card-bg); transition: border-color .16s ease, background .16s ease, opacity .16s ease, transform .16s ease; }
+.automation-step.is-dragging { opacity: .5; }
+.automation-step.is-drag-over { border-color: var(--accent-solid); background: var(--card-active); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-solid) 22%, transparent); }
+.automation-step-drag-handle { width: 30px; min-height: 38px; display: grid; grid-template-columns: repeat(2, 3px); grid-template-rows: repeat(3, 3px); place-content: center; gap: 3px; grid-column: 2; grid-row: 1; padding: 0; border: 1px solid var(--border-card); border-radius: 8px; background: var(--button-ghost-bg); color: var(--text-muted); cursor: grab; touch-action: none; }
+.automation-step-drag-handle:active { cursor: grabbing; }
+.automation-step-drag-handle span { width: 3px; height: 3px; border-radius: 50%; background: currentColor; }
 .automation-step textarea { min-height: 42px; resize: vertical; }
-.automation-input-mode { grid-column: 2 / 5; grid-row: 2; min-height: 38px; }
-.automation-step > .icon-button { grid-column: 5; grid-row: 1 / span 2; }
+.automation-input-mode { grid-column: 3 / 6; grid-row: 2; min-height: 38px; }
+.automation-step-order-actions { grid-column: 6; grid-row: 1 / span 2; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.automation-step-order-actions .icon-button { width: 30px; min-height: 30px; padding: 0; }
+.automation-step-order-actions .icon-button:disabled { opacity: .35; cursor: not-allowed; }
 .automation-step-guide { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; color: var(--text-soft); font-size: 11px; }
 .automation-step-guide code { padding: 4px 7px; border: 1px solid var(--border-card); border-radius: 7px; background: var(--card-bg); color: var(--text-main); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .automation-step-guide i { color: var(--accent-text); font-style: normal; }
@@ -1885,6 +1892,17 @@ svg {
   color: #f87171;
 }
 
+button.danger-action {
+  background: #b4232f;
+  border-color: #d84a57;
+  color: #fff;
+  box-shadow: 0 10px 24px rgba(180, 35, 47, 0.2);
+}
+
+button.danger-action:hover:not(:disabled) {
+  background: #c92d3a;
+}
+
 .primary {
   background: linear-gradient(135deg, var(--accent-strong), var(--accent-solid));
   color: var(--accent-contrast);
@@ -2438,12 +2456,13 @@ svg {
   .automation-hero { align-items: flex-start; }
   .automation-hero-stat { min-width: 86px; padding: 10px 8px; }
   .automation-hero-stat strong { font-size: 24px; }
-  .automation-step { grid-template-columns: 28px 1fr 32px; }
-  .automation-step select { grid-column: 2; }
-  .automation-step input { grid-column: 2; }
-  .automation-step textarea { grid-column: 2; }
-  .automation-input-mode { grid-column: 2; grid-row: 4; }
-  .automation-step .icon-button { grid-column: 3; grid-row: 1; }
+  .automation-step { grid-template-columns: 28px 30px minmax(0, 1fr) 70px; }
+  .automation-step-drag-handle { grid-column: 2; grid-row: 1; }
+  .automation-step select,
+  .automation-step input,
+  .automation-step textarea { grid-column: 3; }
+  .automation-input-mode { grid-column: 3; grid-row: 4; }
+  .automation-step-order-actions { grid-column: 4; grid-row: 1 / span 4; flex-direction: column; align-items: flex-end; }
   .telegram-foot { align-items: flex-start; flex-direction: column; gap: 8px; }
   .automation-editor-layout { grid-template-columns: 1fr; gap: 16px; }
   .automation-editor-basics { padding-right: 0; padding-bottom: 16px; border-right: 0; border-bottom: 1px solid var(--border-soft); }

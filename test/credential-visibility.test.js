@@ -114,3 +114,27 @@ test('editing one DNS credential keeps the other saved fields', async () => {
   const saved = JSON.parse(decryptSecret(harness.readState().dnsAccounts[0].credentialsEnc));
   assert.deepEqual(saved, { accessKey: 'changed-ak', secretKey: 'saved-sk' });
 });
+
+test('deletes one idle incident and bulk-clears records while preserving running work', async () => {
+  const state = credentialState();
+  state.incidents = [
+    { id: 'waiting', targetName: '等待项', status: 'waiting_for_ip', executionId: '' },
+    { id: 'done', targetName: '完成项', status: 'succeeded', executionId: '' },
+    { id: 'running', targetName: '运行项', status: 'automating', executionId: 'execution-1' }
+  ];
+  state.ipLeases = [
+    { id: 'waiting-lease', incidentId: 'waiting' },
+    { id: 'running-lease', incidentId: 'running' }
+  ];
+  const harness = createHarness(state);
+
+  const single = await harness.request('DELETE', '/api/incidents/:id', { params: { id: 'waiting' } });
+  assert.equal(single.body.removed, true);
+  assert.deepEqual(harness.readState().incidents.map((item) => item.id), ['done', 'running']);
+  assert.deepEqual(harness.readState().ipLeases.map((item) => item.id), ['running-lease']);
+
+  const all = await harness.request('DELETE', '/api/incidents');
+  assert.equal(all.body.removed, 1);
+  assert.equal(all.body.kept, 1);
+  assert.deepEqual(harness.readState().incidents.map((item) => item.id), ['running']);
+});

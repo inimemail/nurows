@@ -1,315 +1,63 @@
 diff --git a/server/orchestration.js b/server/orchestration.js
-index 91a0477..6f5e154 100644
+index 6f5e154..a9d0b3b 100644
 --- a/server/orchestration.js
 +++ b/server/orchestration.js
-@@ -1,10 +1,14 @@
- import crypto from 'node:crypto';
-+import { execFile as execFileCallback } from 'node:child_process';
- import fs from 'node:fs';
- import path from 'node:path';
- import dns from 'node:dns/promises';
- import net from 'node:net';
-+import { promisify } from 'node:util';
- import { v4 as uuidv4 } from 'uuid';
-
-+const execFile = promisify(execFileCallback);
-+
- const RESOURCE_MAP = {
-   probes: 'probes',
-   'probe-targets': 'probeTargets',
-@@ -18,7 +22,7 @@ const RESOURCE_MAP = {
- };
-
+@@ -24,6 +24,7 @@ const RESOURCE_MAP = {
  const ACTIVE_INCIDENT_STATES = new Set([
--  'observing', 'pending_approval', 'queued', 'allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'
-+  'observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'
+   'observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'
  ]);
++const RUNNING_INCIDENT_STATES = new Set(['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back']);
 
  const DNS_PROVIDERS = new Set([
-@@ -53,6 +57,11 @@ export function normalizeOrchestrationState(parsed = {}) {
-   const defaults = orchestrationDefaults();
-   const normalized = Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
-   normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, ...pool }) => pool);
-+  normalized.probeTargets = normalized.probeTargets.map(({ quorumMode, quorumCount, ...target }) => target);
-+  normalized.incidents = normalized.incidents.map((incident) => {
-+    const legacyNoIp = incident.status === 'failed' && /备用\s*IP|备用地址|没有可用 IP/i.test(`${incident.error || ''} ${incident.message || ''}`);
-+    return legacyNoIp ? { ...incident, status: 'waiting_for_ip', message: '等待备用 IP', error: '', executionId: '', recheckRequestedAt: '' } : incident;
-+  });
-   normalized.ipLeases = normalized.ipLeases.filter((lease) => lease.status !== 'released');
-   normalized.ipUsageRecords = normalized.ipUsageRecords.slice(0, 5000);
-   return normalized;
-@@ -151,7 +160,7 @@ export function registerProbePublicRoutes(app, deps) {
-         target.health = transition.health;
-         target.lastCheckAt = nowIso();
-         if (transition.failed && target.policyId) {
--          const active = draft.incidents.some((item) => item.targetId === target.id && ACTIVE_INCIDENT_STATES.has(item.status));
-+          const active = draft.incidents.some((item) => item.targetId === target.id && (ACTIVE_INCIDENT_STATES.has(item.status) || (item.status === 'failed' && target.health === 'down')));
-           const policy = draft.failoverPolicies.find((item) => item.id === target.policyId && item.enabled !== false);
-           if (!active && policy) {
-             const incident = createIncident(target, policy, auth.probe.id);
-@@ -165,6 +174,7 @@ export function registerProbePublicRoutes(app, deps) {
-       return draft;
-     });
-     for (const incidentId of createdIncidentIds) deps.onIncidentCreated?.(incidentId);
-+    deps.onProbeReport?.();
-     res.json({ ok: true, accepted: reports.length, incidents: createdIncidentIds });
-   });
- }
-@@ -178,6 +188,7 @@ export function registerOrchestrationRoutes(app, deps) {
-       pushAudit(draft, 'ipAssets.batch_create', 'ipAssets', '', `批量导入 ${result.created} 个 IP，复用 ${result.reused} 个`, req.auth.username);
-       return draft;
-     });
-+    deps.onIpAvailabilityChanged?.();
-     res.json({ ok: true, ...result, state: deps.sanitizeState(state, req.auth) });
+   'huawei', 'aliyun', 'tencent', 'dnspod', 'cloudflare', 'godaddy', 'porkbun', 'cloudns', 'callback',
+@@ -381,6 +382,38 @@ export function registerOrchestrationRoutes(app, deps) {
+     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
    });
 
-@@ -195,6 +206,7 @@ export function registerOrchestrationRoutes(app, deps) {
-       return draft;
-     });
-     if (key === 'telegramBots') deps.onTelegramChanged?.();
-+    if (['ipAssets', 'ipPools'].includes(key)) deps.onIpAvailabilityChanged?.();
-     res.json({ ok: true, item: sanitizeResource(key, created), state: deps.sanitizeState(state, req.auth) });
-   }));
-
-@@ -220,6 +232,7 @@ export function registerOrchestrationRoutes(app, deps) {
-       return draft;
-     });
-     if (key === 'telegramBots') deps.onTelegramChanged?.();
-+    if (['ipAssets', 'ipPools'].includes(key)) deps.onIpAvailabilityChanged?.();
-     res.json({ ok: true, item: sanitizeResource(key, updated), state: deps.sanitizeState(state, req.auth) });
-   }));
-
-@@ -356,6 +369,18 @@ export function registerOrchestrationRoutes(app, deps) {
-     res.json({ ok: true, ...result, state: deps.sanitizeState(result.state, req.auth) });
-   }));
-
-+  app.post('/api/probe-targets/:id/check-now', (req, res) => {
++  app.delete('/api/incidents/:id', (req, res) => {
++    let removed = false;
 +    const state = deps.updateState((draft) => {
-+      const target = draft.probeTargets.find((item) => item.id === req.params.id);
-+      if (!target) throw new Error('检查目标不存在');
-+      target.checkNowAt = nowIso();
-+      target.updatedAt = nowIso();
-+      pushAudit(draft, 'probe_target.check_now', 'probeTarget', target.id, '请求立即检查', req.auth.username);
++      const incident = draft.incidents.find((item) => item.id === req.params.id);
++      if (!incident) throw new Error('故障事件不存在');
++      if (incident.executionId || RUNNING_INCIDENT_STATES.has(incident.status)) throw new Error('事件正在执行，结束后才能删除');
++      draft.ipLeases = draft.ipLeases.filter((lease) => lease.incidentId !== incident.id);
++      draft.incidents = draft.incidents.filter((item) => item.id !== incident.id);
++      pushAudit(draft, 'incident.delete', 'incident', incident.id, `删除故障事件 ${incident.targetName || incident.id}`, req.auth.username);
++      removed = true;
 +      return draft;
 +    });
-+    res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
++    res.json({ ok: true, removed, state: deps.sanitizeState(state, req.auth) });
++  });
++
++  app.delete('/api/incidents', (req, res) => {
++    let removed = 0;
++    let kept = 0;
++    const state = deps.updateState((draft) => {
++      const removableIds = new Set(draft.incidents
++        .filter((item) => !item.executionId && !RUNNING_INCIDENT_STATES.has(item.status))
++        .map((item) => item.id));
++      removed = removableIds.size;
++      kept = draft.incidents.length - removed;
++      draft.ipLeases = draft.ipLeases.filter((lease) => !removableIds.has(lease.incidentId));
++      draft.incidents = draft.incidents.filter((item) => !removableIds.has(item.id));
++      pushAudit(draft, 'incident.clear', 'incident', '', `清理 ${removed} 条故障事件，保留 ${kept} 条执行中事件`, req.auth.username);
++      return draft;
++    });
++    res.json({ ok: true, removed, kept, state: deps.sanitizeState(state, req.auth) });
 +  });
 +
    app.post('/api/incidents/:id/execute', (req, res) => {
      const state = deps.updateState((draft) => {
-       const incident = draft.incidents.find((item) => item.id === req.params.id);
-@@ -404,7 +429,7 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
-   let claimed = false;
-   deps.updateState((draft) => {
-     const item = draft.incidents.find((entry) => entry.id === incidentId);
--    if (!item || !['queued', 'observing'].includes(item.status) || item.executionId) return draft;
-+    if (!item || !['queued', 'observing', 'waiting_for_ip'].includes(item.status) || item.executionId) return draft;
-     Object.assign(item, { executionId, claimedAt: nowIso(), status: 'allocating', message: '正在分配备用 IP', updatedAt: nowIso() });
-     claimed = true;
-     return draft;
-@@ -418,16 +443,53 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
-   if (!policy || !target) return failIncident(deps, incidentId, '关联策略或目标不存在');
-   try {
-     const allocated = allocateIpsForIncident(incidentId, deps);
--    if (!allocated.length && policy.poolIds?.length) throw new Error('备用 IP 池没有满足策略的可用 IP');
--    deps.updateState((draft) => {
--      startIpUsageRecords(draft, incidentId, allocated);
--      return updateIncident(draft, incidentId, { allocatedIps: allocated.map((item) => item.address), leaseIds: allocated.map((item) => item.leaseId) });
--    });
-+    // A failover incident must not run against the original host when no
-+    // replacement address has been allocated. Keep it observable and retry
-+    // when an eligible asset becomes available.
-+    if (!allocated.length) {
-+      deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'waiting_for_ip', message: '等待备用 IP', executionId: '', error: '', recheckRequestedAt: '' }));
-+      deps.notifyIncident?.(incidentId);
-+      return;
-+    }
-+    const checkedLeaseIds = new Set();
-+    let currentAllocated = allocated;
-+    while (currentAllocated.length) {
-+      deps.updateState((draft) => {
-+        startIpUsageRecords(draft, incidentId, currentAllocated);
-+        return updateIncident(draft, incidentId, { allocatedIps: currentAllocated.map((item) => item.address), leaseIds: currentAllocated.map((item) => item.leaseId) });
-+      });
-+      const pendingChecks = currentAllocated.filter((item) => !checkedLeaseIds.has(item.leaseId));
-+      if (!pendingChecks.length) break;
-+      const checks = await Promise.all(pendingChecks.map(async (item) => ({ ...item, ...(await checkReplacementIp(item.address, deps)) })));
-+      checks.forEach((item) => checkedLeaseIds.add(item.leaseId));
-+      const unusable = checks.filter((item) => !item.ok);
-+      deps.updateState((draft) => {
-+        const records = draft.ipUsageRecords.filter((record) => record.incidentId === incidentId);
-+        for (const result of checks) {
-+          const record = records.find((item) => item.leaseId === result.leaseId);
-+          if (record) record.preflight = { attempts: result.attempts, ok: result.ok, checkedAt: nowIso(), error: result.error || '' };
-+        }
-+        if (unusable.length) discardUnusableIncidentIps(draft, incidentId, unusable);
-+        return draft;
-+      });
-+      if (!unusable.length) break;
-+      const beforeLeaseIds = new Set(currentAllocated.map((item) => item.leaseId));
-+      currentAllocated = allocateIpsForIncident(incidentId, deps);
-+      const added = currentAllocated.some((item) => !beforeLeaseIds.has(item.leaseId));
-+      if (!added) break;
-+    }
-+    const allocatedForExecution = currentAllocated;
-+    if (!allocatedForExecution.length) {
-+      deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'waiting_for_ip', message: '等待备用 IP', executionId: '', error: '', allocatedIps: [], leaseIds: [], recheckRequestedAt: '' }));
-+      deps.notifyIncident?.(incidentId);
-+      return;
-+    }
-+    deps.updateState((draft) => updateIncident(draft, incidentId, { allocatedIps: allocatedForExecution.map((item) => item.address), leaseIds: allocatedForExecution.map((item) => item.leaseId) }));
+      const incident = draft.incidents.find((item) => item.id === req.params.id);
 
-     if (policy.automationTaskId) {
-       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'automating', message: '正在执行自动化任务' }));
--      const hosts = policy.automationHosts === 'target' || !allocated.length ? [target.address] : allocated.map((item) => item.address);
--      const context = buildIncidentContext(incident, target, allocated);
-+      const hosts = policy.automationHosts === 'target' ? [target.address] : allocatedForExecution.map((item) => item.address);
-+      const context = buildIncidentContext(incident, target, allocatedForExecution);
-       const result = await deps.executeAutomation(policy.automationTaskId, hosts, context, encryptionKey);
-       deps.updateState((draft) => updateIncident(draft, incidentId, { automationJobId: result.jobId }));
-       await deps.waitAutomation(result.jobId, policy.automationTimeout || 1800);
-@@ -459,11 +521,47 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
-   }
- }
-
-+export function retryWaitingIpIncidents(deps, encryptionKey = null) {
-+  let state = deps.readState();
-+  const recovered = state.incidents.filter((incident) => incident.status === 'waiting_for_ip' && state.probeTargets.find((target) => target.id === incident.targetId)?.health === 'healthy');
-+  if (recovered.length) {
-+    deps.updateState((draft) => {
-+      for (const incident of recovered) updateIncident(draft, incident.id, { status: 'recovered', message: '目标已恢复，无需切换', executionId: '', finishedAt: nowIso() });
-+      return draft;
-+    });
-+    state = deps.readState();
-+  }
-+  const waiting = state.incidents.filter((item) => {
-+    const target = state.probeTargets.find((entry) => entry.id === item.targetId);
-+    const freshRecheck = item.recheckRequestedAt && Date.parse(target?.lastCheckAt || 0) >= Date.parse(item.recheckRequestedAt);
-+    return item.status === 'waiting_for_ip' && target?.health === 'down' && freshRecheck && hasAvailableIpForIncident(item, state);
-+  });
-+  for (const incident of waiting) runIncidentWorkflow(incident.id, deps, encryptionKey);
-+  return waiting.length;
-+}
-+
-+export function requestWaitingIncidentRechecks(deps) {
-+  let requested = 0;
-+  deps.updateState((draft) => {
-+    const requestedAt = nowIso();
-+    for (const incident of draft.incidents.filter((item) => item.status === 'waiting_for_ip' && hasAvailableIpForIncident(item, draft))) {
-+      const target = draft.probeTargets.find((item) => item.id === incident.targetId && item.enabled !== false);
-+      if (!target) continue;
-+      target.checkNowAt = requestedAt;
-+      target.updatedAt = requestedAt;
-+      Object.assign(incident, { recheckRequestedAt: requestedAt, message: '备用 IP 已就绪，正在确认目标故障', updatedAt: requestedAt });
-+      requested += 1;
-+    }
-+    return draft;
-+  });
-+  return requested;
-+}
-+
- function normalizeResource(key, input = {}, existing = null, deps) {
-   const now = nowIso();
-   const base = { id: existing?.id || cleanId(input.id) || uuidv4(), createdAt: existing?.createdAt || now, updatedAt: now };
-   if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', tokenEnc: existing?.tokenEnc || null, agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
--  if (key === 'probeTargets') return { ...base, name: requiredText(input.name, '目标名称'), address: validateHost(input.address, Boolean(input.allowPrivate)), allowPrivate: Boolean(input.allowPrivate), checkType: input.checkType === 'ping' ? 'ping' : 'tcp', port: clampNumber(input.port, 1, 65535, 443), interval: clampNumber(input.interval, 5, 3600, 30), timeout: clampNumber(input.timeout, 1, 60, 5), failureThreshold: clampNumber(input.failureThreshold, 1, 20, 3), recoveryThreshold: clampNumber(input.recoveryThreshold, 1, 20, 2), quorumMode: ['majority', 'all', 'count'].includes(input.quorumMode) ? input.quorumMode : 'majority', quorumCount: clampNumber(input.quorumCount, 1, 100, 2), probeIds: cleanIds(input.probeIds, 500), policyId: cleanId(input.policyId), enabled: input.enabled !== false, health: existing?.health || 'unknown', observations: existing?.observations || {}, lastCheckAt: existing?.lastCheckAt || '' };
-+  if (key === 'probeTargets') return { ...base, name: requiredText(input.name, '目标名称'), address: validateHost(input.address, Boolean(input.allowPrivate)), allowPrivate: Boolean(input.allowPrivate), checkType: input.checkType === 'tcp' ? 'tcp' : 'ping', port: clampNumber(input.port, 1, 65535, 443), interval: clampNumber(input.interval, 5, 3600, 30), timeout: clampNumber(input.timeout, 1, 60, 5), failureThreshold: clampNumber(input.failureThreshold, 1, 20, 3), recoveryThreshold: clampNumber(input.recoveryThreshold, 1, 20, 2), probeIds: cleanIds(input.probeIds, 500), policyId: cleanId(input.policyId), enabled: input.enabled !== false, health: existing?.health || 'unknown', observations: existing?.observations || {}, lastCheckAt: existing?.lastCheckAt || '', checkNowAt: existing?.checkNowAt || '' };
-   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
-   if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, note: cleanText(input.note, 500) };
-   if (key === 'dnsAccounts') {
-@@ -646,21 +744,31 @@ function authenticateProbe(req, state) {
-   return probe && safeHashEqual(probe.agentSecretHash, hashSecret(secret)) ? { probe, state } : null;
- }
-
--function evaluateTargetHealth(target, probes) {
-+export function evaluateTargetHealth(target, probes) {
-+  const assignedProbeIds = (target.probeIds || []).filter((probeId) => probes.some((probe) => probe.id === probeId && probe.enabled !== false));
-   const observations = Object.entries(target.observations || {}).filter(([probeId, observation]) => {
--    const probe = probes.find((item) => item.id === probeId && item.enabled !== false);
--    return probe && Date.now() - Date.parse(observation.checkedAt || 0) < Math.max(120000, target.interval * 4000);
-+    return assignedProbeIds.includes(probeId) && Date.now() - Date.parse(observation.checkedAt || 0) < Math.max(120000, target.interval * 4000);
-   });
--  const qualifiedFailures = observations.filter(([, item]) => !item.ok && item.failures >= target.failureThreshold).length;
--  const qualifiedSuccesses = observations.filter(([, item]) => item.ok && item.successes >= target.recoveryThreshold).length;
--  const required = target.quorumMode === 'all' ? Math.max(1, observations.length) : target.quorumMode === 'count' ? target.quorumCount : Math.max(1, Math.floor(observations.length / 2) + 1);
--  const failed = observations.length > 0 && qualifiedFailures >= required;
--  const healthy = observations.length > 0 && qualifiedSuccesses >= required;
-+  const completeRound = assignedProbeIds.length > 0 && observations.length === assignedProbeIds.length;
-+  const failed = completeRound && observations.every(([, item]) => !item.ok && item.failures >= target.failureThreshold);
-+  const healthy = completeRound && observations.some(([, item]) => item.ok && item.successes >= target.recoveryThreshold);
-   return { failed, health: failed ? 'down' : healthy ? 'healthy' : 'observing' };
- }
-
-+function hasAvailableIpForIncident(incident, state) {
-+  const policy = state.failoverPolicies.find((item) => item.id === incident?.policyId && item.enabled !== false);
-+  if (!policy?.poolIds?.length) return false;
-+  return policy.poolIds.some((poolId) => {
-+    const pool = state.ipPools.find((item) => item.id === poolId && item.enabled !== false);
-+    return Boolean(pool?.assetIds?.some((assetId) => {
-+      const asset = state.ipAssets.find((item) => item.id === assetId);
-+      return asset?.enabled !== false && asset?.health !== 'unhealthy' && canAllocateAsset(state, asset.id);
-+    }));
-+  });
-+}
-+
- function createIncident(target, policy, probeId) {
--  return { id: uuidv4(), targetId: target.id, targetName: target.name, policyId: policy.id, policyName: policy.name, sourceProbeId: probeId, status: policy.approvalMode === 'telegram' ? 'pending_approval' : 'queued', message: policy.approvalMode === 'telegram' ? '等待确认' : '等待执行', allocatedIps: [], leaseIds: [], automationJobId: '', dnsChangeIds: [], executionId: '', claimedAt: '', error: '', startedAt: nowIso(), updatedAt: nowIso(), finishedAt: '' };
-+  return { id: uuidv4(), targetId: target.id, targetName: target.name, policyId: policy.id, policyName: policy.name, sourceProbeId: probeId, status: policy.approvalMode === 'telegram' ? 'pending_approval' : 'queued', message: policy.approvalMode === 'telegram' ? '等待确认' : '等待执行', allocatedIps: [], leaseIds: [], automationJobId: '', dnsChangeIds: [], executionId: '', claimedAt: '', recheckRequestedAt: '', error: '', startedAt: nowIso(), updatedAt: nowIso(), finishedAt: '' };
- }
-
- function allocateIpsForIncident(incidentId, deps) {
-@@ -709,6 +817,46 @@ function canAllocateAsset(state, assetId) {
-   return active.length === 0;
- }
-
-+async function checkReplacementIp(address, deps) {
-+  if (deps.checkIp) {
-+    try {
-+      const result = await deps.checkIp(address, 3);
-+      return { attempts: 3, ok: Boolean(result?.ok), error: cleanText(result?.error, 300) };
-+    } catch (error) {
-+      return { attempts: 3, ok: false, error: cleanText(error?.message || '备用 IP Ping 检查失败', 300) };
-+    }
-+  }
-+  const familyFlag = net.isIPv6(address) ? '-6' : net.isIPv4(address) ? '-4' : '';
-+  const args = process.platform === 'win32'
-+    ? [familyFlag, '-n', '3', '-w', '2000', address]
-+    : process.platform === 'darwin'
-+      ? [familyFlag, '-c', '3', '-W', '2000', address]
-+      : [familyFlag, '-c', '3', '-W', '2', address];
-+  const commandArgs = args.filter(Boolean);
-+  try {
-+    await execFile('ping', commandArgs, { timeout: 12000, maxBuffer: 32 * 1024 });
-+    return { attempts: 3, ok: true, error: '' };
-+  } catch (error) {
-+    return { attempts: 3, ok: false, error: cleanText(error?.stderr || error?.message || '备用 IP Ping 检查失败', 300) };
-+  }
-+}
-+
-+function discardUnusableIncidentIps(state, incidentId, unusable) {
-+  const assetIds = new Set(unusable.map((item) => item.assetId).filter(Boolean));
-+  const leaseIds = new Set(unusable.map((item) => item.leaseId).filter(Boolean));
-+  if (!assetIds.size) return;
-+  state.ipAssets = state.ipAssets.filter((asset) => !assetIds.has(asset.id));
-+  for (const pool of state.ipPools) pool.assetIds = (pool.assetIds || []).filter((assetId) => !assetIds.has(assetId));
-+  state.ipLeases = state.ipLeases.filter((lease) => !leaseIds.has(lease.id));
-+  const incident = state.incidents.find((item) => item.id === incidentId);
-+  if (incident) {
-+    incident.leaseIds = (incident.leaseIds || []).filter((leaseId) => !leaseIds.has(leaseId));
-+    incident.allocatedIps = (incident.allocatedIps || []).filter((address) => !unusable.some((item) => item.address === address));
-+  }
-+  finalizeIpUsageRecords(state, incidentId, 'discarded', '备用 IP Ping 3 次失败，已丢弃', [...leaseIds]);
-+  for (const item of unusable) pushAudit(state, 'ip_preflight.discard', 'ipAsset', item.assetId, `${item.address} 备用 IP Ping 3 次失败，已丢弃`, 'system');
-+}
-+
- export function consumeIncidentIpAssets(state, incidentId) {
-   const incidentLeases = state.ipLeases.filter((lease) => lease.incidentId === incidentId);
-   const assetIds = new Set(incidentLeases.map((lease) => lease.assetId).filter(Boolean));
-@@ -757,6 +905,7 @@ export function startIpUsageRecords(state, incidentId, allocated = []) {
-         automationTaskName: automationTask?.name || '',
-         bindings,
-         status: 'processing',
-+        preflight: { attempts: 0, ok: null, checkedAt: '', error: '' },
-         startedAt: nowIso(),
-         finishedAt: '',
-         error: ''
+diff -- automation-step-ordering
+--- a/src/App.jsx
++++ b/src/App.jsx
+@@
++Added drag-handle HTML5 drag/drop ordering for automation steps.
++Added accessible up/down controls for desktop and touch layouts.
++Dropping a step on another places it before the target; the draft array is submitted in that order.
+--- a/src/styles.css
++++ b/src/styles.css
+@@
++Added drag-over/dragging states, handle styling, and responsive action columns without mobile overlap.

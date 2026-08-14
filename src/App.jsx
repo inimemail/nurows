@@ -407,6 +407,8 @@ export default function App() {
   const automationResultListRef = useRef(null);
   const [automationInputDialog, setAutomationInputDialog] = useState({ open: false, mode: 'choice', value: '', awaitingServerIds: [] });
   const [automationEditorOpen, setAutomationEditorOpen] = useState(false);
+  const [draggedAutomationStepId, setDraggedAutomationStepId] = useState('');
+  const [dragOverAutomationStepId, setDragOverAutomationStepId] = useState('');
   const [executionResults, setExecutionResults] = useState([]);
   const [lastExecutedCommand, setLastExecutedCommand] = useState('');
   const [commandJobId, setCommandJobId] = useState('');
@@ -1131,6 +1133,47 @@ export default function App() {
     if (!item) { toast('请先选择任务'); return; }
     selectAutomationTask(item);
     setAutomationEditorOpen(true);
+  }
+
+  function moveAutomationStep(sourceId, targetId) {
+    if (!sourceId || !targetId || sourceId === targetId) return;
+    setAutomationDraft((current) => {
+      const steps = [...current.steps];
+      const sourceIndex = steps.findIndex((step) => step.id === sourceId);
+      const targetIndex = steps.findIndex((step) => step.id === targetId);
+      if (sourceIndex < 0 || targetIndex < 0) return current;
+      const [moved] = steps.splice(sourceIndex, 1);
+      // Dropping on a card places the dragged step before that card.
+      steps.splice(sourceIndex < targetIndex ? targetIndex - 1 : targetIndex, 0, moved);
+      return { ...current, steps };
+    });
+  }
+
+  function shiftAutomationStep(stepId, offset) {
+    setAutomationDraft((current) => {
+      const steps = [...current.steps];
+      const currentIndex = steps.findIndex((step) => step.id === stepId);
+      const targetIndex = currentIndex + offset;
+      if (currentIndex < 0 || targetIndex < 0 || targetIndex >= steps.length) return current;
+      const [moved] = steps.splice(currentIndex, 1);
+      steps.splice(targetIndex, 0, moved);
+      return { ...current, steps };
+    });
+  }
+
+  function handleAutomationStepDragStart(event, stepId) {
+    event.stopPropagation();
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', stepId);
+    setDraggedAutomationStepId(stepId);
+  }
+
+  function handleAutomationStepDrop(event, targetId) {
+    event.preventDefault();
+    const sourceId = event.dataTransfer.getData('text/plain') || draggedAutomationStepId;
+    moveAutomationStep(sourceId, targetId);
+    setDraggedAutomationStepId('');
+    setDragOverAutomationStepId('');
   }
 
   async function saveAutomationTask() {
@@ -2402,7 +2445,7 @@ export default function App() {
                   </div>
                   <div className="surface automation-results-panel">
                     <div className="workspace-head"><div><strong>当前执行进度</strong><span>{automationCounts.total ? `已处理 ${automationCounts.success + automationCounts.failed} / ${automationCounts.total}` : '暂无执行结果'}</span></div><div className="toolbar">{automationAwaitingResults.length ? <><button className="ghost" onClick={() => openAutomationInputDialog('per-server')}>按行输入</button><button className="ghost" onClick={() => openAutomationInputDialog('broadcast')}>统一输入</button></> : null}{automationCounts.failed ? <button className="ghost" onClick={retryAutomationFailed} disabled={automationIsRunning}>重试失败</button> : null}<button className={'ghost ' + (busy.clearAutomation ? 'is-loading' : '')} onClick={clearAutomationResults} disabled={!automationResults.length || busy.clearAutomation}>{automationIsRunning ? '取消并清空' : '清空'}</button></div></div>
-                    {automationResults.length ? <><div className="automation-progress automation-progress-detailed"><div className="total"><strong>{automationCounts.total}</strong><span>总数</span></div><div className="running"><strong>{automationCounts.queued + automationCounts.running}</strong><span>执行中</span></div><div className="awaiting"><strong>{automationCounts.awaiting}</strong><span>等待输入</span></div><div className="success"><strong>{automationCounts.success}</strong><span>成功</span></div><div className="failed"><strong>{automationCounts.failed}</strong><span>失败</span></div></div><div className="automation-progress-track"><span style={{ width: `${automationCounts.total ? ((automationCounts.success + automationCounts.failed) / automationCounts.total) * 100 : 0}%` }} /></div><div ref={automationResultListRef} className="automation-result-list">{automationResults.map((item) => { const expanded = automationExpandedServerId === item.serverId; const output = cleanTerminalOutput([item.stdout, item.stderr, item.error].filter(Boolean).join('\n')); const statusClass = item.status === 'error' ? 'error' : item.ok ? 'ok' : item.status === 'awaiting_input' ? 'awaiting' : 'running'; return <div key={item.serverId} className={'automation-result-item ' + statusClass}><div className="automation-result-row" onClick={() => setAutomationExpandedServerId(expanded ? '' : item.serverId)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setAutomationExpandedServerId(expanded ? '' : item.serverId); }} role="button" tabIndex={0}><div className="automation-result-host"><i /><span>{item.host}</span></div><div>{item.status === 'awaiting_input' ? <button className="ghost automation-input-button" onClick={(event) => { event.stopPropagation(); openSingleAutomationInputDialog(item.serverId); }}>输入</button> : null}<em>{item.status === 'queued' ? '排队' : item.status === 'running' ? '执行中' : item.status === 'awaiting_input' ? '等待输入' : item.ok ? '成功' : '失败'}</em><ChevronIcon collapsed={!expanded} /></div></div>{expanded ? <pre>{output || '暂无日志'}</pre> : null}</div>; })}</div></> : <div className="empty-state automation-result-empty"><span className="automation-empty-icon"><AutomationIcon /></span><strong>等待执行</strong><span>输入目标 IP 并启动任务后，这里显示实时进度。</span></div>}
+                    {automationResults.length ? <><div className="automation-progress automation-progress-detailed"><div className="total"><strong>{automationCounts.total}</strong><span>总数</span></div><div className="running"><strong>{automationCounts.queued + automationCounts.running}</strong><span>执行中</span></div><div className="awaiting"><strong>{automationCounts.awaiting}</strong><span>等待输入</span></div><div className="success"><strong>{automationCounts.success}</strong><span>成功</span></div><div className="failed"><strong>{automationCounts.failed}</strong><span>失败</span></div></div><div className="automation-progress-track"><span style={{ width: `${automationCounts.total ? ((automationCounts.success + automationCounts.failed) / automationCounts.total) * 100 : 0}%` }} /></div><div ref={automationResultListRef} className="automation-result-list">{automationResults.map((item) => { const expanded = automationExpandedServerId === item.serverId; const output = cleanTerminalOutput([item.stdout, item.stderr, item.error].filter(Boolean).join('\n')); const statusClass = item.status === 'error' ? 'error' : item.ok ? 'ok' : item.status === 'awaiting_input' ? 'awaiting' : 'running'; return <div key={item.serverId} className={'automation-result-item ' + statusClass}><div className="automation-result-row" onClick={() => setAutomationExpandedServerId(expanded ? '' : item.serverId)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setAutomationExpandedServerId(expanded ? '' : item.serverId); }} role="button" tabIndex={0}><div className="automation-result-host"><i /><span>{item.host}</span></div><div>{item.status === 'awaiting_input' ? <button className="ghost automation-input-button" onClick={(event) => { event.stopPropagation(); openSingleAutomationInputDialog(item.serverId); }}>输入</button> : null}<em>{item.status === 'queued' ? '排队' : item.status === 'running' ? '执行中' : item.status === 'awaiting_input' ? '等待输入' : item.ok ? '成功' : '失败'}</em><ChevronIcon collapsed={!expanded} /></div></div>{expanded ? <AutoScrollPre text={output || '暂无日志'} /> : null}</div>; })}</div></> : <div className="empty-state automation-result-empty"><span className="automation-empty-icon"><AutomationIcon /></span><strong>等待执行</strong><span>输入目标 IP 并启动任务后，这里显示实时进度。</span></div>}
                   </div>
                   </>}
                 </div>
@@ -2768,7 +2811,66 @@ export default function App() {
             <section className="automation-editor-steps">
               <div className="automation-steps-head"><div className="dialog-section-head"><strong>执行步骤</strong><span>按顺序执行；“等待输出”后可接输入、Ctrl+C 或结束运行</span></div><div className="automation-step-actions"><button className="ghost" onClick={() => setAutomationDraft((c) => ({ ...c, steps: [...c.steps, { id: crypto.randomUUID(), type: 'command', label: '', value: '', timeout: 120 }] }))}>添加步骤</button><button className="ghost" onClick={() => setAutomationDraft((c) => ({ ...c, steps: [...c.steps, { id: crypto.randomUUID(), type: 'wait', label: '等待提示', value: '', timeout: 120 }, { id: crypto.randomUUID(), type: 'input', label: '自动输入', value: '', timeout: 120 }] }))}>添加等待+输入</button></div></div>
               <div className="automation-step-guide"><span>示例</span><code>执行命令</code><i>→</i><code>等待输出：Password:</code><i>→</i><code>输入文本 / Ctrl+C / 结束运行</code></div>
-              <div className="automation-steps">{automationDraft.steps.map((step, index) => <div className={'automation-step automation-step-' + step.type} key={step.id}><span className="step-index">{String(index + 1).padStart(2, '0')}</span><select value={step.type} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, type: e.target.value, inputMode: e.target.value === 'input' ? (s.inputMode || 'broadcast') : s.inputMode } : s) }))}><option value="command">执行命令</option><option value="wait">等待输出</option><option value="input">输入文本</option><option value="enter">按回车</option><option value="ctrl_c">发送 Ctrl+C</option><option value="finish">结束运行</option><option value="delay">延迟</option></select><input value={step.label || ''} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, label: e.target.value } : s) }))} placeholder={step.type === 'wait' ? '等待说明（例如密码提示）' : '步骤说明'} /><textarea rows={2} value={step.value || ''} disabled={step.type === 'ctrl_c' || step.type === 'finish'} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, value: e.target.value } : s) }))} placeholder={step.type === 'command' ? '输入命令，例如 passwd' : step.type === 'wait' ? '输入需要匹配的输出文本，例如 Password:' : step.type === 'input' ? '统一模式填固定内容；按行模式可留空，执行时逐台填写' : step.type === 'delay' ? '输入延迟秒数' : step.type === 'ctrl_c' ? '等待输出匹配后发送中断信号' : step.type === 'finish' ? '等待输出匹配后结束当前主机运行' : '此步骤自动发送回车，无需填写'} />{step.type === 'input' ? <select className="automation-input-mode" value={step.inputMode || 'broadcast'} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, inputMode: e.target.value } : s) }))}><option value="broadcast">统一输入（自动发送同一内容）</option><option value="per-server">按行输入（每台 IP 一行）</option></select> : null}<button className="icon-button danger" title="删除步骤" onClick={() => setAutomationDraft((c) => ({ ...c, steps: c.steps.length > 1 ? c.steps.filter((s) => s.id !== step.id) : c.steps }))}>×</button></div>)}</div>
+              <div className="automation-steps">
+                {automationDraft.steps.map((step, index) => (
+                  <div
+                    className={[
+                      'automation-step',
+                      'automation-step-' + step.type,
+                      draggedAutomationStepId === step.id ? 'is-dragging' : '',
+                      dragOverAutomationStepId === step.id && draggedAutomationStepId !== step.id ? 'is-drag-over' : ''
+                    ].filter(Boolean).join(' ')}
+                    key={step.id}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = 'move';
+                      if (draggedAutomationStepId && draggedAutomationStepId !== step.id) setDragOverAutomationStepId(step.id);
+                    }}
+                    onDragLeave={(event) => {
+                      if (!event.currentTarget.contains(event.relatedTarget)) setDragOverAutomationStepId('');
+                    }}
+                    onDrop={(event) => handleAutomationStepDrop(event, step.id)}
+                  >
+                    <span className="step-index">{String(index + 1).padStart(2, '0')}</span>
+                    <button
+                      type="button"
+                      className="automation-step-drag-handle"
+                      draggable
+                      title="拖动调整顺序"
+                      aria-label={`拖动第 ${index + 1} 步调整顺序`}
+                      onDragStart={(event) => handleAutomationStepDragStart(event, step.id)}
+                      onDragEnd={() => {
+                        setDraggedAutomationStepId('');
+                        setDragOverAutomationStepId('');
+                      }}
+                    >
+                      <span /><span /><span /><span /><span /><span />
+                    </button>
+                    <select value={step.type} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, type: e.target.value, inputMode: e.target.value === 'input' ? (s.inputMode || 'broadcast') : s.inputMode } : s) }))}>
+                      <option value="command">执行命令</option>
+                      <option value="wait">等待输出</option>
+                      <option value="input">输入文本</option>
+                      <option value="enter">按回车</option>
+                      <option value="ctrl_c">发送 Ctrl+C</option>
+                      <option value="finish">结束运行</option>
+                      <option value="delay">延迟</option>
+                    </select>
+                    <input value={step.label || ''} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, label: e.target.value } : s) }))} placeholder={step.type === 'wait' ? '等待说明（例如密码提示）' : '步骤说明'} />
+                    <textarea rows={2} value={step.value || ''} disabled={step.type === 'ctrl_c' || step.type === 'finish'} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, value: e.target.value } : s) }))} placeholder={step.type === 'command' ? '输入命令，例如 passwd' : step.type === 'wait' ? '输入需要匹配的输出文本，例如 Password:' : step.type === 'input' ? '统一模式填固定内容；按行模式可留空，执行时逐台填写' : step.type === 'delay' ? '输入延迟秒数' : step.type === 'ctrl_c' ? '等待输出匹配后发送中断信号' : step.type === 'finish' ? '等待输出匹配后结束当前主机运行' : '此步骤自动发送回车，无需填写'} />
+                    {step.type === 'input' ? (
+                      <select className="automation-input-mode" value={step.inputMode || 'broadcast'} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, inputMode: e.target.value } : s) }))}>
+                        <option value="broadcast">统一输入（自动发送同一内容）</option>
+                        <option value="per-server">按行输入（每台 IP 一行）</option>
+                      </select>
+                    ) : null}
+                    <div className="automation-step-order-actions">
+                      <button type="button" className="icon-button" title="上移一步" aria-label={`上移第 ${index + 1} 步`} disabled={index === 0} onClick={() => shiftAutomationStep(step.id, -1)}>↑</button>
+                      <button type="button" className="icon-button" title="下移一步" aria-label={`下移第 ${index + 1} 步`} disabled={index === automationDraft.steps.length - 1} onClick={() => shiftAutomationStep(step.id, 1)}>↓</button>
+                      <button type="button" className="icon-button danger" title="删除步骤" aria-label={`删除第 ${index + 1} 步`} onClick={() => setAutomationDraft((c) => ({ ...c, steps: c.steps.length > 1 ? c.steps.filter((s) => s.id !== step.id) : c.steps }))}>×</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </section>
           </div>
         </Dialog>

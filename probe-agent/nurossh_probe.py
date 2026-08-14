@@ -13,7 +13,10 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+CHECK_ROUNDS = 3
+ATTEMPTS_PER_ROUND = 3
+ROUND_DELAY_SECONDS = 1
 
 
 def validate_target_address(address, allow_private=False):
@@ -52,47 +55,94 @@ def register(config):
     os.chmod(CONFIG_PATH, 0o600)
 
 
+def check_address(target, address, timeout):
+    timeout = max(0.1, float(timeout))
+    if target.get("checkType") == "ping":
+        is_windows = platform.system().lower() == "windows"
+        count_flag = "-n" if is_windows else "-c"
+        timeout_flag = "-w" if is_windows else "-W"
+        timeout_value = str(max(1, int(timeout * 1000))) if is_windows else str(max(1, int(timeout + 0.999)))
+        family = ipaddress.ip_address(address).version
+        family_flag = "-6" if family == 6 and not is_windows else ("-4" if family == 4 and not is_windows else None)
+        command = ["ping"] + ([family_flag] if family_flag else []) + [count_flag, "1", timeout_flag, timeout_value, address]
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("ping failed")
+        return
+    with socket.create_connection((address, int(target.get("port", 443))), timeout=timeout):
+        return
+
+
+def check_attempt(target, addresses, timeout):
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    last_error = "check failed"
+    ordered_addresses = sorted(addresses)
+    for index, address in enumerate(ordered_addresses):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, "round timeout"
+        address_timeout = remaining / max(1, len(ordered_addresses) - index)
+        try:
+            check_address(target, address, address_timeout)
+            return True, ""
+        except Exception as error:
+            last_error = str(error) or error.__class__.__name__
+    return False, last_error
+
+
 def check_target(target):
     started = time.monotonic()
     try:
-        addresses = validate_target_address(target["address"], bool(target.get("allowPrivate")))
-        timeout = float(target.get("timeout", 5))
-        if target.get("checkType") == "ping":
-            is_windows = platform.system().lower() == "windows"
-            count_flag = "-n" if is_windows else "-c"
-            timeout_flag = "-w" if is_windows else "-W"
-            timeout_value = str(int(timeout * (1000 if is_windows else 1)))
-            success = False
-            for address in addresses:
-                family = ipaddress.ip_address(address).version
-                family_flag = "-6" if family == 6 and not is_windows else ("-4" if family == 4 and not is_windows else None)
-                command = ["ping"] + ([family_flag] if family_flag else []) + [count_flag, "1", timeout_flag, timeout_value, address]
-                completed = subprocess.run(
-                    command,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=timeout + 2,
-                    check=False
-                )
-                if completed.returncode == 0:
-                    success = True
-                    break
-            if not success:
-                raise RuntimeError("ping failed")
-        else:
-            last_error = None
-            for address in addresses:
-                try:
-                    with socket.create_connection((address, int(target.get("port", 443))), timeout=timeout):
-                        last_error = None
-                        break
-                except OSError as error:
-                    last_error = error
-            if last_error:
-                raise last_error
-        return {"targetId": target["id"], "ok": True, "latencyMs": round((time.monotonic() - started) * 1000, 2), "error": ""}
-    except Exception as error:
-        return {"targetId": target["id"], "ok": False, "latencyMs": round((time.monotonic() - started) * 1000, 2), "error": str(error)[:200]}
+        timeout = max(1.0, float(target.get("timeout", 5)))
+    except (TypeError, ValueError):
+        timeout = 5.0
+    attempts_run = 0
+    rounds_completed = 0
+    addresses = None
+    last_error = "check failed"
+    for round_index in range(1, CHECK_ROUNDS + 1):
+        round_deadline = time.monotonic() + timeout
+        for attempt_index in range(1, ATTEMPTS_PER_ROUND + 1):
+            attempts_run += 1
+            try:
+                if addresses is None:
+                    addresses = validate_target_address(target["address"], bool(target.get("allowPrivate")))
+                remaining = round_deadline - time.monotonic()
+                attempts_left = ATTEMPTS_PER_ROUND - attempt_index + 1
+                if remaining <= 0:
+                    raise TimeoutError("round timeout")
+                ok, error = check_attempt(target, addresses, remaining / attempts_left)
+                if ok:
+                    return {
+                        "targetId": target["id"], "ok": True,
+                        "latencyMs": round((time.monotonic() - started) * 1000, 2), "error": "",
+                        "rounds": CHECK_ROUNDS, "attemptsPerRound": ATTEMPTS_PER_ROUND,
+                        "roundsCompleted": round_index, "attempts": attempts_run,
+                        "successfulRound": round_index, "successfulAttempt": attempt_index,
+                        "resolvedAddresses": sorted(addresses)
+                    }
+                last_error = error
+            except Exception as error:
+                addresses = None
+                last_error = str(error) or error.__class__.__name__
+        rounds_completed = round_index
+        if round_index < CHECK_ROUNDS:
+            time.sleep(ROUND_DELAY_SECONDS)
+    return {
+        "targetId": target["id"], "ok": False,
+        "latencyMs": round((time.monotonic() - started) * 1000, 2),
+        "error": f"3 rounds x 3 attempts failed: {last_error}"[:200],
+        "rounds": CHECK_ROUNDS, "attemptsPerRound": ATTEMPTS_PER_ROUND,
+        "roundsCompleted": rounds_completed, "attempts": attempts_run,
+        "successfulRound": 0, "successfulAttempt": 0,
+        "resolvedAddresses": sorted(addresses or [])
+    }
 
 
 def main():

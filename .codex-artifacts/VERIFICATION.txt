@@ -12,6 +12,11 @@ Changed branch/field
 - Automation progress log: expanded per-host output uses the auto-scroll renderer so the inner log scrollbar follows the newest output.
 - Target/policy/DNS account/DNS binding rows: triple-click opens a copy dialog with identity fields cleared while reusable configuration is retained.
 - Automation step ordering: each step has a drag handle; dropping before another step updates the draft array and numbering, and up/down controls cover touch devices.
+- Probe target check window: every interval runs three rounds with three Ping/TCP attempts per round; the first success ends the check and only nine failures produce a failed observation.
+- Probe aggregation: any assigned probe success keeps the target healthy; all assigned probes must submit fresh complete 3x3 failures before failover is eligible.
+- Incident execution guard: target health is re-evaluated before allocation and immediately before automation/DNS side effects; recovery or incomplete evidence releases IP locks and stops execution.
+- Waiting-IP recheck: all assigned probes must report after the recheck request, preventing old successes from being combined with new failures.
+- Probe target UI: legacy consecutive failure/recovery fields are removed; 3x3 evidence and agent upgrade state are visible.
 
 Artifacts
 - MODIFIED_FILE: .codex-artifacts/MODIFIED_FILE
@@ -21,14 +26,14 @@ Artifacts
 
 BASELINE
 Command: npm test
-Input: repository before this change
-Literal result: tests 19, pass 19, fail 0
+Input: working tree before the 3x3 probe check change
+Literal result: tests 31, pass 31, fail 0
 Exit status: 0
 
 MODIFIED
-Command: npm test && npm run build && node --check server/orchestration.js && node --check server/index.js && python3 -m py_compile probe-agent/nurossh_probe.py && rm -rf probe-agent/__pycache__ && git diff --check
+Command: npm test && python3 -m unittest discover -s test -p 'test_probe_agent.py' -v && npm run build && node --check server/orchestration.js && node --check server/index.js && python3 -m py_compile probe-agent/nurossh_probe.py && bash -n install.sh probe-agent/install.sh probe-agent/uninstall.sh && docker compose config >/dev/null && git diff --check
 Input: current working tree
-Literal result: tests 31, pass 31, fail 0; vite build succeeded; both Node syntax checks passed; Python compilation passed; diff check passed
+Literal result: Node tests 34, pass 34, fail 0; Python probe tests 3, OK; vite build succeeded; both Node syntax checks, Python compilation, shell syntax, Docker Compose config, and diff check passed
 Exit status: 0
 
 UI smoke check

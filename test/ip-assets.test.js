@@ -2,6 +2,20 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { consumeIncidentIpAssets, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, requestWaitingIncidentRechecks, retryWaitingIpIncidents, runIncidentWorkflow, startIpUsageRecords } from '../server/orchestration.js';
 
+function failedObservation(checkedAt = new Date().toISOString()) {
+  return { ok: false, rounds: 3, attemptsPerRound: 3, roundsCompleted: 3, attempts: 9, checkedAt };
+}
+
+function failedTarget(overrides = {}) {
+  const checkedAt = new Date().toISOString();
+  return {
+    id: 'target-1', name: '主站', address: '203.0.113.10', health: 'down',
+    probeIds: ['probe-1'], interval: 30, timeout: 5, lastCheckAt: checkedAt,
+    observations: { 'probe-1': failedObservation(checkedAt) },
+    ...overrides
+  };
+}
+
 test('parses IPv4 and IPv6 batches and removes duplicates', () => {
   assert.deepEqual(parseIpBatch('1.1.1.1\n2001:db8::1, 1.1.1.1'), ['1.1.1.1', '2001:db8::1']);
 });
@@ -66,6 +80,7 @@ test('releases only the internal lock when an incident fails', () => {
 test('removes legacy lease settings and released locks during state normalization', () => {
   const state = normalizeOrchestrationState({
     ipPools: [{ id: 'p1', name: 'pool', leaseMinutes: 30, cooldownMinutes: 10, sharingMode: 'limited', shareLimit: 2 }],
+    probeTargets: [{ id: 'target-1', failureThreshold: 3, recoveryThreshold: 2, observations: { p1: { ok: false, failures: 3, successes: 0 } } }],
     ipLeases: [
       { id: 'released', status: 'released' },
       { id: 'locked', status: 'locked' }
@@ -74,6 +89,11 @@ test('removes legacy lease settings and released locks during state normalizatio
 
   assert.deepEqual(state.ipPools, [{ id: 'p1', name: 'pool' }]);
   assert.deepEqual(state.ipLeases, [{ id: 'locked', status: 'locked' }]);
+  assert.equal(state.probeTargets[0].failureThreshold, undefined);
+  assert.equal(state.probeTargets[0].recoveryThreshold, undefined);
+  assert.equal(state.probeTargets[0].checkRounds, 3);
+  assert.equal(state.probeTargets[0].attemptsPerRound, 3);
+  assert.deepEqual(state.probeTargets[0].observations.p1, { ok: false });
 });
 
 test('migrates old no-IP failures into the waiting state', () => {
@@ -146,23 +166,36 @@ test('updates only the current attempt when an incident is retried', () => {
 
 test('uses all assigned probes for a round, with any success winning the round', () => {
   const probes = [{ id: 'p1', enabled: true }, { id: 'p2', enabled: true }];
-  const base = { id: 'target-1', probeIds: ['p1', 'p2'], interval: 30, failureThreshold: 3, recoveryThreshold: 2 };
+  const base = { id: 'target-1', probeIds: ['p1', 'p2'], interval: 30, timeout: 5 };
   const checkedAt = new Date().toISOString();
+  const failedCheck = failedObservation(checkedAt);
   assert.deepEqual(evaluateTargetHealth({ ...base, observations: {
-    p1: { ok: false, failures: 3, successes: 0, checkedAt },
-    p2: { ok: true, failures: 0, successes: 2, checkedAt }
+    p1: failedCheck,
+    p2: { ok: true, rounds: 3, attemptsPerRound: 3, roundsCompleted: 1, attempts: 1, checkedAt }
   } }, probes), { failed: false, health: 'healthy' });
   assert.deepEqual(evaluateTargetHealth({ ...base, observations: {
-    p1: { ok: false, failures: 3, successes: 0, checkedAt },
-    p2: { ok: false, failures: 3, successes: 0, checkedAt }
+    p1: failedCheck,
+    p2: failedCheck
   } }, probes), { failed: true, health: 'down' });
+});
+
+test('does not trigger failover from legacy or stale single-attempt failures', () => {
+  const probes = [{ id: 'p1', enabled: true }];
+  const base = { id: 'target-1', probeIds: ['p1'], interval: 30, timeout: 5 };
+  assert.deepEqual(evaluateTargetHealth({ ...base, observations: {
+    p1: { ok: false, checkedAt: new Date().toISOString() }
+  } }, probes), { failed: false, health: 'observing' });
+  assert.deepEqual(evaluateTargetHealth({ ...base, observations: {
+    p1: { ok: false, rounds: 3, attemptsPerRound: 3, roundsCompleted: 3, attempts: 9, checkedAt: new Date(Date.now() - 120000).toISOString() }
+  } }, probes), { failed: false, health: 'observing' });
 });
 
 test('waits without a replacement IP and retries after one becomes available', async () => {
   const state = {
     incidents: [{ id: 'incident-wait', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'queued', executionId: '', leaseIds: [], allocatedIps: [], dnsChangeIds: [] }],
     failoverPolicies: [{ id: 'policy-1', name: '切换', poolIds: [], automationTaskId: '', dnsBindingIds: [], enabled: true }],
-    probeTargets: [{ id: 'target-1', name: '主站', address: '203.0.113.10', health: 'down', lastCheckAt: '' }],
+    probes: [{ id: 'probe-1', enabled: true }],
+    probeTargets: [failedTarget()],
     ipPools: [],
     ipAssets: [],
     ipLeases: [],
@@ -186,7 +219,9 @@ test('waits without a replacement IP and retries after one becomes available', a
   state.ipPools.push({ id: 'pool-1', name: '备用池', assetIds: ['asset-1'], allocationMode: 'one', selectionMode: 'ordered', enabled: true });
   state.failoverPolicies[0].poolIds = ['pool-1'];
   assert.equal(requestWaitingIncidentRechecks(deps), 1);
-  state.probeTargets[0].lastCheckAt = new Date(Date.now() + 10).toISOString();
+  const recheckedAt = new Date().toISOString();
+  state.probeTargets[0].lastCheckAt = recheckedAt;
+  state.probeTargets[0].observations['probe-1'].checkedAt = recheckedAt;
   assert.equal(retryWaitingIpIncidents(deps), 1);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(state.incidents[0].status, 'succeeded');
@@ -205,11 +240,32 @@ test('closes a waiting incident when probes confirm the target recovered', () =>
   assert.equal(state.incidents[0].status, 'recovered');
 });
 
+test('does not combine a fresh failure with another probe old success after an IP recheck request', () => {
+  const requestedAt = new Date().toISOString();
+  const freshAt = new Date(Date.now() + 10).toISOString();
+  const oldAt = new Date(Date.now() - 20000).toISOString();
+  const state = {
+    incidents: [{ id: 'incident-recheck', targetId: 'target-1', policyId: 'policy-1', status: 'waiting_for_ip', executionId: '', recheckRequestedAt: requestedAt }],
+    probes: [{ id: 'p1', enabled: true }, { id: 'p2', enabled: true }],
+    probeTargets: [{ id: 'target-1', health: 'healthy', probeIds: ['p1', 'p2'], observations: {
+      p1: { ...failedObservation(freshAt) },
+      p2: { ok: true, rounds: 3, attemptsPerRound: 3, roundsCompleted: 1, attempts: 1, checkedAt: oldAt }
+    } }],
+    failoverPolicies: [{ id: 'policy-1', poolIds: [] }],
+    ipPools: [], ipAssets: [], ipLeases: [], ipUsageRecords: [], auditLogs: []
+  };
+  const deps = { readState: () => state, updateState: (updater) => updater(state) };
+
+  assert.equal(retryWaitingIpIncidents(deps), 0);
+  assert.equal(state.incidents[0].status, 'waiting_for_ip');
+});
+
 test('discards an unusable replacement IP, records it, and takes the next one', async () => {
   const state = {
     incidents: [{ id: 'incident-check', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'queued', executionId: '', leaseIds: [], allocatedIps: [], dnsChangeIds: [] }],
     failoverPolicies: [{ id: 'policy-1', name: '切换', poolIds: ['pool-1'], automationTaskId: '', dnsBindingIds: [], enabled: true }],
-    probeTargets: [{ id: 'target-1', name: '主站', address: '203.0.113.10', health: 'down' }],
+    probes: [{ id: 'probe-1', enabled: true }],
+    probeTargets: [failedTarget()],
     ipPools: [{ id: 'pool-1', name: '备用池', assetIds: ['bad', 'good'], allocationMode: 'one', selectionMode: 'ordered', enabled: true }],
     ipAssets: [{ id: 'bad', address: '198.51.100.1', enabled: true, health: 'unknown' }, { id: 'good', address: '198.51.100.2', enabled: true, health: 'unknown' }],
     ipLeases: [],
@@ -234,4 +290,39 @@ test('discards an unusable replacement IP, records it, and takes the next one', 
     ['198.51.100.2', 'consumed', 3],
     ['198.51.100.1', 'discarded', 3]
   ]);
+});
+
+test('cancels failover before automation when the target recovers during IP preflight', async () => {
+  const state = {
+    incidents: [{ id: 'incident-recovered-before-run', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'queued', executionId: '', leaseIds: [], allocatedIps: [], dnsChangeIds: [] }],
+    failoverPolicies: [{ id: 'policy-1', name: '切换', poolIds: ['pool-1'], automationTaskId: 'task-1', dnsBindingIds: [], enabled: true }],
+    probes: [{ id: 'probe-1', enabled: true }],
+    probeTargets: [failedTarget()],
+    ipPools: [{ id: 'pool-1', name: '备用池', assetIds: ['asset-1'], allocationMode: 'one', selectionMode: 'ordered', enabled: true }],
+    ipAssets: [{ id: 'asset-1', address: '198.51.100.10', enabled: true, health: 'unknown' }],
+    ipLeases: [], ipUsageRecords: [], dnsBindings: [], dnsChanges: [], auditLogs: []
+  };
+  let automationStarted = false;
+  const deps = {
+    readState: () => state,
+    updateState: (updater) => updater(state),
+    executeAutomation: async () => { automationStarted = true; return { jobId: 'unexpected' }; },
+    waitAutomation: async () => {},
+    checkIp: async () => {
+      const checkedAt = new Date().toISOString();
+      state.probeTargets[0].health = 'healthy';
+      state.probeTargets[0].lastCheckAt = checkedAt;
+      state.probeTargets[0].observations['probe-1'] = { ok: true, rounds: 3, attemptsPerRound: 3, roundsCompleted: 1, attempts: 1, checkedAt };
+      return { ok: true, attempts: 3, error: '' };
+    }
+  };
+
+  await runIncidentWorkflow('incident-recovered-before-run', deps);
+
+  assert.equal(automationStarted, false);
+  assert.equal(state.incidents[0].status, 'recovered');
+  assert.equal(state.incidents[0].message, '目标已恢复，无需切换');
+  assert.equal(state.ipAssets.length, 1);
+  assert.equal(state.ipLeases.length, 0);
+  assert.equal(state.ipUsageRecords[0].status, 'rolled_back');
 });

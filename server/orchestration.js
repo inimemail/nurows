@@ -61,7 +61,7 @@ export function sanitizeOrchestrationState(state = {}) {
       status: item.status === 'online' && (!item.lastSeenAt || Date.now() - Date.parse(item.lastSeenAt) > 90000) ? 'offline' : item.status
     })),
     dnsAccounts: domain.dnsAccounts.map(({ credentialsEnc, ...item }) => ({ ...item, configured: Boolean(credentialsEnc) })),
-    telegramBots: domain.telegramBots.map(({ tokenEnc, ...item }) => ({ ...item, configured: Boolean(tokenEnc) })),
+    telegramBots: domain.telegramBots.map(({ tokenEnc, tokenHash, ...item }) => ({ ...item, configured: Boolean(tokenEnc) })),
     incidents: domain.incidents.slice(0, 200),
     dnsChanges: domain.dnsChanges.slice(0, 300),
     auditLogs: domain.auditLogs.slice(0, 500)
@@ -179,11 +179,10 @@ export function registerOrchestrationRoutes(app, deps) {
     if (!key) return res.status(404).json({ error: '未知资源类型' });
     let created;
     const state = deps.updateState((draft) => {
-      if (key === 'telegramBots' && draft.telegramBots.length) throw new Error('系统只使用一个统一 Telegram 机器人，请编辑现有机器人');
       const imported = key === 'ipPools' ? importIpAssets(draft, parseOptionalIpBatch(req.body.newAssetAddresses), req.body.assetDefaults, req.auth.username) : null;
       if (imported) req.body.assetIds = [...new Set([...(req.body.assetIds || []), ...imported.assetIds])];
       created = normalizeResource(key, req.body, null, deps);
-      ensureResourceReferences(draft, key, created);
+      ensureResourceReferences(draft, key, created, deps);
       draft[key].push(created);
       pushAudit(draft, `${key}.create`, key, created.id, `新增 ${created.name || created.address || created.domain || created.id}`, req.auth.username);
       return draft;
@@ -202,7 +201,7 @@ export function registerOrchestrationRoutes(app, deps) {
       const imported = key === 'ipPools' ? importIpAssets(draft, parseOptionalIpBatch(req.body.newAssetAddresses), req.body.assetDefaults, req.auth.username) : null;
       if (imported) req.body.assetIds = [...new Set([...(req.body.assetIds || []), ...imported.assetIds])];
       updated = normalizeResource(key, req.body, item, deps);
-      ensureResourceReferences(draft, key, updated);
+      ensureResourceReferences(draft, key, updated, deps);
       Object.assign(item, updated, { id: item.id, createdAt: item.createdAt });
       pushAudit(draft, `${key}.update`, key, item.id, `更新 ${item.name || item.address || item.domain || item.id}`, req.auth.username);
       return draft;
@@ -299,19 +298,44 @@ export function registerOrchestrationRoutes(app, deps) {
     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
   });
 
+  app.get('/api/dns-accounts/:id/credentials', (req, res) => {
+    const account = deps.readState().dnsAccounts.find((item) => item.id === req.params.id);
+    if (!account) return res.status(404).json({ error: 'DNS 账号不存在' });
+    const credentials = decryptCredentials(account, deps);
+    deps.updateState((draft) => {
+      pushAudit(draft, 'dns_account.reveal', 'dnsAccount', account.id, '查看 DNS 账号凭证', req.auth.username);
+      return draft;
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, credentials });
+  });
+
+  app.get('/api/telegram-bots/:id/token', (req, res) => {
+    const bot = deps.readState().telegramBots.find((item) => item.id === req.params.id);
+    if (!bot) return res.status(404).json({ error: 'Telegram 机器人不存在' });
+    if (!bot.tokenEnc) return res.status(404).json({ error: '机器人尚未配置 Token' });
+    const token = deps.decryptSecret(bot.tokenEnc);
+    deps.updateState((draft) => {
+      pushAudit(draft, 'telegram_bot.reveal', 'telegramBot', bot.id, '查看 Telegram Bot Token', req.auth.username);
+      return draft;
+    });
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, token });
+  });
+
   app.post('/api/dns-accounts/:id/test', asyncRoute(async (req, res) => {
     const state = deps.readState();
     const account = state.dnsAccounts.find((item) => item.id === req.params.id);
     if (!account) return res.status(404).json({ error: 'DNS 账号不存在' });
     const credentials = decryptCredentials(account, deps);
     const result = await testDnsAccount(account, credentials);
-    deps.updateState((draft) => {
+    const next = deps.updateState((draft) => {
       const item = draft.dnsAccounts.find((entry) => entry.id === account.id);
       if (item) Object.assign(item, { status: 'healthy', lastTestAt: nowIso(), lastError: '' });
       pushAudit(draft, 'dns_account.test', 'dnsAccount', account.id, 'DNS 账号连接测试成功', req.auth.username);
       return draft;
     });
-    res.json({ ok: true, result });
+    res.json({ ok: true, result, state: deps.sanitizeState(next, req.auth) });
   }));
 
   app.post('/api/dns-bindings/:id/sync', asyncRoute(async (req, res) => {
@@ -425,11 +449,16 @@ function normalizeResource(key, input = {}, existing = null, deps) {
   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
   if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random', 'weighted'].includes(input.selectionMode) ? input.selectionMode : 'ordered', sharingMode: ['exclusive', 'target', 'business', 'unlimited', 'limited'].includes(input.sharingMode) ? input.sharingMode : 'exclusive', shareLimit: clampNumber(input.shareLimit, 1, 1000, 1), leaseMinutes: clampNumber(input.leaseMinutes, 1, 525600, 30), cooldownMinutes: clampNumber(input.cooldownMinutes, 0, 10080, 10), enabled: input.enabled !== false, note: cleanText(input.note, 500) };
   if (key === 'dnsAccounts') {
-    const credentials = input.credentials && typeof input.credentials === 'object' ? input.credentials : null;
     const provider = DNS_PROVIDERS.has(input.provider) ? input.provider : 'huawei';
-    const hasCredentials = credentials && Object.values(credentials).some(Boolean);
-    const preservedCredentials = existing?.provider === provider ? existing.credentialsEnc : null;
-    return { ...base, name: requiredText(input.name, '账号名称'), provider, enabled: input.enabled !== false, credentialsEnc: hasCredentials ? deps.encryptSecret(JSON.stringify(credentials)) : preservedCredentials || null, status: existing?.provider === provider ? (existing?.status || 'untested') : 'untested', lastTestAt: existing?.provider === provider ? (existing?.lastTestAt || '') : '', lastError: existing?.provider === provider ? (existing?.lastError || '') : '' };
+    const supplied = input.credentials && typeof input.credentials === 'object' ? input.credentials : {};
+    let current = {};
+    if (existing?.provider === provider && existing.credentialsEnc) {
+      try { current = JSON.parse(deps.decryptSecret(existing.credentialsEnc)); } catch (_error) { current = {}; }
+    }
+    const changed = Object.fromEntries(Object.entries(supplied).filter(([, value]) => String(value ?? '').length > 0));
+    const credentials = { ...current, ...changed };
+    const hasCredentials = Object.values(credentials).some((value) => String(value ?? '').length > 0);
+    return { ...base, name: requiredText(input.name, '账号名称'), provider, enabled: input.enabled !== false, credentialsEnc: hasCredentials ? deps.encryptSecret(JSON.stringify(credentials)) : null, status: existing?.provider === provider ? (existing?.status || 'untested') : 'untested', lastTestAt: existing?.provider === provider ? (existing?.lastTestAt || '') : '', lastError: existing?.provider === provider ? (existing?.lastError || '') : '' };
   }
   if (key === 'dnsZones') return { ...base, name: normalizeDomain(input.name), accountId: cleanId(input.accountId), providerZoneId: cleanText(input.providerZoneId, 200), enabled: input.enabled !== false, lastSyncAt: existing?.lastSyncAt || '', status: existing?.status || 'ready' };
   if (key === 'dnsBindings') {
@@ -444,7 +473,12 @@ function normalizeResource(key, input = {}, existing = null, deps) {
   if (key === 'failoverPolicies') return { ...base, name: requiredText(input.name, '策略名称'), poolIds: cleanIds(input.poolIds, 100), automationTaskId: cleanId(input.automationTaskId), automationHosts: input.automationHosts === 'target' ? 'target' : 'allocated', automationTimeout: clampNumber(input.automationTimeout, 30, 7200, 1800), dnsBindingIds: cleanIds(input.dnsBindingIds, 500), approvalMode: input.approvalMode === 'telegram' ? 'telegram' : 'automatic', autoRollback: input.autoRollback !== false, enabled: input.enabled !== false, businessKey: cleanText(input.businessKey, 100) };
   if (key === 'telegramBots') {
     const token = String(input.token || '').trim();
-    return { ...base, name: '统一机器人', tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: [], roles: normalizeRoles(input.roles), menuScopes: cleanTexts(input.menuScopes, 30), automationTaskIds: cleanIds(input.automationTaskIds, 500), lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
+    let tokenHash = existing?.tokenHash || '';
+    if (token) tokenHash = hashSecret(token);
+    else if (!tokenHash && existing?.tokenEnc) {
+      try { tokenHash = hashSecret(deps.decryptSecret(existing.tokenEnc)); } catch (_error) { tokenHash = ''; }
+    }
+    return { ...base, name: requiredText(input.name || 'Telegram 机器人', '机器人名称'), tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, tokenHash, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: [], roles: normalizeRoles(input.roles), menuScopes: cleanTexts(input.menuScopes, 30), automationTaskIds: cleanIds(input.automationTaskIds, 500), lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
   }
   throw new Error('未知资源类型');
 }
@@ -545,7 +579,7 @@ export function createDnsBinding(state, accountId, domain, recordType, values, a
   return binding;
 }
 
-function ensureResourceReferences(state, key, item) {
+function ensureResourceReferences(state, key, item, deps) {
   const exists = (collection, id) => !id || state[collection]?.some((entry) => entry.id === id);
   if (key === 'probeTargets') {
     if (!item.probeIds.length || item.probeIds.some((id) => !exists('probes', id))) throw new Error('至少关联一个有效探针');
@@ -560,7 +594,18 @@ function ensureResourceReferences(state, key, item) {
     if (item.dnsBindingIds.some((id) => !['A', 'AAAA'].includes(state.dnsBindings.find((entry) => entry.id === id)?.recordType))) throw new Error('故障切换只能关联 A/AAAA 解析');
     if (!exists('automationTasks', item.automationTaskId)) throw new Error('关联的自动化任务不存在');
   }
-  if (key === 'telegramBots' && item.automationTaskIds.some((id) => !exists('automationTasks', id))) throw new Error('机器人包含不存在的自动化任务');
+  if (key === 'telegramBots') {
+    if (item.automationTaskIds.some((id) => !exists('automationTasks', id))) throw new Error('机器人包含不存在的自动化任务');
+    const duplicateToken = item.tokenHash && state.telegramBots.some((entry) => {
+      if (entry.id === item.id) return false;
+      let entryHash = entry.tokenHash || '';
+      if (!entryHash && entry.tokenEnc) {
+        try { entryHash = hashSecret(deps.decryptSecret(entry.tokenEnc)); } catch (_error) { entryHash = ''; }
+      }
+      return entryHash === item.tokenHash;
+    });
+    if (duplicateToken) throw new Error('这个 Bot Token 已被其他机器人使用');
+  }
 }
 
 function ensureNotReferenced(state, key, id) {
@@ -1200,7 +1245,7 @@ function pushAudit(state, action, resourceType, resourceId, summary, actor) {
 
 function sanitizeResource(key, item) {
   if (key === 'dnsAccounts') { const { credentialsEnc, ...safe } = item; return { ...safe, configured: Boolean(credentialsEnc) }; }
-  if (key === 'telegramBots') { const { tokenEnc, ...safe } = item; return { ...safe, configured: Boolean(tokenEnc) }; }
+  if (key === 'telegramBots') { const { tokenEnc, tokenHash, ...safe } = item; return { ...safe, configured: Boolean(tokenEnc) }; }
   if (key === 'probes') { const { tokenHash, tokenEnc, agentSecretHash, ...safe } = item; return safe; }
   return item;
 }

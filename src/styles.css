@@ -916,6 +916,9 @@ svg {
 .ops-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .ops-field > span, .ops-multi > strong { color: var(--text-soft); font-size: 11px; font-weight: 500; }
 .ops-field.full, .ops-multi, .ops-toggle { grid-column: 1 / -1; }
+.ops-secret-field { width: 100%; }
+.ops-secret-field .password-toggle { width: 34px; height: 34px; }
+.ops-secret-field .password-toggle svg { width: 17px; height: 17px; }
 .ops-toggle { display: inline-flex; align-items: center; gap: 8px; color: var(--text-main); font-size: 12px; }
 .ops-toggle input { width: auto; }
 .ops-multi { display: flex; flex-direction: column; gap: 8px; }

@@ -1,4 +1,4 @@
-Changed branch/field: DNS provider registry and provider-specific DNS account credentials/adapters (`dnsAccounts.provider`, `credentials`, DNS record sync).
+Changed branch/field: orchestration page layout (`.orchestration-layout` grid columns and `.orchestration-main` grid placement).
 
 Artifacts:
 - /Users/inim/nurows/MODIFIED_FILE
@@ -7,15 +7,15 @@ Artifacts:
 - /Users/inim/nurows/ROLLBACK.sh
 
 BASELINE
-Command: node --check server/orchestration.js
-Input: current server/orchestration.js before provider adapter edits
-Literal output/result: (no output)
+Command: rg -n "orchestration-layout|orchestration-main" src/styles.css
+Input: original orchestration desktop layout
+Literal output/result: `.orchestration-layout { grid-template-columns: 0 minmax(0, 1fr); gap: 0; }`; `.orchestration-main { min-height: 0; overflow: hidden; }`
 Exit status: 0
 
 MODIFIED
-Command: node --check server/orchestration.js && node --check server/index.js && npm run build && npm test && git diff --check
-Input: modified provider registry, DNSPod/GoDaddy/Porkbun/ClouDNS adapters, HTTPS callback validation, and dynamic provider credentials UI
-Literal output/result: syntax checks passed; Vite build completed; 6 tests passed; diff check passed
+Command: npm run build && npm test && git diff --check
+Input: single-column orchestration layout with main content explicitly spanning the full row
+Literal output/result: `38 modules transformed`; `dist/assets/index-CeJ8Bot4.css 57.38 kB`; `6 tests passed`; diff check passed
 Exit status: 0
 
 ROLLBACK
@@ -23,4 +23,4 @@ Command: ./ROLLBACK.sh /tmp/nurossh-rollback-target /tmp/nurossh-rollback-backup
 Input: a separate copy of MODIFIED_FILE and its backup
 Literal output/result: rollback restored: /tmp/nurossh-rollback-target; `cmp` returned identical content (0)
 Exit status: 0
-Restored behavior/status: rollback test restored the separate copy; MODIFIED_FILE remains the changed provider implementation.
+Restored behavior/status: rollback test restores the supplied copy; the workspace keeps the corrected full-width menu layout.

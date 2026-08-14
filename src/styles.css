@@ -870,9 +870,9 @@ svg {
 .telegram-dialog-copy { padding: 0 0 16px; }
 .telegram-dialog-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 
-.orchestration-layout { grid-template-columns: 0 minmax(0, 1fr); gap: 0; }
+.orchestration-layout { grid-template-columns: minmax(0, 1fr); gap: 0; }
 .orchestration-layout .side-panel { display: none; }
-.orchestration-main { min-height: 0; overflow: hidden; }
+.orchestration-main { grid-column: 1 / -1; width: 100%; min-width: 0; min-height: 0; overflow: hidden; }
 .ops-workspace { height: 100%; min-height: 0; display: flex; flex-direction: column; gap: 12px; overflow: hidden; padding: 2px; }
 .ops-header { min-height: 82px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 16px 20px; border-radius: 18px; }
 .ops-header strong { display: block; margin-top: 4px; color: var(--text-strong); font-size: 20px; }

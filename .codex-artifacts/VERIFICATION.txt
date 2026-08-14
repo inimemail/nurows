@@ -3,6 +3,12 @@ Changed branch/field
 - Incident success path: allocated IP assets are deleted and removed from every pool reference.
 - Incident failure path: allocated assets remain available after internal locks are released.
 - IP usage history: processing, consumed, failed, and rolled-back attempts remain searchable after asset deletion.
+- Probe target checks: Ping is the default, TCP port is shown only for TCPing, all assigned probes complete a round, any success wins, and all failures trigger the failure threshold.
+- Incident without an available replacement IP: status remains waiting_for_ip and is retried only after an eligible asset is added or becomes available.
+- Waiting incident recovery: adding an IP requests an immediate target recheck; a recovered target closes the incident without consuming an IP.
+- Replacement IP preflight: each allocated IP is Ping-checked three times; unusable addresses are discarded, audited, recorded, and replaced from the pool.
+- Legacy no-IP failures are normalized to waiting_for_ip so they no longer generate repeated execution failures.
+- Target/policy/DNS account/DNS binding rows: triple-click opens a copy dialog with identity fields cleared while reusable configuration is retained.
 
 Artifacts
 - MODIFIED_FILE: .codex-artifacts/MODIFIED_FILE
@@ -17,9 +23,9 @@ Literal result: tests 19, pass 19, fail 0
 Exit status: 0
 
 MODIFIED
-Command: npm test && npm run build && node --check server/orchestration.js && git diff --check
+Command: npm test && npm run build && node --check server/orchestration.js && node --check server/index.js && python3 -m py_compile probe-agent/nurossh_probe.py && bash -n install.sh probe-agent/install.sh && docker compose config >/dev/null && git diff --check
 Input: current working tree
-Literal result: tests 25, pass 25, fail 0; vite build completed; syntax check passed; diff check passed
+Literal result: tests 30, pass 30, fail 0; vite build succeeded; both Node syntax checks passed; Python and shell compilation passed; Docker Compose config passed; diff check passed
 Exit status: 0
 
 ROLLBACK

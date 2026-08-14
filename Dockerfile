@@ -18,7 +18,8 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:22-alpine AS runtime
 
-RUN addgroup -S app -g 10001 \
+RUN apk add --no-cache iputils \
+  && addgroup -S app -g 10001 \
   && adduser -S -D -H -u 10001 -G app app
 
 WORKDIR /app

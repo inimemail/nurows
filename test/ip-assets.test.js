@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { consumeIncidentIpAssets, finalizeIpUsageRecords, importIpAssets, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, startIpUsageRecords } from '../server/orchestration.js';
+import { consumeIncidentIpAssets, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, requestWaitingIncidentRechecks, retryWaitingIpIncidents, runIncidentWorkflow, startIpUsageRecords } from '../server/orchestration.js';
 
 test('parses IPv4 and IPv6 batches and removes duplicates', () => {
   assert.deepEqual(parseIpBatch('1.1.1.1\n2001:db8::1, 1.1.1.1'), ['1.1.1.1', '2001:db8::1']);
@@ -76,6 +76,13 @@ test('removes legacy lease settings and released locks during state normalizatio
   assert.deepEqual(state.ipLeases, [{ id: 'locked', status: 'locked' }]);
 });
 
+test('migrates old no-IP failures into the waiting state', () => {
+  const state = normalizeOrchestrationState({ incidents: [{ id: 'i1', status: 'failed', message: '执行失败', error: '备用 IP 池没有满足策略的可用 IP' }] });
+  assert.equal(state.incidents[0].status, 'waiting_for_ip');
+  assert.equal(state.incidents[0].message, '等待备用 IP');
+  assert.equal(state.incidents[0].error, '');
+});
+
 test('keeps a complete IP usage record after the asset is consumed', () => {
   const state = {
     incidents: [{ id: 'incident-1', targetId: 'target-1', policyId: 'policy-1', targetName: '主站', policyName: '自动切换' }],
@@ -135,4 +142,96 @@ test('updates only the current attempt when an incident is retried', () => {
   assert.equal(finalizeIpUsageRecords(state, 'incident-1', 'failed', '本次失败', ['current-lease']), 1);
   assert.equal(state.ipUsageRecords[0].status, 'rolled_back');
   assert.equal(state.ipUsageRecords[1].status, 'failed');
+});
+
+test('uses all assigned probes for a round, with any success winning the round', () => {
+  const probes = [{ id: 'p1', enabled: true }, { id: 'p2', enabled: true }];
+  const base = { id: 'target-1', probeIds: ['p1', 'p2'], interval: 30, failureThreshold: 3, recoveryThreshold: 2 };
+  const checkedAt = new Date().toISOString();
+  assert.deepEqual(evaluateTargetHealth({ ...base, observations: {
+    p1: { ok: false, failures: 3, successes: 0, checkedAt },
+    p2: { ok: true, failures: 0, successes: 2, checkedAt }
+  } }, probes), { failed: false, health: 'healthy' });
+  assert.deepEqual(evaluateTargetHealth({ ...base, observations: {
+    p1: { ok: false, failures: 3, successes: 0, checkedAt },
+    p2: { ok: false, failures: 3, successes: 0, checkedAt }
+  } }, probes), { failed: true, health: 'down' });
+});
+
+test('waits without a replacement IP and retries after one becomes available', async () => {
+  const state = {
+    incidents: [{ id: 'incident-wait', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'queued', executionId: '', leaseIds: [], allocatedIps: [], dnsChangeIds: [] }],
+    failoverPolicies: [{ id: 'policy-1', name: '切换', poolIds: [], automationTaskId: '', dnsBindingIds: [], enabled: true }],
+    probeTargets: [{ id: 'target-1', name: '主站', address: '203.0.113.10', health: 'down', lastCheckAt: '' }],
+    ipPools: [],
+    ipAssets: [],
+    ipLeases: [],
+    ipUsageRecords: [],
+    dnsBindings: [],
+    dnsChanges: [],
+    auditLogs: []
+  };
+  const deps = {
+    readState: () => state,
+    updateState: (updater) => updater(state),
+    executeAutomation: async () => { throw new Error('automation must wait for an IP'); },
+    waitAutomation: async () => {},
+    checkIp: async () => ({ ok: true, error: '' })
+  };
+  await runIncidentWorkflow('incident-wait', deps);
+  assert.equal(state.incidents[0].status, 'waiting_for_ip');
+  assert.equal(state.incidents[0].message, '等待备用 IP');
+
+  state.ipAssets.push({ id: 'asset-1', address: '198.51.100.20', enabled: true, health: 'unknown' });
+  state.ipPools.push({ id: 'pool-1', name: '备用池', assetIds: ['asset-1'], allocationMode: 'one', selectionMode: 'ordered', enabled: true });
+  state.failoverPolicies[0].poolIds = ['pool-1'];
+  assert.equal(requestWaitingIncidentRechecks(deps), 1);
+  state.probeTargets[0].lastCheckAt = new Date(Date.now() + 10).toISOString();
+  assert.equal(retryWaitingIpIncidents(deps), 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(state.incidents[0].status, 'succeeded');
+  assert.equal(state.ipAssets.length, 0);
+});
+
+test('closes a waiting incident when probes confirm the target recovered', () => {
+  const state = {
+    incidents: [{ id: 'incident-recovered', targetId: 'target-1', policyId: 'policy-1', status: 'waiting_for_ip', executionId: '', recheckRequestedAt: '' }],
+    probeTargets: [{ id: 'target-1', health: 'healthy', lastCheckAt: new Date().toISOString() }],
+    failoverPolicies: [{ id: 'policy-1', poolIds: [] }],
+    ipPools: [], ipAssets: [], ipLeases: [], ipUsageRecords: [], auditLogs: []
+  };
+  const deps = { readState: () => state, updateState: (updater) => updater(state) };
+  assert.equal(retryWaitingIpIncidents(deps), 0);
+  assert.equal(state.incidents[0].status, 'recovered');
+});
+
+test('discards an unusable replacement IP, records it, and takes the next one', async () => {
+  const state = {
+    incidents: [{ id: 'incident-check', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'queued', executionId: '', leaseIds: [], allocatedIps: [], dnsChangeIds: [] }],
+    failoverPolicies: [{ id: 'policy-1', name: '切换', poolIds: ['pool-1'], automationTaskId: '', dnsBindingIds: [], enabled: true }],
+    probeTargets: [{ id: 'target-1', name: '主站', address: '203.0.113.10', health: 'down' }],
+    ipPools: [{ id: 'pool-1', name: '备用池', assetIds: ['bad', 'good'], allocationMode: 'one', selectionMode: 'ordered', enabled: true }],
+    ipAssets: [{ id: 'bad', address: '198.51.100.1', enabled: true, health: 'unknown' }, { id: 'good', address: '198.51.100.2', enabled: true, health: 'unknown' }],
+    ipLeases: [],
+    ipUsageRecords: [],
+    dnsBindings: [],
+    dnsChanges: [],
+    auditLogs: []
+  };
+  const checked = [];
+  const deps = {
+    readState: () => state,
+    updateState: (updater) => updater(state),
+    executeAutomation: async () => ({ jobId: 'unused' }),
+    waitAutomation: async () => {},
+    checkIp: async (address, attempts) => { checked.push([address, attempts]); return { ok: address.endsWith('.2'), error: address.endsWith('.2') ? '' : 'ping failed' }; }
+  };
+  await runIncidentWorkflow('incident-check', deps);
+  assert.deepEqual(checked, [['198.51.100.1', 3], ['198.51.100.2', 3]]);
+  assert.equal(state.incidents[0].status, 'succeeded');
+  assert.equal(state.ipAssets.length, 0);
+  assert.deepEqual(state.ipUsageRecords.map((item) => [item.address, item.status, item.preflight.attempts]), [
+    ['198.51.100.2', 'consumed', 3],
+    ['198.51.100.1', 'discarded', 3]
+  ]);
 });

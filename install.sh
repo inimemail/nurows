@@ -237,6 +237,8 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      - NET_RAW
     tmpfs:
       - /tmp:size=64m,mode=1777
 EOF

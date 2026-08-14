@@ -22,6 +22,8 @@ import {
   orchestrationDefaults,
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
+  requestWaitingIncidentRechecks,
+  retryWaitingIpIncidents,
   runIncidentWorkflow,
   rollbackIncident,
   sanitizeOrchestrationState,
@@ -108,6 +110,7 @@ const orchestrationDeps = {
   runIncident: (incidentId, encryptionKey) => runIncidentWorkflow(incidentId, orchestrationDeps, encryptionKey),
   notifyIncident: notifyIncidentViaTelegram,
   onTelegramChanged: () => restartTelegramPolling(),
+  onIpAvailabilityChanged: () => requestWaitingIncidentRechecks(orchestrationDeps),
   syncDnsBinding
 };
 orchestrationDeps.allowProbeRegistration = (ip) => {
@@ -200,7 +203,8 @@ app.use((req, res, next) => {
 app.use(cors());
 registerProbePublicRoutes(app, {
   ...orchestrationDeps,
-  onIncidentCreated: (incidentId) => runIncidentWorkflow(incidentId, orchestrationDeps)
+  onIncidentCreated: (incidentId) => runIncidentWorkflow(incidentId, orchestrationDeps),
+  onProbeReport: () => retryWaitingIpIncidents(orchestrationDeps)
 });
 app.use('/api', authGuard);
 
@@ -1052,6 +1056,7 @@ function resumePendingIncidents() {
       orchestrationDeps.runIncident(incident.id).catch?.(() => {});
     }
   }
+  requestWaitingIncidentRechecks(orchestrationDeps);
 }
 
 function handleTerminalConnection(ws, req, url) {
@@ -2643,7 +2648,7 @@ function normalizeTelegramDomain(value) {
   return domain;
 }
 
-const STATUS_LABELS = { online: '在线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
+const STATUS_LABELS = { online: '在线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', discarded: '检测不可用，已丢弃', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
 
 function resolveTelegramRole(state, settings, from, chat) {
   const userId = String(from?.id || '');

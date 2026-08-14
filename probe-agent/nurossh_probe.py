@@ -104,11 +104,17 @@ def main():
     if not config.get("secret"):
         register(config)
     schedules = {}
+    check_now_markers = {}
     while True:
         try:
             payload = request(config, "GET", "/probe/config")
             targets = payload.get("targets", [])
             now = time.time()
+            for target in targets:
+                marker = str(target.get("checkNowAt", ""))
+                if marker and check_now_markers.get(target["id"]) != marker:
+                    check_now_markers[target["id"]] = marker
+                    schedules[target["id"]] = 0
             due = [target for target in targets if now >= schedules.get(target["id"], 0)]
             if due:
                 workers = min(max(1, int(config.get("maxConcurrency", 100))), len(due))

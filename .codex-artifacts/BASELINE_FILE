@@ -438,23 +438,6 @@ app.get('/api/servers/:id/password', (req, res) => {
   }
   try {
     const password = getStoredSecretValue(item, req.auth.encryptionKey);
-    res.set('Cache-Control', 'no-store');
-    res.json({ ok: true, password: password || '' });
-  } catch (error) {
-    res.status(400).json({ error: error.message || '密码无法解密，请重新保存密码' });
-  }
-});
-
-app.get('/api/automation-tasks/:id/password', (req, res) => {
-  const state = readState();
-  const item = state.automationTasks.find((task) => task.id === req.params.id);
-  if (!item) {
-    res.status(404).json({ error: '未找到自动化任务' });
-    return;
-  }
-  try {
-    const password = getStoredSecretValue(item, req.auth.encryptionKey);
-    res.set('Cache-Control', 'no-store');
     res.json({ ok: true, password: password || '' });
   } catch (error) {
     res.status(400).json({ error: error.message || '密码无法解密，请重新保存密码' });
@@ -1738,7 +1721,7 @@ function normalizeAutomationTask(input = {}, existing = null) {
   const steps = Array.isArray(input.steps)
     ? input.steps.map((step, index) => ({
         id: String(step?.id || uuidv4()),
-        type: ['command', 'wait', 'input', 'enter', 'delay', 'ctrl_c', 'finish'].includes(step?.type) ? step.type : 'command',
+        type: ['command', 'wait', 'input', 'enter', 'delay'].includes(step?.type) ? step.type : 'command',
         label: String(step?.label || '').trim(),
         value: String(step?.value ?? ''),
         inputMode: step?.inputMode === 'per-server' ? 'per-server' : 'broadcast',
@@ -2069,10 +2052,9 @@ function createAutomationJob(task, temporaryServers, command, context = {}) {
   task.steps.forEach((step, index) => {
     if (step.type !== 'wait' || !step.value.trim()) return;
     const next = task.steps[index + 1];
-    if (['input', 'enter', 'ctrl_c', 'finish'].includes(next?.type)) {
+    if (next?.type === 'input' || next?.type === 'enter') {
       job.automationResponders.push({
         waitText: interpolateAutomationValue(step.value.trim(), context),
-        action: next.type,
         input: next.type === 'enter' ? '' : interpolateAutomationValue(next.value, context),
         inputMode: next.type === 'input' && next.inputMode === 'per-server' ? 'per-server' : 'broadcast'
       });
@@ -2796,7 +2778,6 @@ function startInteractiveCommandSession(job, resultItem, serverItem, proxies, en
     ssh.end();
     broadcastCommandSession(runtime, { type: 'closed' });
   };
-  runtime.finish = finalizeRuntime;
 
   const markRuntimeError = (message) => {
     if (job.cancelled || runtime.cancelRequested) {
@@ -2918,12 +2899,7 @@ function appendCommandRuntimeOutput(job, runtime, resultItem, text) {
     if (responder && runtime.tailText.toLowerCase().includes(responder.waitText.toLowerCase())) {
       runtime.automationResponderIndex = responderIndex + 1;
       runtime.tailText = '';
-      if (responder.action === 'finish') {
-        finalizeCommandResult(job, runtime, resultItem, 0);
-        runtime.finish?.();
-      } else if (responder.action === 'ctrl_c') {
-        writeCommandSessionInput(job, runtime, resultItem, '\u0003');
-      } else if (responder.inputMode === 'per-server') {
+      if (responder.inputMode === 'per-server') {
         resultItem.status = 'awaiting_input';
         resultItem.awaitingInput = true;
         resultItem.inputRequestCount += 1;

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 const PROVIDERS = {
   huawei: '华为云 DNS', aliyun: '阿里云 DNS', tencent: '腾讯云 DNSPod API', dnspod: 'DNSPod 独立 API', cloudflare: 'Cloudflare',

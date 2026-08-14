@@ -1,4 +1,4 @@
-Changed branch/field: Telegram native/inline menus and resource operations (`telegramBots[0]`, `automationTaskIds`, IP assets, pools, DNS bindings), DNS multi-record reconciliation (`dnsBindings.recordType`, `recordValues`, provider record layout), probe enrollment URL/command display, persistent probe registration tokens with explicit rotation, probe registration dependency wiring, probe heartbeat refresh and offline timeout, uninstall completion verification/output, and environment-aware development CORS (`VITE_DEV_SERVER_PORT`, production origin deny-by-default).
+Changed branch/field: Telegram native/inline menus and resource operations (`telegramBots[0]`, `automationTaskIds`, IP assets, pools, DNS bindings), DNS multi-record reconciliation (`dnsBindings.recordType`, `recordValues`, provider record layout), probe enrollment URL/command display, persistent probe registration tokens with explicit rotation, probe registration dependency wiring, probe heartbeat refresh and offline timeout (`useEffect` imported and runtime-rendered), uninstall completion verification/output, and environment-aware development CORS (`VITE_DEV_SERVER_PORT`, production origin deny-by-default).
 
 Artifacts:
 - /Users/inim/nurows/MODIFIED_FILE
@@ -35,6 +35,12 @@ Command: bash -n probe-agent/uninstall.sh; systemctl disable --now nurossh-probe
 Input: installed probe service and directories
 Literal output/result: successful path prints `探针卸载完成：服务、程序和配置已删除。`; active service or residual files return non-zero with failure details; probe UI maps stale heartbeats older than 90 seconds to `离线`
 Exit status: syntax and residual-check path passed
+
+FRONTEND_RUNTIME
+Command: Vite SSR load `/src/OrchestrationWorkspace.jsx` and React `renderToString` with the probes workspace fixture; npm run build
+Input: probes workspace with automatic heartbeat refresh using `useEffect`
+Literal output/result: `workspace render passed`; `38 modules transformed`; `dist/assets/index-t8fLxYC5.js 620.77 kB`; `built in 668ms`; no undefined React hook reference
+Exit status: 0
 
 RUNTIME
 Command: curl -sS -D - http://localhost:5173/; curl -sS -D - http://localhost:38471/api/state

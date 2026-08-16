@@ -15,6 +15,7 @@ import {
   addIpsToPool,
   createPoolWithIps,
   createDnsBinding,
+  crossedInventoryThresholds,
   dnsRecordLayout,
   importIpAssets,
   parseIpBatch,
@@ -22,7 +23,10 @@ import {
   orchestrationDefaults,
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
+  requestWaitingDnsGuardChecks,
   requestWaitingIncidentRechecks,
+  runDueDnsGuards,
+  processReadyDnsGuards,
   retryWaitingIpIncidents,
   runIncidentWorkflow,
   rollbackIncident,
@@ -109,8 +113,10 @@ const orchestrationDeps = {
   waitAutomation: waitForAutomationJob,
   runIncident: (incidentId, encryptionKey) => runIncidentWorkflow(incidentId, orchestrationDeps, encryptionKey),
   notifyIncident: notifyIncidentViaTelegram,
+  notifyDnsGuard: notifyDnsGuardViaTelegram,
   onTelegramChanged: () => restartTelegramPolling(),
-  onIpAvailabilityChanged: () => requestWaitingIncidentRechecks(orchestrationDeps),
+  onIpAvailabilityChanged: () => { requestWaitingIncidentRechecks(orchestrationDeps); requestWaitingDnsGuardChecks(orchestrationDeps); runDueDnsGuards(orchestrationDeps).catch(() => {}); },
+  onDnsGuardChanged: (guardId) => runDueDnsGuards(orchestrationDeps, guardId).catch(() => {}),
   syncDnsBinding
 };
 orchestrationDeps.allowProbeRegistration = (ip) => {
@@ -204,7 +210,8 @@ app.use(cors());
 registerProbePublicRoutes(app, {
   ...orchestrationDeps,
   onIncidentCreated: (incidentId) => runIncidentWorkflow(incidentId, orchestrationDeps),
-  onProbeReport: () => retryWaitingIpIncidents(orchestrationDeps)
+  onProbeReport: () => retryWaitingIpIncidents(orchestrationDeps),
+  onDnsGuardReport: () => processReadyDnsGuards(orchestrationDeps).catch(() => {})
 });
 app.use('/api', authGuard);
 
@@ -1041,6 +1048,8 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, HOST, () => {
   restartTelegramPolling();
   resumePendingIncidents();
+  runDueDnsGuards(orchestrationDeps).catch(() => {});
+  setInterval(() => runDueDnsGuards(orchestrationDeps).catch(() => {}), 5000).unref();
   console.log(`NuroSSH server running at http://localhost:${PORT}`);
 });
 
@@ -1800,7 +1809,9 @@ function updateState(mutator) {
   const draft = readState();
   const next = mutator(structuredClone(draft));
   writeState(next);
-  return readState();
+  const saved = readState();
+  notifyPoolThresholdDrops(draft, saved);
+  return saved;
 }
 
 function sanitizeStateForClient(state, auth = null) {
@@ -2175,6 +2186,49 @@ function notifyIncidentViaTelegram(incidentId) {
   }
 }
 
+function notifyDnsGuardViaTelegram(guardId) {
+  const state = readState();
+  const guard = state.dnsGuards?.find((item) => item.id === guardId);
+  if (!guard) return;
+  const text = `DNS 守护：${guard.name}\n域名：${guard.domain} · ${guard.recordType}\n状态：${STATUS_LABELS[guard.status] || guard.status}\n${guard.message || guard.lastError || ''}`;
+  for (const settings of (state.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc && telegramMenuAllowed(bot, 'probes'))) {
+    let token = '';
+    try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
+    for (const chatId of [...new Set(settings.userIds || [])]) {
+      telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '立即检查', callback_data: `guard_check:${guard.id}` }], [{ text: '探针管理', callback_data: 'menu:probes' }]] } }).catch(() => {});
+    }
+  }
+}
+
+function notifyPoolThresholdDrops(previous, next) {
+  const previousAssets = new Map((previous.ipAssets || []).map((item) => [item.id, item]));
+  const nextAssets = new Map((next.ipAssets || []).map((item) => [item.id, item]));
+  const available = (pool, assets) => (pool?.assetIds || []).filter((id) => {
+    const asset = assets.get(id);
+    return asset?.enabled !== false && asset?.health !== 'unhealthy';
+  }).length;
+  for (const pool of next.ipPools || []) {
+    if (!pool.alertEnabled) continue;
+    const beforePool = (previous.ipPools || []).find((item) => item.id === pool.id);
+    if (!beforePool) continue;
+    const before = available(beforePool, previousAssets);
+    const after = available(pool, nextAssets);
+    if (after >= before) continue;
+    const crossed = crossedInventoryThresholds(before, after, pool.alertThresholds);
+    if (!crossed.length) continue;
+    const bots = (next.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc && (!pool.alertBotIds?.length || pool.alertBotIds.includes(bot.id)));
+    for (const settings of bots) {
+      let token = '';
+      try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
+      const recipients = pool.alertChatIds?.length ? pool.alertChatIds : settings.userIds || [];
+      const text = `备用池库存预警\n${pool.name}\n本次减少：${before - after}\n当前可用：${after}\n触达数量：${crossed.join('、')}\n状态：${pool.enabled === false ? '已停用' : '可分配'}`;
+      for (const chatId of [...new Set(recipients)]) {
+        telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '查看备用池', callback_data: `pool:${pool.id}` }, { text: '批量补充 IP', callback_data: `pool_add:${pool.id}` }], [{ text: pool.enabled === false ? '启用备用池' : '暂停备用池', callback_data: `pool_toggle_confirm:${pool.id}` }]] } }).catch(() => {});
+      }
+    }
+  }
+}
+
 function runAutomationJob(job, proxies, encryptionKeyHex) {
   let active = 0;
   let cursor = 0;
@@ -2294,6 +2348,56 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
       if (!pool) return;
       telegramRuntime.pending.set(sessionKey, { action: 'pool_add', poolId: pool.id, expiresAt: Date.now() + 10 * 60 * 1000 });
       return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `向“${pool.name}”添加 IP，每行一个。`, reply_markup: telegramCancelButtons('menu:pools') });
+    }
+    if (action === 'pool_toggle_confirm') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      const pool = state.ipPools?.find((item) => item.id === value);
+      if (!pool) return;
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `确认${pool.enabled === false ? '启用' : '暂停'}备用池“${pool.name}”？`, reply_markup: { inline_keyboard: [[{ text: '确认', callback_data: `pool_toggle:${pool.id}` }, { text: '取消', callback_data: `pool:${pool.id}` }]] } });
+    }
+    if (action === 'pool_toggle') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      orchestrationDeps.updateState((draft) => {
+        const pool = draft.ipPools.find((item) => item.id === value);
+        if (pool) { pool.enabled = pool.enabled === false; pool.updatedAt = new Date().toISOString(); }
+        return draft;
+      });
+      return sendTelegramPool(token, chatId, readState(), value);
+    }
+    if (action === 'pool_alert') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      const pool = state.ipPools?.find((item) => item.id === value);
+      if (!pool) return;
+      telegramRuntime.pending.set(sessionKey, { action: 'pool_alert', poolId: pool.id, expiresAt: Date.now() + 10 * 60 * 1000 });
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `发送“${pool.name}”的预警数量，例如：5 3 1 0。发送“关闭”可停用通知。`, reply_markup: telegramCancelButtons('menu:pools') });
+    }
+    if (action === 'guard_check') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      orchestrationDeps.updateState((draft) => {
+        const guard = draft.dnsGuards.find((item) => item.id === value);
+        if (guard) Object.assign(guard, { cycle: null, nextCheckAt: '', status: 'queued', message: 'Telegram 请求立即检查', updatedAt: new Date().toISOString() });
+        return draft;
+      });
+      runDueDnsGuards(orchestrationDeps, value).catch(() => {});
+      return sendTelegramGuard(token, chatId, readState(), value, '已请求立即检查');
+    }
+    if (action === 'guard') return sendTelegramGuard(token, chatId, state, value);
+    if (action === 'guard_toggle_confirm') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      const guard = state.dnsGuards?.find((item) => item.id === value);
+      if (!guard) return;
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `确认${guard.enabled === false ? '启用' : '暂停'} DNS 守护“${guard.name}”？`, reply_markup: { inline_keyboard: [[{ text: '确认', callback_data: `guard_toggle:${guard.id}` }, { text: '取消', callback_data: `guard:${guard.id}` }]] } });
+    }
+    if (action === 'guard_toggle') {
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      orchestrationDeps.updateState((draft) => {
+        const guard = draft.dnsGuards.find((item) => item.id === value);
+        if (guard) Object.assign(guard, { enabled: guard.enabled === false, cycle: null, nextCheckAt: '', status: guard.enabled === false ? 'queued' : guard.status, message: guard.enabled === false ? '已启用，等待检查' : '已暂停', updatedAt: new Date().toISOString() });
+        return draft;
+      });
+      const current = readState().dnsGuards?.find((item) => item.id === value);
+      if (current?.enabled !== false) runDueDnsGuards(orchestrationDeps, value).catch(() => {});
+      return sendTelegramGuard(token, chatId, readState(), value);
     }
     if (action === 'pool_create') {
       if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
@@ -2475,6 +2579,27 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
     await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `备用池名称：${pending.poolName}\n请发送初始 IP，每行一个。`, reply_markup: telegramCancelButtons('menu:pools') });
     return;
   }
+  if (pending?.action === 'pool_alert' && text) {
+    try {
+      const disabled = text === '关闭';
+      const thresholds = disabled ? [] : [...new Set(text.split(/[,，\s]+/).map(Number).filter((item) => Number.isInteger(item) && item >= 0 && item <= 100000))].sort((a, b) => b - a).slice(0, 30);
+      if (!disabled && !thresholds.length) throw new Error('请输入有效的非负整数预警数量');
+      orchestrationDeps.updateState((draft) => {
+        const pool = draft.ipPools.find((item) => item.id === pending.poolId);
+        if (!pool) throw new Error('备用池不存在');
+        pool.alertEnabled = !disabled;
+        pool.alertThresholds = thresholds;
+        if (!pool.alertBotIds?.length) pool.alertBotIds = [settings.id];
+        if (!pool.alertChatIds?.length) pool.alertChatIds = [String(chatId)];
+        pool.updatedAt = new Date().toISOString();
+        return draft;
+      });
+      telegramRuntime.pending.delete(sessionKey);
+      return sendTelegramPool(token, chatId, readState(), pending.poolId);
+    } catch (error) {
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: error.message, reply_markup: telegramCancelButtons('menu:pools') });
+    }
+  }
   if (pending?.action === 'dns_create_domain' && text) {
     try {
       const domain = normalizeTelegramDomain(text);
@@ -2558,8 +2683,19 @@ async function sendTelegramIncidents(token, chatId, state) {
 
 async function sendTelegramProbes(token, chatId, state) {
   const probes = (state.probes || []).slice(0, 20);
-  const text = probes.length ? `探针节点\n${probes.map((item) => `${item.name} · ${STATUS_LABELS[item.status] || item.status} · ${item.region || '未设置地区'}`).join('\n')}` : '当前没有探针节点';
-  await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '刷新', callback_data: 'menu:probes' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+  const guards = (state.dnsGuards || []).slice(0, 20);
+  const probeText = probes.length ? probes.map((item) => `${item.name} · ${STATUS_LABELS[item.status] || item.status} · ${item.region || '未设置地区'}`).join('\n') : '暂无探针节点';
+  const guardText = guards.length ? guards.map((item) => `${item.name} · ${STATUS_LABELS[item.status] || item.status} · ${item.currentValues?.length || 0} IP`).join('\n') : '暂无 DNS 守护';
+  const guardButtons = guards.map((item) => ([{ text: `${item.enabled === false ? '暂停' : '运行'} · ${item.name}`, callback_data: `guard:${item.id}` }]));
+  await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `探针节点\n${probeText}\n\nDNS 守护\n${guardText}`, reply_markup: { inline_keyboard: [...guardButtons, [{ text: '刷新', callback_data: 'menu:probes' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+}
+
+async function sendTelegramGuard(token, chatId, state, guardId, notice = '') {
+  const guard = state.dnsGuards?.find((item) => item.id === guardId);
+  if (!guard) return;
+  const values = (guard.currentValues || []).slice(0, 30);
+  const text = `${notice ? `${notice}\n\n` : ''}DNS 守护：${guard.name}\n状态：${guard.enabled === false ? '已暂停' : (STATUS_LABELS[guard.status] || guard.status)}\n记录：${guard.domain} · ${guard.recordType}\n活动 IP：${guard.currentValues?.length || 0} / ${guard.maxActiveIps || 50}\n探针：${guard.probeIds?.length || 0}\n来源：${guard.sources?.length || 0}\n最近检查：${guard.lastCheckAt ? new Date(guard.lastCheckAt).toLocaleString('zh-CN', { hour12: false }) : '尚未检查'}\n\n${values.join('\n') || guard.message || '尚未读取到服务商记录'}`;
+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '立即检查', callback_data: `guard_check:${guard.id}` }, { text: guard.enabled === false ? '启用' : '暂停', callback_data: `guard_toggle_confirm:${guard.id}` }], [{ text: '返回探针管理', callback_data: 'menu:probes' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
 }
 
 async function sendTelegramAssets(token, chatId, state) {
@@ -2570,8 +2706,8 @@ async function sendTelegramAssets(token, chatId, state) {
 
 async function sendTelegramPools(token, chatId, state) {
   const pools = (state.ipPools || []).slice(0, 20);
-  const text = pools.length ? `备用 IP 池\n${pools.map((item) => `${item.name} · ${item.assetIds?.length || 0} 个 IP · ${item.allocationMode === 'all' ? '全部取用' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '取一个'}`).join('\n')}` : '当前没有备用 IP 池';
-  const buttons = pools.map((item) => ([{ text: `${item.name} · ${item.assetIds?.length || 0} IP`, callback_data: `pool:${item.id}` }]));
+  const text = pools.length ? `备用 IP 池\n${pools.map((item) => `${item.name} · ${item.assetIds?.length || 0} 个 IP · ${item.enabled === false ? '已停用' : '可分配'}`).join('\n')}` : '当前没有备用 IP 池';
+  const buttons = pools.map((item) => ([{ text: `${item.enabled === false ? '暂停' : '运行'} · ${item.name} · ${item.assetIds?.length || 0} IP`, callback_data: `pool:${item.id}` }]));
   await telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...buttons, [{ text: '新建备用池', callback_data: 'pool_create:new' }], [{ text: '刷新', callback_data: 'menu:pools' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
 }
 
@@ -2579,8 +2715,8 @@ async function sendTelegramPool(token, chatId, state, poolId) {
   const pool = state.ipPools?.find((item) => item.id === poolId);
   if (!pool) return;
   const addresses = (pool.assetIds || []).map((id) => state.ipAssets.find((item) => item.id === id)?.address).filter(Boolean);
-  const text = `备用池：${pool.name}\nIP 数量：${addresses.length}\n取用方式：${pool.allocationMode === 'all' ? '全部取用' : pool.allocationMode === 'count' ? `取 ${pool.allocationCount} 个` : '一次取一个'}\n\n${addresses.slice(0, 30).join('\n') || '暂无 IP'}`;
-  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '批量加入 IP', callback_data: `pool_add:${pool.id}` }], [{ text: '返回备用池', callback_data: 'menu:pools' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+  const text = `备用池：${pool.name}\n状态：${pool.enabled === false ? '已停用' : '可分配'}\nIP 数量：${addresses.length}\n取用方式：${pool.allocationMode === 'all' ? '全部取用' : pool.allocationMode === 'count' ? `取 ${pool.allocationCount} 个` : '一次取一个'}\n库存预警：${pool.alertEnabled ? (pool.alertThresholds || []).join('、') || '未设置' : '已关闭'}\n\n${addresses.slice(0, 30).join('\n') || '暂无 IP'}`;
+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '批量加入 IP', callback_data: `pool_add:${pool.id}` }, { text: '修改预警', callback_data: `pool_alert:${pool.id}` }], [{ text: pool.enabled === false ? '启用备用池' : '暂停备用池', callback_data: `pool_toggle_confirm:${pool.id}` }], [{ text: '返回备用池', callback_data: 'menu:pools' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
 }
 
 async function sendTelegramDns(token, chatId, state) {
@@ -2648,7 +2784,7 @@ function normalizeTelegramDomain(value) {
   return domain;
 }
 
-const STATUS_LABELS = { online: '在线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', discarded: '检测不可用，已丢弃', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
+const STATUS_LABELS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待备用 IP', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', discarded: '检测不可用，已丢弃', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
 
 function resolveTelegramRole(state, settings, from, chat) {
   const userId = String(from?.id || '');

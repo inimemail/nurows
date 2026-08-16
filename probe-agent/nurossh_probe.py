@@ -13,7 +13,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10

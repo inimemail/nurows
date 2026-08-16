@@ -115,6 +115,34 @@ test('editing one DNS credential keeps the other saved fields', async () => {
   assert.deepEqual(saved, { accessKey: 'changed-ak', secretKey: 'saved-sk' });
 });
 
+test('pool alerts require a configured bot and protect its delivery settings', async () => {
+  const harness = createHarness(credentialState());
+  const poolBody = {
+    name: '备用池', assetIds: [], allocationMode: 'one', allocationCount: 1, selectionMode: 'ordered',
+    enabled: true, alertEnabled: true, alertThresholds: [5, 1, 0], alertBotIds: []
+  };
+  await assert.rejects(
+    harness.request('POST', '/api/orchestration/:resource', { params: { resource: 'ip-pools' }, body: poolBody }),
+    /至少选择一个发送机器人/
+  );
+
+  const created = await harness.request('POST', '/api/orchestration/:resource', {
+    params: { resource: 'ip-pools' }, body: { ...poolBody, alertBotIds: ['bot-1'] }
+  });
+  assert.equal(created.statusCode, 200);
+  await assert.rejects(
+    harness.request('PUT', '/api/orchestration/:resource/:id', {
+      params: { resource: 'telegram-bots', id: 'bot-1' },
+      body: { name: '运维机器人', enabled: true, userIds: [], menuScopes: [], automationTaskIds: [] }
+    }),
+    /请先解除备用池关联/
+  );
+  await assert.rejects(
+    harness.request('DELETE', '/api/orchestration/:resource/:id', { params: { resource: 'telegram-bots', id: 'bot-1' } }),
+    /仍被其他配置引用/
+  );
+});
+
 test('deletes one idle incident and bulk-clears records while preserving running work', async () => {
   const state = credentialState();
   state.incidents = [

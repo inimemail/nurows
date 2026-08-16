@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { consumeIncidentIpAssets, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, requestWaitingIncidentRechecks, retryWaitingIpIncidents, runIncidentWorkflow, startIpUsageRecords } from '../server/orchestration.js';
+import { consumeIncidentIpAssets, crossedInventoryThresholds, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, migratePoolAlertBotSelections, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, requestWaitingIncidentRechecks, retryWaitingIpIncidents, runIncidentWorkflow, startIpUsageRecords } from '../server/orchestration.js';
 
 function failedObservation(checkedAt = new Date().toISOString()) {
   return { ok: false, rounds: 3, attemptsPerRound: 3, roundsCompleted: 3, attempts: 9, checkedAt };
@@ -94,6 +94,30 @@ test('removes legacy lease settings and released locks during state normalizatio
   assert.equal(state.probeTargets[0].checkRounds, 3);
   assert.equal(state.probeTargets[0].attemptsPerRound, 3);
   assert.deepEqual(state.probeTargets[0].observations.p1, { ok: false });
+});
+
+test('migrates pool alerts to bot recipients and removes pool-level chat IDs', () => {
+  const state = normalizeOrchestrationState({
+    telegramBots: [{ id: 'bot-1', enabled: true, tokenEnc: 'encrypted', userIds: ['10001'] }],
+    ipPools: [{ id: 'pool-1', alertEnabled: true, alertThresholds: [5, 1, 0], alertBotIds: [], alertChatIds: ['legacy-chat'] }]
+  });
+  assert.deepEqual(state.ipPools[0].alertBotIds, ['bot-1']);
+  assert.equal('alertChatIds' in state.ipPools[0], false);
+
+  const legacyState = normalizeOrchestrationState({
+    ipPools: [{ id: 'pool-legacy', alertEnabled: true, alertThresholds: [1, 0], alertBotIds: [] }]
+  });
+  legacyState.telegramBots.push({ id: 'telegram-primary', enabled: true, tokenEnc: 'encrypted', userIds: ['10001'] });
+  migratePoolAlertBotSelections(legacyState);
+  assert.deepEqual(legacyState.ipPools[0].alertBotIds, ['telegram-primary']);
+});
+
+test('notifies only when inventory drops across configured thresholds', () => {
+  const thresholds = [5, 3, 1, 0];
+  assert.deepEqual(crossedInventoryThresholds(6, 5, thresholds), [5]);
+  assert.deepEqual(crossedInventoryThresholds(6, 0, thresholds), [5, 3, 1, 0]);
+  assert.deepEqual(crossedInventoryThresholds(5, 4, thresholds), []);
+  assert.deepEqual(crossedInventoryThresholds(0, 5, thresholds), []);
 });
 
 test('migrates old no-IP failures into the waiting state', () => {

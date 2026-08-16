@@ -66,20 +66,21 @@ export function orchestrationDefaults() {
 export function normalizeOrchestrationState(parsed = {}) {
   const defaults = orchestrationDefaults();
   const normalized = Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
-  normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, ...pool }) => pool);
+  normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, alertChatIds, ...pool }) => pool);
   normalized.ipPools = normalized.ipPools.map((pool) => {
-    const hasAlertConfig = ['alertEnabled', 'alertThresholds', 'alertBotIds', 'alertChatIds'].some((key) => Object.prototype.hasOwnProperty.call(pool, key));
+    const hasAlertConfig = ['alertEnabled', 'alertThresholds', 'alertBotIds'].some((key) => Object.prototype.hasOwnProperty.call(pool, key));
+    const selectedBotIds = cleanIds(pool.alertBotIds, 50);
     return {
       ...pool,
       ...(Object.prototype.hasOwnProperty.call(pool, 'enabled') ? { enabled: pool.enabled !== false } : {}),
       ...(hasAlertConfig ? {
         alertEnabled: Boolean(pool.alertEnabled),
         alertThresholds: normalizeThresholds(pool.alertThresholds ?? [5, 3, 1, 0]),
-        alertBotIds: cleanIds(pool.alertBotIds, 50),
-        alertChatIds: cleanTexts(pool.alertChatIds, 500)
+        alertBotIds: selectedBotIds
       } : {})
     };
   });
+  migratePoolAlertBotSelections(normalized);
   normalized.probeTargets = normalized.probeTargets.map(({ quorumMode, quorumCount, failureThreshold, recoveryThreshold, ...target }) => ({
     ...target,
     checkRounds: clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS),
@@ -1167,7 +1168,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     });
   }
   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
-  if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, alertEnabled: Boolean(input.alertEnabled), alertThresholds: normalizeThresholds(input.alertThresholds), alertBotIds: cleanIds(input.alertBotIds, 50), alertChatIds: cleanTexts(input.alertChatIds, 500), note: cleanText(input.note, 500) };
+  if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, alertEnabled: Boolean(input.alertEnabled), alertThresholds: normalizeThresholds(input.alertThresholds), alertBotIds: cleanIds(input.alertBotIds, 50), note: cleanText(input.note, 500) };
   if (key === 'dnsAccounts') {
     const provider = DNS_PROVIDERS.has(input.provider) ? input.provider : 'huawei';
     const supplied = input.credentials && typeof input.credentials === 'object' ? input.credentials : {};
@@ -1311,7 +1312,14 @@ function ensureResourceReferences(state, key, item, deps) {
     if (item.poolIds.some((id) => !exists('ipPools', id))) throw new Error('关联的备用池不存在');
   }
   if (key === 'ipPools' && item.assetIds.some((id) => !exists('ipAssets', id))) throw new Error('备用池包含不存在的 IP');
-  if (key === 'ipPools' && item.alertBotIds.some((id) => !exists('telegramBots', id))) throw new Error('备用池通知包含不存在的机器人');
+  if (key === 'ipPools' && item.alertEnabled) {
+    if (!item.alertThresholds.length) throw new Error('启用库存预警时，请至少填写一个预警数量');
+    if (!item.alertBotIds.length) throw new Error('启用库存预警时，请至少选择一个发送机器人');
+    const bots = item.alertBotIds.map((id) => state.telegramBots.find((entry) => entry.id === id));
+    if (bots.some((bot) => !bot)) throw new Error('备用池通知包含不存在的机器人');
+    if (bots.some((bot) => bot.enabled === false || !bot.tokenEnc)) throw new Error('发送机器人未启用或尚未配置 Token');
+    if (bots.some((bot) => !bot.userIds?.length)) throw new Error('发送机器人尚未配置授权用户或群 ID');
+  }
   if (key === 'dnsZones' && !exists('dnsAccounts', item.accountId)) throw new Error('DNS 账号不存在');
   if (key === 'dnsBindings' && !exists('dnsAccounts', item.accountId)) throw new Error('DNS 账号不存在');
   if (key === 'failoverPolicies') {
@@ -1331,6 +1339,8 @@ function ensureResourceReferences(state, key, item, deps) {
       return entryHash === item.tokenHash;
     });
     if (duplicateToken) throw new Error('这个 Bot Token 已被其他机器人使用');
+    const usedByPoolAlert = state.ipPools.some((pool) => pool.alertEnabled && pool.alertBotIds?.includes(item.id));
+    if (usedByPoolAlert && (item.enabled === false || !item.tokenEnc || !item.userIds.length)) throw new Error('该机器人正在发送库存预警，请先解除备用池关联');
   }
 }
 
@@ -1342,7 +1352,8 @@ function ensureNotReferenced(state, key, id) {
     dnsAccounts: state.dnsZones.some((item) => item.accountId === id) || state.dnsBindings.some((item) => item.accountId === id) || state.dnsGuards.some((item) => item.accountId === id),
     dnsZones: state.dnsBindings.some((item) => item.zoneId === id),
     dnsBindings: state.failoverPolicies.some((item) => item.dnsBindingIds?.includes(id)),
-    failoverPolicies: state.probeTargets.some((item) => item.policyId === id)
+    failoverPolicies: state.probeTargets.some((item) => item.policyId === id),
+    telegramBots: state.ipPools.some((item) => item.alertEnabled && item.alertBotIds?.includes(id))
   };
   if (references[key]) throw new Error('当前记录仍被其他配置引用，请先解除关联');
 }
@@ -2017,6 +2028,16 @@ function normalizeThresholds(value) {
 export function crossedInventoryThresholds(before, after, thresholds) {
   if (!Number.isFinite(Number(before)) || !Number.isFinite(Number(after)) || Number(after) >= Number(before)) return [];
   return normalizeThresholds(thresholds).filter((level) => Number(before) > level && Number(after) <= level);
+}
+
+export function migratePoolAlertBotSelections(state) {
+  const availableBotIds = cleanIds((state.telegramBots || [])
+    .filter((bot) => bot.enabled !== false && bot.tokenEnc && bot.userIds?.length)
+    .map((bot) => bot.id), 50);
+  for (const pool of state.ipPools || []) {
+    if (pool.alertEnabled && !pool.alertBotIds?.length && availableBotIds.length) pool.alertBotIds = [...availableBotIds];
+  }
+  return state;
 }
 
 function normalizeCheckEvidence(raw, target) {

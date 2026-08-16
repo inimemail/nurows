@@ -17,6 +17,7 @@ import {
   crossedInventoryThresholds,
   dnsRecordLayout,
   importIpAssets,
+  migratePoolAlertBotSelections,
   parseIpBatch,
   normalizeOrchestrationState,
   orchestrationDefaults,
@@ -1721,6 +1722,7 @@ function normalizeStateRecord(parsed) {
     legacyTelegram.enabled = false;
   }
   if (orchestration.telegramBots.length) legacyTelegram.enabled = false;
+  migratePoolAlertBotSelections(orchestration);
   return {
     groups: Array.isArray(parsed?.groups) && parsed.groups.length ? parsed.groups : defaultState.groups,
     servers: Array.isArray(parsed?.servers) ? parsed.servers : [],
@@ -2215,11 +2217,12 @@ function notifyPoolThresholdDrops(previous, next) {
     if (after >= before) continue;
     const crossed = crossedInventoryThresholds(before, after, pool.alertThresholds);
     if (!crossed.length) continue;
-    const bots = (next.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc && (!pool.alertBotIds?.length || pool.alertBotIds.includes(bot.id)));
+    const selectedBotIds = new Set(pool.alertBotIds || []);
+    const bots = (next.telegramBots || []).filter((bot) => bot.enabled !== false && bot.tokenEnc && selectedBotIds.has(bot.id));
     for (const settings of bots) {
       let token = '';
       try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
-      const recipients = pool.alertChatIds?.length ? pool.alertChatIds : settings.userIds || [];
+      const recipients = settings.userIds || [];
       const text = `备用池库存预警\n${pool.name}\n本次减少：${before - after}\n当前可用：${after}\n触达数量：${crossed.join('、')}\n状态：${pool.enabled === false ? '已停用' : '可分配'}`;
       for (const chatId of [...new Set(recipients)]) {
         telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '查看备用池', callback_data: `pool:${pool.id}` }, { text: '批量补充 IP', callback_data: `pool_add:${pool.id}` }], [{ text: pool.enabled === false ? '启用备用池' : '暂停备用池', callback_data: `pool_toggle_confirm:${pool.id}` }]] } }).catch(() => {});
@@ -2608,8 +2611,7 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
         if (!pool) throw new Error('备用池不存在');
         pool.alertEnabled = !disabled;
         pool.alertThresholds = thresholds;
-        if (!pool.alertBotIds?.length) pool.alertBotIds = [settings.id];
-        if (!pool.alertChatIds?.length) pool.alertChatIds = [String(chatId)];
+        pool.alertBotIds = [settings.id];
         pool.updatedAt = new Date().toISOString();
         return draft;
       });

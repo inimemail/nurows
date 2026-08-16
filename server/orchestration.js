@@ -67,14 +67,19 @@ export function normalizeOrchestrationState(parsed = {}) {
   const defaults = orchestrationDefaults();
   const normalized = Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
   normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, ...pool }) => pool);
-  normalized.ipPools = normalized.ipPools.map((pool) => ({
-    ...pool,
-    enabled: pool.enabled !== false,
-    alertEnabled: Boolean(pool.alertEnabled),
-    alertThresholds: normalizeThresholds(pool.alertThresholds ?? [5, 3, 1, 0]),
-    alertBotIds: cleanIds(pool.alertBotIds, 50),
-    alertChatIds: cleanTexts(pool.alertChatIds, 500)
-  }));
+  normalized.ipPools = normalized.ipPools.map((pool) => {
+    const hasAlertConfig = ['alertEnabled', 'alertThresholds', 'alertBotIds', 'alertChatIds'].some((key) => Object.prototype.hasOwnProperty.call(pool, key));
+    return {
+      ...pool,
+      ...(Object.prototype.hasOwnProperty.call(pool, 'enabled') ? { enabled: pool.enabled !== false } : {}),
+      ...(hasAlertConfig ? {
+        alertEnabled: Boolean(pool.alertEnabled),
+        alertThresholds: normalizeThresholds(pool.alertThresholds ?? [5, 3, 1, 0]),
+        alertBotIds: cleanIds(pool.alertBotIds, 50),
+        alertChatIds: cleanTexts(pool.alertChatIds, 500)
+      } : {})
+    };
+  });
   normalized.probeTargets = normalized.probeTargets.map(({ quorumMode, quorumCount, failureThreshold, recoveryThreshold, ...target }) => ({
     ...target,
     checkRounds: clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS),
@@ -257,9 +262,22 @@ export function registerOrchestrationRoutes(app, deps) {
     res.json({ ok: true, ...result, state: deps.sanitizeState(state, req.auth) });
   });
 
+  app.post('/api/dns-sources/resolve', asyncRoute(async (req, res) => {
+    const domain = normalizeDomain(req.body.domain);
+    const recordType = req.body.recordType === 'AAAA' ? 'AAAA' : 'A';
+    let addresses = [];
+    try { addresses = await resolveDomainAddresses(domain, recordType === 'AAAA' ? 6 : 4); }
+    catch (_error) { addresses = []; }
+    res.json({ ok: true, domain, recordType, addresses });
+  }));
+
   app.post('/api/orchestration/:resource', asyncRoute(async (req, res) => {
     const key = RESOURCE_MAP[req.params.resource];
     if (!key) return res.status(404).json({ error: '未知资源类型' });
+    if (key === 'dnsBindings') {
+      const result = await saveDnsBindingConfiguration(req.body, '', deps, req.auth.username);
+      return res.json({ ok: true, item: sanitizeResource(key, result.item), state: deps.sanitizeState(result.state, req.auth) });
+    }
     let created;
     const state = deps.updateState((draft) => {
       const imported = key === 'ipPools' ? importIpAssets(draft, parseOptionalIpBatch(req.body.newAssetAddresses), req.body.assetDefaults, req.auth.username) : null;
@@ -279,6 +297,10 @@ export function registerOrchestrationRoutes(app, deps) {
   app.put('/api/orchestration/:resource/:id', asyncRoute(async (req, res) => {
     const key = RESOURCE_MAP[req.params.resource];
     if (!key) return res.status(404).json({ error: '未知资源类型' });
+    if (key === 'dnsBindings') {
+      const result = await saveDnsBindingConfiguration(req.body, req.params.id, deps, req.auth.username);
+      return res.json({ ok: true, item: sanitizeResource(key, result.item), state: deps.sanitizeState(result.state, req.auth) });
+    }
     let updated;
     const state = deps.updateState((draft) => {
       const item = draft[key].find((entry) => entry.id === req.params.id);
@@ -527,23 +549,99 @@ export async function syncDnsBinding(bindingId, deps, actor = 'system') {
   const state = deps.readState();
   const binding = state.dnsBindings.find((item) => item.id === bindingId);
   if (!binding) throw new Error('解析绑定不存在');
-  const values = await resolveBindingSources(binding);
-  if (!values.length) throw new Error('主来源和备用来源均未解析出可用地址');
   const account = state.dnsAccounts.find((item) => item.id === binding.accountId && item.enabled !== false);
   if (!account) throw new Error('DNS 账号不可用');
   const credentials = decryptCredentials(account, deps);
   const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, binding);
-  const before = await getDnsRecord(account, credentials, zone, normalizedBinding);
-  const after = binding.pruneStale === false ? [...new Set([...before.values, ...values])] : values;
-  const providerRecordIds = await updateDnsRecord(account, credentials, zone, normalizedBinding, after);
+  const remote = await getDnsRecord(account, credentials, zone, withoutProviderRecordIds(normalizedBinding));
+  const values = normalizeDnsRecordValues(remote.values, binding.recordType);
   const next = deps.updateState((draft) => {
     const item = draft.dnsBindings.find((entry) => entry.id === binding.id);
-    if (item) Object.assign(item, { managedValues: after, providerRecordIds: providerRecordIds || item.providerRecordIds, lastSyncAt: nowIso(), lastSyncError: '' });
-    draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, beforeValues: before.values, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' });
-    pushAudit(draft, 'dns.sync', 'dnsBinding', binding.id, `${binding.domain} 同步 ${after.length} 个地址`, actor);
+    if (!item) throw new Error('解析绑定已被删除');
+    const providerRecordIds = cleanTexts(remote.recordIds || (remote.recordId ? [remote.recordId] : []), 500);
+    Object.assign(item, {
+      ...(isAddressRecord(item.recordType) ? { backupIps: values, managedValues: values } : { recordValues: values }),
+      recordName: normalizedBinding.recordName,
+      providerRecordId: providerRecordIds[0] || '',
+      providerRecordIds,
+      lastSyncAt: nowIso(),
+      lastSyncError: '',
+      updatedAt: nowIso()
+    });
+    pushAudit(draft, 'dns.pull', 'dnsBinding', binding.id, `${binding.domain} 从服务商读取 ${values.length} 个记录值`, actor);
     return draft;
   });
-  return { values: after, layout: dnsRecordLayout(account.provider), state: next };
+  return { values, layout: dnsRecordLayout(account.provider), direction: 'remote_to_local', state: next };
+}
+
+export async function saveDnsBindingConfiguration(input, bindingId, deps, actor = 'system') {
+  const state = deps.readState();
+  const existing = bindingId ? state.dnsBindings.find((item) => item.id === bindingId) : null;
+  if (bindingId && !existing) throw new Error('解析绑定不存在');
+  const candidate = normalizeResource('dnsBindings', input, existing, deps);
+  ensureResourceReferences(state, 'dnsBindings', candidate, deps);
+  const account = state.dnsAccounts.find((item) => item.id === candidate.accountId && item.enabled !== false);
+  if (!account) throw new Error('DNS 账号不可用');
+  const credentials = decryptCredentials(account, deps);
+  const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, candidate);
+  const remote = await getDnsRecord(account, credentials, zone, withoutProviderRecordIds(normalizedBinding));
+  const providerBinding = {
+    ...normalizedBinding,
+    providerRecordId: remote.recordId ? String(remote.recordId) : '',
+    providerRecordIds: cleanTexts(remote.recordIds || (remote.recordId ? [remote.recordId] : []), 500)
+  };
+  const beforeValues = normalizeDnsRecordValues(remote.values, candidate.recordType);
+  const configuredValues = await resolveBindingSources(candidate);
+  const desiredValues = dnsBindingDesiredValues(candidate, beforeValues, configuredValues);
+  if (!desiredValues.length) throw new Error(`${candidate.domain} 没有可写入的 ${candidate.recordType} 记录值`);
+
+  let providerRecordIds;
+  let writeStarted = false;
+  try {
+    writeStarted = true;
+    providerRecordIds = await updateDnsRecord(account, credentials, zone, providerBinding, desiredValues);
+    const verified = await getDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || '', providerRecordIds });
+    const verifiedValues = normalizeDnsRecordValues(verified.values, candidate.recordType);
+    if (!sameStringSet(verifiedValues, desiredValues)) throw new Error('服务商返回的记录值与保存内容不一致');
+  } catch (error) {
+    if (writeStarted) {
+      try { await updateDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || providerBinding.providerRecordId, providerRecordIds: providerRecordIds || providerBinding.providerRecordIds }, beforeValues); }
+      catch (rollbackError) { throw new Error(`远端保存失败，且自动恢复失败：${cleanText(error.message, 240)}；${cleanText(rollbackError.message, 240)}`); }
+    }
+    throw new Error(`远端保存失败，已恢复原记录：${cleanText(error.message, 300)}`);
+  }
+
+  const savedAt = nowIso();
+  const managedValues = configuredValues.length ? configuredValues : desiredValues;
+  Object.assign(candidate, {
+    ...(isAddressRecord(candidate.recordType) && !configuredValues.length ? { backupIps: desiredValues } : {}),
+    recordName: normalizedBinding.recordName,
+    providerRecordId: providerRecordIds?.[0] || '',
+    providerRecordIds: providerRecordIds || [],
+    managedValues,
+    lastSyncAt: savedAt,
+    lastSyncError: '',
+    updatedAt: savedAt
+  });
+
+  let next;
+  try {
+    next = deps.updateState((draft) => {
+      const current = bindingId ? draft.dnsBindings.find((item) => item.id === bindingId) : null;
+      if (bindingId && !current) throw new Error('解析绑定已被删除');
+      if (current) Object.assign(current, candidate, { id: current.id, createdAt: current.createdAt });
+      else draft.dnsBindings.push(candidate);
+      draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', bindingId: candidate.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: candidate.domain, beforeValues, afterValues: desiredValues, status: 'applied', createdAt: savedAt, rolledBackAt: '' });
+      pushAudit(draft, bindingId ? 'dnsBindings.update' : 'dnsBindings.create', 'dnsBindings', candidate.id, `${bindingId ? '更新' : '新增'} ${candidate.name}`, actor);
+      pushAudit(draft, 'dns.push', 'dnsBinding', candidate.id, `${candidate.domain} 写入服务商 ${desiredValues.length} 个记录值`, actor);
+      return draft;
+    });
+  } catch (error) {
+    try { await updateDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || providerBinding.providerRecordId, providerRecordIds: providerRecordIds || providerBinding.providerRecordIds }, beforeValues); }
+    catch (rollbackError) { throw new Error(`本地保存失败，且远端自动恢复失败：${cleanText(error.message, 240)}；${cleanText(rollbackError.message, 240)}`); }
+    throw new Error(`本地保存失败，远端已恢复原记录：${cleanText(error.message, 300)}`);
+  }
+  return { item: next.dnsBindings.find((item) => item.id === candidate.id), values: desiredValues, layout: dnsRecordLayout(account.provider), direction: 'local_to_remote', state: next };
 }
 
 export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null) {
@@ -775,7 +873,7 @@ async function prepareDnsGuardCycle(guardId, deps) {
   if (!values.length) {
     deps.updateState((draft) => updateDnsGuard(draft, guardId, {
       status: 'waiting_ip', message: '没有解析值或可用备用 IP', currentValues: [], sourceState: sourceResult.state,
-      cycle: null, lastCheckAt: nowIso(), nextCheckAt: addSeconds(guard.interval), lastError: sourceResult.errors.join('；')
+      cycle: null, lastCheckAt: nowIso(), nextCheckAt: addSeconds(guard.interval), lastError: ''
     }));
     if (guard.status !== 'waiting_ip') deps.notifyDnsGuard?.(guardId);
     return;
@@ -795,7 +893,7 @@ async function prepareDnsGuardCycle(guardId, deps) {
   };
   deps.updateState((draft) => updateDnsGuard(draft, guardId, {
     status: 'checking', message: `正在检查 ${values.length} 个 IP`, currentValues, sourceState: sourceResult.state,
-    cycle, lastError: sourceResult.errors.join('；'), nextCheckAt: addSeconds(guard.interval)
+    cycle, lastError: '', nextCheckAt: addSeconds(guard.interval)
   }));
 }
 
@@ -806,23 +904,18 @@ async function resolveDnsGuardSources(guard, currentValues) {
   const errors = [];
   for (const source of guard.sources || []) {
     const key = source.id || source.domain;
-    const previous = state[key] || { activeSide: 'primary', cached: [], blocked: [] };
+    const previous = state[key] || { cached: [], blocked: [] };
     const blocked = new Set(cleanTexts(previous.blocked, 500).filter((address) => !currentValues.includes(address)));
     let selected = [];
-    let activeSide = 'primary';
-    for (const [side, domainName] of [['primary', source.domain], ['backup', source.backupDomain]]) {
-      if (!domainName) continue;
-      try {
-        const records = await dns.lookup(domainName, { all: true, family, verbatim: true });
-        selected = [...new Set(records.map((record) => record.address).filter((address) => net.isIP(address) === family && !blocked.has(address)))];
-        if (selected.length) { activeSide = side; break; }
-      } catch (error) {
-        errors.push(`${domainName}: ${cleanText(error.message, 120)}`);
-      }
+    try {
+      const addresses = await resolveDomainAddresses(source.domain, family);
+      selected = addresses.filter((address) => !blocked.has(address));
+    } catch (error) {
+      errors.push(`${source.domain}: ${cleanText(error.message, 120)}`);
     }
     if (!selected.length) selected = cleanTexts(previous.cached, 500).filter((address) => currentValues.includes(address) && !blocked.has(address));
     for (const address of selected) if (!values.includes(address)) values.push(address);
-    state[key] = { activeSide, cached: selected, blocked: [...blocked], checkedAt: nowIso() };
+    state[key] = { cached: selected, blocked: [...blocked], checkedAt: nowIso() };
   }
   return { values: values.slice(0, DNS_GUARD_MAX_VALUES), state, errors };
 }
@@ -909,7 +1002,7 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
     const sourceState = structuredClone(cycleSnapshot.sourceState || {});
     for (const source of item.sources || []) {
       const key = source.id || source.domain;
-      const current = sourceState[key] || { activeSide: 'primary', cached: [], blocked: [] };
+      const current = sourceState[key] || { cached: [], blocked: [] };
       current.blocked = [...new Set([...(current.blocked || []), ...failedRemote.filter((address) => current.cached?.includes(address))])];
       sourceState[key] = current;
     }
@@ -943,7 +1036,7 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
           : 'healthy');
     Object.assign(item, {
       status, message: dnsGuardStatusMessage(status, failedRemote.length, usedAssets.length), currentValues: desired,
-      ownedValues, sourceOwnedValues, sourceState, cycle: null, lastCheckAt: finishedAt, nextCheckAt: addSeconds(item.interval), lastError: cycleSnapshot.sourceErrors?.join('；') || '',
+      ownedValues, sourceOwnedValues, sourceState, cycle: null, lastCheckAt: finishedAt, nextCheckAt: addSeconds(item.interval), lastError: '',
       providerRecordIds: providerRecordIds.length ? providerRecordIds : item.providerRecordIds
     });
     draft.dnsGuardRuns.unshift({ id: uuidv4(), guardId, guardName: item.name, domain: item.domain, status, beforeValues: remote, afterValues: desired, failedValues: failedRemote, sourceValues: cycleSnapshot.sourceValues, consumedIps: usedAssets.map((entry) => entry.address), discardedIps: unusableAssets.map((entry) => entry.address), startedAt: cycleSnapshot.startedAt, finishedAt, message: item.message });
@@ -1635,7 +1728,7 @@ async function listProviderZones(account, credentials) {
 }
 
 async function resolveBindingSources(binding) {
-  if (!['A', 'AAAA'].includes(binding.recordType)) return cleanRecordValues(binding.recordValues, binding.recordType === 'CNAME' ? 1 : 5000);
+  if (!isAddressRecord(binding.recordType)) return cleanRecordValues(binding.recordValues, binding.recordType === 'CNAME' ? 1 : 5000);
   const family = binding.recordType === 'AAAA' ? 6 : 4;
   const sources = Array.isArray(binding.ddnsSources) ? binding.ddnsSources : [];
   const output = [];
@@ -1643,11 +1736,10 @@ async function resolveBindingSources(binding) {
     const domains = [source.domain, source.backupDomain].filter(Boolean);
     for (const domain of domains) {
       try {
-        const records = await dns.lookup(domain, { all: true, family, verbatim: true });
-        for (const record of records) if (net.isIP(record.address) === family && !output.includes(record.address)) output.push(record.address);
-        if (output.length) break;
+        const addresses = await resolveDomainAddresses(domain, family);
+        for (const address of addresses) if (!output.includes(address)) output.push(address);
       } catch (_error) {
-        // Try the next source or its backup domain.
+        // Sources without an address of the requested family are ignored.
       }
     }
   }
@@ -1657,43 +1749,90 @@ async function resolveBindingSources(binding) {
   return output.slice(0, binding.maxActiveIps || 50);
 }
 
+function isAddressRecord(recordType) {
+  return recordType === 'A' || recordType === 'AAAA';
+}
+
+function normalizeDnsRecordValues(values, recordType) {
+  if (isAddressRecord(recordType)) return filterAddressFamily(cleanTexts(values, 5000), recordType);
+  return cleanRecordValues(values, recordType === 'CNAME' ? 1 : 5000);
+}
+
+function withoutProviderRecordIds(binding) {
+  return { ...binding, providerRecordId: '', providerRecordIds: [] };
+}
+
+export function dnsBindingDesiredValues(binding, currentValues, configuredValues) {
+  const current = normalizeDnsRecordValues(currentValues, binding.recordType);
+  const configured = normalizeDnsRecordValues(configuredValues, binding.recordType);
+  if (!configured.length) return current;
+  if (!isAddressRecord(binding.recordType)) return configured;
+  if (binding.updateMode === 'append') return [...new Set([...current, ...configured])];
+  if (binding.updateMode === 'managed_replace') {
+    const managed = new Set(normalizeDnsRecordValues(binding.managedValues, binding.recordType));
+    return [...new Set([...current.filter((value) => !managed.has(value)), ...configured])];
+  }
+  return configured;
+}
+
+async function resolveDomainAddresses(domain, family) {
+  const errors = [];
+  try {
+    const records = family === 6 ? await dns.resolve6(domain) : await dns.resolve4(domain);
+    const addresses = [...new Set(records.filter((address) => net.isIP(address) === family))];
+    if (addresses.length) return addresses;
+  } catch (error) {
+    errors.push(cleanText(error.message, 160));
+  }
+  try {
+    const records = await dns.lookup(domain, { all: true, family, verbatim: true });
+    const addresses = [...new Set(records.map((record) => record.address).filter((address) => net.isIP(address) === family))];
+    if (addresses.length) return addresses;
+  } catch (error) {
+    errors.push(cleanText(error.message, 160));
+  }
+  throw new Error(`${domain} 未解析出 ${family === 6 ? 'AAAA' : 'A'} 地址${errors.length ? `：${errors.join('；')}` : ''}`);
+}
+
 async function getDnsRecord(account, credentials, zone, binding) {
   if (CALLBACK_PROVIDERS.has(account.provider)) {
     const result = await callbackRequest(account, credentials, callbackPayload('read', zone, binding, []));
-    return { values: cleanTexts(result?.values, 5000), recordId: '' };
+    return { values: cleanTexts(result?.values, 5000), recordId: '', recordIds: cleanTexts(result?.recordIds, 500) };
   }
   if (account.provider === 'godaddy') {
     const records = await godaddyRequest(credentials, 'GET', `/v1/domains/${encodeURIComponent(zone.name)}/records/${binding.recordType}/${encodeURIComponent(binding.recordName)}`);
-    return { values: (records || []).map((item) => item.data).filter(Boolean) };
+    return { values: (records || []).map((item) => item.data).filter(Boolean), recordIds: [] };
   }
   if (account.provider === 'porkbun') {
     const result = await porkbunRequest(credentials, `/api/json/v3/dns/retrieve/${encodeURIComponent(zone.name)}`);
-    return { values: (result.records || []).filter((item) => item.type === binding.recordType && normalizeRecordName(item.name, zone.name) === binding.recordName).map((item) => item.content) };
+    const records = (result.records || []).filter((item) => item.type === binding.recordType && normalizeRecordName(item.name, zone.name) === binding.recordName);
+    return { values: records.map((item) => item.content), recordIds: records.map((item) => String(item.id || '')).filter(Boolean) };
   }
   if (account.provider === 'cloudns') {
     const result = await cloudnsRequest(credentials, `/dns/records.json?domain-name=${encodeURIComponent(zone.name)}&host=${encodeURIComponent(binding.recordName)}`);
-    const records = Object.values(result || {}).filter((item) => item?.type === binding.recordType);
-    return { values: records.map((item) => item.record || item.value || item.content).filter(Boolean) };
+    const records = Object.entries(result || {}).filter(([, item]) => item?.type === binding.recordType);
+    return { values: records.map(([, item]) => item.record || item.value || item.content).filter(Boolean), recordIds: records.map(([id]) => id) };
   }
   const recordIds = account.provider === 'huawei' ? [] : await discoverProviderRecordIds(account, credentials, zone, binding);
   if (account.provider === 'cloudflare') {
     const records = await Promise.all(recordIds.map((id) => cloudflareRequest(credentials, 'GET', `/zones/${encodeURIComponent(zone.providerZoneId)}/dns_records/${encodeURIComponent(id)}`)));
-    return { values: records.map((data) => data.result?.content).filter(Boolean) };
+    return { values: records.map((data) => data.result?.content).filter(Boolean), recordIds };
   }
   if (account.provider === 'huawei') {
     const recordset = await findHuaweiRecordset(account, credentials, zone, binding);
-    return { values: recordset?.records || [], recordId: recordset?.id || '' };
+    const recordId = recordset?.id ? String(recordset.id) : '';
+    return { values: recordset?.records || [], recordId, recordIds: recordId ? [recordId] : [] };
   }
   if (account.provider === 'aliyun') {
     const records = await Promise.all(recordIds.map((id) => aliyunRequest(credentials, 'DescribeDomainRecordInfo', { RecordId: id })));
-    return { values: records.map((data) => data.Value).filter(Boolean) };
+    return { values: records.map((data) => data.Value).filter(Boolean), recordIds };
   }
   if (account.provider === 'dnspod') {
     const records = await Promise.all(recordIds.map((id) => dnspodRequest(credentials, 'Record.Info', { domain: zone.name, record_id: id })));
-    return { values: records.map((data) => data.record?.value).filter(Boolean) };
+    return { values: records.map((data) => data.record?.value).filter(Boolean), recordIds };
   }
   const records = await Promise.all(recordIds.map((id) => tencentRequest(credentials, 'DescribeRecord', { Domain: zone.name, RecordId: Number(id) })));
-  return { values: records.map((data) => data.Response?.RecordInfo?.Value).filter(Boolean) };
+  return { values: records.map((data) => data.Response?.RecordInfo?.Value).filter(Boolean), recordIds };
 }
 
 async function updateDnsRecord(account, credentials, zone, binding, values) {
@@ -1775,7 +1914,12 @@ async function reconcileProviderRecords(recordIds, values, adapter) {
 
 async function findHuaweiRecordset(account, credentials, zone, binding) {
   if (binding.providerRecordId) {
-    return huaweiRequest(account, credentials, 'GET', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets/${encodeURIComponent(binding.providerRecordId)}`);
+    try {
+      const recordset = await huaweiRequest(account, credentials, 'GET', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets/${encodeURIComponent(binding.providerRecordId)}`);
+      if (recordset && normalizeDomain(recordset.name) === binding.domain && recordset.type === binding.recordType) return recordset;
+    } catch (_error) {
+      // The record may have been deleted and recreated manually; discover its current ID by name.
+    }
   }
   const query = `?name=${encodeURIComponent(`${binding.domain}.`)}&type=${encodeURIComponent(binding.recordType)}&limit=500`;
   const data = await huaweiRequest(account, credentials, 'GET', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets${query}`);
@@ -1810,12 +1954,22 @@ async function discoverProviderRecordIds(account, credentials, zone, binding) {
 
 function normalizeDdnsSources(value) {
   if (!Array.isArray(value)) return [];
-  return value.slice(0, 100).map((item, index) => ({
-    id: cleanId(item?.id) || `source-${index + 1}`,
-    name: cleanText(item?.name, 100),
-    domain: item?.domain ? normalizeDomain(item.domain) : '',
-    backupDomain: item?.backupDomain ? normalizeDomain(item.backupDomain) : ''
-  })).filter((item) => item.domain);
+  const result = [];
+  const domains = new Set();
+  const append = (domainValue, id, name) => {
+    if (!domainValue || result.length >= 100) return;
+    const domain = normalizeDomain(domainValue);
+    if (domains.has(domain)) return;
+    domains.add(domain);
+    result.push({ id: cleanId(id) || `source-${result.length + 1}`, name: cleanText(name, 100), domain });
+  };
+  for (const [index, item] of value.slice(0, 100).entries()) {
+    const baseId = cleanId(item?.id) || `source-${index + 1}`;
+    const baseName = cleanText(item?.name, 100);
+    append(item?.domain, baseId, baseName);
+    append(item?.backupDomain, `${baseId}-backup`, baseName ? `${baseName} 备用` : '备用来源');
+  }
+  return result;
 }
 
 function normalizeDnsGuardState(value = {}) {

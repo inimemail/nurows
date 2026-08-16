@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { addIpsToPool, createDnsBinding, createPoolWithIps, dnsRecordLayout, normalizeRecordName, setDnsBindingIps, withRecordName } from '../server/orchestration.js';
+import { addIpsToPool, createDnsBinding, createPoolWithIps, dnsBindingDesiredValues, dnsRecordLayout, normalizeRecordName, setDnsBindingIps, withRecordName } from '../server/orchestration.js';
 
 test('derives the root record from a complete domain', () => {
   assert.equal(withRecordName({ domain: 'example.com' }, 'example.com').recordName, '@');
@@ -46,4 +46,12 @@ test('creates non-address DNS records and limits CNAME to one target', () => {
   const cname = createDnsBinding(state, 'account-1', 'www.example.com', 'CNAME', ['target.example.com', 'ignored.example.com'], 'tester');
   assert.deepEqual(txt.recordValues, ['value,with,commas', 'second']);
   assert.deepEqual(cname.recordValues, ['target.example.com']);
+});
+
+test('applies DNS editor values according to the selected remote update mode', () => {
+  const base = { recordType: 'A', managedValues: ['2.2.2.2'] };
+  assert.deepEqual(dnsBindingDesiredValues({ ...base, updateMode: 'append' }, ['1.1.1.1'], ['2.2.2.2']), ['1.1.1.1', '2.2.2.2']);
+  assert.deepEqual(dnsBindingDesiredValues({ ...base, updateMode: 'managed_replace' }, ['1.1.1.1', '2.2.2.2'], ['3.3.3.3']), ['1.1.1.1', '3.3.3.3']);
+  assert.deepEqual(dnsBindingDesiredValues({ ...base, updateMode: 'replace' }, ['1.1.1.1'], ['4.4.4.4']), ['4.4.4.4']);
+  assert.deepEqual(dnsBindingDesiredValues({ recordType: 'TXT' }, ['old'], ['new']), ['new']);
 });

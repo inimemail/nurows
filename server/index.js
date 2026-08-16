@@ -14,7 +14,6 @@ import { hasExactPerServerInputs } from '../shared/command-input.js';
 import {
   addIpsToPool,
   createPoolWithIps,
-  createDnsBinding,
   crossedInventoryThresholds,
   dnsRecordLayout,
   importIpAssets,
@@ -30,8 +29,8 @@ import {
   retryWaitingIpIncidents,
   runIncidentWorkflow,
   rollbackIncident,
+  saveDnsBindingConfiguration,
   sanitizeOrchestrationState,
-  setDnsBindingIps,
   syncDnsBinding
 } from './orchestration.js';
 
@@ -2427,13 +2426,23 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
     }
     if (action === 'dns_create_confirm' && pending?.action === 'dns_create_confirm') {
       if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
-      let binding;
-      orchestrationDeps.updateState((draft) => {
-        binding = createDnsBinding(draft, pending.accountId, pending.domain, pending.recordType, pending.values, `telegram:${from.id}`);
-        return draft;
-      });
-      telegramRuntime.pending.delete(sessionKey);
-      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已创建解析\n${binding.domain} · ${binding.recordType}\n记录值：${pending.values.length}`, reply_markup: { inline_keyboard: [[{ text: '立即同步', callback_data: `dns_sync:${binding.id}` }], [{ text: '返回解析', callback_data: 'menu:dns' }]] } });
+      try {
+        const addressRecord = ['A', 'AAAA'].includes(pending.recordType);
+        const result = await saveDnsBindingConfiguration({
+          name: `${pending.domain} ${pending.recordType}`,
+          accountId: pending.accountId,
+          domain: pending.domain,
+          recordType: pending.recordType,
+          backupIps: addressRecord ? pending.values : [],
+          recordValues: addressRecord ? [] : pending.values,
+          updateMode: 'replace',
+          enabled: true
+        }, '', orchestrationDeps, `telegram:${from.id}`);
+        telegramRuntime.pending.delete(sessionKey);
+        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已创建并写入远端\n${result.item.domain} · ${result.item.recordType}\n记录值：${result.values.length}`, reply_markup: telegramBackButtons('menu:dns') });
+      } catch (error) {
+        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `创建解析失败\n${error.message}`, reply_markup: telegramCancelButtons('menu:dns') });
+      }
     }
     if (action === 'dns_add' || action === 'dns_replace') {
       if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
@@ -2446,9 +2455,9 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
       if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
       try {
         const result = await syncDnsBinding(value, orchestrationDeps, `telegram:${from.id}`);
-        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `解析同步完成\n记录值：${result.values.length}\n写入方式：${result.layout === 'recordset' ? '一个记录集包含多个值' : '多条同名记录，每条一个值'}`, reply_markup: telegramBackButtons('menu:dns') });
+        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已读取远端解析\n记录值：${result.values.length}`, reply_markup: telegramBackButtons('menu:dns') });
       } catch (error) {
-        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `解析同步失败\n${error.message}`, reply_markup: telegramBackButtons('menu:dns') });
+        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `读取远端解析失败\n${error.message}`, reply_markup: telegramBackButtons('menu:dns') });
       }
     }
     if (action === 'run') return sendTelegramAutomationRun(token, chatId, state, value);
@@ -2495,6 +2504,20 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
     }
     if (action === 'confirm_write' && pending?.addresses) {
       if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      if (pending.action === 'dns_add' || pending.action === 'dns_replace') {
+        try {
+          const binding = state.dnsBindings.find((item) => item.id === pending.bindingId);
+          if (!binding) throw new Error('解析绑定不存在');
+          const backupIps = pending.action === 'dns_replace'
+            ? pending.addresses
+            : [...new Set([...(binding.backupIps || []), ...pending.addresses])];
+          const result = await saveDnsBindingConfiguration({ ...binding, backupIps, updateMode: pending.action === 'dns_replace' ? 'replace' : 'append' }, binding.id, orchestrationDeps, `telegram:${from.id}`);
+          telegramRuntime.pending.delete(sessionKey);
+          return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已保存并写入远端\n${binding.domain}\n记录值：${result.values.length}`, reply_markup: telegramBackButtons('menu:dns') });
+        } catch (error) {
+          return telegramCall(token, 'sendMessage', { chat_id: chatId, text: `写入远端失败\n${error.message}`, reply_markup: telegramCancelButtons('menu:dns') });
+        }
+      }
       let resultText = '';
       orchestrationDeps.updateState((draft) => {
         if (pending.action === 'asset_add') {
@@ -2506,15 +2529,11 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
         } else if (pending.action === 'pool_create_ips') {
           const result = createPoolWithIps(draft, pending.poolName, pending.addresses, `telegram:${from.id}`);
           resultText = `已创建备用池“${result.pool.name}”\nIP 数量：${result.pool.assetIds.length}`;
-        } else if (pending.action === 'dns_add' || pending.action === 'dns_replace') {
-          const binding = setDnsBindingIps(draft, pending.bindingId, pending.addresses, pending.action === 'dns_replace' ? 'replace' : 'append', `telegram:${from.id}`);
-          resultText = `已保存 ${binding.domain}\n待同步地址：${binding.backupIps.length}`;
         }
         return draft;
       });
-      const dnsBindingId = ['dns_add', 'dns_replace'].includes(pending.action) ? pending.bindingId : '';
       telegramRuntime.pending.delete(sessionKey);
-      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: resultText, reply_markup: dnsBindingId ? { inline_keyboard: [[{ text: '立即同步', callback_data: `dns_sync:${dnsBindingId}` }], [{ text: '返回解析', callback_data: 'menu:dns' }]] } : telegramBackButtons(pending.action.startsWith('pool_') ? 'menu:pools' : 'menu:assets') });
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: resultText, reply_markup: telegramBackButtons(pending.action.startsWith('pool_') ? 'menu:pools' : 'menu:assets') });
     }
     if (action === 'canceljob') {
       if (!telegramMenuAllowed(settings, 'automation')) return;
@@ -2734,7 +2753,7 @@ async function sendTelegramDnsBinding(token, chatId, state, bindingId) {
   const values = binding.managedValues?.length ? binding.managedValues : binding.backupIps || [];
   const text = `解析绑定：${telegramShortText(binding.name, 100)}\n域名：${binding.domain}\n类型：${binding.recordType}\n记录值：${values.length}\n供应商写入：${layout === 'recordset' ? '一个记录集，多值' : '多条同名记录，每条一个值'}\n最近同步：${binding.lastSyncAt ? new Date(binding.lastSyncAt).toLocaleString('zh-CN', { hour12: false }) : '尚未同步'}\n\n${telegramValuePreview(values)}`;
   const editRow = ['A', 'AAAA'].includes(binding.recordType) ? [[{ text: '添加 IP', callback_data: `dns_add:${binding.id}` }, { text: '替换全部 IP', callback_data: `dns_replace:${binding.id}` }]] : [];
-  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...editRow, [{ text: '立即同步', callback_data: `dns_sync:${binding.id}` }], [{ text: '返回解析', callback_data: 'menu:dns' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
+  return telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [...editRow, [{ text: '读取远端', callback_data: `dns_sync:${binding.id}` }], [{ text: '返回解析', callback_data: 'menu:dns' }, { text: '返回菜单', callback_data: 'menu:root' }]] } });
 }
 
 async function sendTelegramAutomation(token, chatId, state, settings) {

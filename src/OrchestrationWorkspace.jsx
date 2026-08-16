@@ -24,6 +24,7 @@ const EMPTY = {
 export default function OrchestrationWorkspace({ tab, state, api, onState, toast, Dialog }) {
   const [section, setSection] = useState(tab === 'probes' ? 'nodes' : tab === 'pools' ? 'assets' : 'accounts');
   const [editor, setEditor] = useState({ open: false, type: '', value: null });
+  const [editorBusy, setEditorBusy] = useState(false);
   const [install, setInstall] = useState(null);
   const [assetImport, setAssetImport] = useState({ open: false, addresses: '', region: '', carrier: '', labels: '' });
   const [incidentCleanup, setIncidentCleanup] = useState({ open: false, id: '', all: false, busy: false });
@@ -52,9 +53,10 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [api, onState, tab]);
 
-  const openCreate = (type) => setEditor({ open: true, type, value: structuredClone(EMPTY[type]) });
-  const openEdit = (type, value) => setEditor({ open: true, type, value: normalizeDraft(type, value) });
+  const openCreate = (type) => { setEditorBusy(false); setEditor({ open: true, type, value: structuredClone(EMPTY[type]) }); };
+  const openEdit = (type, value) => { setEditorBusy(false); setEditor({ open: true, type, value: normalizeDraft(type, value) }); };
   const duplicateRecord = async (type, source) => {
+    setEditorBusy(false);
     const next = { ...normalizeDraft(type, source), id: '', name: '', createdAt: '', updatedAt: '' };
     if (type === 'target') Object.assign(next, { address: '', health: 'unknown', observations: {}, lastCheckAt: '', checkNowAt: '' });
     if (type === 'guard') Object.assign(next, { domain: '', status: 'queued', message: '', currentValues: [], ownedValues: [], sourceOwnedValues: [], sourceState: {}, cycle: null, lastCheckAt: '', nextCheckAt: '', lastError: '', providerRecordIds: [] });
@@ -86,22 +88,28 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
   };
   const closeEditor = () => setEditor({ open: false, type: '', value: null });
   const save = async () => {
+    if (editorBusy) return;
+    setEditorBusy(true);
     try {
       const resource = resourceFor(editor.type);
       const value = serializeDraft(editor.type, editor.value);
       const data = await api(`/api/orchestration/${resource}${value.id ? `/${value.id}` : ''}`, { method: value.id ? 'PUT' : 'POST', body: JSON.stringify(value) });
       onState(data.state);
       closeEditor();
-      toast('已保存');
+      toast(editor.type === 'binding' ? '已保存并写入远端' : '已保存');
     } catch (error) { toast(error.message); }
+    finally { setEditorBusy(false); }
   };
   const remove = async () => {
+    if (editorBusy) return;
+    setEditorBusy(true);
     try {
       const data = await api(`/api/orchestration/${resourceFor(editor.type)}/${editor.value.id}`, { method: 'DELETE' });
       onState(data.state);
       closeEditor();
       toast('已删除');
     } catch (error) { toast(error.message); }
+    finally { setEditorBusy(false); }
   };
   const openProbeInstall = async (id) => {
     try {
@@ -162,7 +170,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
         {renderSection(active, { state, openCreate, openEdit, duplicateRecord, checkTargetNow, checkGuardNow, openGuardView: setGuardView, openProbeInstall, rotateProbe, executeIncident, rollbackIncident, requestIncidentDelete: (id) => setIncidentCleanup({ open: true, id, all: false, busy: false }), requestIncidentClear: () => setIncidentCleanup({ open: true, id: '', all: true, busy: false }), openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
       </div>
 
-      {editor.open ? <Dialog title={`${editor.value.id ? '编辑' : '新增'}${typeLabel(editor.type)}`} className="ops-editor-dialog" wide={editor.type !== 'target' && editor.type !== 'policy' && editor.type !== 'guard'} xwide={editor.type === 'target' || editor.type === 'policy' || editor.type === 'guard'} onClose={closeEditor} footer={<><div>{editor.value.id ? <button className="danger-text" onClick={remove}>删除</button> : null}</div><div className="dialog-actions"><button className="ghost" onClick={closeEditor}>取消</button><button className="primary" onClick={save}>保存</button></div></>}>{renderEditor(editor.type, editor.value, (patch) => setEditor((current) => ({ ...current, value: { ...current.value, ...patch } })), state, api, toast)}</Dialog> : null}
+      {editor.open ? <Dialog title={`${editor.value.id ? '编辑' : '新增'}${typeLabel(editor.type)}`} className="ops-editor-dialog" wide={editor.type !== 'target' && editor.type !== 'policy' && editor.type !== 'guard'} xwide={editor.type === 'target' || editor.type === 'policy' || editor.type === 'guard'} onClose={() => !editorBusy && closeEditor()} footer={<><div>{editor.value.id ? <button className="danger-text" disabled={editorBusy} onClick={remove}>删除</button> : null}</div><div className="dialog-actions"><button className="ghost" disabled={editorBusy} onClick={closeEditor}>取消</button><button className="primary" disabled={editorBusy} onClick={save}>{editorBusy ? (editor.type === 'binding' ? '写入远端中...' : '保存中...') : '保存'}</button></div></>}>{renderEditor(editor.type, editor.value, (patch) => setEditor((current) => ({ ...current, value: { ...current.value, ...patch } })), state, api, toast)}</Dialog> : null}
       {guardView ? <GuardDetails guard={state.dnsGuards?.find((item) => item.id === guardView.id) || guardView} runs={(state.dnsGuardRuns || []).filter((item) => item.guardId === guardView.id)} Dialog={Dialog} onClose={() => setGuardView(null)} onCheck={() => { checkGuardNow(guardView.id); setGuardView(null); }} /> : null}
       {install ? <Dialog title="探针安装 / 升级" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装 / 升级命令" value={install.installCommand} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>重复执行安装命令会下载最新代理并重启探针服务，现有长期注册令牌继续使用。</span></div></Dialog> : null}
       {assetImport.open ? <Dialog title="批量导入 IP 资产" className="ops-editor-dialog" wide onClose={() => setAssetImport((current) => ({ ...current, open: false }))} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setAssetImport((current) => ({ ...current, open: false }))}>取消</button><button className="primary" onClick={importAssets}>导入</button></div></>}><EditorGrid><Field label="IP 地址" full><textarea className="ops-batch-ip-input" rows="12" value={assetImport.addresses} onChange={(e) => setAssetImport((current) => ({ ...current, addresses: e.target.value }))} placeholder={'每行一个，也支持空格或逗号分隔\n1.1.1.1\n2001:db8::1'} /></Field><Field label="地区（选填，批量设置）"><input value={assetImport.region} onChange={(e) => setAssetImport((current) => ({ ...current, region: e.target.value }))} /></Field><Field label="运营商（选填，批量设置）"><input value={assetImport.carrier} onChange={(e) => setAssetImport((current) => ({ ...current, carrier: e.target.value }))} /></Field><Field label="标签（选填，逗号分隔）" full><input value={assetImport.labels} onChange={(e) => setAssetImport((current) => ({ ...current, labels: e.target.value }))} /></Field></EditorGrid></Dialog> : null}
@@ -183,7 +191,7 @@ function renderSection(section, ctx) {
   if (section === 'pools') return <DataView title="备用池" copy="IP 可加入多个备用池；成功切换后会自动消耗并删除" action="新增备用池" onAction={() => ctx.openCreate('pool')} empty="还没有备用池">{state.ipPools?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.assetIds?.length || 0} 个 IP · ${allocationLabel(item)}`} status={item.enabled ? '可分配' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('pool', item)}>编辑</button>} />)}</DataView>;
   if (section === 'usage') return <UsageRecordsView records={state.ipUsageRecords || []} />;
   if (section === 'accounts') return <DataView title="服务商账号" copy="保存凭证后，系统按完整域名自动识别托管域和解析记录" action="新增账号" onAction={() => ctx.openCreate('account')} empty="还没有 DNS 服务商账号">{state.dnsAccounts?.map((item) => <Row key={item.id} title={item.name} subtitle={PROVIDERS[item.provider] || item.provider} status={item.configured ? (item.status === 'healthy' ? '连接正常' : '待测试') : '未配置凭证'} tone={item.status === 'healthy' ? 'ok' : 'warn'} onTripleClick={() => ctx.duplicateRecord('account', item)} actions={<><button className="ghost" onClick={async () => { try { const data = await ctx.api(`/api/dns-accounts/${item.id}/test`, { method: 'POST' }); ctx.onState(data.state); ctx.toast('连接测试成功'); } catch (error) { ctx.toast(error.message); } }}>测试</button><button className="ghost" onClick={() => ctx.openEdit('account', item)}>编辑</button></>} />)}</DataView>;
-  if (section === 'bindings') return <DataView title="解析绑定" copy="按完整域名管理 A、AAAA、CNAME、TXT、NS、CAA 记录和多值地址" action="新增解析绑定" onAction={() => ctx.openCreate('binding')} empty="还没有解析绑定">{state.dnsBindings?.map((item) => { const count = ['A', 'AAAA'].includes(item.recordType) ? (item.managedValues?.length || item.backupIps?.length || 0) : (item.recordValues?.length || 0); return <Row key={item.id} title={item.name} subtitle={`${item.recordType} · ${item.domain} · ${count} 个记录值`} status={item.enabled ? '已启用' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} onTripleClick={() => ctx.duplicateRecord('binding', item)} actions={<><button className="ghost" onClick={async () => { try { const data = await ctx.api(`/api/dns-bindings/${item.id}/sync`, { method: 'POST' }); ctx.onState(data.state); ctx.toast(`已同步 ${data.values?.length || 0} 个记录值`); } catch (error) { ctx.toast(error.message); } }}>立即同步</button><button className="ghost" onClick={() => ctx.openEdit('binding', item)}>编辑</button></>} />; })}</DataView>;
+  if (section === 'bindings') return <DataView title="解析绑定" copy="按完整域名管理 A、AAAA、CNAME、TXT、NS、CAA 记录和多值地址" action="新增解析绑定" onAction={() => ctx.openCreate('binding')} empty="还没有解析绑定">{state.dnsBindings?.map((item) => { const count = ['A', 'AAAA'].includes(item.recordType) ? (item.managedValues?.length || item.backupIps?.length || 0) : (item.recordValues?.length || 0); return <Row key={item.id} title={item.name} subtitle={`${item.recordType} · ${item.domain} · ${count} 个记录值`} status={item.enabled ? '已启用' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} onTripleClick={() => ctx.duplicateRecord('binding', item)} actions={<><button className="ghost" onClick={async () => { try { const data = await ctx.api(`/api/dns-bindings/${item.id}/sync`, { method: 'POST' }); ctx.onState(data.state); ctx.toast(`已读取远端 ${data.values?.length || 0} 个记录值`); } catch (error) { ctx.toast(error.message); } }}>读取远端</button><button className="ghost" onClick={() => ctx.openEdit('binding', item)}>编辑</button></>} />; })}</DataView>;
   return <DataView title="DNS 变更" copy="保留变更前后快照，可从故障事件执行整组回滚" empty="还没有 DNS 变更记录">{state.dnsChanges?.map((item) => <Row key={item.id} title={item.domain} subtitle={`${item.beforeValues?.join(', ') || '空'} → ${item.afterValues?.join(', ') || '空'} · ${formatTime(item.createdAt)}`} status={item.status === 'rolled_back' ? '已回滚' : '已应用'} tone={item.status === 'rolled_back' ? 'muted' : 'ok'} />)}</DataView>;
 }
 
@@ -217,7 +225,7 @@ function CommandBlock({ label, value, toast }) {
 function renderEditor(type, value, patch, state, api, toast) {
   if (type === 'probe') return <EditorGrid><Field label="探针名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="地区"><input value={value.region} onChange={(e) => patch({ region: e.target.value })} placeholder="例如：上海" /></Field><Field label="运营商/线路"><input value={value.carrier} onChange={(e) => patch({ carrier: e.target.value })} placeholder="例如：电信" /></Field><Field label="最大检查并发"><input type="number" min="1" max="1000" value={value.maxConcurrency} onChange={(e) => patch({ maxConcurrency: e.target.value })} /></Field><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用探针</Toggle></EditorGrid>;
   if (type === 'target') return <EditorGrid><Field label="目标名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="地址"><input value={value.address} onChange={(e) => patch({ address: e.target.value })} placeholder="IP 或域名" /></Field><Field label="检查类型"><select value={value.checkType} onChange={(e) => patch({ checkType: e.target.value })}><option value="ping">Ping</option><option value="tcp">TCPing</option></select></Field>{value.checkType === 'tcp' ? <Field label="TCP 端口"><input type="number" min="1" max="65535" value={value.port} onChange={(e) => patch({ port: e.target.value })} /></Field> : null}<Field label="检查间隔（秒）"><input type="number" min="5" max="3600" value={value.interval} onChange={(e) => patch({ interval: e.target.value })} /></Field><Field label="每轮超时（秒）"><input type="number" min="1" max="60" value={value.timeout} onChange={(e) => patch({ timeout: e.target.value })} /></Field><Field label="检查轮数"><input type="number" min="1" max="10" value={value.checkRounds} onChange={(e) => patch({ checkRounds: e.target.value })} /></Field><Field label="每轮次数"><input type="number" min="1" max="10" value={value.attemptsPerRound} onChange={(e) => patch({ attemptsPerRound: e.target.value })} /></Field><Multi label="负责探针（任意一个成功即正常）" items={state.probes} value={value.probeIds} onChange={(probeIds) => patch({ probeIds })} /><Field label="切换策略"><select value={value.policyId} onChange={(e) => patch({ policyId: e.target.value })}><option value="">仅监控，不触发</option>{state.failoverPolicies?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Toggle checked={value.allowPrivate} onChange={(allowPrivate) => patch({ allowPrivate })}>允许检查私网地址</Toggle><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用检查</Toggle></EditorGrid>;
-  if (type === 'guard') return <GuardEditor value={value} patch={patch} state={state} />;
+  if (type === 'guard') return <GuardEditor value={value} patch={patch} state={state} api={api} />;
   if (type === 'asset') return <EditorGrid><Field label="资产名称（选填）"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="IP 地址"><input value={value.address} onChange={(e) => patch({ address: e.target.value })} /></Field><Field label="地区（选填）"><input value={value.region} onChange={(e) => patch({ region: e.target.value })} /></Field><Field label="运营商（选填）"><input value={value.carrier} onChange={(e) => patch({ carrier: e.target.value })} /></Field><Field label="健康状态"><select value={value.health} onChange={(e) => patch({ health: e.target.value })}><option value="unknown">未检测</option><option value="healthy">正常</option><option value="unhealthy">异常</option></select></Field><Field label="标签（选填）"><input value={value.labels} onChange={(e) => patch({ labels: e.target.value })} placeholder="逗号分隔" /></Field><Field label="备注（选填）" full><textarea value={value.note} onChange={(e) => patch({ note: e.target.value })} /></Field><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>允许加入备用池</Toggle></EditorGrid>;
   if (type === 'pool') return <PoolEditor value={value} patch={patch} state={state} />;
   if (type === 'account') return <AccountEditor value={value} patch={patch} api={api} toast={toast} />;
@@ -226,9 +234,27 @@ function renderEditor(type, value, patch, state, api, toast) {
   return <EditorGrid><Field label="策略名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field><Field label="业务标识"><input value={value.businessKey} onChange={(e) => patch({ businessKey: e.target.value })} placeholder="用于同业务共享 IP" /></Field><Multi label="备用池（按顺序兜底）" items={state.ipPools} value={value.poolIds} onChange={(poolIds) => patch({ poolIds })} /><Field label="自动化任务"><select value={value.automationTaskId} onChange={(e) => patch({ automationTaskId: e.target.value })}><option value="">不执行自动化</option>{state.automationTasks?.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field><Field label="自动化目标"><select value={value.automationHosts} onChange={(e) => patch({ automationHosts: e.target.value })}><option value="allocated">分配出来的备用 IP</option><option value="target">故障目标地址</option></select></Field><Field label="任务超时（秒）"><input type="number" value={value.automationTimeout} onChange={(e) => patch({ automationTimeout: e.target.value })} /></Field><Multi label="A/AAAA 解析绑定" items={state.dnsBindings?.filter((item) => ['A', 'AAAA'].includes(item.recordType))} value={value.dnsBindingIds} onChange={(dnsBindingIds) => patch({ dnsBindingIds })} secondary={(item) => item.domain} /><Field label="执行方式"><select value={value.approvalMode} onChange={(e) => patch({ approvalMode: e.target.value })}><option value="automatic">自动执行</option><option value="telegram">Telegram / Web 确认</option></select></Field><Toggle checked={value.autoRollback} onChange={(autoRollback) => patch({ autoRollback })}>失败时自动回滚</Toggle><Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用策略</Toggle></EditorGrid>;
 }
 
-function GuardEditor({ value, patch, state }) {
+function GuardEditor({ value, patch, state, api }) {
   const sources = Array.isArray(value.sources) ? value.sources : [];
-  const updateSource = (index, next) => patch({ sources: sources.map((item, current) => current === index ? { ...item, ...next } : item) });
+  const [sourceChecks, setSourceChecks] = useState({});
+  const updateSource = (index, next) => {
+    const key = sources[index]?.id || index;
+    if (Object.prototype.hasOwnProperty.call(next, 'domain')) setSourceChecks((current) => ({ ...current, [key]: null }));
+    patch({ sources: sources.map((item, current) => current === index ? { ...item, ...next } : item) });
+  };
+  const checkSource = async (index) => {
+    const source = sources[index];
+    const domain = String(source?.domain || '').trim();
+    if (!domain) return;
+    const key = source.id || index;
+    setSourceChecks((current) => ({ ...current, [key]: { domain, checking: true, addresses: [] } }));
+    try {
+      const data = await api('/api/dns-sources/resolve', { method: 'POST', body: JSON.stringify({ domain, recordType: value.recordType }) });
+      setSourceChecks((current) => ({ ...current, [key]: { domain, checking: false, addresses: data.addresses || [] } }));
+    } catch (_error) {
+      setSourceChecks((current) => ({ ...current, [key]: { domain, checking: false, addresses: [] } }));
+    }
+  };
   return <EditorGrid>
     <EditorSection title="托管记录" />
     <Field label="任务名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field>
@@ -249,7 +275,7 @@ function GuardEditor({ value, patch, state }) {
     <Multi label="负责探针（任意一个成功即正常）" items={state.probes || []} value={value.probeIds || []} onChange={(probeIds) => patch({ probeIds })} secondary={(item) => item.region || item.carrier} searchable selectable />
 
     <EditorSection title="DDNS 来源域名" />
-    <div className="ops-multi"><div className="ops-multi-head"><strong>主 / 备用来源</strong><span>{sources.length} 个来源</span></div><div className="ops-source-list">{sources.map((source, index) => <div className="ops-source-row" key={source.id || index}><input value={source.name || ''} placeholder="来源名称" onChange={(e) => updateSource(index, { name: e.target.value })} /><input value={source.domain || ''} placeholder="主来源完整域名" onChange={(e) => updateSource(index, { domain: e.target.value })} /><input value={source.backupDomain || ''} placeholder="备用来源域名" onChange={(e) => updateSource(index, { backupDomain: e.target.value })} /><button type="button" className="icon-button danger" title="删除来源" onClick={() => patch({ sources: sources.filter((_, current) => current !== index) })}>×</button></div>)}<button type="button" className="ghost ops-add-source" onClick={() => patch({ sources: [...sources, { id: crypto.randomUUID(), name: '', domain: '', backupDomain: '' }] })}>添加来源域名</button></div></div>
+    <div className="ops-multi"><div className="ops-multi-head"><strong>来源域名</strong><span>{sources.length} 个来源</span></div><div className="ops-source-list">{sources.map((source, index) => { const key = source.id || index; const check = sourceChecks[key]; const visibleAddresses = check?.domain === String(source.domain || '').trim() ? check.addresses : []; return <div className="ops-source-item" key={key}><div className="ops-source-row"><input value={source.name || ''} placeholder="来源名称（选填）" onChange={(e) => updateSource(index, { name: e.target.value })} /><input value={source.domain || ''} placeholder="完整来源域名" onChange={(e) => updateSource(index, { domain: e.target.value })} onBlur={() => checkSource(index)} /><button type="button" className="ghost ops-source-check" disabled={!source.domain || check?.checking} onClick={() => checkSource(index)}>{check?.checking ? '检测中' : '检测'}</button><button type="button" className="icon-button danger" title="删除来源" onClick={() => patch({ sources: sources.filter((_, current) => current !== index) })}>×</button></div>{visibleAddresses?.length ? <div className="ops-source-addresses">{visibleAddresses.map((address) => <span key={address}>{address}</span>)}</div> : null}</div>; })}<button type="button" className="ghost ops-add-source" onClick={() => patch({ sources: [...sources, { id: crypto.randomUUID(), name: '', domain: '' }] })}>添加来源域名</button></div></div>
     <Toggle checked={value.pruneStale} onChange={(pruneStale) => patch({ pruneStale })}>移除来源已不再提供的旧 IP</Toggle>
 
     <EditorSection title="备用池补位" />

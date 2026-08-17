@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { consumeIncidentIpAssets, crossedInventoryThresholds, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, migratePoolAlertBotSelections, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, requestWaitingIncidentRechecks, retryWaitingIpIncidents, runIncidentWorkflow, startIpUsageRecords } from '../server/orchestration.js';
+import { consumeIncidentIpAssets, crossedInventoryThresholds, dnsVerificationMatches, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, migratePoolAlertBotSelections, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, requestWaitingIncidentRechecks, retryWaitingIpIncidents, runIncidentWorkflow, startIpUsageRecords } from '../server/orchestration.js';
 
 function failedObservation(checkedAt = new Date().toISOString()) {
   return { ok: false, rounds: 3, attemptsPerRound: 3, roundsCompleted: 3, attempts: 9, checkedAt };
@@ -125,6 +125,20 @@ test('migrates old no-IP failures into the waiting state', () => {
   assert.equal(state.incidents[0].status, 'waiting_for_ip');
   assert.equal(state.incidents[0].message, '等待备用 IP');
   assert.equal(state.incidents[0].error, '');
+});
+
+test('normalizes legacy DNS change values for the change history view', () => {
+  const state = normalizeOrchestrationState({
+    dnsChanges: [{ id: 'change-1', beforeValues: '1.1.1.1, 2.2.2.2', afterValues: null }]
+  });
+  assert.deepEqual(state.dnsChanges[0].beforeValues, ['1.1.1.1', '2.2.2.2']);
+  assert.deepEqual(state.dnsChanges[0].afterValues, []);
+});
+
+test('verifies replacement IPs against provider records by address family', () => {
+  assert.equal(dnsVerificationMatches('A', ['172.236.12.169'], ['172.236.12.169']), true);
+  assert.equal(dnsVerificationMatches('A', ['198.51.100.8'], ['172.236.12.169']), false);
+  assert.equal(dnsVerificationMatches('AAAA', ['2001:db8::8'], ['172.236.12.169']), false);
 });
 
 test('keeps a complete IP usage record after the asset is consumed', () => {

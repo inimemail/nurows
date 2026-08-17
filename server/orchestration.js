@@ -41,6 +41,7 @@ const DNS_RECORD_TYPES = new Set(['A', 'AAAA', 'CNAME', 'TXT', 'NS', 'CAA']);
 const ALLOCATION_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
 const DNS_GUARD_HISTORY_LIMIT = 1000;
 const DNS_GUARD_MAX_VALUES = 50;
+const DNS_PROVIDER_VERIFY_DELAYS_MS = [0, 500, 1500, 3000];
 
 export function orchestrationDefaults() {
   return {
@@ -94,6 +95,11 @@ export function normalizeOrchestrationState(parsed = {}) {
     const legacyNoIp = incident.status === 'failed' && /备用\s*IP|备用地址|没有可用 IP/i.test(`${incident.error || ''} ${incident.message || ''}`);
     return legacyNoIp ? { ...incident, status: 'waiting_for_ip', message: '等待备用 IP', error: '', executionId: '', recheckRequestedAt: '' } : incident;
   });
+  normalized.dnsChanges = normalized.dnsChanges.filter((change) => change && typeof change === 'object').map((change) => ({
+    ...change,
+    beforeValues: cleanTexts(change.beforeValues, 5000),
+    afterValues: cleanTexts(change.afterValues, 5000)
+  }));
   normalized.dnsGuards = normalized.dnsGuards.map((guard) => normalizeDnsGuardState(guard));
   normalized.ipLeases = normalized.ipLeases.filter((lease) => lease.status !== 'released');
   normalized.ipUsageRecords = normalized.ipUsageRecords.slice(0, 5000);
@@ -738,7 +744,7 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'dns_updating', message: '正在更新 DNS' }));
       for (const binding of bindings) await applyDnsBinding(binding, incident.allocatedIps || [], incidentId, deps);
       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'verifying', message: '正在验证 DNS 变更' }));
-      await verifyDnsBindings(bindings, incident.allocatedIps || []);
+      await verifyDnsBindings(bindings, incident.allocatedIps || [], deps);
     }
 
     deps.updateState((draft) => {
@@ -1572,21 +1578,19 @@ async function applyDnsBinding(binding, allocatedIps, incidentId, deps) {
   const credentials = decryptCredentials(account, deps);
   const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, binding);
   const before = await getDnsRecord(account, credentials, zone, normalizedBinding);
-  const current = before.values || [];
-  let after;
-  if (binding.updateMode === 'append') after = [...new Set([...current, ...allocatedIps])];
-  else if (binding.updateMode === 'managed_replace') after = [...new Set([...current.filter((value) => !binding.managedValues?.includes(value)), ...allocatedIps])];
-  else after = [...new Set(allocatedIps)];
-  if (!after.length) throw new Error(`解析绑定 ${binding.name} 没有可写入 IP`);
+  const current = normalizeDnsRecordValues(before.values, binding.recordType);
+  const replacementIps = filterAddressFamily(allocatedIps, binding.recordType);
+  if (!replacementIps.length) throw new Error(`解析绑定 ${binding.name} 没有匹配的 ${binding.recordType} 备用 IP`);
+  const after = dnsBindingDesiredValues(binding, current, replacementIps);
   const providerRecordIds = await updateDnsRecord(account, credentials, zone, normalizedBinding, after);
   deps.updateState((draft) => {
-    const change = { id: uuidv4(), incidentId, bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, beforeValues: current, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' };
+    const change = { id: uuidv4(), incidentId, bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, recordType: binding.recordType, provider: account.provider, beforeValues: current, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' };
     draft.dnsChanges.unshift(change);
     const incident = draft.incidents.find((item) => item.id === incidentId);
     if (incident) incident.dnsChangeIds = [...(incident.dnsChangeIds || []), change.id];
     const bindingItem = draft.dnsBindings.find((item) => item.id === binding.id);
     if (bindingItem) {
-      bindingItem.managedValues = allocatedIps;
+      bindingItem.managedValues = replacementIps;
       if (providerRecordIds?.length) bindingItem.providerRecordIds = providerRecordIds;
     }
     pushAudit(draft, 'dns.update', 'dnsBinding', binding.id, `${binding.domain}: ${current.join(',')} -> ${after.join(',')}`, 'system');
@@ -1627,16 +1631,37 @@ export async function rollbackIncident(incidentId, deps, actor) {
   return { incident: next.incidents.find((item) => item.id === incidentId) };
 }
 
-async function verifyDnsBindings(bindings, expectedIps) {
-  await new Promise((resolve) => setTimeout(resolve, 800));
+export function dnsVerificationMatches(recordType, actualValues, expectedIps) {
+  const expected = filterAddressFamily(expectedIps, recordType);
+  const actual = new Set(normalizeDnsRecordValues(actualValues, recordType));
+  return expected.length > 0 && expected.every((ip) => actual.has(ip));
+}
+
+async function verifyDnsBindings(bindings, expectedIps, deps) {
   for (const binding of bindings) {
     if (!['A', 'AAAA'].includes(binding.recordType)) continue;
-    const type = binding.recordType === 'AAAA' ? 28 : 1;
-    const response = await fetch(`https://1.1.1.1/dns-query?name=${encodeURIComponent(binding.domain)}&type=${type}`, { headers: { accept: 'application/dns-json' }, signal: AbortSignal.timeout(8000) });
-    if (!response.ok) throw new Error(`DNS 验证失败：${binding.domain}`);
-    const payload = await response.json();
-    const values = (payload.Answer || []).map((item) => item.data);
-    if (expectedIps.length && !expectedIps.some((ip) => values.includes(ip))) throw new Error(`DNS 尚未解析到备用 IP：${binding.domain}`);
+    let lastError = null;
+    let verified = false;
+    for (const delay of DNS_PROVIDER_VERIFY_DELAYS_MS) {
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      try {
+        const state = deps.readState();
+        const currentBinding = state.dnsBindings.find((item) => item.id === binding.id) || binding;
+        const account = state.dnsAccounts.find((item) => item.id === currentBinding.accountId && item.enabled !== false);
+        if (!account) throw new Error('DNS 账号不可用');
+        const credentials = decryptCredentials(account, deps);
+        const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, currentBinding);
+        const remote = await getDnsRecord(account, credentials, zone, normalizedBinding);
+        if (dnsVerificationMatches(currentBinding.recordType, remote.values, expectedIps)) {
+          verified = true;
+          break;
+        }
+        lastError = new Error('服务商记录暂未包含备用 IP');
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (!verified) throw new Error(`DNS 服务商未确认备用 IP：${binding.domain}${lastError?.message ? `（${cleanText(lastError.message, 180)}）` : ''}`);
   }
 }
 

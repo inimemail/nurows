@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { consumeIncidentIpAssets, crossedInventoryThresholds, dnsVerificationMatches, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, migratePoolAlertBotSelections, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, requestWaitingIncidentRechecks, retryWaitingIpIncidents, runIncidentWorkflow, startIpUsageRecords } from '../server/orchestration.js';
+import { consumeIncidentIpAssets, crossedInventoryThresholds, dnsVerificationMatches, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, migratePoolAlertBotSelections, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, requestWaitingIncidentRechecks, restoreDnsBindingLocalState, retryWaitingIpIncidents, rollbackIncident, runIncidentWorkflow, startIpUsageRecords, syncDnsBindingLocalState } from '../server/orchestration.js';
 
 function failedObservation(checkedAt = new Date().toISOString()) {
   return { ok: false, rounds: 3, attemptsPerRound: 3, roundsCompleted: 3, attempts: 9, checkedAt };
@@ -138,7 +138,73 @@ test('normalizes legacy DNS change values for the change history view', () => {
 test('verifies replacement IPs against provider records by address family', () => {
   assert.equal(dnsVerificationMatches('A', ['172.236.12.169'], ['172.236.12.169']), true);
   assert.equal(dnsVerificationMatches('A', ['198.51.100.8'], ['172.236.12.169']), false);
+  assert.equal(dnsVerificationMatches('A', ['172.236.12.169', '198.51.100.8'], ['172.236.12.169']), false);
   assert.equal(dnsVerificationMatches('AAAA', ['2001:db8::8'], ['172.236.12.169']), false);
+  assert.equal(dnsVerificationMatches('A', [], []), true);
+});
+
+test('keeps local DNS values aligned with remote writes and rollbacks', () => {
+  const binding = { id: 'binding-1', recordType: 'A', backupIps: ['1.1.1.1'], currentValues: ['1.1.1.1'], managedValues: ['1.1.1.1'] };
+  syncDnsBindingLocalState(binding, ['2.2.2.2', '3.3.3.3'], ['3.3.3.3'], ['record-2'], '2026-08-17T01:00:00.000Z');
+  assert.deepEqual(binding.backupIps, ['2.2.2.2', '3.3.3.3']);
+  assert.deepEqual(binding.currentValues, ['2.2.2.2', '3.3.3.3']);
+  assert.deepEqual(binding.managedValues, ['3.3.3.3']);
+  assert.equal(binding.providerRecordId, 'record-2');
+  assert.equal(binding.lastSyncAt, '2026-08-17T01:00:00.000Z');
+
+  restoreDnsBindingLocalState(binding, { beforeValues: ['1.1.1.1'], beforeManagedValues: ['1.1.1.1'] }, ['record-1'], '2026-08-17T01:01:00.000Z');
+  assert.deepEqual(binding.backupIps, ['1.1.1.1']);
+  assert.deepEqual(binding.currentValues, ['1.1.1.1']);
+  assert.deepEqual(binding.managedValues, ['1.1.1.1']);
+  assert.equal(binding.providerRecordId, 'record-1');
+});
+
+test('runs a complete failover DNS write and restores remote and local values on rollback', async () => {
+  const oldIp = '203.0.113.10';
+  const replacementIp = '198.51.100.40';
+  let remoteValues = [oldIp];
+  const state = {
+    incidents: [{ id: 'incident-dns', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'queued', executionId: '', leaseIds: [], allocatedIps: [], dnsChangeIds: [] }],
+    failoverPolicies: [{ id: 'policy-1', name: 'DNS 切换', poolIds: ['pool-1'], automationTaskId: '', dnsBindingIds: ['binding-1'], autoRollback: true, enabled: true }],
+    probes: [{ id: 'probe-1', enabled: true }],
+    probeTargets: [failedTarget()],
+    ipPools: [{ id: 'pool-1', name: '备用池', assetIds: ['asset-1'], allocationMode: 'one', selectionMode: 'ordered', enabled: true }],
+    ipAssets: [{ id: 'asset-1', address: replacementIp, enabled: true, health: 'unknown' }],
+    ipLeases: [], ipUsageRecords: [],
+    dnsAccounts: [{ id: 'account-1', provider: 'huawei', credentialsEnc: 'encrypted', enabled: true }],
+    dnsBindings: [{ id: 'binding-1', name: '主站解析', accountId: 'account-1', domain: 'www.example.com', recordName: 'www', recordType: 'A', updateMode: 'replace', backupIps: [oldIp], currentValues: [oldIp], managedValues: [oldIp], enabled: true }],
+    dnsChanges: [], auditLogs: []
+  };
+  const deps = {
+    readState: () => state,
+    updateState: (updater) => updater(state),
+    decryptSecret: () => '{}',
+    resolveDnsBinding: async (_state, _account, _credentials, binding) => ({ zone: { id: 'zone-1', name: 'example.com', providerZoneId: 'provider-zone-1' }, normalizedBinding: binding }),
+    readDnsRecord: async () => ({ values: [...remoteValues], recordId: 'record-1', recordIds: ['record-1'] }),
+    writeDnsRecord: async (_account, _credentials, _zone, _binding, values) => { remoteValues = [...values]; return ['record-1']; },
+    executeAutomation: async () => ({ jobId: 'unused' }),
+    waitAutomation: async () => {},
+    checkIp: async () => ({ ok: true, error: '' })
+  };
+
+  await runIncidentWorkflow('incident-dns', deps);
+
+  assert.equal(state.incidents[0].status, 'succeeded');
+  assert.deepEqual(remoteValues, [replacementIp]);
+  assert.deepEqual(state.dnsBindings[0].backupIps, [replacementIp]);
+  assert.deepEqual(state.dnsBindings[0].currentValues, [replacementIp]);
+  assert.deepEqual(state.dnsBindings[0].managedValues, [replacementIp]);
+  assert.deepEqual(state.dnsChanges[0].beforeValues, [oldIp]);
+  assert.deepEqual(state.dnsChanges[0].afterValues, [replacementIp]);
+
+  await rollbackIncident('incident-dns', deps, 'tester');
+
+  assert.equal(state.incidents[0].status, 'rolled_back');
+  assert.deepEqual(remoteValues, [oldIp]);
+  assert.deepEqual(state.dnsBindings[0].backupIps, [oldIp]);
+  assert.deepEqual(state.dnsBindings[0].currentValues, [oldIp]);
+  assert.deepEqual(state.dnsBindings[0].managedValues, [oldIp]);
+  assert.equal(state.dnsChanges[0].status, 'rolled_back');
 });
 
 test('keeps a complete IP usage record after the asset is consumed', () => {
@@ -367,4 +433,74 @@ test('cancels failover before automation when the target recovers during IP pref
   assert.equal(state.ipAssets.length, 1);
   assert.equal(state.ipLeases.length, 0);
   assert.equal(state.ipUsageRecords[0].status, 'rolled_back');
+});
+
+test('honors disabled auto rollback and removes a DNS-bound IP from inventory', async () => {
+  const state = {
+    incidents: [{ id: 'incident-preserve', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'queued', executionId: '', leaseIds: [], allocatedIps: [], dnsChangeIds: [] }],
+    failoverPolicies: [{ id: 'policy-1', name: '保留变更', poolIds: ['pool-1'], automationTaskId: 'task-1', dnsBindingIds: [], autoRollback: false, enabled: true }],
+    probes: [{ id: 'probe-1', enabled: true }],
+    probeTargets: [failedTarget()],
+    ipPools: [{ id: 'pool-1', name: '备用池', assetIds: ['asset-1'], allocationMode: 'one', selectionMode: 'ordered', enabled: true }],
+    ipAssets: [{ id: 'asset-1', address: '198.51.100.30', enabled: true, health: 'unknown' }],
+    ipLeases: [], ipUsageRecords: [], dnsBindings: [], dnsChanges: [], auditLogs: []
+  };
+  const deps = {
+    readState: () => state,
+    updateState: (updater) => updater(state),
+    executeAutomation: async () => ({ jobId: 'job-1' }),
+    waitAutomation: async () => {
+      state.dnsChanges.unshift({ id: 'change-1', incidentId: 'incident-preserve', status: 'applied' });
+      state.incidents[0].dnsChangeIds.push('change-1');
+      throw new Error('验证失败');
+    },
+    checkIp: async () => ({ ok: true, error: '' })
+  };
+
+  await runIncidentWorkflow('incident-preserve', deps);
+
+  assert.equal(state.incidents[0].status, 'failed');
+  assert.match(state.incidents[0].error, /已按策略保留 DNS 变更/);
+  assert.equal(state.ipAssets.length, 0);
+  assert.deepEqual(state.ipPools[0].assetIds, []);
+  assert.equal(state.ipUsageRecords[0].status, 'failed');
+  assert.equal(state.auditLogs.some((item) => item.action === 'incident.rollback'), false);
+  assert.equal(state.auditLogs.some((item) => item.action === 'incident.dns_preserved'), true);
+});
+
+test('keeps a partially written DNS IP out of inventory when provider recovery fails', async () => {
+  const replacementIp = '198.51.100.50';
+  let remoteValues = ['203.0.113.50'];
+  let writeCalls = 0;
+  const state = {
+    incidents: [{ id: 'incident-partial', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'queued', executionId: '', leaseIds: [], allocatedIps: [], dnsChangeIds: [] }],
+    failoverPolicies: [{ id: 'policy-1', name: 'DNS 切换', poolIds: ['pool-1'], automationTaskId: '', dnsBindingIds: ['binding-1'], autoRollback: true, enabled: true }],
+    probes: [{ id: 'probe-1', enabled: true }], probeTargets: [failedTarget()],
+    ipPools: [{ id: 'pool-1', name: '备用池', assetIds: ['asset-1'], allocationMode: 'one', selectionMode: 'ordered', enabled: true }],
+    ipAssets: [{ id: 'asset-1', address: replacementIp, enabled: true, health: 'unknown' }], ipLeases: [], ipUsageRecords: [],
+    dnsAccounts: [{ id: 'account-1', provider: 'huawei', credentialsEnc: 'encrypted', enabled: true }],
+    dnsBindings: [{ id: 'binding-1', name: '主站解析', accountId: 'account-1', domain: 'www.example.com', recordName: 'www', recordType: 'A', updateMode: 'replace', backupIps: ['203.0.113.50'], currentValues: ['203.0.113.50'], managedValues: ['203.0.113.50'], enabled: true }],
+    dnsChanges: [], auditLogs: []
+  };
+  const deps = {
+    readState: () => state, updateState: (updater) => updater(state), decryptSecret: () => '{}',
+    resolveDnsBinding: async (_state, _account, _credentials, binding) => ({ zone: { id: 'zone-1', name: 'example.com', providerZoneId: 'provider-zone-1' }, normalizedBinding: binding }),
+    readDnsRecord: async () => ({ values: [...remoteValues], recordId: 'record-1', recordIds: ['record-1'] }),
+    writeDnsRecord: async (_account, _credentials, _zone, _binding, values) => {
+      writeCalls += 1;
+      if (writeCalls === 1) remoteValues = [...values];
+      throw new Error(writeCalls === 1 ? '服务商部分写入失败' : '服务商恢复接口不可用');
+    },
+    executeAutomation: async () => ({ jobId: 'unused' }), waitAutomation: async () => {}, checkIp: async () => ({ ok: true, error: '' })
+  };
+
+  await runIncidentWorkflow('incident-partial', deps);
+
+  assert.equal(state.incidents[0].status, 'failed');
+  assert.match(state.incidents[0].error, /自动回滚失败/);
+  assert.equal(state.dnsChanges[0].status, 'recovery_pending');
+  assert.equal(state.ipAssets.length, 0);
+  assert.deepEqual(state.ipPools[0].assetIds, []);
+  assert.equal(state.auditLogs.some((item) => item.action === 'dns.recovery_pending'), true);
+  assert.equal(state.auditLogs.some((item) => item.action === 'incident.dns_preserved'), true);
 });

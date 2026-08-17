@@ -26,6 +26,7 @@ const ACTIVE_INCIDENT_STATES = new Set([
   'observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'
 ]);
 const RUNNING_INCIDENT_STATES = new Set(['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back']);
+const ACTIVE_DNS_CHANGE_STATES = new Set(['applied', 'recovery_pending']);
 const DEFAULT_TARGET_CHECK_ROUNDS = 3;
 const DEFAULT_TARGET_ATTEMPTS_PER_ROUND = 3;
 const MAX_TARGET_CHECK_ROUNDS = 10;
@@ -98,7 +99,13 @@ export function normalizeOrchestrationState(parsed = {}) {
   normalized.dnsChanges = normalized.dnsChanges.filter((change) => change && typeof change === 'object').map((change) => ({
     ...change,
     beforeValues: cleanTexts(change.beforeValues, 5000),
-    afterValues: cleanTexts(change.afterValues, 5000)
+    afterValues: cleanTexts(change.afterValues, 5000),
+    beforeManagedValues: cleanTexts(change.beforeManagedValues, 5000),
+    afterManagedValues: cleanTexts(change.afterManagedValues, 5000)
+  }));
+  normalized.dnsBindings = normalized.dnsBindings.map((binding) => ({
+    ...binding,
+    currentValues: cleanTexts(binding.currentValues ?? (isAddressRecord(binding.recordType) ? (binding.managedValues ?? binding.backupIps) : binding.recordValues), 5000)
   }));
   normalized.dnsGuards = normalized.dnsGuards.map((guard) => normalizeDnsGuardState(guard));
   normalized.ipLeases = normalized.ipLeases.filter((lease) => lease.status !== 'released');
@@ -567,7 +574,7 @@ export async function syncDnsBinding(bindingId, deps, actor = 'system') {
     if (!item) throw new Error('解析绑定已被删除');
     const providerRecordIds = cleanTexts(remote.recordIds || (remote.recordId ? [remote.recordId] : []), 500);
     Object.assign(item, {
-      ...(isAddressRecord(item.recordType) ? { backupIps: values, managedValues: values } : { recordValues: values }),
+      ...(isAddressRecord(item.recordType) ? { backupIps: values, currentValues: values, managedValues: values } : { recordValues: values, currentValues: values }),
       recordName: normalizedBinding.recordName,
       providerRecordId: providerRecordIds[0] || '',
       providerRecordIds,
@@ -622,6 +629,7 @@ export async function saveDnsBindingConfiguration(input, bindingId, deps, actor 
   const managedValues = configuredValues.length ? configuredValues : desiredValues;
   Object.assign(candidate, {
     ...(isAddressRecord(candidate.recordType) && !configuredValues.length ? { backupIps: desiredValues } : {}),
+    currentValues: desiredValues,
     recordName: normalizedBinding.recordName,
     providerRecordId: providerRecordIds?.[0] || '',
     providerRecordIds: providerRecordIds || [],
@@ -638,7 +646,7 @@ export async function saveDnsBindingConfiguration(input, bindingId, deps, actor 
       if (bindingId && !current) throw new Error('解析绑定已被删除');
       if (current) Object.assign(current, candidate, { id: current.id, createdAt: current.createdAt });
       else draft.dnsBindings.push(candidate);
-      draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', bindingId: candidate.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: candidate.domain, beforeValues, afterValues: desiredValues, status: 'applied', createdAt: savedAt, rolledBackAt: '' });
+      draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', bindingId: candidate.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: candidate.domain, recordType: candidate.recordType, provider: account.provider, beforeValues, afterValues: desiredValues, beforeManagedValues: existing?.managedValues || [], afterManagedValues: managedValues, status: 'applied', createdAt: savedAt, rolledBackAt: '' });
       pushAudit(draft, bindingId ? 'dnsBindings.update' : 'dnsBindings.create', 'dnsBindings', candidate.id, `${bindingId ? '更新' : '新增'} ${candidate.name}`, actor);
       pushAudit(draft, 'dns.push', 'dnsBinding', candidate.id, `${candidate.domain} 写入服务商 ${desiredValues.length} 个记录值`, actor);
       return draft;
@@ -744,7 +752,7 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'dns_updating', message: '正在更新 DNS' }));
       for (const binding of bindings) await applyDnsBinding(binding, incident.allocatedIps || [], incidentId, deps);
       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'verifying', message: '正在验证 DNS 变更' }));
-      await verifyDnsBindings(bindings, incident.allocatedIps || [], deps);
+      await verifyDnsBindings(bindings, incidentId, deps);
     }
 
     deps.updateState((draft) => {
@@ -757,8 +765,27 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
     });
     deps.notifyIncident?.(incidentId);
   } catch (error) {
-    await rollbackIncident(incidentId, deps, 'system').catch(() => {});
-    failIncident(deps, incidentId, error.message || '故障编排失败');
+    let failureMessage = error.message || '故障编排失败';
+    if (policy.autoRollback !== false) {
+      try {
+        await rollbackIncident(incidentId, deps, 'system');
+      } catch (rollbackError) {
+        failureMessage = `${failureMessage}；自动回滚失败：${cleanText(rollbackError.message, 300)}`;
+      }
+    }
+    const current = deps.readState();
+    const failedIncident = current.incidents.find((item) => item.id === incidentId);
+    const appliedChangeIds = new Set(current.dnsChanges.filter((item) => ACTIVE_DNS_CHANGE_STATES.has(item.status)).map((item) => item.id));
+    const keepsDnsChanges = failedIncident?.dnsChangeIds?.some((id) => appliedChangeIds.has(id));
+    if (keepsDnsChanges) {
+      deps.updateState((draft) => {
+        const consumed = consumeIncidentIpAssets(draft, incidentId);
+        pushAudit(draft, 'incident.dns_preserved', 'incident', incidentId, `故障流程保留 DNS 变更，已隔离 ${consumed.addresses.length} 个在用 IP`, 'system');
+        return draft;
+      });
+      if (policy.autoRollback === false) failureMessage = `${failureMessage}；已按策略保留 DNS 变更`;
+    }
+    failIncident(deps, incidentId, failureMessage);
     deps.notifyIncident?.(incidentId);
   }
 }
@@ -1195,7 +1222,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     const identityChanged = Boolean(existing && (existing.accountId !== accountId || existing.domain !== domain || existing.recordType !== recordType));
     const recordValues = cleanRecordValues(input.recordValues, recordType === 'CNAME' ? 1 : 5000);
     if (recordType === 'CNAME' && recordValues[0]) recordValues[0] = normalizeDomain(recordValues[0]);
-    return { ...base, name: requiredText(input.name, '解析绑定名称'), zoneId: identityChanged ? '' : cleanId(input.zoneId), accountId, domain, recordName: identityChanged ? '' : cleanText(input.recordName, 255), recordType, recordValues, providerRecordId: identityChanged ? '' : cleanText(input.providerRecordId, 200), providerRecordIds: identityChanged ? [] : cleanTexts(input.providerRecordIds, 500), recordLine: cleanText(input.recordLine, 100) || '默认', ttl: clampNumber(input.ttl, 1, 86400, 60), updateMode: ['append', 'managed_replace', 'replace'].includes(input.updateMode) ? input.updateMode : 'managed_replace', managedValues: identityChanged ? [] : cleanTexts(input.managedValues, 5000), ddnsSources: normalizeDdnsSources(input.ddnsSources), backupIps: cleanTexts(input.backupIps, 5000), maxActiveIps: clampNumber(input.maxActiveIps, 1, 50, 50), pruneStale: input.pruneStale !== false, healthEnabled: input.healthEnabled !== false, healthInterval: clampNumber(input.healthInterval, 10, 86400, 30), pingCount: clampNumber(input.pingCount, 1, 10, 3), checkRounds: clampNumber(input.checkRounds, 1, 10, 3), roundDelay: clampNumber(input.roundDelay, 0, 60, 2), maxParallel: clampNumber(input.maxParallel, 1, 300, 20), lastSyncAt: identityChanged ? '' : (existing?.lastSyncAt || ''), lastSyncError: '', enabled: input.enabled !== false };
+    return { ...base, name: requiredText(input.name, '解析绑定名称'), zoneId: identityChanged ? '' : cleanId(input.zoneId), accountId, domain, recordName: identityChanged ? '' : cleanText(input.recordName, 255), recordType, recordValues, currentValues: identityChanged ? [] : cleanTexts(input.currentValues ?? existing?.currentValues ?? input.managedValues ?? input.backupIps, 5000), providerRecordId: identityChanged ? '' : cleanText(input.providerRecordId, 200), providerRecordIds: identityChanged ? [] : cleanTexts(input.providerRecordIds, 500), recordLine: cleanText(input.recordLine, 100) || '默认', ttl: clampNumber(input.ttl, 1, 86400, 60), updateMode: ['append', 'managed_replace', 'replace'].includes(input.updateMode) ? input.updateMode : 'managed_replace', managedValues: identityChanged ? [] : cleanTexts(input.managedValues, 5000), ddnsSources: normalizeDdnsSources(input.ddnsSources), backupIps: cleanTexts(input.backupIps, 5000), maxActiveIps: clampNumber(input.maxActiveIps, 1, 50, 50), pruneStale: input.pruneStale !== false, healthEnabled: input.healthEnabled !== false, healthInterval: clampNumber(input.healthInterval, 10, 86400, 30), pingCount: clampNumber(input.pingCount, 1, 10, 3), checkRounds: clampNumber(input.checkRounds, 1, 10, 3), roundDelay: clampNumber(input.roundDelay, 0, 60, 2), maxParallel: clampNumber(input.maxParallel, 1, 300, 20), lastSyncAt: identityChanged ? '' : (existing?.lastSyncAt || ''), lastSyncError: '', enabled: input.enabled !== false };
   }
   if (key === 'failoverPolicies') return { ...base, name: requiredText(input.name, '策略名称'), poolIds: cleanIds(input.poolIds, 100), automationTaskId: cleanId(input.automationTaskId), automationHosts: input.automationHosts === 'target' ? 'target' : 'allocated', automationTimeout: clampNumber(input.automationTimeout, 30, 7200, 1800), dnsBindingIds: cleanIds(input.dnsBindingIds, 500), approvalMode: input.approvalMode === 'telegram' ? 'telegram' : 'automatic', autoRollback: input.autoRollback !== false, enabled: input.enabled !== false, businessKey: cleanText(input.businessKey, 100) };
   if (key === 'telegramBots') {
@@ -1570,32 +1597,82 @@ export function finalizeIpUsageRecords(state, incidentId, status, error = '', le
   return updated;
 }
 
+export function syncDnsBindingLocalState(binding, values, managedValues, providerRecordIds = [], syncedAt = nowIso()) {
+  const normalizedValues = normalizeDnsRecordValues(values, binding.recordType);
+  const normalizedRecordIds = cleanTexts(providerRecordIds, 500);
+  Object.assign(binding, {
+    ...(isAddressRecord(binding.recordType) ? { backupIps: normalizedValues, managedValues: normalizeDnsRecordValues(managedValues, binding.recordType) } : { recordValues: normalizedValues }),
+    currentValues: normalizedValues,
+    providerRecordId: normalizedRecordIds[0] || '',
+    providerRecordIds: normalizedRecordIds,
+    lastSyncAt: syncedAt,
+    lastSyncError: '',
+    updatedAt: syncedAt
+  });
+  return binding;
+}
+
+export function restoreDnsBindingLocalState(binding, change, providerRecordIds = [], syncedAt = nowIso()) {
+  const beforeValues = normalizeDnsRecordValues(change.beforeValues, binding.recordType);
+  const beforeManagedValues = change.beforeManagedValues?.length ? change.beforeManagedValues : beforeValues;
+  syncDnsBindingLocalState(binding, beforeValues, beforeManagedValues, providerRecordIds, syncedAt);
+  return binding;
+}
+
 async function applyDnsBinding(binding, allocatedIps, incidentId, deps) {
   if (!['A', 'AAAA'].includes(binding.recordType)) throw new Error(`故障切换不能更新 ${binding.recordType} 记录`);
   const state = deps.readState();
   const account = state.dnsAccounts.find((item) => item.id === binding.accountId && item.enabled !== false);
   if (!account) throw new Error(`解析绑定 ${binding.name} 的账号不可用`);
   const credentials = decryptCredentials(account, deps);
-  const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, binding);
-  const before = await getDnsRecord(account, credentials, zone, normalizedBinding);
+  const resolveDnsBinding = deps.resolveDnsBinding || resolveManagedDnsZone;
+  const readDnsRecord = deps.readDnsRecord || getDnsRecord;
+  const writeDnsRecord = deps.writeDnsRecord || updateDnsRecord;
+  const { zone, normalizedBinding } = await resolveDnsBinding(state, account, credentials, binding);
+  const before = await readDnsRecord(account, credentials, zone, normalizedBinding);
   const current = normalizeDnsRecordValues(before.values, binding.recordType);
   const replacementIps = filterAddressFamily(allocatedIps, binding.recordType);
   if (!replacementIps.length) throw new Error(`解析绑定 ${binding.name} 没有匹配的 ${binding.recordType} 备用 IP`);
   const after = dnsBindingDesiredValues(binding, current, replacementIps);
-  const providerRecordIds = await updateDnsRecord(account, credentials, zone, normalizedBinding, after);
-  deps.updateState((draft) => {
-    const change = { id: uuidv4(), incidentId, bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, recordType: binding.recordType, provider: account.provider, beforeValues: current, afterValues: after, status: 'applied', createdAt: nowIso(), rolledBackAt: '' };
-    draft.dnsChanges.unshift(change);
-    const incident = draft.incidents.find((item) => item.id === incidentId);
-    if (incident) incident.dnsChangeIds = [...(incident.dnsChangeIds || []), change.id];
-    const bindingItem = draft.dnsBindings.find((item) => item.id === binding.id);
-    if (bindingItem) {
-      bindingItem.managedValues = replacementIps;
-      if (providerRecordIds?.length) bindingItem.providerRecordIds = providerRecordIds;
+  let providerRecordIds = [];
+  let writeStarted = false;
+  try {
+    writeStarted = true;
+    providerRecordIds = await writeDnsRecord(account, credentials, zone, normalizedBinding, after);
+    const savedAt = nowIso();
+    deps.updateState((draft) => {
+      const currentBinding = draft.dnsBindings.find((item) => item.id === binding.id);
+      const change = { id: uuidv4(), incidentId, bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, recordType: binding.recordType, provider: account.provider, beforeValues: current, afterValues: after, beforeManagedValues: currentBinding?.managedValues || binding.managedValues || [], afterManagedValues: replacementIps, status: 'applied', createdAt: savedAt, rolledBackAt: '' };
+      draft.dnsChanges.unshift(change);
+      const incident = draft.incidents.find((item) => item.id === incidentId);
+      if (incident) incident.dnsChangeIds = [...(incident.dnsChangeIds || []), change.id];
+      const bindingItem = currentBinding;
+      if (bindingItem) syncDnsBindingLocalState(bindingItem, after, replacementIps, providerRecordIds, savedAt);
+      pushAudit(draft, 'dns.update', 'dnsBinding', binding.id, `${binding.domain}: ${current.join(',')} -> ${after.join(',')}`, 'system');
+      return draft;
+    });
+  } catch (error) {
+    if (writeStarted) {
+      try {
+        const restoredRecordIds = await writeDnsRecord(account, credentials, zone, { ...normalizedBinding, providerRecordId: before.recordId || normalizedBinding.providerRecordId, providerRecordIds: before.recordIds || normalizedBinding.providerRecordIds }, current);
+        await verifyProviderDnsValues(account, credentials, zone, { ...normalizedBinding, providerRecordIds: restoredRecordIds }, current, '服务商记录未恢复到写入前内容', readDnsRecord);
+      } catch (rollbackError) {
+        const failedAt = nowIso();
+        deps.updateState((draft) => {
+          const currentBinding = draft.dnsBindings.find((item) => item.id === binding.id);
+          const change = { id: uuidv4(), incidentId, bindingId: binding.id, accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: binding.domain, recordType: binding.recordType, provider: account.provider, beforeValues: current, afterValues: after, beforeManagedValues: currentBinding?.managedValues || binding.managedValues || [], afterManagedValues: replacementIps, status: 'recovery_pending', error: cleanText(rollbackError.message, 500), createdAt: failedAt, rolledBackAt: '' };
+          draft.dnsChanges.unshift(change);
+          const currentIncident = draft.incidents.find((item) => item.id === incidentId);
+          if (currentIncident) currentIncident.dnsChangeIds = [...(currentIncident.dnsChangeIds || []), change.id];
+          if (currentBinding) Object.assign(currentBinding, { lastSyncError: `远端状态待恢复：${cleanText(rollbackError.message, 300)}`, updatedAt: failedAt });
+          pushAudit(draft, 'dns.recovery_pending', 'dnsBinding', binding.id, `${binding.domain} 部分写入后恢复失败，已进入待恢复状态`, 'system');
+          return draft;
+        });
+        throw new Error(`DNS 写入失败且自动恢复失败：${cleanText(error.message, 240)}；${cleanText(rollbackError.message, 240)}`);
+      }
     }
-    pushAudit(draft, 'dns.update', 'dnsBinding', binding.id, `${binding.domain}: ${current.join(',')} -> ${after.join(',')}`, 'system');
-    return draft;
-  });
+    throw new Error(`DNS 写入失败，已恢复原记录：${cleanText(error.message, 300)}`);
+  }
 }
 
 export async function rollbackIncident(incidentId, deps, actor) {
@@ -1603,65 +1680,86 @@ export async function rollbackIncident(incidentId, deps, actor) {
   const incident = state.incidents.find((item) => item.id === incidentId);
   if (!incident) throw new Error('故障事件不存在');
   deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'rolling_back', message: '正在回滚 DNS 并释放备用 IP' }));
-  for (const changeId of [...(incident.dnsChangeIds || [])].reverse()) {
-    const current = deps.readState();
-    const change = current.dnsChanges.find((item) => item.id === changeId && item.status === 'applied');
-    if (!change) continue;
-    const binding = current.dnsBindings.find((item) => item.id === change.bindingId);
-    const account = current.dnsAccounts.find((item) => item.id === change.accountId);
-    if (!binding || !account) continue;
-    const credentials = decryptCredentials(account, deps);
-    const discovered = change.zoneName ? { zone: { id: change.zoneId, name: change.zoneName, providerZoneId: change.providerZoneId }, normalizedBinding: withRecordName(binding, change.zoneName) } : await resolveManagedDnsZone(current, account, credentials, binding);
-    const providerRecordIds = await updateDnsRecord(account, credentials, discovered.zone, discovered.normalizedBinding, change.beforeValues);
-    deps.updateState((draft) => {
-      const item = draft.dnsChanges.find((entry) => entry.id === change.id);
-      if (item) Object.assign(item, { status: 'rolled_back', rolledBackAt: nowIso() });
-      const bindingItem = draft.dnsBindings.find((entry) => entry.id === binding.id);
-      if (bindingItem && providerRecordIds?.length) bindingItem.providerRecordIds = providerRecordIds;
+  try {
+    for (const changeId of [...(incident.dnsChangeIds || [])].reverse()) {
+      const current = deps.readState();
+      const change = current.dnsChanges.find((item) => item.id === changeId && ACTIVE_DNS_CHANGE_STATES.has(item.status));
+      if (!change) continue;
+      const binding = current.dnsBindings.find((item) => item.id === change.bindingId);
+      const account = current.dnsAccounts.find((item) => item.id === change.accountId);
+      if (!binding) throw new Error(`DNS 回滚失败：解析绑定 ${change.bindingId} 不存在`);
+      if (!account) throw new Error(`DNS 回滚失败：${binding.domain} 的服务商账号不存在`);
+      const credentials = decryptCredentials(account, deps);
+      const resolveDnsBinding = deps.resolveDnsBinding || resolveManagedDnsZone;
+      const readDnsRecord = deps.readDnsRecord || getDnsRecord;
+      const writeDnsRecord = deps.writeDnsRecord || updateDnsRecord;
+      const discovered = change.zoneName ? { zone: { id: change.zoneId, name: change.zoneName, providerZoneId: change.providerZoneId }, normalizedBinding: withRecordName(binding, change.zoneName) } : await resolveDnsBinding(current, account, credentials, binding);
+      const providerRecordIds = await writeDnsRecord(account, credentials, discovered.zone, discovered.normalizedBinding, change.beforeValues);
+      await verifyProviderDnsValues(account, credentials, discovered.zone, { ...discovered.normalizedBinding, providerRecordIds }, change.beforeValues, `DNS 回滚验证失败：${binding.domain}`, readDnsRecord);
+      deps.updateState((draft) => {
+        const item = draft.dnsChanges.find((entry) => entry.id === change.id);
+        if (item) Object.assign(item, { status: 'rolled_back', rolledBackAt: nowIso() });
+        const bindingItem = draft.dnsBindings.find((entry) => entry.id === binding.id);
+        if (bindingItem) restoreDnsBindingLocalState(bindingItem, change, providerRecordIds);
+        return draft;
+      });
+    }
+    const next = deps.updateState((draft) => {
+      releaseIncidentIpLocks(draft, incidentId);
+      finalizeIpUsageRecords(draft, incidentId, 'rolled_back', '', incident.leaseIds);
+      updateIncident(draft, incidentId, { status: 'rolled_back', message: '已回滚', error: '', executionId: '', finishedAt: nowIso() });
+      pushAudit(draft, 'incident.rollback', 'incident', incidentId, '回滚 DNS 变更并释放备用 IP', actor);
       return draft;
     });
+    return { incident: next.incidents.find((item) => item.id === incidentId) };
+  } catch (error) {
+    deps.updateState((draft) => {
+      updateIncident(draft, incidentId, { status: 'failed', message: '回滚失败', error: cleanText(error.message, 1000), executionId: '', finishedAt: nowIso() });
+      pushAudit(draft, 'incident.rollback_failed', 'incident', incidentId, cleanText(error.message, 500), actor);
+      return draft;
+    });
+    throw error;
   }
-  const next = deps.updateState((draft) => {
-    releaseIncidentIpLocks(draft, incidentId);
-    finalizeIpUsageRecords(draft, incidentId, 'rolled_back', '', incident.leaseIds);
-    updateIncident(draft, incidentId, { status: 'rolled_back', message: '已回滚', executionId: '', finishedAt: nowIso() });
-    pushAudit(draft, 'incident.rollback', 'incident', incidentId, '回滚 DNS 变更并释放备用 IP', actor);
-    return draft;
-  });
-  return { incident: next.incidents.find((item) => item.id === incidentId) };
 }
 
-export function dnsVerificationMatches(recordType, actualValues, expectedIps) {
-  const expected = filterAddressFamily(expectedIps, recordType);
-  const actual = new Set(normalizeDnsRecordValues(actualValues, recordType));
-  return expected.length > 0 && expected.every((ip) => actual.has(ip));
+export function dnsVerificationMatches(recordType, actualValues, expectedValues) {
+  const expected = normalizeDnsRecordValues(expectedValues, recordType);
+  const actual = normalizeDnsRecordValues(actualValues, recordType);
+  return sameStringSet(actual, expected);
 }
 
-async function verifyDnsBindings(bindings, expectedIps, deps) {
+async function verifyProviderDnsValues(account, credentials, zone, binding, expectedValues, failureLabel, readDnsRecord = getDnsRecord) {
+  let lastError = null;
+  for (const delay of DNS_PROVIDER_VERIFY_DELAYS_MS) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      const remote = await readDnsRecord(account, credentials, zone, binding);
+      if (dnsVerificationMatches(binding.recordType, remote.values, expectedValues)) return remote;
+      lastError = new Error('服务商记录暂未与预期内容一致');
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`${failureLabel}${lastError?.message ? `（${cleanText(lastError.message, 180)}）` : ''}`);
+}
+
+async function verifyDnsBindings(bindings, incidentId, deps) {
   for (const binding of bindings) {
     if (!['A', 'AAAA'].includes(binding.recordType)) continue;
-    let lastError = null;
-    let verified = false;
-    for (const delay of DNS_PROVIDER_VERIFY_DELAYS_MS) {
-      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-      try {
-        const state = deps.readState();
-        const currentBinding = state.dnsBindings.find((item) => item.id === binding.id) || binding;
-        const account = state.dnsAccounts.find((item) => item.id === currentBinding.accountId && item.enabled !== false);
-        if (!account) throw new Error('DNS 账号不可用');
-        const credentials = decryptCredentials(account, deps);
-        const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, currentBinding);
-        const remote = await getDnsRecord(account, credentials, zone, normalizedBinding);
-        if (dnsVerificationMatches(currentBinding.recordType, remote.values, expectedIps)) {
-          verified = true;
-          break;
-        }
-        lastError = new Error('服务商记录暂未包含备用 IP');
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    if (!verified) throw new Error(`DNS 服务商未确认备用 IP：${binding.domain}${lastError?.message ? `（${cleanText(lastError.message, 180)}）` : ''}`);
+    const expectedChange = deps.readState().dnsChanges
+      .filter((item) => item.incidentId === incidentId && item.bindingId === binding.id && item.status === 'applied')
+      .sort((left, right) => Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0))[0];
+    if (!expectedChange) throw new Error(`DNS 变更快照不存在：${binding.domain}`);
+    const expectedValues = expectedChange?.afterValues || [];
+    const state = deps.readState();
+    const currentBinding = state.dnsBindings.find((item) => item.id === binding.id) || binding;
+    const account = state.dnsAccounts.find((item) => item.id === currentBinding.accountId && item.enabled !== false);
+    if (!account) throw new Error(`DNS 服务商记录验证失败：${binding.domain}（账号不可用）`);
+    const credentials = decryptCredentials(account, deps);
+    const resolveDnsBinding = deps.resolveDnsBinding || resolveManagedDnsZone;
+    const readDnsRecord = deps.readDnsRecord || getDnsRecord;
+    const { zone, normalizedBinding } = await resolveDnsBinding(state, account, credentials, currentBinding);
+    await verifyProviderDnsValues(account, credentials, zone, normalizedBinding, expectedValues, `DNS 服务商记录与预期不一致：${binding.domain}`, readDnsRecord);
   }
 }
 

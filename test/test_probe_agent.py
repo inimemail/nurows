@@ -63,8 +63,23 @@ class ProbeCheckWindowTests(unittest.TestCase):
             result = PROBE.check_target(self.target)
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["attempts"], 1)
         self.assertEqual(resolver.call_count, 2)
+
+    def test_resolves_again_for_every_round_and_reports_the_successful_address(self):
+        resolutions = [{"203.0.113.10"}, {"198.51.100.40"}]
+        attempts = iter([(False, "failed", ""), (True, "", "198.51.100.40")])
+        target = {**self.target, "checkRounds": 2, "attemptsPerRound": 1, "checkNowAt": "marker-1"}
+        with mock.patch.object(PROBE, "validate_target_address", side_effect=resolutions) as resolver, \
+                mock.patch.object(PROBE, "check_attempt", side_effect=lambda *_args: next(attempts)), \
+                mock.patch.object(PROBE.time, "sleep", return_value=None):
+            result = PROBE.check_target(target)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(resolver.call_count, 2)
+        self.assertEqual(result["successfulAddress"], "198.51.100.40")
+        self.assertEqual(result["resolvedAddresses"], ["198.51.100.40", "203.0.113.10"])
+        self.assertEqual(result["checkMarker"], "marker-1")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import test from 'node:test';
-import { consumeIncidentIpAssets, crossedInventoryThresholds, dnsVerificationMatches, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, migratePoolAlertBotSelections, normalizeOrchestrationState, parseIpBatch, releaseIncidentIpLocks, requestWaitingIncidentRechecks, restoreDnsBindingLocalState, retryWaitingIpIncidents, rollbackIncident, runIncidentWorkflow, startIpUsageRecords, syncDnsBindingLocalState } from '../server/orchestration.js';
+import { consumeIncidentIpAssets, crossedInventoryThresholds, dnsVerificationMatches, evaluateIncidentStabilization, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, migratePoolAlertBotSelections, normalizeOrchestrationState, parseIpBatch, registerProbePublicRoutes, releaseIncidentIpLocks, requestWaitingIncidentRechecks, restoreDnsBindingLocalState, retryWaitingIpIncidents, rollbackIncident, runIncidentWorkflow, settleStabilizingIncidentForTarget, startIpUsageRecords, syncDnsBindingLocalState } from '../server/orchestration.js';
 
 function failedObservation(checkedAt = new Date().toISOString()) {
   return { ok: false, rounds: 3, attemptsPerRound: 3, roundsCompleted: 3, attempts: 9, checkedAt };
@@ -503,4 +504,204 @@ test('keeps a partially written DNS IP out of inventory when provider recovery f
   assert.deepEqual(state.ipPools[0].assetIds, []);
   assert.equal(state.auditLogs.some((item) => item.action === 'dns.recovery_pending'), true);
   assert.equal(state.auditLogs.some((item) => item.action === 'incident.dns_preserved'), true);
+});
+
+function stabilizingFixture(overrides = {}) {
+  const writtenAt = '2026-08-20T00:00:00.000Z';
+  const expectedAddress = '198.51.100.40';
+  const incident = {
+    id: 'incident-stabilizing', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'stabilizing',
+    message: '等待 DNS 生效', executionId: '', leaseIds: ['lease-1'], allocatedIps: [expectedAddress], dnsChangeIds: ['change-1'],
+    stabilization: { expectedAddresses: [expectedAddress], bindingIds: ['binding-1'], domains: ['www.example.com'], dnsWrittenAt: writtenAt, deadlineAt: '2026-08-20T00:03:00.000Z', checkMarker: 'marker-1', timeoutNotifiedAt: '' }
+  };
+  const target = {
+    id: 'target-1', name: '主站', address: 'www.example.com', probeIds: ['probe-1', 'probe-2'],
+    checkRounds: 3, attemptsPerRound: 3, observations: {}
+  };
+  return {
+    incidents: [incident], probeTargets: [target],
+    probes: [{ id: 'probe-1', enabled: true, agentVersion: '1.4.0' }, { id: 'probe-2', enabled: true, agentVersion: '1.4.0' }],
+    failoverPolicies: [{ id: 'policy-1', poolIds: ['pool-1'], dnsBindingIds: ['binding-1'] }],
+    ipPools: [{ id: 'pool-1', assetIds: ['asset-1'] }],
+    ipAssets: [{ id: 'asset-1', address: expectedAddress }],
+    ipLeases: [{ id: 'lease-1', assetId: 'asset-1', poolId: 'pool-1', incidentId: incident.id, status: 'locked', expiresAt: '2026-08-20T01:00:00.000Z' }],
+    ipUsageRecords: [{ id: 'usage-1', incidentId: incident.id, leaseId: 'lease-1', address: expectedAddress, status: 'processing' }],
+    dnsBindings: [{ id: 'binding-1', domain: 'www.example.com', recordType: 'A', ttl: 60 }],
+    dnsChanges: [{ id: 'change-1', incidentId: incident.id, bindingId: 'binding-1', status: 'applied', createdAt: writtenAt }],
+    auditLogs: [],
+    ...overrides
+  };
+}
+
+test('keeps a domain failover active until probes actually check the replacement IP', async () => {
+  const oldIp = '203.0.113.10';
+  const replacementIp = '198.51.100.40';
+  let remoteValues = [oldIp];
+  const state = {
+    incidents: [{ id: 'incident-domain', targetId: 'target-1', targetName: '主站', policyId: 'policy-1', status: 'queued', executionId: '', leaseIds: [], allocatedIps: [], dnsChangeIds: [] }],
+    failoverPolicies: [{ id: 'policy-1', name: 'DNS 切换', poolIds: ['pool-1'], automationTaskId: '', dnsBindingIds: ['binding-1'], autoRollback: true, enabled: true }],
+    probes: [{ id: 'probe-1', enabled: true, agentVersion: '1.4.0' }],
+    probeTargets: [failedTarget({ address: 'www.example.com' })],
+    ipPools: [{ id: 'pool-1', name: '备用池', assetIds: ['asset-1'], allocationMode: 'one', selectionMode: 'ordered', enabled: true }],
+    ipAssets: [{ id: 'asset-1', address: replacementIp, enabled: true, health: 'unknown' }],
+    ipLeases: [], ipUsageRecords: [],
+    dnsAccounts: [{ id: 'account-1', provider: 'huawei', credentialsEnc: 'encrypted', enabled: true }],
+    dnsBindings: [{ id: 'binding-1', name: '主站解析', accountId: 'account-1', domain: 'www.example.com', recordType: 'A', ttl: 60, updateMode: 'replace', enabled: true }],
+    dnsChanges: [], auditLogs: []
+  };
+  const deps = {
+    readState: () => state, updateState: (updater) => updater(state), decryptSecret: () => '{}',
+    resolveDnsBinding: async (_state, _account, _credentials, binding) => ({ zone: { id: 'zone-1', name: 'example.com' }, normalizedBinding: binding }),
+    readDnsRecord: async () => ({ values: [...remoteValues], recordIds: ['record-1'] }),
+    writeDnsRecord: async (_account, _credentials, _zone, _binding, values) => { remoteValues = [...values]; return ['record-1']; },
+    executeAutomation: async () => ({ jobId: 'unused' }), waitAutomation: async () => {}, checkIp: async () => ({ ok: true, error: '' })
+  };
+
+  await runIncidentWorkflow('incident-domain', deps);
+
+  assert.equal(state.incidents[0].status, 'stabilizing');
+  assert.equal(state.incidents[0].message, '等待 DNS 生效');
+  assert.deepEqual(state.incidents[0].stabilization.expectedAddresses, [replacementIp]);
+  assert.equal(Date.parse(state.incidents[0].stabilization.deadlineAt) - Date.parse(state.incidents[0].stabilization.dnsWrittenAt), 180000);
+  assert.equal(state.ipAssets.length, 1);
+  assert.equal(state.ipLeases.length, 1);
+  assert.ok(state.probeTargets[0].checkNowAt);
+  assert.equal(state.probeTargets[0].checkNowAt, state.incidents[0].stabilization.checkMarker);
+});
+
+test('waits on old-only and mixed DNS answers without consuming another IP', () => {
+  const state = stabilizingFixture();
+  const afterWrite = '2026-08-20T00:00:30.000Z';
+  state.probeTargets[0].observations = {
+    'probe-1': { ...failedObservation(afterWrite), resolvedAddresses: ['203.0.113.10'], checkMarker: 'marker-1' },
+    'probe-2': { ...failedObservation(afterWrite), resolvedAddresses: ['203.0.113.10', '198.51.100.40'], checkMarker: 'marker-1' }
+  };
+
+  assert.equal(evaluateIncidentStabilization(state.incidents[0], state.probeTargets[0], state.probes, Date.parse(afterWrite)).action, 'waiting');
+  assert.equal(settleStabilizingIncidentForTarget(state, state.probeTargets[0], Date.parse(afterWrite)).action, 'waiting');
+  assert.equal(state.incidents[0].status, 'stabilizing');
+  assert.equal(state.ipAssets.length, 1);
+  assert.equal(state.ipLeases.length, 1);
+});
+
+test('finishes only when a probe successfully checks the expected replacement IP', () => {
+  const state = stabilizingFixture();
+  state.probeTargets[0].observations['probe-1'] = {
+    ok: true, rounds: 3, attemptsPerRound: 3, roundsCompleted: 1, attempts: 1,
+    checkedAt: '2026-08-20T00:00:30.000Z', resolvedAddresses: ['203.0.113.10', '198.51.100.40'], successfulAddress: '198.51.100.40', checkMarker: 'marker-1'
+  };
+
+  assert.equal(settleStabilizingIncidentForTarget(state, state.probeTargets[0], Date.parse('2026-08-20T00:00:30.000Z')).action, 'succeeded');
+  assert.equal(state.incidents[0].status, 'succeeded');
+  assert.equal(state.ipAssets.length, 0);
+  assert.equal(state.ipLeases.length, 0);
+  assert.equal(state.ipUsageRecords[0].status, 'consumed');
+});
+
+test('supports old probes only when every resolved address is the expected replacement', () => {
+  const state = stabilizingFixture();
+  state.probes[0].agentVersion = '1.3.0';
+  state.probeTargets[0].observations['probe-1'] = {
+    ok: true, rounds: 3, attemptsPerRound: 3, roundsCompleted: 1, attempts: 1,
+    checkedAt: '2026-08-20T00:00:30.000Z', resolvedAddresses: ['198.51.100.40'], successfulAddress: ''
+  };
+  const checkedAt = Date.parse('2026-08-20T00:00:30.000Z');
+  assert.equal(evaluateIncidentStabilization(state.incidents[0], state.probeTargets[0], state.probes, checkedAt).action, 'succeeded');
+
+  state.probeTargets[0].observations['probe-1'].resolvedAddresses.push('203.0.113.10');
+  assert.equal(evaluateIncidentStabilization(state.incidents[0], state.probeTargets[0], state.probes, checkedAt).action, 'waiting');
+});
+
+test('discards a replacement only after every assigned probe fully checks only that IP and fails', () => {
+  const state = stabilizingFixture();
+  const afterWrite = '2026-08-20T00:00:30.000Z';
+  state.probeTargets[0].observations = {
+    'probe-1': { ...failedObservation(afterWrite), resolvedAddresses: ['198.51.100.40'], checkMarker: 'marker-1' },
+    'probe-2': { ...failedObservation(afterWrite), resolvedAddresses: ['198.51.100.40'], checkMarker: 'marker-1' }
+  };
+
+  assert.equal(settleStabilizingIncidentForTarget(state, state.probeTargets[0], Date.parse(afterWrite)).action, 'retry');
+  assert.equal(state.incidents[0].status, 'queued');
+  assert.equal(state.incidents[0].id, 'incident-stabilizing');
+  assert.equal(state.ipAssets.length, 0);
+  assert.equal(state.ipLeases.length, 0);
+  assert.equal(state.ipUsageRecords[0].status, 'discarded');
+});
+
+test('reports DNS propagation timeout once and keeps the IP locked', () => {
+  const state = stabilizingFixture();
+  const afterDeadline = Date.parse('2026-08-20T00:04:00.000Z');
+
+  assert.equal(settleStabilizingIncidentForTarget(state, state.probeTargets[0], afterDeadline).action, 'timed_out');
+  assert.equal(state.incidents[0].status, 'stabilizing');
+  assert.equal(state.incidents[0].message, 'DNS 传播超时，继续等待');
+  assert.ok(state.incidents[0].stabilization.timeoutNotifiedAt);
+  assert.equal(settleStabilizingIncidentForTarget(state, state.probeTargets[0], afterDeadline + 30000).action, 'waiting');
+  assert.equal(state.auditLogs.filter((item) => item.action === 'incident.dns_timeout').length, 1);
+  assert.equal(state.ipAssets.length, 1);
+  assert.equal(state.ipLeases.length, 1);
+});
+
+test('preserves DNS stabilization state through normalization and restart', () => {
+  const state = stabilizingFixture();
+  const normalized = normalizeOrchestrationState(state);
+  assert.equal(normalized.incidents[0].status, 'stabilizing');
+  assert.deepEqual(normalized.incidents[0].stabilization, state.incidents[0].stabilization);
+  assert.equal(normalized.ipLeases.length, 1);
+});
+
+test('rejects a stale probe marker and waits for every allocated IP before retrying', () => {
+  const state = stabilizingFixture();
+  state.incidents[0].stabilization.expectedAddresses.push('198.51.100.41');
+  state.probeTargets[0].observations = {
+    'probe-1': { ...failedObservation('2026-08-20T00:00:30.000Z'), resolvedAddresses: ['198.51.100.40'], checkMarker: 'marker-1' },
+    'probe-2': { ...failedObservation('2026-08-20T00:00:30.000Z'), resolvedAddresses: ['198.51.100.40'], checkMarker: 'marker-1' }
+  };
+  assert.equal(evaluateIncidentStabilization(state.incidents[0], state.probeTargets[0], state.probes, Date.parse('2026-08-20T00:00:30.000Z')).action, 'waiting');
+
+  state.incidents[0].stabilization.expectedAddresses = ['198.51.100.40'];
+  state.probeTargets[0].observations['probe-1'] = {
+    ok: true, checkedAt: '2026-08-20T00:00:30.000Z', resolvedAddresses: ['198.51.100.40'],
+    successfulAddress: '198.51.100.40', checkMarker: 'older-marker'
+  };
+  delete state.probeTargets[0].observations['probe-2'];
+  assert.equal(evaluateIncidentStabilization(state.incidents[0], state.probeTargets[0], state.probes, Date.parse('2026-08-20T00:00:30.000Z')).action, 'waiting');
+
+  state.incidents[0].stabilization.checkMarker = '2026-08-20T00:00:10.000Z';
+  state.probeTargets[0].observations['probe-1'].checkMarker = '2026-08-20T00:00:20.000Z';
+  assert.equal(evaluateIncidentStabilization(state.incidents[0], state.probeTargets[0], state.probes, Date.parse('2026-08-20T00:00:30.000Z')).action, 'succeeded');
+});
+
+test('probe reports retry the same incident without creating a duplicate', () => {
+  const state = stabilizingFixture();
+  state.probeTargets[0].policyId = 'policy-1';
+  for (const probe of state.probes) probe.agentSecretHash = crypto.createHash('sha256').update('probe-secret').digest('hex');
+  const routes = new Map();
+  const app = {
+    get: (path, handler) => routes.set(`GET ${path}`, handler),
+    post: (path, handler) => routes.set(`POST ${path}`, handler)
+  };
+  const retried = [];
+  const deps = {
+    readState: () => state,
+    updateState: (updater) => updater(state),
+    allowProbeRegistration: () => true,
+    onIncidentCreated: (id) => retried.push(id)
+  };
+  registerProbePublicRoutes(app, deps);
+  const report = routes.get('POST /probe/report');
+  const response = () => ({ status: () => response(), json: () => {} });
+  const body = {
+    version: '1.4.0',
+    results: [{ targetId: 'target-1', ...failedObservation(), resolvedAddresses: ['198.51.100.40'], checkMarker: 'marker-1' }]
+  };
+
+  report({ headers: { 'x-probe-id': 'probe-1', authorization: 'Bearer probe-secret' }, body }, response());
+  assert.equal(state.incidents[0].status, 'stabilizing');
+  report({ headers: { 'x-probe-id': 'probe-2', authorization: 'Bearer probe-secret' }, body }, response());
+
+  assert.equal(state.incidents.length, 1);
+  assert.equal(state.incidents[0].id, 'incident-stabilizing');
+  assert.equal(state.incidents[0].status, 'queued');
+  assert.deepEqual(retried, ['incident-stabilizing']);
 });

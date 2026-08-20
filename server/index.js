@@ -2177,7 +2177,7 @@ function notifyIncidentViaTelegram(incidentId) {
   const incident = state.incidents?.find((item) => item.id === incidentId);
   if (!incident) return;
   const configs = (state.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc);
-  const text = `故障事件：${incident.targetName}\n状态：${incident.status}\n${incident.message || incident.error || ''}`;
+  const text = `故障事件：${incident.targetName}\n状态：${STATUS_LABELS[incident.status] || incident.status}\n${incident.message || incident.error || ''}`;
   for (const settings of configs) {
     let token = '';
     try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
@@ -2805,7 +2805,7 @@ function normalizeTelegramDomain(value) {
   return domain;
 }
 
-const STATUS_LABELS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待备用 IP', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', discarded: '检测不可用，已丢弃', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
+const STATUS_LABELS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待备用 IP', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', stabilizing: '等待 DNS 生效', discarded: '检测不可用，已丢弃', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
 
 function resolveTelegramRole(state, settings, from, chat) {
   const userId = String(from?.id || '');

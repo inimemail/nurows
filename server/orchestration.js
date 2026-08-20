@@ -23,9 +23,9 @@ const RESOURCE_MAP = {
 };
 
 const ACTIVE_INCIDENT_STATES = new Set([
-  'observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'
+  'observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'stabilizing', 'rolling_back'
 ]);
-const RUNNING_INCIDENT_STATES = new Set(['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back']);
+const RUNNING_INCIDENT_STATES = new Set(['allocating', 'automating', 'dns_updating', 'verifying', 'stabilizing', 'rolling_back']);
 const ACTIVE_DNS_CHANGE_STATES = new Set(['applied', 'recovery_pending']);
 const DEFAULT_TARGET_CHECK_ROUNDS = 3;
 const DEFAULT_TARGET_ATTEMPTS_PER_ROUND = 3;
@@ -94,7 +94,20 @@ export function normalizeOrchestrationState(parsed = {}) {
   }));
   normalized.incidents = normalized.incidents.map((incident) => {
     const legacyNoIp = incident.status === 'failed' && /备用\s*IP|备用地址|没有可用 IP/i.test(`${incident.error || ''} ${incident.message || ''}`);
-    return legacyNoIp ? { ...incident, status: 'waiting_for_ip', message: '等待备用 IP', error: '', executionId: '', recheckRequestedAt: '' } : incident;
+    const current = legacyNoIp ? { ...incident, status: 'waiting_for_ip', message: '等待备用 IP', error: '', executionId: '', recheckRequestedAt: '' } : incident;
+    if (current.status !== 'stabilizing') return current;
+    return {
+      ...current,
+      stabilization: {
+        expectedAddresses: cleanTexts(current.stabilization?.expectedAddresses, 100),
+        bindingIds: cleanIds(current.stabilization?.bindingIds, 100),
+        domains: cleanTexts(current.stabilization?.domains, 100),
+        dnsWrittenAt: cleanText(current.stabilization?.dnsWrittenAt, 40),
+        deadlineAt: cleanText(current.stabilization?.deadlineAt, 40),
+        checkMarker: cleanText(current.stabilization?.checkMarker, 100),
+        timeoutNotifiedAt: cleanText(current.stabilization?.timeoutNotifiedAt, 40)
+      }
+    };
   });
   normalized.dnsChanges = normalized.dnsChanges.filter((change) => change && typeof change === 'object').map((change) => ({
     ...change,
@@ -206,9 +219,11 @@ export function registerProbePublicRoutes(app, deps) {
     if (!auth) return res.status(401).json({ error: '探针凭证无效' });
     const reports = Array.isArray(req.body.results) ? req.body.results.slice(0, 2000) : [];
     const createdIncidentIds = [];
+    const retryIncidentIds = [];
+    const notifyIncidentIds = [];
     deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === auth.probe.id);
-      if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), updatedAt: nowIso() });
+      if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), agentVersion: cleanText(req.body.version, 40) || probe.agentVersion, updatedAt: nowIso() });
       for (const raw of reports) {
         const target = draft.probeTargets.find((item) => item.id === cleanId(raw.targetId) && item.probeIds?.includes(auth.probe.id));
         if (!target) {
@@ -236,12 +251,17 @@ export function registerProbePublicRoutes(app, deps) {
           attempts: clampNumber(raw.attempts, 0, checkRounds * attemptsPerRound, 0),
           successfulRound: clampNumber(raw.successfulRound, 0, checkRounds, 0),
           successfulAttempt: clampNumber(raw.successfulAttempt, 0, attemptsPerRound, 0),
-          resolvedAddresses: cleanTexts(raw.resolvedAddresses, 20)
+          resolvedAddresses: cleanTexts(raw.resolvedAddresses, 20),
+          successfulAddress: cleanText(raw.successfulAddress, 80),
+          checkMarker: cleanText(raw.checkMarker, 100)
         };
         target.updatedAt = nowIso();
         const transition = evaluateTargetHealth(target, draft.probes);
         target.health = transition.health;
         target.lastCheckAt = checkedAt;
+        const stabilizationResult = settleStabilizingIncidentForTarget(draft, target);
+        if (stabilizationResult.action === 'retry') retryIncidentIds.push(stabilizationResult.incidentId);
+        if (['succeeded', 'timed_out'].includes(stabilizationResult.action)) notifyIncidentIds.push(stabilizationResult.incidentId);
         if (transition.failed && target.policyId) {
           const active = draft.incidents.some((item) => item.targetId === target.id && (ACTIVE_INCIDENT_STATES.has(item.status) || (item.status === 'failed' && target.health === 'down')));
           const policy = draft.failoverPolicies.find((item) => item.id === target.policyId && item.enabled !== false);
@@ -257,6 +277,8 @@ export function registerProbePublicRoutes(app, deps) {
       return draft;
     });
     for (const incidentId of createdIncidentIds) deps.onIncidentCreated?.(incidentId);
+    for (const incidentId of [...new Set(retryIncidentIds)]) deps.onIncidentCreated?.(incidentId);
+    for (const incidentId of [...new Set(notifyIncidentIds)]) deps.notifyIncident?.(incidentId);
     deps.onDnsGuardReport?.();
     deps.onProbeReport?.();
     res.json({ ok: true, accepted: reports.length, incidents: createdIncidentIds });
@@ -756,11 +778,19 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
     }
 
     deps.updateState((draft) => {
-      const consumed = consumeIncidentIpAssets(draft, incidentId);
       const currentIncident = draft.incidents.find((item) => item.id === incidentId);
-      finalizeIpUsageRecords(draft, incidentId, 'consumed', '', currentIncident?.leaseIds);
-      updateIncident(draft, incidentId, { status: 'succeeded', message: '故障切换完成', executionId: '', finishedAt: nowIso() });
-      pushAudit(draft, 'incident.succeeded', 'incident', incidentId, `自动故障切换完成，已消耗 ${consumed.addresses.length} 个备用 IP`, 'system');
+      const currentTarget = draft.probeTargets.find((item) => item.id === currentIncident?.targetId);
+      const currentPolicy = draft.failoverPolicies.find((item) => item.id === currentIncident?.policyId);
+      const stabilization = createIncidentStabilization(draft, currentIncident, currentTarget, currentPolicy);
+      if (stabilization) {
+        const requestedAt = nowIso();
+        stabilization.checkMarker = requestedAt;
+        if (currentTarget) Object.assign(currentTarget, { checkNowAt: stabilization.checkMarker, updatedAt: requestedAt });
+        updateIncident(draft, incidentId, { status: 'stabilizing', message: '等待 DNS 生效', error: '', executionId: '', finishedAt: '', stabilization });
+        pushAudit(draft, 'incident.stabilizing', 'incident', incidentId, `DNS 已写入，等待探针确认新 IP：${stabilization.expectedAddresses.join(', ')}`, 'system');
+        return draft;
+      }
+      completeIncidentSuccess(draft, incidentId);
       return draft;
     });
     deps.notifyIncident?.(incidentId);
@@ -1423,6 +1453,138 @@ export function evaluateTargetHealth(target, probes) {
   return { failed, health: failed ? 'down' : healthy ? 'healthy' : 'observing' };
 }
 
+function completeConfiguredFailure(observation, target) {
+  const checkRounds = clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS);
+  const attemptsPerRound = clampNumber(target.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND);
+  return !observation.ok && observation.rounds === checkRounds &&
+    observation.attemptsPerRound === attemptsPerRound &&
+    observation.roundsCompleted === checkRounds &&
+    observation.attempts === checkRounds * attemptsPerRound;
+}
+
+function probeSupportsSuccessfulAddress(version) {
+  const parts = String(version || '').split('.').map((part) => Number.parseInt(part, 10));
+  if (parts.some((part) => !Number.isFinite(part))) return false;
+  return (parts[0] || 0) > 1 || ((parts[0] || 0) === 1 && (parts[1] || 0) >= 4);
+}
+
+export function evaluateIncidentStabilization(incident, target, probes, now = Date.now()) {
+  if (incident?.status !== 'stabilizing' || !incident.stabilization) return { action: 'inactive' };
+  const expected = new Set(cleanTexts(incident.stabilization.expectedAddresses, 100).map(normalizeComparableIp).filter(Boolean));
+  const dnsWrittenAt = Date.parse(incident.stabilization.dnsWrittenAt || 0);
+  const checkRounds = clampNumber(target?.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS);
+  const legacyCheckWindowMs = Math.max(15000, clampNumber(target?.timeout, 1, 60, 5) * checkRounds * 1000 + Math.max(0, checkRounds - 1) * 1000 + 10000);
+  const assigned = (target?.probeIds || [])
+    .map((probeId) => probes.find((probe) => probe.id === probeId && probe.enabled !== false))
+    .filter(Boolean);
+  const evidence = assigned.map((probe) => ({ probe, observation: target?.observations?.[probe.id] })).filter(({ probe, observation }) => {
+    const checkedAt = Date.parse(observation?.checkedAt || 0);
+    if (!Number.isFinite(checkedAt) || !Number.isFinite(dnsWrittenAt)) return false;
+    if (probeSupportsSuccessfulAddress(probe.agentVersion)) return checkMarkerAtOrAfter(observation?.checkMarker, incident.stabilization.checkMarker);
+    return checkedAt >= dnsWrittenAt + legacyCheckWindowMs;
+  });
+  const checkedExpectedSuccessfully = evidence.some(({ probe, observation }) => {
+    if (!observation.ok) return false;
+    if (expected.has(normalizeComparableIp(observation.successfulAddress))) return true;
+    const resolved = cleanTexts(observation.resolvedAddresses, 100).map(normalizeComparableIp).filter(Boolean);
+    return !probeSupportsSuccessfulAddress(probe.agentVersion) && resolved.length > 0 && resolved.every((address) => expected.has(address));
+  });
+  if (checkedExpectedSuccessfully) return { action: 'succeeded' };
+  const failedResolved = evidence.map(({ observation }) => cleanTexts(observation.resolvedAddresses, 100).map(normalizeComparableIp).filter(Boolean));
+  const resolvedEveryExpected = expected.size > 0 && [...expected].every((address) => failedResolved.some((addresses) => addresses.includes(address)));
+  const everyProbeFailedExpected = assigned.length > 0 && evidence.length === assigned.length && resolvedEveryExpected && evidence.every(({ observation }, index) => {
+    const resolved = failedResolved[index];
+    return resolved.length > 0 && resolved.every((address) => expected.has(address)) && completeConfiguredFailure(observation, target);
+  });
+  if (everyProbeFailedExpected) return { action: 'retry' };
+  const deadline = Date.parse(incident.stabilization.deadlineAt || 0);
+  if (!incident.stabilization.timeoutNotifiedAt && Number.isFinite(deadline) && now >= deadline) return { action: 'timed_out' };
+  return { action: 'waiting' };
+}
+
+export function settleStabilizingIncidentForTarget(state, target, now = Date.now()) {
+  const incident = state.incidents?.find((item) => item.targetId === target?.id && item.status === 'stabilizing');
+  if (!incident) return { action: 'inactive', incidentId: '' };
+  const result = evaluateIncidentStabilization(incident, target, state.probes || [], now);
+  const incidentId = incident.id;
+  if (result.action === 'succeeded') {
+    completeIncidentSuccess(state, incidentId);
+  } else if (result.action === 'retry') {
+    const candidates = (incident.leaseIds || []).map((leaseId) => {
+      const lease = state.ipLeases.find((item) => item.id === leaseId && item.incidentId === incidentId);
+      const asset = state.ipAssets.find((item) => item.id === lease?.assetId);
+      return lease && asset ? { leaseId, assetId: asset.id, address: asset.address } : null;
+    }).filter(Boolean);
+    discardUnusableIncidentIps(state, incidentId, candidates, '新 IP 经全部负责探针完整检查失败，已丢弃');
+    updateIncident(state, incidentId, { status: 'queued', message: '新 IP 检查失败，正在尝试下一个备用 IP', error: '', executionId: '', allocatedIps: [], leaseIds: [], stabilization: null, finishedAt: '' });
+    pushAudit(state, 'incident.stabilization_failed', 'incident', incidentId, `新 IP 检查失败，已丢弃 ${candidates.length} 个候选并继续同一事件`, 'probe');
+  } else if (result.action === 'timed_out') {
+    const timedOutAt = new Date(now).toISOString();
+    incident.stabilization.timeoutNotifiedAt = timedOutAt;
+    updateIncident(state, incidentId, { message: 'DNS 传播超时，继续等待' });
+    pushAudit(state, 'incident.dns_timeout', 'incident', incidentId, 'DNS 传播超时，保留当前备用 IP 并继续等待探针解析生效', 'system');
+  } else if (result.action === 'waiting') {
+    const leaseIds = new Set(incident.leaseIds || []);
+    for (const lease of state.ipLeases || []) {
+      if (leaseIds.has(lease.id)) lease.expiresAt = new Date(now + ALLOCATION_LOCK_TTL_MS).toISOString();
+    }
+  }
+  return { ...result, incidentId };
+}
+
+function createIncidentStabilization(state, incident, target, policy) {
+  if (!incident || !target || !policy || net.isIP(target.address)) return null;
+  const targetDomain = String(target.address || '').trim().toLowerCase().replace(/\.$/, '');
+  const bindings = (state.dnsBindings || []).filter((binding) =>
+    policy.dnsBindingIds?.includes(binding.id) && binding.enabled !== false &&
+    ['A', 'AAAA'].includes(binding.recordType) && String(binding.domain || '').trim().toLowerCase().replace(/\.$/, '') === targetDomain
+  );
+  if (!bindings.length) return null;
+  const expectedAddresses = [...new Set(bindings.flatMap((binding) => filterAddressFamily(incident.allocatedIps || [], binding.recordType)))];
+  if (!expectedAddresses.length) return null;
+  const bindingIds = bindings.map((binding) => binding.id);
+  const changes = (state.dnsChanges || []).filter((change) => change.incidentId === incident.id && bindingIds.includes(change.bindingId) && change.status === 'applied');
+  if (!changes.length) return null;
+  const writtenTimes = changes.map((change) => Date.parse(change.createdAt || 0)).filter(Number.isFinite);
+  const writtenMs = writtenTimes.length ? Math.max(...writtenTimes) : Date.now();
+  const maxTtl = Math.max(...bindings.map((binding) => clampNumber(binding.ttl, 1, 86400, 60)));
+  const propagationSeconds = Math.min(1800, Math.max(180, 2 * maxTtl + 60));
+  return {
+    expectedAddresses,
+    bindingIds,
+    domains: [...new Set(bindings.map((binding) => binding.domain))],
+    dnsWrittenAt: new Date(writtenMs).toISOString(),
+    deadlineAt: new Date(writtenMs + propagationSeconds * 1000).toISOString(),
+    checkMarker: '',
+    timeoutNotifiedAt: ''
+  };
+}
+
+function completeIncidentSuccess(state, incidentId) {
+  const incident = state.incidents.find((item) => item.id === incidentId);
+  const consumed = consumeIncidentIpAssets(state, incidentId);
+  finalizeIpUsageRecords(state, incidentId, 'consumed', '', incident?.leaseIds);
+  updateIncident(state, incidentId, { status: 'succeeded', message: '故障切换完成', error: '', executionId: '', finishedAt: nowIso() });
+  pushAudit(state, 'incident.succeeded', 'incident', incidentId, `自动故障切换完成，已消耗 ${consumed.addresses.length} 个备用 IP`, 'system');
+  return consumed;
+}
+
+function normalizeComparableIp(value) {
+  const address = cleanText(value, 80);
+  if (net.isIPv4(address)) return address.split('.').map(Number).join('.');
+  if (!net.isIPv6(address)) return '';
+  try { return new URL(`http://[${address}]/`).hostname.slice(1, -1).toLowerCase(); }
+  catch (_error) { return address.toLowerCase(); }
+}
+
+function checkMarkerAtOrAfter(actual, required) {
+  if (!actual || !required) return false;
+  const actualTime = Date.parse(actual);
+  const requiredTime = Date.parse(required);
+  if (Number.isFinite(actualTime) && Number.isFinite(requiredTime)) return actualTime >= requiredTime;
+  return actual === required;
+}
+
 function hasAvailableIpForIncident(incident, state) {
   const policy = state.failoverPolicies.find((item) => item.id === incident?.policyId && item.enabled !== false);
   if (!policy?.poolIds?.length) return false;
@@ -1481,7 +1643,11 @@ function allocateIpsForIncident(incidentId, deps) {
 }
 
 function canAllocateAsset(state, assetId) {
-  const active = state.ipLeases.filter((lease) => lease.assetId === assetId && ['locked', 'active'].includes(lease.status) && Date.parse(lease.expiresAt) > Date.now());
+  const active = state.ipLeases.filter((lease) => {
+    if (lease.assetId !== assetId || !['locked', 'active'].includes(lease.status)) return false;
+    const incident = state.incidents?.find((item) => item.id === lease.incidentId);
+    return incident?.status === 'stabilizing' || Date.parse(lease.expiresAt) > Date.now();
+  });
   return active.length === 0;
 }
 
@@ -1509,7 +1675,7 @@ async function checkReplacementIp(address, deps) {
   }
 }
 
-function discardUnusableIncidentIps(state, incidentId, unusable) {
+function discardUnusableIncidentIps(state, incidentId, unusable, reason = '备用 IP Ping 3 次失败，已丢弃') {
   const assetIds = new Set(unusable.map((item) => item.assetId).filter(Boolean));
   const leaseIds = new Set(unusable.map((item) => item.leaseId).filter(Boolean));
   if (!assetIds.size) return;
@@ -1521,8 +1687,8 @@ function discardUnusableIncidentIps(state, incidentId, unusable) {
     incident.leaseIds = (incident.leaseIds || []).filter((leaseId) => !leaseIds.has(leaseId));
     incident.allocatedIps = (incident.allocatedIps || []).filter((address) => !unusable.some((item) => item.address === address));
   }
-  finalizeIpUsageRecords(state, incidentId, 'discarded', '备用 IP Ping 3 次失败，已丢弃', [...leaseIds]);
-  for (const item of unusable) pushAudit(state, 'ip_preflight.discard', 'ipAsset', item.assetId, `${item.address} 备用 IP Ping 3 次失败，已丢弃`, 'system');
+  finalizeIpUsageRecords(state, incidentId, 'discarded', reason, [...leaseIds]);
+  for (const item of unusable) pushAudit(state, 'ip_preflight.discard', 'ipAsset', item.assetId, `${item.address} ${reason}`, 'system');
 }
 
 export function consumeIncidentIpAssets(state, incidentId) {

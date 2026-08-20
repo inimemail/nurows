@@ -148,21 +148,28 @@ test('deletes one idle incident and bulk-clears records while preserving running
   state.incidents = [
     { id: 'waiting', targetName: '等待项', status: 'waiting_for_ip', executionId: '' },
     { id: 'done', targetName: '完成项', status: 'succeeded', executionId: '' },
+    { id: 'stabilizing', targetName: '等待 DNS', status: 'stabilizing', executionId: '' },
     { id: 'running', targetName: '运行项', status: 'automating', executionId: 'execution-1' }
   ];
   state.ipLeases = [
     { id: 'waiting-lease', incidentId: 'waiting' },
+    { id: 'stabilizing-lease', incidentId: 'stabilizing' },
     { id: 'running-lease', incidentId: 'running' }
   ];
   const harness = createHarness(state);
 
   const single = await harness.request('DELETE', '/api/incidents/:id', { params: { id: 'waiting' } });
   assert.equal(single.body.removed, true);
-  assert.deepEqual(harness.readState().incidents.map((item) => item.id), ['done', 'running']);
-  assert.deepEqual(harness.readState().ipLeases.map((item) => item.id), ['running-lease']);
+  assert.deepEqual(harness.readState().incidents.map((item) => item.id), ['done', 'stabilizing', 'running']);
+  assert.deepEqual(harness.readState().ipLeases.map((item) => item.id), ['stabilizing-lease', 'running-lease']);
+
+  await assert.rejects(
+    harness.request('DELETE', '/api/incidents/:id', { params: { id: 'stabilizing' } }),
+    /事件正在执行/
+  );
 
   const all = await harness.request('DELETE', '/api/incidents');
   assert.equal(all.body.removed, 1);
-  assert.equal(all.body.kept, 1);
-  assert.deepEqual(harness.readState().incidents.map((item) => item.id), ['running']);
+  assert.equal(all.body.kept, 2);
+  assert.deepEqual(harness.readState().incidents.map((item) => item.id), ['stabilizing', 'running']);
 });

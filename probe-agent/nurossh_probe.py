@@ -13,7 +13,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
@@ -88,14 +88,14 @@ def check_attempt(target, addresses, timeout):
     for index, address in enumerate(ordered_addresses):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return False, "round timeout"
+            return False, "round timeout", ""
         address_timeout = remaining / max(1, len(ordered_addresses) - index)
         try:
             check_address(target, address, address_timeout)
-            return True, ""
+            return True, "", address
         except Exception as error:
             last_error = str(error) or error.__class__.__name__
-    return False, last_error
+    return False, last_error, ""
 
 
 def check_target(target):
@@ -115,19 +115,29 @@ def check_target(target):
     attempts_run = 0
     rounds_completed = 0
     addresses = None
+    resolved_addresses = set()
     last_error = "check failed"
     for round_index in range(1, check_rounds + 1):
+        addresses = None
+        try:
+            addresses = validate_target_address(target["address"], bool(target.get("allowPrivate")))
+            resolved_addresses.update(addresses)
+        except Exception as error:
+            last_error = str(error) or error.__class__.__name__
         round_deadline = time.monotonic() + timeout
         for attempt_index in range(1, attempts_per_round + 1):
             attempts_run += 1
             try:
                 if addresses is None:
                     addresses = validate_target_address(target["address"], bool(target.get("allowPrivate")))
+                    resolved_addresses.update(addresses)
                 remaining = round_deadline - time.monotonic()
                 attempts_left = attempts_per_round - attempt_index + 1
                 if remaining <= 0:
                     raise TimeoutError("round timeout")
-                ok, error = check_attempt(target, addresses, remaining / attempts_left)
+                attempt_result = check_attempt(target, addresses, remaining / attempts_left)
+                ok, error = attempt_result[:2]
+                successful_address = attempt_result[2] if len(attempt_result) > 2 else ""
                 if ok:
                     return {
                         "targetId": target["id"], "ok": True,
@@ -135,11 +145,12 @@ def check_target(target):
                         "rounds": check_rounds, "attemptsPerRound": attempts_per_round,
                         "roundsCompleted": round_index, "attempts": attempts_run,
                         "successfulRound": round_index, "successfulAttempt": attempt_index,
-                        "resolvedAddresses": sorted(addresses)
+                        "resolvedAddresses": sorted(resolved_addresses),
+                        "successfulAddress": successful_address,
+                        "checkMarker": str(target.get("checkNowAt", ""))
                     }
                 last_error = error
             except Exception as error:
-                addresses = None
                 last_error = str(error) or error.__class__.__name__
         rounds_completed = round_index
         if round_index < check_rounds:
@@ -151,7 +162,9 @@ def check_target(target):
         "rounds": check_rounds, "attemptsPerRound": attempts_per_round,
         "roundsCompleted": rounds_completed, "attempts": attempts_run,
         "successfulRound": 0, "successfulAttempt": 0,
-        "resolvedAddresses": sorted(addresses or [])
+        "resolvedAddresses": sorted(resolved_addresses),
+        "successfulAddress": "",
+        "checkMarker": str(target.get("checkNowAt", ""))
     }
 
 

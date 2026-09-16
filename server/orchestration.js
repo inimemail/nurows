@@ -333,6 +333,7 @@ export function registerOrchestrationRoutes(app, deps) {
   app.put('/api/orchestration/:resource/:id', asyncRoute(async (req, res) => {
     const key = RESOURCE_MAP[req.params.resource];
     if (!key) return res.status(404).json({ error: '未知资源类型' });
+    if (key === 'dnsGuards') assertDnsGuardIdle(req.params.id, deps, '守护检查正在执行，请结束后再编辑规则');
     if (key === 'dnsBindings') {
       const result = await saveDnsBindingConfiguration(req.body, req.params.id, deps, req.auth.username);
       return res.json({ ok: true, item: sanitizeResource(key, result.item), state: deps.sanitizeState(result.state, req.auth) });
@@ -368,6 +369,7 @@ export function registerOrchestrationRoutes(app, deps) {
   app.delete('/api/orchestration/:resource/:id', asyncRoute(async (req, res) => {
     const key = RESOURCE_MAP[req.params.resource];
     if (!key) return res.status(404).json({ error: '未知资源类型' });
+    if (key === 'dnsGuards') assertDnsGuardIdle(req.params.id, deps, '守护检查正在执行，请结束后再删除');
     const state = deps.updateState((draft) => {
       ensureNotReferenced(draft, key, req.params.id);
       draft[key] = draft[key].filter((entry) => entry.id !== req.params.id);
@@ -458,6 +460,7 @@ export function registerOrchestrationRoutes(app, deps) {
   });
 
   app.post('/api/dns-guards/:id/check-now', (req, res) => {
+    assertDnsGuardIdle(req.params.id, deps, '守护检查正在执行，请稍后再试');
     const state = deps.updateState((draft) => {
       const guard = draft.dnsGuards.find((item) => item.id === req.params.id);
       if (!guard) throw new Error('DNS 守护任务不存在');
@@ -471,6 +474,17 @@ export function registerOrchestrationRoutes(app, deps) {
     deps.onDnsGuardChanged?.(req.params.id);
     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
   });
+
+  app.post('/api/dns-guards/:id/sync', asyncRoute(async (req, res) => {
+    const result = await syncDnsGuardRemote(req.params.id, deps, req.auth.username);
+    res.json({ ok: true, ...result, state: deps.sanitizeState(result.state, req.auth) });
+  }));
+
+  app.put('/api/dns-guards/:id/remote-values', asyncRoute(async (req, res) => {
+    const result = await writeDnsGuardRemoteValues(req.params.id, req.body, deps, req.auth.username);
+    deps.onDnsGuardChanged?.(req.params.id);
+    res.json({ ok: true, ...result, state: deps.sanitizeState(result.state, req.auth) });
+  }));
 
   app.get('/api/dns-accounts/:id/credentials', (req, res) => {
     const account = deps.readState().dnsAccounts.find((item) => item.id === req.params.id);
@@ -608,6 +622,136 @@ export async function syncDnsBinding(bindingId, deps, actor = 'system') {
     return draft;
   });
   return { values, layout: dnsRecordLayout(account.provider), direction: 'remote_to_local', state: next };
+}
+
+export async function syncDnsGuardRemote(guardId, deps, actor = 'system') {
+  const current = deps.readState().dnsGuards.find((item) => item.id === guardId);
+  if (!current) throw new Error('DNS 守护任务不存在');
+  if (dnsGuardRuntime.has(guardId)) {
+    const error = new Error('守护任务正在处理，请稍后再读取远程 IP');
+    error.statusCode = 409;
+    throw error;
+  }
+  dnsGuardRuntime.add(guardId);
+  try {
+    return await syncDnsGuardRemoteLocked(guardId, deps, actor);
+  } finally {
+    dnsGuardRuntime.delete(guardId);
+  }
+}
+
+async function syncDnsGuardRemoteLocked(guardId, deps, actor) {
+  const state = deps.readState();
+  const guard = state.dnsGuards.find((item) => item.id === guardId);
+  if (!guard) throw new Error('DNS 守护任务不存在');
+  const account = state.dnsAccounts.find((item) => item.id === guard.accountId && item.enabled !== false);
+  if (!account) throw new Error('DNS 账号不可用');
+  const credentials = decryptCredentials(account, deps);
+  const resolveDnsBinding = deps.resolveDnsBinding || resolveManagedDnsZone;
+  const readDnsRecord = deps.readDnsRecord || getDnsRecord;
+  const { zone, normalizedBinding } = await resolveDnsBinding(state, account, credentials, guardBinding(guard));
+  const remote = await readDnsRecord(account, credentials, zone, withoutProviderRecordIds(normalizedBinding));
+  const values = filterAddressFamily(remote.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
+  const providerRecordIds = cleanTexts(remote.recordIds || (remote.recordId ? [remote.recordId] : []), 500);
+  const next = deps.updateState((draft) => {
+    const item = draft.dnsGuards.find((entry) => entry.id === guard.id);
+    if (!item) throw new Error('DNS 守护任务已被删除');
+    Object.assign(item, {
+      currentValues: values,
+      ownedValues: (item.ownedValues || []).filter((address) => values.includes(address)),
+      sourceOwnedValues: (item.sourceOwnedValues || []).filter((address) => values.includes(address)),
+      providerRecordId: providerRecordIds[0] || '',
+      providerRecordIds,
+      updatedAt: nowIso()
+    });
+    pushAudit(draft, 'dnsGuard.pull', 'dnsGuard', guard.id, `${guard.domain} 从服务商读取 ${values.length} 个 IP`, actor);
+    return draft;
+  });
+  return { values, direction: 'remote_to_local', state: next };
+}
+
+export async function writeDnsGuardRemoteValues(guardId, input, deps, actor = 'system') {
+  const current = deps.readState().dnsGuards.find((item) => item.id === guardId);
+  if (!current) throw new Error('DNS 守护任务不存在');
+  if (current.cycle || dnsGuardRuntime.has(guardId)) {
+    const error = new Error('守护检查正在执行，请结束后再编辑远程 IP');
+    error.statusCode = 409;
+    throw error;
+  }
+  dnsGuardRuntime.add(guardId);
+  try {
+    return await writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor);
+  } finally {
+    dnsGuardRuntime.delete(guardId);
+  }
+}
+
+async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
+  const state = deps.readState();
+  const guard = state.dnsGuards.find((item) => item.id === guardId);
+  if (!guard) throw new Error('DNS 守护任务不存在');
+  if (guard.cycle) {
+    const error = new Error('守护检查正在执行，请结束后再编辑远程 IP');
+    error.statusCode = 409;
+    throw error;
+  }
+  const values = normalizeGuardRemoteValues(input.values, guard.recordType);
+  const expectedValues = Array.isArray(input.expectedValues) ? normalizeGuardRemoteValues(input.expectedValues, guard.recordType) : null;
+  const account = state.dnsAccounts.find((item) => item.id === guard.accountId && item.enabled !== false);
+  if (!account) throw new Error('DNS 账号不可用');
+  const credentials = decryptCredentials(account, deps);
+  const resolveDnsBinding = deps.resolveDnsBinding || resolveManagedDnsZone;
+  const readDnsRecord = deps.readDnsRecord || getDnsRecord;
+  const writeDnsRecord = deps.writeDnsRecord || updateDnsRecord;
+  const { zone, normalizedBinding } = await resolveDnsBinding(state, account, credentials, guardBinding(guard));
+  const remote = await readDnsRecord(account, credentials, zone, withoutProviderRecordIds(normalizedBinding));
+  const beforeValues = filterAddressFamily(remote.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
+  if (expectedValues && !sameStringSet(beforeValues, expectedValues)) {
+    const error = new Error('远程 IP 已发生变化，请重新读取后再保存');
+    error.statusCode = 409;
+    throw error;
+  }
+  const providerBinding = {
+    ...normalizedBinding,
+    providerRecordId: remote.recordId ? String(remote.recordId) : '',
+    providerRecordIds: cleanTexts(remote.recordIds || (remote.recordId ? [remote.recordId] : []), 500)
+  };
+  const providerRecordIds = await replaceDnsRecordSafely({
+    account, credentials, zone, binding: providerBinding, beforeValues, afterValues: values,
+    recordType: guard.recordType, readDnsRecord, writeDnsRecord
+  });
+  const savedAt = nowIso();
+  const removed = new Set(beforeValues.filter((address) => !values.includes(address)));
+  const next = deps.updateState((draft) => {
+    const item = draft.dnsGuards.find((entry) => entry.id === guard.id);
+    if (!item || item.cycle) throw new Error('守护任务状态已变化，请重新读取后再保存');
+    const sourceState = structuredClone(item.sourceState || {});
+    for (const source of item.sources || []) {
+      const key = source.id || source.domain;
+      const current = sourceState[key];
+      if (!current) continue;
+      const sourceValues = [...cleanTexts(current.primary, 500), ...cleanTexts(current.backup, 500), ...cleanTexts(current.cached, 500)];
+      if (sourceValues.some((address) => removed.has(address))) current.pending = true;
+    }
+    Object.assign(item, {
+      currentValues: values,
+      ownedValues: (item.ownedValues || []).filter((address) => values.includes(address)),
+      sourceOwnedValues: (item.sourceOwnedValues || []).filter((address) => values.includes(address)),
+      sourceState,
+      providerRecordId: providerRecordIds?.[0] || '',
+      providerRecordIds: providerRecordIds || [],
+      status: 'queued',
+      message: '远程 IP 已更新，等待检查并修复',
+      nextCheckAt: '',
+      lastError: '',
+      updatedAt: savedAt
+    });
+    draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', guardId: item.id, bindingId: '', accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: item.domain, recordType: item.recordType, provider: account.provider, beforeValues, afterValues: values, status: 'applied', createdAt: savedAt, rolledBackAt: '' });
+    draft.dnsChanges = draft.dnsChanges.slice(0, 3000);
+    pushAudit(draft, 'dnsGuard.push', 'dnsGuard', item.id, `${item.domain} 手工写入服务商 ${values.length} 个 IP`, actor);
+    return draft;
+  });
+  return { values, beforeValues, direction: 'local_to_remote', state: next };
 }
 
 export async function saveDnsBindingConfiguration(input, bindingId, deps, actor = 'system') {
@@ -863,6 +1007,15 @@ export function requestWaitingIncidentRechecks(deps) {
 
 const dnsGuardRuntime = new Set();
 
+function assertDnsGuardIdle(guardId, deps, message) {
+  const guard = deps.readState().dnsGuards.find((item) => item.id === guardId);
+  if (!guard) throw new Error('DNS 守护任务不存在');
+  if (!guard.cycle && !dnsGuardRuntime.has(guardId)) return guard;
+  const error = new Error(message);
+  error.statusCode = 409;
+  throw error;
+}
+
 export async function runDueDnsGuards(deps, requestedId = '') {
   const state = deps.readState();
   const now = Date.now();
@@ -933,11 +1086,11 @@ async function prepareDnsGuardCycle(guardId, deps) {
   const currentValues = filterAddressFamily(before.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
   const sourceResult = await resolveDnsGuardSources(guard, currentValues);
   const candidateAssets = collectDnsGuardPoolCandidates(state, guard, DNS_GUARD_MAX_VALUES);
-  const values = [...new Set([...currentValues, ...sourceResult.values, ...candidateAssets.map((item) => item.address)])].slice(0, DNS_GUARD_MAX_VALUES * 3);
+  const values = buildDnsGuardCheckAddresses(currentValues, sourceResult.values, candidateAssets);
   if (!values.length) {
     deps.updateState((draft) => updateDnsGuard(draft, guardId, {
       status: 'waiting_ip', message: '没有解析值或可用备用 IP', currentValues: [], sourceState: sourceResult.state,
-      cycle: null, lastCheckAt: nowIso(), nextCheckAt: addSeconds(guard.interval), lastError: ''
+      sourceErrors: sourceResult.errors, cycle: null, lastCheckAt: nowIso(), nextCheckAt: addSeconds(guard.interval), lastError: ''
     }));
     if (guard.status !== 'waiting_ip') deps.notifyDnsGuard?.(guardId);
     return;
@@ -948,6 +1101,7 @@ async function prepareDnsGuardCycle(guardId, deps) {
     expectedProbeIds,
     remoteValues: currentValues,
     sourceValues: sourceResult.values,
+    sourceCandidates: sourceResult.candidates,
     candidateAssets,
     sourceState: sourceResult.state,
     sourceErrors: sourceResult.errors,
@@ -957,31 +1111,94 @@ async function prepareDnsGuardCycle(guardId, deps) {
   };
   deps.updateState((draft) => updateDnsGuard(draft, guardId, {
     status: 'checking', message: `正在检查 ${values.length} 个 IP`, currentValues, sourceState: sourceResult.state,
-    cycle, lastError: '', nextCheckAt: addSeconds(guard.interval)
+    sourceErrors: sourceResult.errors, cycle, lastError: '', nextCheckAt: addSeconds(guard.interval)
   }));
 }
 
-async function resolveDnsGuardSources(guard, currentValues) {
+export async function resolveDnsGuardSources(guard, currentValues, resolveAddresses = resolveDomainAddresses) {
   const family = guard.recordType === 'AAAA' ? 6 : 4;
-  const state = structuredClone(guard.sourceState || {});
-  const values = [];
+  const previousState = structuredClone(guard.sourceState || {});
+  const state = {};
+  const candidates = {};
   const errors = [];
   for (const source of guard.sources || []) {
     const key = source.id || source.domain;
-    const previous = state[key] || { cached: [], blocked: [] };
-    const blocked = new Set(cleanTexts(previous.blocked, 500).filter((address) => !currentValues.includes(address)));
-    let selected = [];
-    try {
-      const addresses = await resolveDomainAddresses(source.domain, family);
-      selected = addresses.filter((address) => !blocked.has(address));
-    } catch (error) {
-      errors.push(`${source.domain}: ${cleanText(error.message, 120)}`);
+    const previous = previousState[key] || {};
+    const domains = { primary: source.domain, backup: source.backupDomain || '' };
+    const previousDomains = previous.domains && typeof previous.domains === 'object' ? previous.domains : { primary: source.domain, backup: '' };
+    const entry = {
+      domains,
+      primary: [],
+      backup: [],
+      activeSide: previous.activeSide === 'backup' && domains.backup ? 'backup' : 'primary',
+      pending: Boolean(previous.pending),
+      lastError: '',
+      checkedAt: nowIso()
+    };
+    const sourceErrors = [];
+    for (const side of ['primary', 'backup']) {
+      const domain = domains[side];
+      if (!domain) continue;
+      const legacyCache = side === 'primary' ? previous.cached : [];
+      const cached = previousDomains[side] === domain ? cleanTexts(previous[side] || legacyCache, 500) : [];
+      try {
+        entry[side] = await resolveAddresses(domain, family);
+      } catch (error) {
+        const message = `${domain}: ${cleanText(error.message, 120)}`;
+        errors.push(message);
+        sourceErrors.push(message);
+        entry[side] = cached.filter((address) => currentValues.includes(address));
+      }
     }
-    if (!selected.length) selected = cleanTexts(previous.cached, 500).filter((address) => currentValues.includes(address) && !blocked.has(address));
-    for (const address of selected) if (!values.includes(address)) values.push(address);
-    state[key] = { cached: selected, blocked: [...blocked], checkedAt: nowIso() };
+    entry.lastError = sourceErrors.join('；');
+    candidates[key] = { primary: entry.primary, backup: entry.backup };
+    state[key] = entry;
   }
-  return { values: values.slice(0, DNS_GUARD_MAX_VALUES), state, errors };
+  const values = roundRobinDnsGuardSourceValues(guard.sources, candidates, DNS_GUARD_MAX_VALUES * 4);
+  return { values, candidates, state, errors };
+}
+
+export function roundRobinDnsGuardSourceValues(sources, candidates, limit = DNS_GUARD_MAX_VALUES * 4) {
+  const groups = (sources || []).flatMap((source) => {
+    const item = candidates?.[source.id || source.domain] || {};
+    return [cleanTexts(item.primary, 500), cleanTexts(item.backup, 500)];
+  });
+  const result = [];
+  const seen = new Set();
+  const maxLength = Math.max(0, ...groups.map((values) => values.length));
+  for (let index = 0; index < maxLength && result.length < limit; index += 1) {
+    for (const values of groups) {
+      const address = values[index];
+      if (!address || seen.has(address)) continue;
+      seen.add(address);
+      result.push(address);
+      if (result.length >= limit) break;
+    }
+  }
+  return result;
+}
+
+export function selectHealthyDnsGuardSources(sources, candidates, sourceState, resultByAddress) {
+  const state = structuredClone(sourceState || {});
+  const values = [];
+  for (const source of sources || []) {
+    const key = source.id || source.domain;
+    const current = state[key] || { domains: { primary: source.domain, backup: source.backupDomain || '' }, primary: [], backup: [] };
+    const sourceCandidates = candidates?.[key] || { primary: current.primary || current.cached || [], backup: current.backup || [] };
+    const primary = cleanTexts(sourceCandidates.primary, 500).filter((address) => resultByAddress.get(address)?.ok);
+    const backup = cleanTexts(sourceCandidates.backup, 500).filter((address) => resultByAddress.get(address)?.ok);
+    const activeSide = primary.length ? 'primary' : backup.length ? 'backup' : (current.activeSide === 'backup' && source.backupDomain ? 'backup' : 'primary');
+    const selected = activeSide === 'backup' ? backup : primary;
+    current.activeSide = activeSide;
+    current.pending = selected.length === 0;
+    if (!selected.length && (sourceCandidates.primary?.length || sourceCandidates.backup?.length)) {
+      current.lastError = [current.lastError, '探针检查失败'].filter(Boolean).join('；');
+    }
+    current.checkedAt = nowIso();
+    state[key] = current;
+    for (const address of selected) if (!values.includes(address)) values.push(address);
+  }
+  return { values: values.slice(0, DNS_GUARD_MAX_VALUES), state };
 }
 
 export function collectDnsGuardPoolCandidates(state, guard, limit = DNS_GUARD_MAX_VALUES) {
@@ -1001,6 +1218,14 @@ export function collectDnsGuardPoolCandidates(state, guard, limit = DNS_GUARD_MA
     }
   }
   return result;
+}
+
+export function buildDnsGuardCheckAddresses(currentValues, sourceValues, candidateAssets) {
+  return [...new Set([
+    ...cleanTexts(currentValues, DNS_GUARD_MAX_VALUES),
+    ...cleanTexts(sourceValues, DNS_GUARD_MAX_VALUES * 4),
+    ...(candidateAssets || []).slice(0, DNS_GUARD_MAX_VALUES).map((item) => item.address)
+  ])].slice(0, DNS_GUARD_MAX_VALUES * 6);
 }
 
 export function dnsGuardCycleReady(guard) {
@@ -1026,8 +1251,9 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
   const remote = guard.cycle.remoteValues || [];
   const failedRemote = remote.filter((address) => !resultByAddress.get(address)?.ok);
   const healthyRemote = remote.filter((address) => resultByAddress.get(address)?.ok);
-  const healthySources = (guard.cycle.sourceValues || []).filter((address) => resultByAddress.get(address)?.ok);
-  const staleOwned = guard.pruneStale === false ? new Set() : new Set((guard.sourceOwnedValues || []).filter((address) => !guard.cycle.sourceValues.includes(address)));
+  const selectedSources = selectHealthyDnsGuardSources(guard.sources, guard.cycle.sourceCandidates, guard.cycle.sourceState, resultByAddress);
+  const healthySources = selectedSources.values;
+  const staleOwned = guard.pruneStale === false ? new Set() : new Set((guard.sourceOwnedValues || []).filter((address) => !healthySources.includes(address)));
   const desired = healthyRemote.filter((address) => !staleOwned.has(address));
   for (const address of healthySources) if (!desired.includes(address) && desired.length < guard.maxActiveIps) desired.push(address);
   const usedAssets = [];
@@ -1038,24 +1264,25 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
     if (resultByAddress.get(item.address)?.ok) { desired.push(item.address); usedAssets.push(item); }
     else unusableAssets.push(item);
   }
-  const preservedAllFailed = !desired.length && remote.length > 0;
-  if (preservedAllFailed) desired.push(...remote);
   const changed = !sameStringSet(remote, desired);
   const account = state.dnsAccounts.find((item) => item.id === guard.accountId && item.enabled !== false);
   if (!account) throw new Error('DNS 服务商账号不可用');
   let providerRecordIds = [];
-  if (changed && desired.length) {
+  if (changed) {
     const credentials = decryptCredentials(account, deps);
+    const readDnsRecord = deps.readDnsRecord || getDnsRecord;
+    const writeDnsRecord = deps.writeDnsRecord || updateDnsRecord;
     const binding = { ...guardBinding(guard), ...(guard.cycle.normalizedBinding || {}) };
     const zone = guard.cycle.zone;
-    const latest = await getDnsRecord(account, credentials, zone, binding);
+    const latest = await readDnsRecord(account, credentials, zone, binding);
     if (!sameStringSet(filterAddressFamily(latest.values, guard.recordType), remote)) {
       deps.updateState((draft) => updateDnsGuard(draft, guardId, { status: 'queued', message: '服务商记录已变化，等待重新检查', cycle: null, nextCheckAt: '' }));
       return;
     }
-    providerRecordIds = await updateDnsRecord(account, credentials, zone, binding, desired);
-    const verified = await getDnsRecord(account, credentials, zone, { ...binding, providerRecordIds });
-    if (!sameStringSet(filterAddressFamily(verified.values, guard.recordType), desired)) throw new Error('服务商记录验证不一致，已停止消耗备用 IP');
+    providerRecordIds = await replaceDnsRecordSafely({
+      account, credentials, zone, binding, beforeValues: remote, afterValues: desired,
+      recordType: guard.recordType, readDnsRecord, writeDnsRecord
+    });
   }
   const previousStatus = guard.status;
   const finishedAt = nowIso();
@@ -1063,13 +1290,7 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
     const item = draft.dnsGuards.find((entry) => entry.id === guardId && entry.cycle?.id === cycleId);
     if (!item) return draft;
     const cycleSnapshot = structuredClone(item.cycle);
-    const sourceState = structuredClone(cycleSnapshot.sourceState || {});
-    for (const source of item.sources || []) {
-      const key = source.id || source.domain;
-      const current = sourceState[key] || { cached: [], blocked: [] };
-      current.blocked = [...new Set([...(current.blocked || []), ...failedRemote.filter((address) => current.cached?.includes(address))])];
-      sourceState[key] = current;
-    }
+    const sourceState = selectedSources.state;
     const discardedIds = new Set(unusableAssets.map((entry) => entry.assetId));
     const consumedIds = new Set(usedAssets.map((entry) => entry.assetId));
     const removedIds = new Set([...discardedIds, ...consumedIds]);
@@ -1091,17 +1312,18 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
     draft.ipUsageRecords = draft.ipUsageRecords.slice(0, 5000);
     if (changed) draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', guardId, bindingId: '', accountId: item.accountId, zoneId: cycleSnapshot.zone.id || '', zoneName: cycleSnapshot.zone.name, providerZoneId: cycleSnapshot.zone.providerZoneId || '', domain: item.domain, beforeValues: remote, afterValues: desired, status: 'applied', createdAt: finishedAt, rolledBackAt: '' });
     draft.dnsChanges = draft.dnsChanges.slice(0, 3000);
-    const ownedValues = [...new Set([...(item.ownedValues || []).filter((address) => desired.includes(address)), ...healthySources.filter((address) => desired.includes(address)), ...usedAssets.map((entry) => entry.address)])];
-    const sourceOwnedValues = [...new Set([...(item.sourceOwnedValues || []).filter((address) => desired.includes(address) && cycleSnapshot.sourceValues.includes(address)), ...healthySources.filter((address) => desired.includes(address))])];
-    const status = preservedAllFailed || !desired.length
+    const ownership = calculateDnsGuardOwnership(item, remote, desired, healthySources, usedAssets);
+    const status = !desired.length
       ? 'waiting_ip'
       : (failedRemote.length
           ? (usedAssets.length || healthySources.some((address) => !remote.includes(address)) ? 'replaced' : 'degraded')
           : 'healthy');
     Object.assign(item, {
       status, message: dnsGuardStatusMessage(status, failedRemote.length, usedAssets.length), currentValues: desired,
-      ownedValues, sourceOwnedValues, sourceState, cycle: null, lastCheckAt: finishedAt, nextCheckAt: addSeconds(item.interval), lastError: '',
-      providerRecordIds: providerRecordIds.length ? providerRecordIds : item.providerRecordIds
+      ...ownership, sourceState, cycle: null, lastCheckAt: finishedAt, nextCheckAt: addSeconds(item.interval), lastError: '',
+      sourceErrors: Object.values(sourceState).map((entry) => cleanText(entry?.lastError, 300)).filter(Boolean),
+      providerRecordId: changed ? (providerRecordIds[0] || '') : item.providerRecordId,
+      providerRecordIds: changed ? providerRecordIds : item.providerRecordIds
     });
     draft.dnsGuardRuns.unshift({ id: uuidv4(), guardId, guardName: item.name, domain: item.domain, status, beforeValues: remote, afterValues: desired, failedValues: failedRemote, sourceValues: cycleSnapshot.sourceValues, consumedIps: usedAssets.map((entry) => entry.address), discardedIps: unusableAssets.map((entry) => entry.address), startedAt: cycleSnapshot.startedAt, finishedAt, message: item.message });
     draft.dnsGuardRuns = draft.dnsGuardRuns.slice(0, DNS_GUARD_HISTORY_LIMIT);
@@ -1110,6 +1332,52 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
   });
   const next = state.dnsGuards.find((item) => item.id === guardId);
   if (next && (next.status !== previousStatus || ['replaced', 'degraded', 'waiting_ip'].includes(next.status))) deps.notifyDnsGuard?.(guardId);
+}
+
+export function calculateDnsGuardOwnership(guard, remoteValues, desiredValues, healthySourceValues, usedAssets = []) {
+  const remote = new Set(remoteValues || []);
+  const desired = new Set(desiredValues || []);
+  const healthySources = new Set(healthySourceValues || []);
+  const introducedSources = [...healthySources].filter((address) => desired.has(address) && !remote.has(address));
+  return {
+    ownedValues: [...new Set([
+      ...(guard.ownedValues || []).filter((address) => desired.has(address)),
+      ...introducedSources,
+      ...usedAssets.map((entry) => entry.address).filter((address) => desired.has(address))
+    ])],
+    sourceOwnedValues: [...new Set([
+      ...(guard.sourceOwnedValues || []).filter((address) => desired.has(address) && healthySources.has(address)),
+      ...introducedSources
+    ])]
+  };
+}
+
+async function replaceDnsRecordSafely({ account, credentials, zone, binding, beforeValues, afterValues, recordType, readDnsRecord, writeDnsRecord }) {
+  let afterIds = [];
+  try {
+    afterIds = await writeDnsRecord(account, credentials, zone, binding, afterValues);
+    const verifyBinding = afterIds?.length
+      ? { ...binding, providerRecordId: afterIds[0], providerRecordIds: afterIds }
+      : withoutProviderRecordIds(binding);
+    const verified = await readDnsRecord(account, credentials, zone, verifyBinding);
+    if (!sameStringSet(filterAddressFamily(verified.values, recordType), afterValues)) throw new Error('服务商返回的记录值与写入内容不一致');
+    return afterIds || [];
+  } catch (error) {
+    try {
+      const rollbackBinding = afterIds?.length
+        ? { ...binding, providerRecordId: afterIds[0], providerRecordIds: afterIds }
+        : withoutProviderRecordIds(binding);
+      const rollbackIds = await writeDnsRecord(account, credentials, zone, rollbackBinding, beforeValues);
+      const verifyRollbackBinding = rollbackIds?.length
+        ? { ...binding, providerRecordId: rollbackIds[0], providerRecordIds: rollbackIds }
+        : withoutProviderRecordIds(binding);
+      const restored = await readDnsRecord(account, credentials, zone, verifyRollbackBinding);
+      if (!sameStringSet(filterAddressFamily(restored.values, recordType), beforeValues)) throw new Error('自动恢复后的记录验证不一致');
+    } catch (rollbackError) {
+      throw new Error(`远程写入失败且自动恢复失败：${cleanText(error.message, 240)}；${cleanText(rollbackError.message, 240)}`);
+    }
+    throw new Error(`远程写入失败，已恢复原记录：${cleanText(error.message, 300)}`);
+  }
 }
 
 function recordDnsGuardError(guardId, error, deps) {
@@ -1142,6 +1410,16 @@ function dnsGuardStatusMessage(status, failed, consumed) {
 function addSeconds(seconds) { return new Date(Date.now() + Math.max(1, Number(seconds) || 30) * 1000).toISOString(); }
 function sameStringSet(left, right) { return JSON.stringify([...new Set(left || [])].sort()) === JSON.stringify([...new Set(right || [])].sort()); }
 function filterAddressFamily(values, recordType) { const family = recordType === 'AAAA' ? 6 : 4; return [...new Set((values || []).filter((value) => net.isIP(value) === family))]; }
+function normalizeGuardRemoteValues(value, recordType) {
+  const raw = cleanTexts(value, DNS_GUARD_MAX_VALUES + 1);
+  if (raw.length > DNS_GUARD_MAX_VALUES) throw new Error(`远程 IP 最多 ${DNS_GUARD_MAX_VALUES} 个`);
+  const family = recordType === 'AAAA' ? 6 : 4;
+  return [...new Set(raw.map((address) => {
+    const normalized = validateIp(address);
+    if (net.isIP(normalized) !== family) throw new Error(`${address} 不是有效的 ${recordType} 地址`);
+    return normalized;
+  }))];
+}
 
 function targetCompletedCheckSince(target, probes, requestedAt) {
   if (!target || !requestedAt) return true;
@@ -1194,8 +1472,12 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     const recordType = input.recordType === 'AAAA' ? 'AAAA' : 'A';
     const probeIds = cleanIds(input.probeIds, 500);
     const poolIds = cleanIds(input.poolIds, 100);
+    validateDdnsSources(input.sources || input.ddnsSources);
+    const sources = normalizeDdnsSources(input.sources || input.ddnsSources);
+    const targetChanged = Boolean(existing && (existing.accountId !== accountId || existing.domain !== domain || existing.recordType !== recordType));
+    const sourcesChanged = Boolean(existing && JSON.stringify(existing.sources || []) !== JSON.stringify(sources));
     const identityChanged = Boolean(existing && (
-      existing.accountId !== accountId || existing.domain !== domain || existing.recordType !== recordType ||
+      targetChanged || sourcesChanged ||
       JSON.stringify([...(existing.probeIds || [])].sort()) !== JSON.stringify([...probeIds].sort())
     ));
     return normalizeDnsGuardState({
@@ -1217,13 +1499,17 @@ function normalizeResource(key, input = {}, existing = null, deps) {
       attemptsPerRound: clampNumber(input.attemptsPerRound, 1, 10, 3),
       maxParallel: clampNumber(input.maxParallel, 1, 300, 20),
       pruneStale: input.pruneStale !== false,
-      sources: normalizeDdnsSources(input.sources || input.ddnsSources),
+      sources,
       enabled: input.enabled !== false,
       status: identityChanged ? 'queued' : (existing?.status || 'queued'),
       message: identityChanged ? '配置已更新，等待检查' : (existing?.message || ''),
-      currentValues: identityChanged ? [] : (existing?.currentValues || []),
-      ownedValues: identityChanged ? [] : (existing?.ownedValues || []),
-      sourceState: identityChanged ? {} : (existing?.sourceState || {}),
+      currentValues: targetChanged ? [] : (existing?.currentValues || []),
+      ownedValues: targetChanged ? [] : (existing?.ownedValues || []),
+      sourceOwnedValues: targetChanged ? [] : (existing?.sourceOwnedValues || []),
+      sourceState: targetChanged || sourcesChanged ? {} : (existing?.sourceState || {}),
+      sourceErrors: targetChanged || sourcesChanged ? [] : (existing?.sourceErrors || []),
+      providerRecordId: targetChanged ? '' : (existing?.providerRecordId || ''),
+      providerRecordIds: targetChanged ? [] : (existing?.providerRecordIds || []),
       cycle: null,
       lastCheckAt: identityChanged ? '' : (existing?.lastCheckAt || ''),
       nextCheckAt: identityChanged ? '' : (existing?.nextCheckAt || ''),
@@ -2224,7 +2510,16 @@ async function findHuaweiRecordset(account, credentials, zone, binding) {
   const query = `?name=${encodeURIComponent(`${binding.domain}.`)}&type=${encodeURIComponent(binding.recordType)}&limit=500`;
   const data = await huaweiRequest(account, credentials, 'GET', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets${query}`);
   const matches = (data.recordsets || []).filter((item) => normalizeDomain(item.name) === binding.domain && item.type === binding.recordType);
-  if (matches.length > 1) throw new Error(`华为云存在多个同名 ${binding.recordType} 记录，请先在华为云合并重复记录`);
+  if (matches.length > 1) {
+    const requestedLine = cleanText(binding.recordLine, 100).toLowerCase();
+    const lineMatches = matches.filter((item) => {
+      const line = cleanText(item.line, 100).toLowerCase();
+      if (!requestedLine || requestedLine === '默认' || requestedLine === 'default_view') return !line || line === 'default_view' || line === '默认';
+      return line === requestedLine;
+    });
+    if (lineMatches.length === 1) return lineMatches[0];
+    throw new Error(`华为云存在多个同名 ${binding.recordType} 记录，无法确定线路`);
+  }
   return matches[0] || null;
 }
 
@@ -2256,20 +2551,57 @@ function normalizeDdnsSources(value) {
   if (!Array.isArray(value)) return [];
   const result = [];
   const domains = new Set();
-  const append = (domainValue, id, name) => {
-    if (!domainValue || result.length >= 100) return;
-    const domain = normalizeDomain(domainValue);
-    if (domains.has(domain)) return;
+  const items = value.slice(0, 100);
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (!item?.domain) continue;
+    const domain = normalizeDomain(item.domain);
+    if (domains.has(domain)) continue;
     domains.add(domain);
-    result.push({ id: cleanId(id) || `source-${result.length + 1}`, name: cleanText(name, 100), domain });
-  };
-  for (const [index, item] of value.slice(0, 100).entries()) {
-    const baseId = cleanId(item?.id) || `source-${index + 1}`;
-    const baseName = cleanText(item?.name, 100);
-    append(item?.domain, baseId, baseName);
-    append(item?.backupDomain, `${baseId}-backup`, baseName ? `${baseName} 备用` : '备用来源');
+    let backupDomain = '';
+    const next = items[index + 1];
+    const itemId = cleanId(item.id) || `source-${index + 1}`;
+    const itemName = cleanText(item.name, 100);
+    const legacyBackup = !item.backupDomain && !item.backup_domain && next?.domain && !next.backupDomain && !next.backup_domain
+      && cleanId(next.id) === `${itemId}-backup`
+      && cleanText(next.name, 100) === (itemName ? `${itemName} 备用` : '备用来源');
+    const backupValue = item.backupDomain || item.backup_domain || (legacyBackup ? next.domain : '');
+    if (backupValue) {
+      const normalizedBackup = normalizeDomain(backupValue);
+      if (!domains.has(normalizedBackup) && normalizedBackup !== domain) {
+        backupDomain = normalizedBackup;
+        domains.add(normalizedBackup);
+      }
+    }
+    result.push({
+      id: itemId,
+      name: itemName,
+      domain,
+      backupDomain
+    });
+    if (legacyBackup) index += 1;
   }
   return result;
+}
+
+function validateDdnsSources(value) {
+  if (!Array.isArray(value)) return;
+  if (value.length > 100) throw new Error('DDNS 来源最多 100 个');
+  const ids = new Set();
+  const domains = new Set();
+  for (const [index, item] of value.entries()) {
+    if (!item?.domain) continue;
+    const id = cleanId(item.id) || `source-${index + 1}`;
+    if (ids.has(id)) throw new Error('DDNS 来源 ID 不能重复');
+    ids.add(id);
+    const primary = normalizeDomain(item.domain);
+    const backup = item.backupDomain || item.backup_domain ? normalizeDomain(item.backupDomain || item.backup_domain) : '';
+    if (backup && backup === primary) throw new Error('备用 DDNS 域名不能与主域名相同');
+    for (const domain of [primary, backup].filter(Boolean)) {
+      if (domains.has(domain)) throw new Error(`DDNS 来源域名重复：${domain}`);
+      domains.add(domain);
+    }
+  }
 }
 
 function normalizeDnsGuardState(value = {}) {
@@ -2300,7 +2632,9 @@ function normalizeDnsGuardState(value = {}) {
     ownedValues: filterAddressFamily(cleanTexts(value.ownedValues, DNS_GUARD_MAX_VALUES), value.recordType),
     sourceOwnedValues: filterAddressFamily(cleanTexts(value.sourceOwnedValues, DNS_GUARD_MAX_VALUES), value.recordType),
     sourceState: value.sourceState && typeof value.sourceState === 'object' ? value.sourceState : {},
+    sourceErrors: cleanTexts(value.sourceErrors, 100),
     cycle: value.cycle && typeof value.cycle === 'object' ? value.cycle : null,
+    providerRecordId: cleanText(value.providerRecordId, 200),
     providerRecordIds: cleanTexts(value.providerRecordIds, 500),
     lastCheckAt: cleanText(value.lastCheckAt, 40),
     nextCheckAt: cleanText(value.nextCheckAt, 40),

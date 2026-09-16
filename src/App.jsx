@@ -405,6 +405,7 @@ export default function App() {
   const [automationPaused, setAutomationPaused] = useState(false);
   const [automationExpandedServerId, setAutomationExpandedServerId] = useState('');
   const automationResultListRef = useRef(null);
+  const automationCompletionNotifiedJobIdRef = useRef('');
   const [automationInputDialog, setAutomationInputDialog] = useState({ open: false, mode: 'choice', value: '', awaitingServerIds: [] });
   const [automationEditorOpen, setAutomationEditorOpen] = useState(false);
   const [draggedAutomationStepId, setDraggedAutomationStepId] = useState('');
@@ -706,21 +707,27 @@ export default function App() {
   useEffect(() => {
     if (!automationJobId) return;
     let cancelled = false;
-    const timer = window.setInterval(async () => {
+    let timer = null;
+    const poll = async () => {
       try {
         const data = await api(`/api/commands/jobs/${automationJobId}`);
         if (cancelled) return;
         setAutomationResults(data.results || []);
         if (data.status === 'done') {
-          window.clearInterval(timer);
           api('/api/state').then((nextState) => setState(nextState)).catch(() => undefined);
-          toast('自动化任务执行完成');
+          if (automationCompletionNotifiedJobIdRef.current !== automationJobId) {
+            automationCompletionNotifiedJobIdRef.current = automationJobId;
+            toast('自动化任务执行完成');
+          }
+          return;
         }
+        timer = window.setTimeout(poll, 900);
       } catch (_error) {
-        window.clearInterval(timer);
+        // Stop polling when the job expires or the request fails.
       }
-    }, 900);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    };
+    poll();
+    return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
   }, [automationJobId]);
 
   const filteredServers = useMemo(() => {
@@ -1217,6 +1224,7 @@ export default function App() {
     if (!automationJobId) return;
     try {
       const data = await api(`/api/automation-jobs/${automationJobId}/cancel`, { method: 'POST' });
+      automationCompletionNotifiedJobIdRef.current = automationJobId;
       setAutomationResults(data.results || []); toast('自动化任务已取消');
     } catch (error) { toast(error.message); }
   }

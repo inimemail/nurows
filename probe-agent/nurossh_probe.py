@@ -14,13 +14,15 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
 MAX_ATTEMPTS_PER_ROUND = 10
 ROUND_DELAY_SECONDS = 1
 POLL_INTERVAL_SECONDS = 1
+REPORT_BATCH_WINDOW_SECONDS = 0.04
+MAX_REPORT_RESULTS = 2000
 
 
 def validate_target_address(address, allow_private=False):
@@ -177,13 +179,29 @@ def run_due_checks(config, due, schedules, now):
     due = sorted(due, key=lambda target: 0 if target.get("guardId") else 1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(check_target, target): target for target in due}
-        for future in concurrent.futures.as_completed(futures):
-            target = futures[future]
-            result = future.result()
-            # Report each IP as it finishes so one fast success is not held up
-            # by another slow or failing IP in the same parallel batch.
-            request(config, "POST", "/probe/report", {"version": VERSION, "results": [result]})
-            schedules[target["id"]] = now + max(5, int(target.get("interval", 30)))
+        pending = set(futures)
+        while pending:
+            completed, pending = concurrent.futures.wait(
+                pending, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            # Healthy IPs in the same parallel wave usually finish together.
+            # Briefly collect them into one state write without waiting for a
+            # slow or failing IP that still has rounds left to run.
+            if pending and len(completed) < MAX_REPORT_RESULTS:
+                nearby, pending = concurrent.futures.wait(
+                    pending,
+                    timeout=REPORT_BATCH_WINDOW_SECONDS,
+                    return_when=concurrent.futures.ALL_COMPLETED,
+                )
+                completed.update(nearby)
+            completed_list = list(completed)
+            for offset in range(0, len(completed_list), MAX_REPORT_RESULTS):
+                batch = completed_list[offset:offset + MAX_REPORT_RESULTS]
+                results = [future.result() for future in batch]
+                request(config, "POST", "/probe/report", {"version": VERSION, "results": results})
+                for future in batch:
+                    target = futures[future]
+                    schedules[target["id"]] = now + max(5, int(target.get("interval", 30)))
 
 
 def start_check_batch(config, due, schedules, now):

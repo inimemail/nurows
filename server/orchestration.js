@@ -249,6 +249,8 @@ export function registerProbePublicRoutes(app, deps) {
     const createdIncidentIds = [];
     const retryIncidentIds = [];
     const notifyIncidentIds = [];
+    let acceptedGuardReport = false;
+    let acceptedTargetReport = false;
     const state = deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === auth.probe.id);
       if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), agentVersion: cleanText(req.body.version, 40) || probe.agentVersion, updatedAt: nowIso() });
@@ -258,6 +260,7 @@ export function registerProbePublicRoutes(app, deps) {
           const guard = draft.dnsGuards.find((item) => item.enabled !== false && item.cycle?.expectedProbeIds?.includes(auth.probe.id) && item.cycle.checks?.some((check) => check.id === cleanId(raw.targetId)));
           const check = guard?.cycle?.checks?.find((item) => item.id === cleanId(raw.targetId));
           if (!guard || !check) continue;
+          acceptedGuardReport = true;
           check.observations ||= {};
           check.observations[auth.probe.id] = normalizeCheckEvidence(raw, guard);
           if (guard.cycle.phase === 'replacement') {
@@ -271,6 +274,7 @@ export function registerProbePublicRoutes(app, deps) {
           guard.updatedAt = nowIso();
           continue;
         }
+        acceptedTargetReport = true;
         target.observations ||= {};
         const ok = Boolean(raw.ok);
         const checkedAt = nowIso();
@@ -316,8 +320,8 @@ export function registerProbePublicRoutes(app, deps) {
     for (const incidentId of [...new Set(retryIncidentIds)]) deps.onIncidentCreated?.(incidentId);
     for (const incidentId of [...new Set(notifyIncidentIds)]) deps.notifyIncident?.(incidentId);
     deps.onProbeAvailable?.(auth.probe.id, state);
-    deps.onDnsGuardReport?.();
-    deps.onProbeReport?.();
+    if (acceptedGuardReport) deps.onDnsGuardReport?.();
+    if (acceptedTargetReport) deps.onProbeReport?.();
     res.json({ ok: true, accepted: reports.length, incidents: createdIncidentIds });
   });
 }

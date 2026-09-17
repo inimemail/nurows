@@ -83,7 +83,32 @@ class ProbeCheckWindowTests(unittest.TestCase):
         self.assertEqual(result["resolvedAddresses"], ["198.51.100.40", "203.0.113.10"])
         self.assertEqual(result["checkMarker"], "marker-1")
 
-    def test_parallel_batch_reports_each_ip_as_soon_as_it_finishes(self):
+    def test_parallel_batch_combines_results_that_finish_together(self):
+        reports = []
+        ready = threading.Barrier(2)
+        due = [
+            {"id": "first", "interval": 30},
+            {"id": "second", "interval": 30},
+        ]
+
+        def check(target):
+            ready.wait(1)
+            return {"targetId": target["id"], "ok": True}
+
+        def report(_config, _method, _path, payload=None):
+            reports.append([result["targetId"] for result in payload["results"]])
+            return {"ok": True}
+
+        schedules = {}
+        with mock.patch.object(PROBE, "check_target", side_effect=check), \
+                mock.patch.object(PROBE, "request", side_effect=report):
+            PROBE.run_due_checks({"maxConcurrency": 2}, due, schedules, 100)
+
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(set(reports[0]), {"first", "second"})
+        self.assertEqual(schedules, {"first": 130, "second": 130})
+
+    def test_parallel_batch_reports_fast_ip_without_waiting_for_slow_ip(self):
         release_slow = threading.Event()
         fast_reported = threading.Event()
         reports = []
@@ -98,9 +123,9 @@ class ProbeCheckWindowTests(unittest.TestCase):
             return {"targetId": target["id"], "ok": True}
 
         def report(_config, _method, _path, payload=None):
-            target_id = payload["results"][0]["targetId"]
-            reports.append(target_id)
-            if target_id == "fast":
+            target_ids = [result["targetId"] for result in payload["results"]]
+            reports.append(target_ids)
+            if "fast" in target_ids:
                 fast_reported.set()
             return {"ok": True}
 
@@ -111,13 +136,28 @@ class ProbeCheckWindowTests(unittest.TestCase):
             worker.start()
             self.assertTrue(fast_reported.wait(1))
             self.assertTrue(worker.is_alive())
-            self.assertEqual(reports, ["fast"])
+            self.assertEqual(reports, [["fast"]])
             release_slow.set()
             worker.join(2)
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(reports, ["fast", "slow"])
+        self.assertEqual(reports, [["fast"], ["slow"]])
         self.assertEqual(schedules, {"fast": 130, "slow": 130})
+
+    def test_failed_report_releases_all_schedules_for_retry(self):
+        due = [
+            {"id": "first", "interval": 30},
+            {"id": "second", "interval": 30},
+        ]
+        schedules = {}
+        with mock.patch.object(
+            PROBE, "check_target", side_effect=lambda target: {"targetId": target["id"], "ok": True}
+        ), mock.patch.object(PROBE, "request", side_effect=TimeoutError("report timeout")):
+            worker = PROBE.start_check_batch({"maxConcurrency": 2}, due, schedules, 100)
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(schedules, {"first": 0, "second": 0})
 
     def test_guard_checks_are_prioritized_with_a_small_worker_pool(self):
         started = []

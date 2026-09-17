@@ -913,6 +913,51 @@ test('sends DNS guard checks before ordinary probe targets', () => {
   assert.equal(response.maxConcurrency, 100);
 });
 
+test('routes probe report follow-up work only to the matching subsystem', () => {
+  const state = guardState();
+  const secret = 'probe-secret';
+  state.probes.push({
+    id: 'probe-1', enabled: true,
+    agentSecretHash: crypto.createHash('sha256').update(secret).digest('hex')
+  });
+  state.probeTargets.push({
+    id: 'target-1', name: '普通目标', address: 'example.net', probeIds: ['probe-1'],
+    enabled: true, checkRounds: 3, attemptsPerRound: 3, observations: {}
+  });
+  Object.assign(state.dnsGuards[0], {
+    enabled: true, probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3,
+    status: 'checking',
+    cycle: {
+      id: 'cycle-1', phase: 'remote', expectedProbeIds: ['probe-1'],
+      checks: [{ id: 'guard-check-1', address: '198.51.100.10', observations: {} }]
+    }
+  });
+  const routes = new Map();
+  const app = {
+    get: (path, handler) => routes.set(`GET ${path}`, handler),
+    post: (path, handler) => routes.set(`POST ${path}`, handler)
+  };
+  let guardFollowUps = 0;
+  let targetFollowUps = 0;
+  registerProbePublicRoutes(app, {
+    readState: () => state,
+    updateState: (updater) => updater(state),
+    allowProbeRegistration: () => true,
+    onDnsGuardReport: () => { guardFollowUps += 1; },
+    onProbeReport: () => { targetFollowUps += 1; }
+  });
+  const report = routes.get('POST /probe/report');
+  const response = { status: () => response, json: () => {} };
+  const headers = { 'x-probe-id': 'probe-1', authorization: `Bearer ${secret}` };
+  const result = { ok: true, rounds: 3, attemptsPerRound: 3, roundsCompleted: 1, attempts: 1 };
+
+  report({ headers, body: { version: '1.4.5', results: [{ targetId: 'guard-check-1', ...result }] } }, response);
+  assert.deepEqual([guardFollowUps, targetFollowUps], [1, 0]);
+
+  report({ headers, body: { version: '1.4.5', results: [{ targetId: 'target-1', ...result }] } }, response);
+  assert.deepEqual([guardFollowUps, targetFollowUps], [1, 1]);
+});
+
 test('skips redundant probe heartbeat state writes', () => {
   const state = guardState();
   const secret = 'probe-secret';

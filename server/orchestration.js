@@ -42,10 +42,13 @@ const DNS_RECORD_TYPES = new Set(['A', 'AAAA', 'CNAME', 'TXT', 'NS', 'CAA']);
 const ALLOCATION_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
 const DNS_GUARD_HISTORY_LIMIT = 1000;
 const DNS_GUARD_MAX_VALUES = 50;
+const DNS_GUARD_PREPARE_CONCURRENCY = 10;
+const DNS_ZONE_CACHE_TTL_MS = 60 * 1000;
 // Probe agents poll the server for cycle progress. This is not the guard's
 // user-configured interval between complete DNS guard cycles.
 const DNS_GUARD_PROBE_POLL_INTERVAL_SECONDS = 5;
 const DNS_PROVIDER_VERIFY_DELAYS_MS = [0, 500, 1500, 3000];
+const dnsZoneCache = new Map();
 
 export function orchestrationDefaults() {
   return {
@@ -202,7 +205,9 @@ export function registerProbePublicRoutes(app, deps) {
           checkNowAt: guard.cycle.id
         }));
     });
-    const checks = [...targets, ...guardChecks];
+    // DNS guard cycles are latency-sensitive: start them before ordinary
+    // targets so a busy probe cannot make a two-IP guard wait behind a queue.
+    const checks = [...guardChecks, ...targets];
     res.json({ ok: true, version: configVersion(checks), probeId: auth.probe.id, targets: checks });
   });
 
@@ -1055,12 +1060,18 @@ export async function runDueDnsGuards(deps, requestedId = '') {
     }
     return cycleStale || !guard.nextCheckAt || Date.parse(guard.nextCheckAt) <= now;
   });
-  for (const guard of due) {
-    dnsGuardRuntime.add(guard.id);
-    try { await prepareDnsGuardCycle(guard.id, deps); }
-    catch (error) { recordDnsGuardError(guard.id, error, deps); }
-    finally { dnsGuardRuntime.delete(guard.id); }
-  }
+  for (const guard of due) dnsGuardRuntime.add(guard.id);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(DNS_GUARD_PREPARE_CONCURRENCY, due.length) }, async () => {
+    while (cursor < due.length) {
+      const guard = due[cursor];
+      cursor += 1;
+      try { await prepareDnsGuardCycle(guard.id, deps); }
+      catch (error) { recordDnsGuardError(guard.id, error, deps); }
+      finally { dnsGuardRuntime.delete(guard.id); }
+    }
+  });
+  await Promise.all(workers);
   return due.length;
 }
 
@@ -2381,11 +2392,35 @@ async function testDnsAccount(account, credentials) {
 async function resolveManagedDnsZone(state, account, credentials, binding) {
   const legacy = state.dnsZones.find((item) => item.id === binding.zoneId && item.accountId === account.id && item.enabled !== false);
   if (legacy) return { zone: legacy, normalizedBinding: withRecordName(binding, legacy.name) };
-  const zones = await listProviderZones(account, credentials);
+  let zones = await listProviderZonesCached(account, credentials);
   const domain = normalizeDomain(binding.domain);
-  const matches = zones.filter((zone) => domain === zone.name || domain.endsWith(`.${zone.name}`)).sort((left, right) => right.name.length - left.name.length);
+  let matches = zones.filter((zone) => domain === zone.name || domain.endsWith(`.${zone.name}`)).sort((left, right) => right.name.length - left.name.length);
+  if (!matches.length && dnsZoneCache.has(`${account.id}:${account.provider}`)) {
+    dnsZoneCache.delete(`${account.id}:${account.provider}`);
+    zones = await listProviderZonesCached(account, credentials);
+    matches = zones.filter((zone) => domain === zone.name || domain.endsWith(`.${zone.name}`)).sort((left, right) => right.name.length - left.name.length);
+  }
   if (!matches.length) throw new Error(`账号中未找到 ${domain} 对应的托管域`);
   return { zone: matches[0], normalizedBinding: withRecordName(binding, matches[0].name) };
+}
+
+async function listProviderZonesCached(account, credentials) {
+  const key = `${account.id}:${account.provider}`;
+  const now = Date.now();
+  const cached = dnsZoneCache.get(key);
+  if (cached?.zones && now - cached.createdAt < DNS_ZONE_CACHE_TTL_MS) return cached.zones;
+  if (cached?.pending) return cached.pending;
+  const pending = listProviderZones(account, credentials)
+    .then((zones) => {
+      dnsZoneCache.set(key, { zones, createdAt: Date.now() });
+      return zones;
+    })
+    .catch((error) => {
+      dnsZoneCache.delete(key);
+      throw error;
+    });
+  dnsZoneCache.set(key, { pending, createdAt: now });
+  return pending;
 }
 
 export function withRecordName(binding, zoneName) {

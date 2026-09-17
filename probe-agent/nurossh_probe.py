@@ -13,7 +13,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
@@ -170,6 +170,9 @@ def check_target(target):
 
 def run_due_checks(config, due, schedules, now):
     workers = min(max(1, int(config.get("maxConcurrency", 100))), len(due))
+    # Guard checks are already ordered first by the server. Keep that priority
+    # when a probe has a small worker pool and a stale client sends old order.
+    due = sorted(due, key=lambda target: 0 if target.get("guardId") else 1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(check_target, target): target for target in due}
         for future in concurrent.futures.as_completed(futures):

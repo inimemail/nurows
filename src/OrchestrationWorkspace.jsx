@@ -38,6 +38,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
         ? [['bots', '机器人配置']]
         : [['accounts', '服务商账号'], ['bindings', '解析绑定'], ['changes', '变更记录']];
   const active = sections.some(([key]) => key === section) ? section : sections[0][0];
+  const guardCheckActive = tab === 'probes' && state.dnsGuards?.some((guard) => Boolean(guard.cycle));
 
   useEffect(() => {
     let cancelled = false;
@@ -50,9 +51,9 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       }
     };
     refresh();
-    const timer = window.setInterval(refresh, 10000);
+    const timer = window.setInterval(refresh, guardCheckActive ? 2000 : 10000);
     return () => { cancelled = true; window.clearInterval(timer); };
-  }, [api, onState, tab]);
+  }, [api, onState, tab, guardCheckActive]);
 
   const openCreate = (type) => { setEditorBusy(false); setEditor({ open: true, type, value: structuredClone(EMPTY[type]) }); };
   const openEdit = (type, value) => { setEditorBusy(false); setEditor({ open: true, type, value: normalizeDraft(type, value) }); };
@@ -489,7 +490,7 @@ function summary(tab, state) { if (tab === 'probes') return `${state.probes?.fil
 function allocationLabel(item) { return item.allocationMode === 'all' ? '全部取用' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '一次取一个'; }
 function assetSubtitle(item) { return [item.name && item.name !== item.address ? item.address : '', item.region, item.carrier].filter(Boolean).join(' · '); }
 function targetSubtitle(item) { const rounds = Number(item.checkRounds) || 3; const perRound = Number(item.attemptsPerRound) || 3; const expectedAttempts = rounds * perRound; const observations = Object.values(item.observations || {}).sort((a, b) => Date.parse(b.checkedAt || 0) - Date.parse(a.checkedAt || 0)); const latest = observations[0]; const result = !latest ? '尚未检查' : latest.ok ? `第 ${latest.successfulRound || 1} 轮第 ${latest.successfulAttempt || 1} 次成功` : latest.attempts === expectedAttempts ? `${expectedAttempts} 次全部失败` : '等待探针升级'; return `${item.checkType === 'ping' ? 'PING' : `TCP:${item.port}`} · ${item.address || '未填写地址'} · ${item.probeIds?.length || 0} 个探针 · ${rounds}轮×${perRound}次 · ${result} · ${formatTime(item.lastCheckAt)}`; }
-function probeVersionCurrent(version) { const [major = 0, minor = 0, patch = 0] = String(version || '').split('.').map(Number); return major > 1 || (major === 1 && (minor > 4 || (minor === 4 && patch >= 1))); }
+function probeVersionCurrent(version) { const [major = 0, minor = 0, patch = 0] = String(version || '').split('.').map(Number); return major > 1 || (major === 1 && (minor > 4 || (minor === 4 && patch >= 2))); }
 function probeVersionLabel(version) { return version ? `${version}${probeVersionCurrent(version) ? '' : '（需升级）'}` : '未接入'; }
 function updateModeLabel(mode) { return ({ append: '追加 IP', managed_replace: '覆盖托管值', replace: '完全替换' })[mode] || mode; }
 function formatTime(value) { if (!value) return '-'; return new Date(value).toLocaleString('zh-CN', { hour12: false }); }

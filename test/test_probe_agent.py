@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -117,6 +118,35 @@ class ProbeCheckWindowTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(reports, ["fast", "slow"])
         self.assertEqual(schedules, {"fast": 130, "slow": 130})
+
+    def test_guard_checks_are_prioritized_with_a_small_worker_pool(self):
+        started = []
+        release_first = threading.Event()
+        due = [
+            {"id": "ordinary", "interval": 30},
+            {"id": "guard", "guardId": "guard-1", "interval": 5},
+        ]
+
+        def check(target):
+            started.append(target["id"])
+            if target["id"] == "guard":
+                return {"targetId": target["id"], "ok": True}
+            release_first.wait(2)
+            return {"targetId": target["id"], "ok": True}
+
+        with mock.patch.object(PROBE, "check_target", side_effect=check), \
+                mock.patch.object(PROBE, "request", return_value={"ok": True}):
+            worker = threading.Thread(target=PROBE.run_due_checks, args=({"maxConcurrency": 1}, due, {}, 100))
+            worker.start()
+            for _ in range(20):
+                if started:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(started[0], "guard")
+            release_first.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import test from 'node:test';
 import {
   buildDnsGuardCheckAddresses,
@@ -9,6 +10,7 @@ import {
   orchestrationDefaults,
   processReadyDnsGuards,
   registerOrchestrationRoutes,
+  registerProbePublicRoutes,
   resolveDnsGuardSources,
   roundRobinDnsGuardSourceValues,
   runDueDnsGuards,
@@ -431,6 +433,82 @@ test('starts a DNS guard cycle with remote IPs only', async () => {
   assert.deepEqual(guard.cycle.checks.map((check) => check.address), ['198.51.100.10', '198.51.100.11']);
   assert.deepEqual(guard.cycle.candidateAssets, []);
   assert.equal(guard.message, '正在检查活动 IP：0/2');
+});
+
+test('prepares multiple due DNS guards concurrently', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20
+  });
+  state.dnsGuards.push({
+    ...structuredClone(state.dnsGuards[0]), id: 'guard-2', name: '第二守护', domain: 'edge-2.example.com'
+  });
+  state.probes.push({
+    id: 'probe-1', name: '英国探针', enabled: true, agentSecretHash: 'registered',
+    lastSeenAt: new Date().toISOString()
+  });
+  const deps = remoteDeps(state, ['198.51.100.10']);
+  const started = [];
+  let release;
+  let markBothStarted;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const bothStarted = new Promise((resolve) => { markBothStarted = resolve; });
+  deps.resolveDnsBinding = async (_state, _account, _credentials, binding) => {
+    started.push(binding.domain);
+    if (started.length === 2) markBothStarted();
+    await gate;
+    return {
+      zone: { id: 'zone-1', name: 'example.com', providerZoneId: 'provider-zone-1' },
+      normalizedBinding: { ...binding, recordName: binding.domain.split('.')[0] }
+    };
+  };
+
+  const running = runDueDnsGuards(deps);
+  await Promise.race([
+    bothStarted,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('DNS guards were prepared serially')), 500))
+  ]);
+  assert.deepEqual(new Set(started), new Set(['edge.example.com', 'edge-2.example.com']));
+  release();
+  assert.equal(await running, 2);
+});
+
+test('sends DNS guard checks before ordinary probe targets', () => {
+  const state = guardState();
+  const secret = 'probe-secret';
+  state.probes.push({
+    id: 'probe-1', name: '英国探针', enabled: true,
+    agentSecretHash: crypto.createHash('sha256').update(secret).digest('hex')
+  });
+  state.probeTargets.push({
+    id: 'target-1', name: '普通目标', address: 'example.net', probeIds: ['probe-1'], enabled: true
+  });
+  Object.assign(state.dnsGuards[0], {
+    enabled: true, probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, maxParallel: 20,
+    cycle: {
+      id: 'cycle-1', expectedProbeIds: ['probe-1'],
+      checks: [{ id: 'guard-check-1', address: '198.51.100.10', observations: {} }]
+    }
+  });
+  const routes = new Map();
+  const app = {
+    get: (path, handler) => routes.set(`GET ${path}`, handler),
+    post: (path, handler) => routes.set(`POST ${path}`, handler)
+  };
+  registerProbePublicRoutes(app, {
+    readState: () => state,
+    updateState: (updater) => updater(state),
+    allowProbeRegistration: () => true
+  });
+  let response;
+  routes.get('GET /probe/config')({
+    headers: { 'x-probe-id': 'probe-1', authorization: `Bearer ${secret}` }
+  }, {
+    status: () => ({ json: (value) => { response = value; } }),
+    json: (value) => { response = value; }
+  });
+
+  assert.deepEqual(response.targets.map((target) => target.id), ['guard-check-1', 'target-1']);
 });
 
 test('checks replacements only after a remote failure and stops after enough succeed', async () => {

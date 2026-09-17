@@ -235,6 +235,14 @@ export function registerProbePublicRoutes(app, deps) {
           if (!guard || !check) continue;
           check.observations ||= {};
           check.observations[auth.probe.id] = normalizeCheckEvidence(raw, guard);
+          if (guard.cycle.phase === 'replacement') {
+            const completed = Object.values(guard.cycle.candidateResults || {}).filter((result) => result?.ok).length;
+            const current = guard.cycle.checks.filter((item) => Object.values(item.observations || {}).some((evidence) => evidence?.ok)).length;
+            guard.message = `正在寻找替补：已找到 ${Math.min(guard.cycle.replacementNeeded || 1, completed + current)}/${guard.cycle.replacementNeeded || 1}`;
+          } else {
+            const settled = guard.cycle.checks.filter((item) => dnsGuardCheckReady(item, guard)).length;
+            guard.message = `正在检查活动 IP：${settled}/${guard.cycle.checks.length}`;
+          }
           guard.updatedAt = nowIso();
           continue;
         }
@@ -1097,36 +1105,88 @@ async function prepareDnsGuardCycle(guardId, deps) {
   if (!account) throw new Error('DNS 服务商账号不可用');
   const credentials = decryptCredentials(account, deps);
   const binding = guardBinding(guard);
-  const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, binding);
-  const before = await getDnsRecord(account, credentials, zone, normalizedBinding);
+  const resolveDnsBinding = deps.resolveDnsBinding || resolveManagedDnsZone;
+  const readDnsRecord = deps.readDnsRecord || getDnsRecord;
+  const { zone, normalizedBinding } = await resolveDnsBinding(state, account, credentials, binding);
+  const before = await readDnsRecord(account, credentials, zone, normalizedBinding);
   const currentValues = filterAddressFamily(before.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
-  const sourceResult = await resolveDnsGuardSources(guard, currentValues);
-  const candidateAssets = collectDnsGuardPoolCandidates(state, guard, DNS_GUARD_MAX_VALUES);
-  const values = buildDnsGuardCheckAddresses(currentValues, sourceResult.values, candidateAssets);
-  if (!values.length) {
-    deps.updateState((draft) => updateDnsGuard(draft, guardId, {
-      status: 'waiting_ip', message: '没有解析值或可用备用 IP', currentValues: [], sourceState: sourceResult.state,
-      sourceErrors: sourceResult.errors, cycle: null, lastCheckAt: nowIso(), nextCheckAt: addSeconds(guard.interval), lastError: ''
-    }));
-    return;
-  }
   const cycle = {
     id: uuidv4(),
     startedAt: nowIso(),
+    phase: 'remote',
     expectedProbeIds,
     remoteValues: currentValues,
+    sourceValues: [],
+    sourceCandidates: {},
+    candidateAssets: [],
+    sourceState: structuredClone(guard.sourceState || {}),
+    sourceErrors: [],
+    zone: { id: zone.id || '', name: zone.name, providerZoneId: zone.providerZoneId || '' },
+    normalizedBinding: { recordName: normalizedBinding.recordName, providerRecordId: normalizedBinding.providerRecordId || '', providerRecordIds: normalizedBinding.providerRecordIds || [] },
+    checks: currentValues.map(createDnsGuardCheck)
+  };
+  if (!currentValues.length) {
+    await startDnsGuardReplacement(guard, cycle, [], deps);
+    return;
+  }
+  deps.updateState((draft) => updateDnsGuard(draft, guardId, {
+    status: 'checking', message: `正在检查活动 IP：0/${currentValues.length}`, currentValues,
+    cycle, lastError: '', nextCheckAt: addSeconds(guard.interval)
+  }));
+}
+
+function createDnsGuardCheck(address) {
+  return { id: cleanId(`guard_${uuidv4()}`), address, observations: {} };
+}
+
+async function startDnsGuardReplacement(guard, cycle, failedRemote, deps) {
+  const state = deps.readState();
+  const sourceResult = await resolveDnsGuardSources(guard, cycle.remoteValues || []);
+  const candidateAssets = collectDnsGuardPoolCandidates(state, guard, DNS_GUARD_MAX_VALUES);
+  const healthyRemote = (cycle.remoteValues || []).filter((address) => !failedRemote.includes(address));
+  // maxActiveIps is an upper bound. A repair maintains the pre-check record
+  // count instead of filling every healthy task up to that limit.
+  const targetCount = Math.max(1, (cycle.remoteValues || []).length);
+  const replacementNeeded = Math.max(0, targetCount - healthyRemote.length);
+  const excluded = new Set(cycle.remoteValues || []);
+  const remainingAddresses = buildDnsGuardCheckAddresses([], sourceResult.values, candidateAssets)
+    .filter((address) => !excluded.has(address));
+  const batchSize = Math.max(1, guard.maxParallel);
+  const batch = remainingAddresses.slice(0, batchSize);
+  const replacementCycle = {
+    ...cycle,
+    startedAt: nowIso(),
+    phase: 'replacement',
+    failedRemote,
+    targetCount,
+    replacementNeeded,
     sourceValues: sourceResult.values,
     sourceCandidates: sourceResult.candidates,
     candidateAssets,
     sourceState: sourceResult.state,
     sourceErrors: sourceResult.errors,
-    zone: { id: zone.id || '', name: zone.name, providerZoneId: zone.providerZoneId || '' },
-    normalizedBinding: { recordName: normalizedBinding.recordName, providerRecordId: normalizedBinding.providerRecordId || '', providerRecordIds: normalizedBinding.providerRecordIds || [] },
-    checks: values.map((address) => ({ id: cleanId(`guard_${uuidv4()}`), address, observations: {} }))
+    candidateResults: {},
+    remainingAddresses: remainingAddresses.slice(batch.length),
+    checks: batch.map(createDnsGuardCheck)
   };
-  deps.updateState((draft) => updateDnsGuard(draft, guardId, {
-    status: 'checking', message: `正在检查 ${values.length} 个 IP`, currentValues, sourceState: sourceResult.state,
-    sourceErrors: sourceResult.errors, cycle, lastError: '', nextCheckAt: addSeconds(guard.interval)
+  if (!batch.length) {
+    deps.updateState((draft) => updateDnsGuard(draft, guard.id, {
+      status: 'checking', message: `正在寻找替补：已找到 0/${replacementNeeded}`,
+      currentValues: cycle.remoteValues || [], sourceState: sourceResult.state,
+      sourceErrors: sourceResult.errors, cycle: replacementCycle, lastError: ''
+    }));
+    const resultByAddress = new Map((cycle.remoteValues || []).map((address) => [address, { ok: !failedRemote.includes(address) }]));
+    await finalizeDnsGuardCycle(guard.id, cycle.id, replacementCycle, resultByAddress, deps);
+    return;
+  }
+  deps.updateState((draft) => updateDnsGuard(draft, guard.id, {
+    status: 'checking',
+    message: `正在寻找替补：已找到 0/${replacementNeeded}`,
+    currentValues: cycle.remoteValues || [],
+    sourceState: sourceResult.state,
+    sourceErrors: sourceResult.errors,
+    cycle: replacementCycle,
+    lastError: ''
   }));
 }
 
@@ -1200,8 +1260,14 @@ export function selectHealthyDnsGuardSources(sources, candidates, sourceState, r
     const key = source.id || source.domain;
     const current = state[key] || { domains: { primary: source.domain, backup: source.backupDomain || '' }, primary: [], backup: [] };
     const sourceCandidates = candidates?.[key] || { primary: current.primary || current.cached || [], backup: current.backup || [] };
+    const allCandidates = [...new Set([...cleanTexts(sourceCandidates.primary, 500), ...cleanTexts(sourceCandidates.backup, 500)])];
+    const evaluated = allCandidates.filter((address) => resultByAddress.has(address));
     const primary = cleanTexts(sourceCandidates.primary, 500).filter((address) => resultByAddress.get(address)?.ok);
     const backup = cleanTexts(sourceCandidates.backup, 500).filter((address) => resultByAddress.get(address)?.ok);
+    if (!primary.length && !backup.length && evaluated.length < allCandidates.length) {
+      state[key] = current;
+      continue;
+    }
     const activeSide = primary.length ? 'primary' : backup.length ? 'backup' : (current.activeSide === 'backup' && source.backupDomain ? 'backup' : 'primary');
     const selected = activeSide === 'backup' ? backup : primary;
     current.activeSide = activeSide;
@@ -1246,6 +1312,11 @@ export function buildDnsGuardCheckAddresses(currentValues, sourceValues, candida
 export function dnsGuardCycleReady(guard) {
   const expected = guard.cycle?.expectedProbeIds || [];
   if (!expected.length || !guard.cycle?.checks?.length) return false;
+  if (guard.cycle.phase === 'replacement') {
+    const completed = Object.values(guard.cycle.candidateResults || {}).filter((result) => result?.ok).length;
+    const current = guard.cycle.checks.filter((check) => Object.values(check.observations || {}).some((item) => item?.ok)).length;
+    if (completed + current >= Math.max(1, Number(guard.cycle.replacementNeeded) || 1)) return true;
+  }
   return guard.cycle.checks.every((check) => dnsGuardCheckReady(check, guard));
 }
 
@@ -1266,28 +1337,83 @@ export function completeGuardEvidence(evidence, guard) {
 }
 
 async function applyDnsGuardCycle(guardId, cycleId, deps) {
-  let state = deps.readState();
+  const state = deps.readState();
   const guard = state.dnsGuards.find((item) => item.id === guardId && item.cycle?.id === cycleId);
   if (!guard || !dnsGuardCycleReady(guard)) return;
-  const resultByAddress = new Map(guard.cycle.checks.map((check) => [check.address, {
-    ok: Object.values(check.observations || {}).some((item) => item.ok),
-    observations: check.observations
-  }]));
-  const remote = guard.cycle.remoteValues || [];
-  const failedRemote = remote.filter((address) => !resultByAddress.get(address)?.ok);
+  if (guard.cycle.phase !== 'replacement') {
+    const resultByAddress = new Map(guard.cycle.checks.map((check) => [check.address, {
+      ok: Object.values(check.observations || {}).some((item) => item.ok),
+      observations: check.observations
+    }]));
+    const failedRemote = (guard.cycle.remoteValues || []).filter((address) => !resultByAddress.get(address)?.ok);
+    if (failedRemote.length) {
+      await startDnsGuardReplacement(guard, guard.cycle, failedRemote, deps);
+      return;
+    }
+    await finalizeDnsGuardCycle(guardId, cycleId, guard.cycle, resultByAddress, deps);
+    return;
+  }
+
+  const candidateResults = structuredClone(guard.cycle.candidateResults || {});
+  for (const check of guard.cycle.checks) {
+    const ok = Object.values(check.observations || {}).some((item) => item?.ok);
+    if (ok || dnsGuardCheckReady(check, guard)) candidateResults[check.address] = { ok, observations: check.observations };
+  }
+  const found = Object.values(candidateResults).filter((result) => result?.ok).length;
+  const needed = Math.max(1, Number(guard.cycle.replacementNeeded) || 1);
+  if (found < needed && guard.cycle.remainingAddresses?.length) {
+    const batchSize = Math.max(1, guard.maxParallel);
+    const batch = guard.cycle.remainingAddresses.slice(0, batchSize);
+    deps.updateState((draft) => {
+      const item = draft.dnsGuards.find((entry) => entry.id === guardId && entry.cycle?.id === cycleId);
+      if (!item) return draft;
+      Object.assign(item.cycle, {
+        startedAt: nowIso(),
+        candidateResults,
+        remainingAddresses: item.cycle.remainingAddresses.slice(batch.length),
+        checks: batch.map(createDnsGuardCheck)
+      });
+      item.message = `正在寻找替补：已找到 ${found}/${needed}`;
+      item.updatedAt = nowIso();
+      return draft;
+    });
+    return;
+  }
+
+  const resultByAddress = new Map();
+  const failedRemote = guard.cycle.failedRemote || [];
+  for (const address of guard.cycle.remoteValues || []) resultByAddress.set(address, { ok: !failedRemote.includes(address) });
+  for (const [address, result] of Object.entries(candidateResults)) resultByAddress.set(address, result);
+  await finalizeDnsGuardCycle(guardId, cycleId, { ...guard.cycle, candidateResults }, resultByAddress, deps);
+}
+
+async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, deps) {
+  let state = deps.readState();
+  const guard = state.dnsGuards.find((item) => item.id === guardId && item.cycle?.id === cycleId);
+  if (!guard) return;
+  const remote = cycle.remoteValues || [];
+  const failedRemote = cycle.failedRemote || remote.filter((address) => !resultByAddress.get(address)?.ok);
   const healthyRemote = remote.filter((address) => resultByAddress.get(address)?.ok);
-  const selectedSources = selectHealthyDnsGuardSources(guard.sources, guard.cycle.sourceCandidates, guard.cycle.sourceState, resultByAddress);
-  const healthySources = selectedSources.values;
-  const staleOwned = guard.pruneStale === false ? new Set() : new Set((guard.sourceOwnedValues || []).filter((address) => !healthySources.includes(address)));
+  const selectedSources = cycle.phase === 'replacement'
+    ? selectHealthyDnsGuardSources(guard.sources, cycle.sourceCandidates, cycle.sourceState, resultByAddress)
+    : { values: [], state: structuredClone(guard.sourceState || {}) };
+  const healthySources = [...new Set([
+    ...(guard.sourceOwnedValues || []).filter((address) => healthyRemote.includes(address)),
+    ...selectedSources.values
+  ])];
+  const staleOwned = cycle.phase !== 'replacement' || guard.pruneStale === false
+    ? new Set()
+    : new Set((guard.sourceOwnedValues || []).filter((address) => !healthySources.includes(address)));
   const desired = healthyRemote.filter((address) => !staleOwned.has(address));
-  for (const address of healthySources) if (!desired.includes(address) && desired.length < guard.maxActiveIps) desired.push(address);
+  const targetCount = cycle.phase === 'replacement' ? Math.max(1, Number(cycle.targetCount) || remote.length || 1) : remote.length;
+  for (const address of healthySources) if (!desired.includes(address) && desired.length < targetCount) desired.push(address);
   const usedAssets = [];
   const unusableAssets = [];
-  for (const item of guard.cycle.candidateAssets || []) {
-    if (desired.length >= guard.maxActiveIps) break;
+  for (const item of cycle.candidateAssets || []) {
     if (desired.includes(item.address)) continue;
-    if (resultByAddress.get(item.address)?.ok) { desired.push(item.address); usedAssets.push(item); }
-    else unusableAssets.push(item);
+    const result = resultByAddress.get(item.address);
+    if (result?.ok && desired.length < targetCount) { desired.push(item.address); usedAssets.push(item); }
+    else if (result && !result.ok) unusableAssets.push(item);
   }
   const changed = !sameStringSet(remote, desired);
   const account = state.dnsAccounts.find((item) => item.id === guard.accountId && item.enabled !== false);
@@ -1297,8 +1423,8 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
     const credentials = decryptCredentials(account, deps);
     const readDnsRecord = deps.readDnsRecord || getDnsRecord;
     const writeDnsRecord = deps.writeDnsRecord || updateDnsRecord;
-    const binding = { ...guardBinding(guard), ...(guard.cycle.normalizedBinding || {}) };
-    const zone = guard.cycle.zone;
+    const binding = { ...guardBinding(guard), ...(cycle.normalizedBinding || {}) };
+    const zone = cycle.zone;
     const latest = await readDnsRecord(account, credentials, zone, binding);
     if (!sameStringSet(filterAddressFamily(latest.values, guard.recordType), remote)) {
       deps.updateState((draft) => updateDnsGuard(draft, guardId, { status: 'queued', message: '服务商记录已变化，等待重新检查', cycle: null, nextCheckAt: '' }));
@@ -1313,7 +1439,7 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
   state = deps.updateState((draft) => {
     const item = draft.dnsGuards.find((entry) => entry.id === guardId && entry.cycle?.id === cycleId);
     if (!item) return draft;
-    const cycleSnapshot = structuredClone(item.cycle);
+    const cycleSnapshot = structuredClone(cycle);
     const sourceState = selectedSources.state;
     const discardedIds = new Set(unusableAssets.map((entry) => entry.assetId));
     const consumedIds = new Set(usedAssets.map((entry) => entry.assetId));
@@ -1340,7 +1466,7 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
     const status = !desired.length
       ? 'waiting_ip'
       : (failedRemote.length
-          ? (usedAssets.length || healthySources.some((address) => !remote.includes(address)) ? 'replaced' : 'degraded')
+          ? (desired.length >= targetCount && (usedAssets.length || healthySources.some((address) => !remote.includes(address))) ? 'replaced' : 'degraded')
           : 'healthy');
     Object.assign(item, {
       status, message: dnsGuardStatusMessage(status, failedRemote.length, usedAssets.length), currentValues: desired,

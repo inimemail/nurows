@@ -329,6 +329,42 @@ test('removes the last failed remote IP during an automatic guard cycle', async 
   assert.equal(Object.values(guard.sourceState).some((entry) => entry?.blocked?.length), false);
 });
 
+test('keeps healthy remote IPs when a failed peer has no replacement', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    checkRounds: 1,
+    attemptsPerRound: 1,
+    maxParallel: 20,
+    status: 'checking',
+    currentValues: ['198.51.100.10', '198.51.100.11'],
+    cycle: {
+      id: 'partial-failure-cycle',
+      phase: 'remote',
+      startedAt: new Date().toISOString(),
+      expectedProbeIds: ['probe-1'],
+      remoteValues: ['198.51.100.10', '198.51.100.11'],
+      sourceValues: [],
+      sourceCandidates: {},
+      candidateAssets: [],
+      sourceState: {},
+      sourceErrors: [],
+      zone: { id: 'zone-1', name: 'example.com', providerZoneId: 'provider-zone-1' },
+      normalizedBinding: { recordName: 'edge', providerRecordId: 'record-1', providerRecordIds: ['record-1'] },
+      checks: [
+        { id: 'check-1', address: '198.51.100.10', observations: { 'probe-1': { ok: false, rounds: 1, attemptsPerRound: 1, roundsCompleted: 1, attempts: 1 } } },
+        { id: 'check-2', address: '198.51.100.11', observations: { 'probe-1': { ok: true, rounds: 1, attemptsPerRound: 1, roundsCompleted: 1, attempts: 1 } } }
+      ]
+    }
+  });
+  const deps = remoteDeps(state, ['198.51.100.10', '198.51.100.11']);
+
+  await processReadyDnsGuards(deps);
+
+  assert.deepEqual(deps.getRemote(), ['198.51.100.11']);
+  assert.deepEqual(deps.getState().dnsGuards[0].currentValues, ['198.51.100.11']);
+  assert.equal(deps.getState().dnsGuards[0].status, 'degraded');
+});
+
 test('does not notify after a routine healthy DNS guard check', async () => {
   const state = guardState();
   Object.assign(state.dnsGuards[0], {
@@ -337,6 +373,9 @@ test('does not notify after a routine healthy DNS guard check', async () => {
     maxParallel: 20,
     status: 'checking',
     currentValues: ['198.51.100.10'],
+    ownedValues: ['198.51.100.10'],
+    sourceOwnedValues: ['198.51.100.10'],
+    sourceState: { home: { primary: ['198.51.100.10'], backup: [], pending: false } },
     cycle: {
       id: 'healthy-cycle',
       startedAt: new Date().toISOString(),
@@ -363,7 +402,79 @@ test('does not notify after a routine healthy DNS guard check', async () => {
   await processReadyDnsGuards(deps);
 
   assert.equal(deps.getState().dnsGuards[0].status, 'healthy');
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues, ['198.51.100.10']);
   assert.equal(notifications, 0);
+});
+
+test('starts a DNS guard cycle with remote IPs only', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'],
+    poolIds: ['pool-1'],
+    checkRounds: 3,
+    attemptsPerRound: 3,
+    timeout: 5,
+    maxParallel: 20
+  });
+  state.probes.push({
+    id: 'probe-1', name: '英国探针', enabled: true, agentSecretHash: 'registered',
+    lastSeenAt: new Date().toISOString()
+  });
+  state.ipAssets.push({ id: 'asset-1', address: '203.0.113.20', enabled: true, health: 'unknown' });
+  state.ipPools.push({ id: 'pool-1', assetIds: ['asset-1'], enabled: true, selectionMode: 'ordered' });
+  const deps = remoteDeps(state, ['198.51.100.10', '198.51.100.11']);
+
+  assert.equal(await runDueDnsGuards(deps), 1);
+
+  const guard = deps.getState().dnsGuards[0];
+  assert.equal(guard.cycle.phase, 'remote');
+  assert.deepEqual(guard.cycle.checks.map((check) => check.address), ['198.51.100.10', '198.51.100.11']);
+  assert.deepEqual(guard.cycle.candidateAssets, []);
+  assert.equal(guard.message, '正在检查活动 IP：0/2');
+});
+
+test('checks replacements only after a remote failure and stops after enough succeed', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    poolIds: ['pool-1'], checkRounds: 1, attemptsPerRound: 1, maxParallel: 20,
+    status: 'checking', currentValues: ['198.51.100.10', '198.51.100.11'],
+    cycle: {
+      id: 'staged-cycle', phase: 'remote', startedAt: new Date().toISOString(),
+      expectedProbeIds: ['probe-1'], remoteValues: ['198.51.100.10', '198.51.100.11'],
+      sourceValues: [], sourceCandidates: {}, candidateAssets: [], sourceState: {}, sourceErrors: [],
+      zone: { id: 'zone-1', name: 'example.com', providerZoneId: 'provider-zone-1' },
+      normalizedBinding: { recordName: 'edge', providerRecordId: 'record-1', providerRecordIds: ['record-1'] },
+      checks: [
+        { id: 'remote-1', address: '198.51.100.10', observations: { 'probe-1': { ok: false, rounds: 1, attemptsPerRound: 1, roundsCompleted: 1, attempts: 1 } } },
+        { id: 'remote-2', address: '198.51.100.11', observations: { 'probe-1': { ok: true, rounds: 1, attemptsPerRound: 1, roundsCompleted: 1, attempts: 1 } } }
+      ]
+    }
+  });
+  state.ipAssets.push(
+    { id: 'asset-1', address: '203.0.113.20', enabled: true, health: 'unknown' },
+    { id: 'asset-2', address: '203.0.113.21', enabled: true, health: 'unknown' }
+  );
+  state.ipPools.push({ id: 'pool-1', name: '备用池', assetIds: ['asset-1', 'asset-2'], enabled: true, selectionMode: 'ordered' });
+  const deps = remoteDeps(state, ['198.51.100.10', '198.51.100.11']);
+  let notifications = 0;
+  deps.notifyDnsGuard = () => { notifications += 1; };
+
+  await processReadyDnsGuards(deps);
+  let guard = deps.getState().dnsGuards[0];
+  assert.equal(guard.cycle.phase, 'replacement');
+  assert.equal(guard.cycle.replacementNeeded, 1);
+  assert.deepEqual(guard.cycle.checks.map((check) => check.address), ['203.0.113.20', '203.0.113.21']);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11']);
+
+  guard.cycle.checks[0].observations['probe-1'] = { ok: true, rounds: 1, attemptsPerRound: 1, roundsCompleted: 1, attempts: 1 };
+  await processReadyDnsGuards(deps);
+
+  guard = deps.getState().dnsGuards[0];
+  assert.deepEqual(deps.getRemote(), ['198.51.100.11', '203.0.113.20']);
+  assert.equal(guard.cycle, null);
+  assert.equal(guard.status, 'replaced');
+  assert.equal(notifications, 1);
+  assert.ok(deps.getState().ipAssets.some((asset) => asset.id === 'asset-2'));
 });
 
 test('checks every selected pool candidate instead of discarding untested assets', () => {

@@ -45,8 +45,13 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
     let cancelled = false;
     const refresh = async () => {
       try {
-        const data = await api('/api/state');
-        if (!cancelled) onState(data);
+        if (guardCheckActive) {
+          const data = await api('/api/dns-guards/status');
+          if (!cancelled) onState((current) => ({ ...current, ...data }));
+        } else {
+          const data = await api('/api/state');
+          if (!cancelled) onState(data);
+        }
       } catch (_error) {
         // The main application handles authentication and connectivity errors.
       }

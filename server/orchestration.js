@@ -316,6 +316,14 @@ export function registerProbePublicRoutes(app, deps) {
 }
 
 export function registerOrchestrationRoutes(app, deps) {
+  app.get('/api/dns-guards/status', (req, res) => {
+    const state = deps.readState();
+    res.json({
+      dnsGuards: (state.dnsGuards || []).map(normalizeDnsGuardState),
+      dnsGuardRuns: (state.dnsGuardRuns || []).slice(0, DNS_GUARD_HISTORY_LIMIT)
+    });
+  });
+
   app.post('/api/ip-assets/batch', (req, res) => {
     const addresses = parseIpBatch(req.body.addresses);
     let result;
@@ -764,6 +772,10 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
       const sourceValues = [...cleanTexts(current.primary, 500), ...cleanTexts(current.backup, 500), ...cleanTexts(current.cached, 500)];
       if (sourceValues.some((address) => removed.has(address))) current.pending = true;
     }
+    const expectedProbeIds = activeDnsGuardProbeIds(item, draft);
+    const verifiedCycle = values.length && expectedProbeIds.length
+      ? createDnsGuardRemoteCycle(item, expectedProbeIds, values, zone, normalizedBinding, providerRecordIds)
+      : null;
     Object.assign(item, {
       currentValues: values,
       ownedValues: (item.ownedValues || []).filter((address) => values.includes(address)),
@@ -771,10 +783,10 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
       sourceState,
       providerRecordId: providerRecordIds?.[0] || '',
       providerRecordIds: providerRecordIds || [],
-      cycle: null,
-      status: 'queued',
-      message: '远程 IP 已更新，等待检查并修复',
-      nextCheckAt: '',
+      cycle: verifiedCycle,
+      status: verifiedCycle ? 'checking' : 'queued',
+      message: verifiedCycle ? `正在检查活动 IP：0/${values.length}` : '远程 IP 已更新，等待检查并修复',
+      nextCheckAt: verifiedCycle ? addSeconds(item.interval) : '',
       lastError: '',
       updatedAt: savedAt
     });
@@ -1230,21 +1242,7 @@ async function prepareDnsGuardCycle(guardId, deps) {
   }
   const currentValues = filterAddressFamily(before.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
   const providerRecordIds = cleanTexts(before.recordIds || (before.recordId ? [before.recordId] : []), 500);
-  const cycle = {
-    id: uuidv4(),
-    startedAt: nowIso(),
-    phase: 'remote',
-    expectedProbeIds,
-    remoteValues: currentValues,
-    sourceValues: [],
-    sourceCandidates: {},
-    candidateAssets: [],
-    sourceState: structuredClone(guard.sourceState || {}),
-    sourceErrors: [],
-    zone: { id: resolved.zone.id || '', name: resolved.zone.name, providerZoneId: resolved.zone.providerZoneId || '' },
-    normalizedBinding: { recordName: resolved.normalizedBinding.recordName, providerRecordId: providerRecordIds[0] || '', providerRecordIds },
-    checks: currentValues.map(createDnsGuardCheck)
-  };
+  const cycle = createDnsGuardRemoteCycle(guard, expectedProbeIds, currentValues, resolved.zone, resolved.normalizedBinding, providerRecordIds);
   deps.updateState((draft) => updateDnsGuard(draft, guardId, {
     status: 'checking',
     message: currentValues.length ? `正在检查活动 IP：0/${currentValues.length}` : '正在寻找替补',
@@ -1263,6 +1261,25 @@ function activeDnsGuardProbeIds(guard, state) {
 
 function createDnsGuardCheck(address) {
   return { id: cleanId(`guard_${uuidv4()}`), address, observations: {} };
+}
+
+function createDnsGuardRemoteCycle(guard, expectedProbeIds, currentValues, zone, normalizedBinding, providerRecordIds = []) {
+  const recordIds = cleanTexts(providerRecordIds, 500);
+  return {
+    id: uuidv4(),
+    startedAt: nowIso(),
+    phase: 'remote',
+    expectedProbeIds,
+    remoteValues: currentValues,
+    sourceValues: [],
+    sourceCandidates: {},
+    candidateAssets: [],
+    sourceState: structuredClone(guard.sourceState || {}),
+    sourceErrors: [],
+    zone: { id: zone.id || '', name: zone.name, providerZoneId: zone.providerZoneId || '' },
+    normalizedBinding: { recordName: normalizedBinding.recordName, providerRecordId: recordIds[0] || '', providerRecordIds: recordIds },
+    checks: currentValues.map(createDnsGuardCheck)
+  };
 }
 
 async function startDnsGuardReplacement(guard, cycle, failedRemote, deps) {

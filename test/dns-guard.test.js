@@ -489,8 +489,33 @@ test('manual guard writes do not wait for a slow automatic provider read', async
 
   const guard = deps.getState().dnsGuards[0];
   assert.deepEqual(guard.currentValues, ['198.51.100.11']);
-  assert.equal(guard.cycle, null);
-  assert.equal(guard.status, 'queued');
+  assert.equal(guard.cycle.phase, 'remote');
+  assert.deepEqual(guard.cycle.remoteValues, ['198.51.100.11']);
+  assert.equal(guard.status, 'checking');
+});
+
+test('starts probe checks from a verified manual write without rereading the provider', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20
+  });
+  state.probes.push({ id: 'probe-1', enabled: true, agentSecretHash: 'registered' });
+  const deps = remoteDeps(state);
+  const readRemote = deps.readDnsRecord;
+  let reads = 0;
+  deps.readDnsRecord = async (...args) => {
+    reads += 1;
+    return readRemote(...args);
+  };
+
+  await writeDnsGuardRemoteValues('guard-1', {
+    expectedValues: ['198.51.100.10'], values: ['198.51.100.11']
+  }, deps, 'tester');
+
+  assert.equal(reads, 2);
+  assert.equal(await runDueDnsGuards(deps, 'guard-1'), 0);
+  assert.equal(reads, 2);
+  assert.deepEqual(deps.getState().dnsGuards[0].cycle.checks.map((check) => check.address), ['198.51.100.11']);
 });
 
 test('keeps the last healthy guard status when a provider read times out', async () => {

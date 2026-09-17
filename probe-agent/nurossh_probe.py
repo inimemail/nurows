@@ -7,18 +7,20 @@ import platform
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
 MAX_ATTEMPTS_PER_ROUND = 10
 ROUND_DELAY_SECONDS = 1
+POLL_INTERVAL_SECONDS = 1
 
 
 def validate_target_address(address, allow_private=False):
@@ -184,6 +186,27 @@ def run_due_checks(config, due, schedules, now):
             schedules[target["id"]] = now + max(5, int(target.get("interval", 30)))
 
 
+def start_check_batch(config, due, schedules, now):
+    if not due:
+        return None
+    for target in due:
+        schedules[target["id"]] = float("inf")
+
+    def worker():
+        try:
+            run_due_checks(config, due, schedules, now)
+        except Exception as error:
+            print(f"probe check batch failed: {error}", file=sys.stderr, flush=True)
+        finally:
+            for target in due:
+                if schedules.get(target["id"]) == float("inf"):
+                    schedules[target["id"]] = 0
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread
+
+
 def main():
     with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
         config = json.load(handle)
@@ -196,6 +219,8 @@ def main():
     check_now_markers = {}
     last_heartbeat_at = 0.0
     heartbeat_interval = 20
+    guard_worker = None
+    ordinary_worker = None
     while True:
         try:
             payload = request(config, "GET", "/probe/config")
@@ -204,6 +229,7 @@ def main():
                 heartbeat_interval = max(10, int(payload.get("heartbeatInterval", heartbeat_interval)))
             except (TypeError, ValueError):
                 heartbeat_interval = 20
+            runtime_config = {**config, "maxConcurrency": payload.get("maxConcurrency", config.get("maxConcurrency", 100))}
             now = time.time()
             for target in targets:
                 marker = str(target.get("checkNowAt", ""))
@@ -211,8 +237,12 @@ def main():
                     check_now_markers[target["id"]] = marker
                     schedules[target["id"]] = 0
             due = [target for target in targets if now >= schedules.get(target["id"], 0)]
-            if due:
-                run_due_checks(config, due, schedules, now)
+            guard_due = [target for target in due if target.get("guardId")]
+            ordinary_due = [target for target in due if not target.get("guardId")]
+            if guard_due and (guard_worker is None or not guard_worker.is_alive()):
+                guard_worker = start_check_batch(runtime_config, guard_due, schedules, now)
+            if ordinary_due and (ordinary_worker is None or not ordinary_worker.is_alive()):
+                ordinary_worker = start_check_batch(runtime_config, ordinary_due, schedules, now)
             now = time.time()
             if now - last_heartbeat_at >= heartbeat_interval:
                 request(config, "POST", "/probe/heartbeat", {"version": VERSION})
@@ -230,7 +260,7 @@ def main():
         except Exception as error:
             print(f"probe loop error: {error}", file=sys.stderr, flush=True)
             time.sleep(10)
-        time.sleep(5)
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

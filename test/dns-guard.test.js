@@ -12,6 +12,7 @@ import {
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
   requestWaitingDnsGuardProbeChecks,
+  resolveManagedDnsZone,
   resolveDnsGuardSources,
   roundRobinDnsGuardSourceValues,
   runDueDnsGuards,
@@ -764,8 +765,27 @@ test('starts a DNS guard cycle with remote IPs only', async () => {
   assert.deepEqual(guard.cycle.candidateAssets, []);
   assert.equal(guard.providerRecordId, 'record-1');
   assert.deepEqual(guard.providerRecordIds, ['record-1']);
+  assert.equal(guard.zoneName, 'example.com');
+  assert.equal(guard.providerZoneId, 'provider-zone-1');
   assert.equal(guard.cycle.normalizedBinding.providerRecordId, 'record-1');
   assert.equal(guard.message, '正在检查活动 IP：0/2');
+});
+
+test('reuses a persisted provider zone without listing account zones again', async () => {
+  const binding = {
+    domain: 'edge.example.com', recordType: 'A', ttl: 60,
+    zoneName: 'example.com', providerZoneId: 'provider-zone-1'
+  };
+  const resolved = await resolveManagedDnsZone(
+    { dnsZones: [] },
+    { id: 'account-1', provider: 'huawei' },
+    { accessKey: 'ak', secretKey: 'sk' },
+    binding
+  );
+
+  assert.equal(resolved.zone.name, 'example.com');
+  assert.equal(resolved.zone.providerZoneId, 'provider-zone-1');
+  assert.equal(resolved.normalizedBinding.recordName, 'edge');
 });
 
 test('prepares multiple due DNS guards concurrently', async () => {
@@ -890,13 +910,14 @@ test('sends DNS guard checks before ordinary probe targets', () => {
 
   assert.deepEqual(response.targets.map((target) => target.id), ['guard-check-1', 'target-1']);
   assert.equal(response.heartbeatInterval, 20);
+  assert.equal(response.maxConcurrency, 100);
 });
 
 test('skips redundant probe heartbeat state writes', () => {
   const state = guardState();
   const secret = 'probe-secret';
   state.probes.push({
-    id: 'probe-1', enabled: true, status: 'online', agentVersion: '1.4.3',
+    id: 'probe-1', enabled: true, status: 'online', agentVersion: '1.4.4',
     lastSeenAt: new Date().toISOString(),
     agentSecretHash: crypto.createHash('sha256').update(secret).digest('hex')
   });
@@ -913,7 +934,7 @@ test('skips redundant probe heartbeat state writes', () => {
   });
   routes.get('POST /probe/heartbeat')({
     headers: { 'x-probe-id': 'probe-1', authorization: `Bearer ${secret}` },
-    body: { version: '1.4.3' }
+    body: { version: '1.4.4' }
   }, { status: () => ({ json: () => {} }), json: () => {} });
 
   assert.equal(updates, 0);

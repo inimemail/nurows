@@ -148,6 +148,64 @@ class ProbeCheckWindowTests(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
 
+    def test_background_batch_does_not_block_the_polling_thread(self):
+        release = threading.Event()
+        reported = threading.Event()
+        due = [{"id": "guard", "guardId": "guard-1", "interval": 5}]
+        schedules = {}
+
+        def check(_target):
+            release.wait(2)
+            return {"targetId": "guard", "ok": True}
+
+        def report(*_args, **_kwargs):
+            reported.set()
+            return {"ok": True}
+
+        with mock.patch.object(PROBE, "check_target", side_effect=check), \
+                mock.patch.object(PROBE, "request", side_effect=report):
+            worker = PROBE.start_check_batch({"maxConcurrency": 1}, due, schedules, 100)
+            self.assertTrue(worker.is_alive())
+            self.assertEqual(schedules["guard"], float("inf"))
+            release.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(reported.is_set())
+        self.assertEqual(schedules["guard"], 105)
+
+    def test_guard_batch_finishes_while_an_ordinary_batch_is_still_blocked(self):
+        release_ordinary = threading.Event()
+        guard_reported = threading.Event()
+        schedules = {}
+
+        def check(target):
+            if not target.get("guardId"):
+                release_ordinary.wait(2)
+            return {"targetId": target["id"], "ok": True}
+
+        def report(_config, _method, _path, payload=None):
+            if payload["results"][0]["targetId"] == "guard":
+                guard_reported.set()
+            return {"ok": True}
+
+        with mock.patch.object(PROBE, "check_target", side_effect=check), \
+                mock.patch.object(PROBE, "request", side_effect=report):
+            ordinary_worker = PROBE.start_check_batch(
+                {"maxConcurrency": 1}, [{"id": "ordinary", "interval": 30}], schedules, 100
+            )
+            guard_worker = PROBE.start_check_batch(
+                {"maxConcurrency": 1}, [{"id": "guard", "guardId": "guard-1", "interval": 5}], schedules, 100
+            )
+            self.assertTrue(guard_reported.wait(1))
+            guard_worker.join(1)
+            self.assertFalse(guard_worker.is_alive())
+            self.assertTrue(ordinary_worker.is_alive())
+            release_ordinary.set()
+            ordinary_worker.join(2)
+
+        self.assertFalse(ordinary_worker.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()

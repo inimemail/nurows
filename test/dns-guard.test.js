@@ -11,6 +11,7 @@ import {
   processReadyDnsGuards,
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
+  requestWaitingDnsGuardProbeChecks,
   resolveDnsGuardSources,
   roundRobinDnsGuardSourceValues,
   runDueDnsGuards,
@@ -211,6 +212,49 @@ test('restarts a stale DNS guard cycle without waiting for the regular interval'
   assert.equal(deps.getState().dnsGuards[0].cycle, null);
 });
 
+test('uses a registered guard probe even when its heartbeat timestamp is stale', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20
+  });
+  state.probes.push({
+    id: 'probe-1', name: '英国探针', enabled: true, agentSecretHash: 'registered',
+    lastSeenAt: new Date(Date.now() - 5 * 60 * 1000).toISOString()
+  });
+  const deps = remoteDeps(state);
+
+  assert.equal(await runDueDnsGuards(deps), 1);
+  assert.equal(deps.getState().dnsGuards[0].status, 'checking');
+  assert.deepEqual(deps.getState().dnsGuards[0].cycle.expectedProbeIds, ['probe-1']);
+});
+
+test('wakes a waiting DNS guard as soon as its probe becomes available', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'], status: 'waiting_probe', message: '等待负责探针上线',
+    nextCheckAt: new Date(Date.now() + 30000).toISOString()
+  });
+  state.probes.push({ id: 'probe-1', enabled: true, agentSecretHash: 'registered' });
+  const deps = remoteDeps(state);
+
+  assert.equal(requestWaitingDnsGuardProbeChecks(deps, 'probe-1'), 1);
+  assert.notEqual(deps.getState().dnsGuards[0].status, 'waiting_probe');
+  assert.equal(deps.getState().dnsGuards[0].nextCheckAt, '');
+});
+
+test('does not rewrite state when a probe has no waiting DNS guard', () => {
+  const deps = remoteDeps(guardState());
+  let updates = 0;
+  const updateState = deps.updateState;
+  deps.updateState = (updater) => {
+    updates += 1;
+    return updateState(updater);
+  };
+
+  assert.equal(requestWaitingDnsGuardProbeChecks(deps, 'probe-1'), 0);
+  assert.equal(updates, 0);
+});
+
 test('gives every configured source a primary and backup probe slot before extra addresses', () => {
   const sources = Array.from({ length: 100 }, (_, index) => ({ id: `source-${index}`, domain: `primary-${index}.example.com`, backupDomain: `backup-${index}.example.com` }));
   const candidates = Object.fromEntries(sources.map((source, index) => [source.id, {
@@ -408,6 +452,45 @@ test('keeps automatic guard preparation healthy while a manual remote read is ac
   assert.equal(guard.status, 'checking');
   assert.equal(guard.lastError || '', '');
   assert.deepEqual(guard.cycle.checks.map((check) => check.address), ['198.51.100.10']);
+});
+
+test('manual guard writes do not wait for a slow automatic provider read', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20
+  });
+  state.probes.push({ id: 'probe-1', enabled: true, agentSecretHash: 'registered' });
+  const deps = remoteDeps(state);
+  const readRemote = deps.readDnsRecord;
+  let reads = 0;
+  let releaseAutomaticRead;
+  let markAutomaticReadStarted;
+  const automaticReadStarted = new Promise((resolve) => { markAutomaticReadStarted = resolve; });
+  deps.readDnsRecord = async (...args) => {
+    reads += 1;
+    if (reads === 1) {
+      markAutomaticReadStarted();
+      await new Promise((resolve) => { releaseAutomaticRead = resolve; });
+    }
+    return readRemote(...args);
+  };
+
+  const checking = runDueDnsGuards(deps);
+  await automaticReadStarted;
+  const written = await Promise.race([
+    writeDnsGuardRemoteValues('guard-1', {
+      expectedValues: ['198.51.100.10'], values: ['198.51.100.11']
+    }, deps, 'tester'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Manual write waited for automatic read')), 500))
+  ]);
+  assert.deepEqual(written.values, ['198.51.100.11']);
+  releaseAutomaticRead();
+  await checking;
+
+  const guard = deps.getState().dnsGuards[0];
+  assert.deepEqual(guard.currentValues, ['198.51.100.11']);
+  assert.equal(guard.cycle, null);
+  assert.equal(guard.status, 'queued');
 });
 
 test('keeps the last healthy guard status when a provider read times out', async () => {
@@ -654,6 +737,9 @@ test('starts a DNS guard cycle with remote IPs only', async () => {
   assert.equal(guard.cycle.phase, 'remote');
   assert.deepEqual(guard.cycle.checks.map((check) => check.address), ['198.51.100.10', '198.51.100.11']);
   assert.deepEqual(guard.cycle.candidateAssets, []);
+  assert.equal(guard.providerRecordId, 'record-1');
+  assert.deepEqual(guard.providerRecordIds, ['record-1']);
+  assert.equal(guard.cycle.normalizedBinding.providerRecordId, 'record-1');
   assert.equal(guard.message, '正在检查活动 IP：0/2');
 });
 
@@ -695,6 +781,53 @@ test('prepares multiple due DNS guards concurrently', async () => {
   assert.equal(await running, 2);
 });
 
+test('processes ready DNS guards concurrently with a fixed worker pool', async () => {
+  const state = guardState();
+  const readyCycle = (id, address) => ({
+    id,
+    startedAt: new Date().toISOString(),
+    phase: 'remote',
+    expectedProbeIds: ['probe-1'],
+    remoteValues: [address],
+    sourceValues: [], sourceCandidates: {}, candidateAssets: [], sourceState: {}, sourceErrors: [],
+    zone: { id: 'zone-1', name: 'example.com', providerZoneId: 'provider-zone-1' },
+    normalizedBinding: { recordName: 'edge', providerRecordId: 'record-1', providerRecordIds: ['record-1'] },
+    checks: [{
+      id: `${id}-check`, address,
+      observations: { 'probe-1': { ok: false, rounds: 1, attemptsPerRound: 1, roundsCompleted: 1, attempts: 1 } }
+    }]
+  });
+  Object.assign(state.dnsGuards[0], {
+    checkRounds: 1, attemptsPerRound: 1, maxParallel: 20, status: 'checking',
+    currentValues: ['198.51.100.10'], cycle: readyCycle('cycle-1', '198.51.100.10')
+  });
+  state.dnsGuards.push({
+    ...structuredClone(state.dnsGuards[0]), id: 'guard-2', name: '第二守护', domain: 'edge-2.example.com',
+    currentValues: ['198.51.100.11'], cycle: readyCycle('cycle-2', '198.51.100.11')
+  });
+  const deps = remoteDeps(state, ['198.51.100.10']);
+  const readRemote = deps.readDnsRecord;
+  const started = new Set();
+  let release;
+  let markBothStarted;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const bothStarted = new Promise((resolve) => { markBothStarted = resolve; });
+  deps.readDnsRecord = async (...args) => {
+    started.add(args[3].domain);
+    if (started.size === 2) markBothStarted();
+    await gate;
+    return readRemote(...args);
+  };
+
+  const processing = processReadyDnsGuards(deps);
+  await Promise.race([
+    bothStarted,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Ready DNS guards were processed serially')), 500))
+  ]);
+  release();
+  assert.equal(await processing, 2);
+});
+
 test('sends DNS guard checks before ordinary probe targets', () => {
   const state = guardState();
   const secret = 'probe-secret';
@@ -731,6 +864,34 @@ test('sends DNS guard checks before ordinary probe targets', () => {
   });
 
   assert.deepEqual(response.targets.map((target) => target.id), ['guard-check-1', 'target-1']);
+  assert.equal(response.heartbeatInterval, 20);
+});
+
+test('skips redundant probe heartbeat state writes', () => {
+  const state = guardState();
+  const secret = 'probe-secret';
+  state.probes.push({
+    id: 'probe-1', enabled: true, status: 'online', agentVersion: '1.4.3',
+    lastSeenAt: new Date().toISOString(),
+    agentSecretHash: crypto.createHash('sha256').update(secret).digest('hex')
+  });
+  const routes = new Map();
+  const app = {
+    get: (path, handler) => routes.set(`GET ${path}`, handler),
+    post: (path, handler) => routes.set(`POST ${path}`, handler)
+  };
+  let updates = 0;
+  registerProbePublicRoutes(app, {
+    readState: () => state,
+    updateState: (updater) => { updates += 1; return updater(state); },
+    allowProbeRegistration: () => true
+  });
+  routes.get('POST /probe/heartbeat')({
+    headers: { 'x-probe-id': 'probe-1', authorization: `Bearer ${secret}` },
+    body: { version: '1.4.3' }
+  }, { status: () => ({ json: () => {} }), json: () => {} });
+
+  assert.equal(updates, 0);
 });
 
 test('checks replacements only after a remote failure and stops after enough succeed', async () => {

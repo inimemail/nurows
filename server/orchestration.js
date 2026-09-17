@@ -43,7 +43,8 @@ const ALLOCATION_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
 const DNS_GUARD_HISTORY_LIMIT = 1000;
 const DNS_GUARD_MAX_VALUES = 50;
 const DNS_GUARD_PREPARE_CONCURRENCY = 10;
-const DNS_ZONE_CACHE_TTL_MS = 60 * 1000;
+const DNS_GUARD_APPLY_CONCURRENCY = 10;
+const DNS_ZONE_CACHE_TTL_MS = 10 * 60 * 1000;
 // Probe agents poll the server for cycle progress. This is not the guard's
 // user-configured interval between complete DNS guard cycles.
 const DNS_GUARD_PROBE_POLL_INTERVAL_SECONDS = 5;
@@ -164,7 +165,7 @@ export function registerProbePublicRoutes(app, deps) {
     let agentSecret = '';
     let found = false;
     if (!deps.allowProbeRegistration(req.ip)) return res.status(429).json({ error: '注册请求过于频繁，请稍后再试' });
-    deps.updateState((draft) => {
+    const state = deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === probeId);
       if (!probe || probe.enabled === false || !probe.tokenHash || !safeHashEqual(probe.tokenHash, hashSecret(token))) return draft;
       agentSecret = randomSecret(32);
@@ -178,6 +179,7 @@ export function registerProbePublicRoutes(app, deps) {
       return draft;
     });
     if (!found) return res.status(401).json({ error: '注册凭证无效、已使用或已过期' });
+    deps.onProbeAvailable?.(probeId, state);
     res.json({ ok: true, probeId, agentSecret, heartbeatInterval: 20 });
   });
 
@@ -209,17 +211,27 @@ export function registerProbePublicRoutes(app, deps) {
     // DNS guard cycles are latency-sensitive: start them before ordinary
     // targets so a busy probe cannot make a two-IP guard wait behind a queue.
     const checks = [...guardChecks, ...targets];
-    res.json({ ok: true, version: configVersion(checks), probeId: auth.probe.id, targets: checks });
+    res.json({ ok: true, version: configVersion(checks), probeId: auth.probe.id, heartbeatInterval: 20, targets: checks });
   });
 
   app.post('/probe/heartbeat', (req, res) => {
     const auth = authenticateProbe(req, deps.readState());
     if (!auth) return res.status(401).json({ error: '探针凭证无效' });
-    deps.updateState((draft) => {
-      const probe = draft.probes.find((item) => item.id === auth.probe.id);
-      if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), agentVersion: cleanText(req.body.version, 40), updatedAt: nowIso() });
-      return draft;
-    });
+    const agentVersion = cleanText(req.body.version, 40);
+    const lastSeenAt = Date.parse(auth.probe.lastSeenAt || 0);
+    const heartbeatFresh = auth.probe.status === 'online'
+      && auth.probe.agentVersion === agentVersion
+      && Number.isFinite(lastSeenAt)
+      && Date.now() - lastSeenAt < 15000;
+    let state = auth.state;
+    if (!heartbeatFresh) {
+      state = deps.updateState((draft) => {
+        const probe = draft.probes.find((item) => item.id === auth.probe.id);
+        if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), agentVersion, updatedAt: nowIso() });
+        return draft;
+      });
+    }
+    deps.onProbeAvailable?.(auth.probe.id, state);
     res.json({ ok: true, serverTime: nowIso() });
   });
 
@@ -230,7 +242,7 @@ export function registerProbePublicRoutes(app, deps) {
     const createdIncidentIds = [];
     const retryIncidentIds = [];
     const notifyIncidentIds = [];
-    deps.updateState((draft) => {
+    const state = deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === auth.probe.id);
       if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), agentVersion: cleanText(req.body.version, 40) || probe.agentVersion, updatedAt: nowIso() });
       for (const raw of reports) {
@@ -296,6 +308,7 @@ export function registerProbePublicRoutes(app, deps) {
     for (const incidentId of createdIncidentIds) deps.onIncidentCreated?.(incidentId);
     for (const incidentId of [...new Set(retryIncidentIds)]) deps.onIncidentCreated?.(incidentId);
     for (const incidentId of [...new Set(notifyIncidentIds)]) deps.notifyIncident?.(incidentId);
+    deps.onProbeAvailable?.(auth.probe.id, state);
     deps.onDnsGuardReport?.();
     deps.onProbeReport?.();
     res.json({ ok: true, accepted: reports.length, incidents: createdIncidentIds });
@@ -683,6 +696,7 @@ async function syncDnsGuardRemoteLocked(guardId, deps, actor) {
 export async function writeDnsGuardRemoteValues(guardId, input, deps, actor = 'system') {
   const current = deps.readState().dnsGuards.find((item) => item.id === guardId);
   if (!current) throw new Error('DNS 守护任务不存在');
+  dnsGuardPreparationVersions.set(guardId, (dnsGuardPreparationVersions.get(guardId) || 0) + 1);
   return withDnsGuardProviderOperation(guardId, () => writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor));
 }
 
@@ -1025,6 +1039,7 @@ export function requestWaitingIncidentRechecks(deps) {
 
 const dnsGuardRuntime = new Set();
 const dnsGuardProviderRuntime = new Set();
+const dnsGuardPreparationVersions = new Map();
 const dnsGuardProcessors = new WeakMap();
 
 function assertDnsGuardIdle(guardId, deps, message) {
@@ -1048,9 +1063,10 @@ function assertDnsGuardProviderIdle(guardId, deps, message) {
 export async function runDueDnsGuards(deps, requestedId = '') {
   const state = deps.readState();
   const now = Date.now();
+  const requestedIds = new Set(Array.isArray(requestedId) ? requestedId : (requestedId ? [requestedId] : []));
   const due = state.dnsGuards.filter((guard) => {
     if (guard.enabled === false || dnsGuardRuntime.has(guard.id)) return false;
-    if (requestedId && guard.id !== requestedId) return false;
+    if (requestedIds.size && !requestedIds.has(guard.id)) return false;
     let cycleStale = false;
     if (guard.cycle) {
       const batchCount = Math.max(1, Math.ceil((guard.cycle.checks?.length || 1) / Math.max(1, guard.maxParallel)));
@@ -1088,7 +1104,29 @@ export function requestWaitingDnsGuardChecks(deps) {
     }
     return draft;
   });
-  for (const id of requestedIds) runDueDnsGuards(deps, id).catch(() => {});
+  if (requestedIds.length) runDueDnsGuards(deps, requestedIds).catch(() => {});
+  return requestedIds.length;
+}
+
+export function requestWaitingDnsGuardProbeChecks(deps, probeId, snapshot = null) {
+  const waiting = (snapshot || deps.readState()).dnsGuards.some((guard) => guard.enabled !== false
+    && guard.status === 'waiting_probe'
+    && !guard.cycle
+    && guard.probeIds?.includes(probeId));
+  if (!waiting) return 0;
+  const requestedIds = [];
+  deps.updateState((draft) => {
+    for (const guard of draft.dnsGuards) {
+      if (guard.enabled === false || guard.status !== 'waiting_probe' || guard.cycle || !guard.probeIds?.includes(probeId)) continue;
+      guard.status = 'queued';
+      guard.message = '探针已上线，等待检查';
+      guard.nextCheckAt = '';
+      guard.updatedAt = nowIso();
+      requestedIds.push(guard.id);
+    }
+    return draft;
+  });
+  if (requestedIds.length) runDueDnsGuards(deps, requestedIds).catch(() => {});
   return requestedIds.length;
 }
 
@@ -1112,12 +1150,18 @@ export function processReadyDnsGuards(deps) {
         attempted.add(workId);
         return true;
       });
-      for (const guard of ready) {
-        dnsGuardRuntime.add(guard.id);
-        try { await applyDnsGuardCycle(guard.id, guard.cycle.id, deps); }
-        catch (error) { recordDnsGuardError(guard.id, error, deps); }
-        finally { dnsGuardRuntime.delete(guard.id); }
-      }
+      let cursor = 0;
+      const workers = Array.from({ length: Math.min(DNS_GUARD_APPLY_CONCURRENCY, ready.length) }, async () => {
+        while (cursor < ready.length) {
+          const guard = ready[cursor];
+          cursor += 1;
+          dnsGuardRuntime.add(guard.id);
+          try { await applyDnsGuardCycle(guard.id, guard.cycle.id, deps); }
+          catch (error) { recordDnsGuardError(guard.id, error, deps); }
+          finally { dnsGuardRuntime.delete(guard.id); }
+        }
+      });
+      await Promise.all(workers);
       processed += ready.length;
     } while (controller.rerun);
     return processed;
@@ -1133,6 +1177,26 @@ function dnsGuardWorkId(guard) {
   return `${guard.id}:${guard.cycle?.id || ''}:${guard.cycle?.phase || ''}:${checkIds}`;
 }
 
+function dnsGuardPreparationKey(guard) {
+  return JSON.stringify({
+    accountId: guard.accountId,
+    domain: guard.domain,
+    recordType: guard.recordType,
+    recordLine: guard.recordLine,
+    ttl: guard.ttl,
+    probeIds: guard.probeIds,
+    poolIds: guard.poolIds,
+    checkType: guard.checkType,
+    port: guard.port,
+    timeout: guard.timeout,
+    checkRounds: guard.checkRounds,
+    attemptsPerRound: guard.attemptsPerRound,
+    maxParallel: guard.maxParallel,
+    sources: guard.sources,
+    pruneStale: guard.pruneStale
+  });
+}
+
 async function prepareDnsGuardCycle(guardId, deps) {
   let state = deps.readState();
   let guard = state.dnsGuards.find((item) => item.id === guardId && item.enabled !== false);
@@ -1144,48 +1208,57 @@ async function prepareDnsGuardCycle(guardId, deps) {
   }
   const resolveDnsBinding = deps.resolveDnsBinding || resolveManagedDnsZone;
   const readDnsRecord = deps.readDnsRecord || getDnsRecord;
-  const prepared = await withDnsGuardProviderOperation(guardId, async () => {
-    state = deps.readState();
-    guard = state.dnsGuards.find((item) => item.id === guardId && item.enabled !== false);
-    if (!guard) return null;
-    expectedProbeIds = activeDnsGuardProbeIds(guard, state);
-    if (!expectedProbeIds.length) {
-      deps.updateState((draft) => updateDnsGuard(draft, guardId, { status: 'waiting_probe', message: '等待负责探针上线', cycle: null, nextCheckAt: addSeconds(guard.interval) }));
-      return null;
-    }
-    const account = state.dnsAccounts.find((item) => item.id === guard.accountId && item.enabled !== false);
-    if (!account) throw new Error('DNS 服务商账号不可用');
-    const credentials = decryptCredentials(account, deps);
-    const resolved = await resolveDnsBinding(state, account, credentials, guardBinding(guard));
-    const before = await readDnsRecord(account, credentials, resolved.zone, resolved.normalizedBinding);
-    const currentValues = filterAddressFamily(before.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
-    const cycle = {
-      id: uuidv4(),
-      startedAt: nowIso(),
-      phase: 'remote',
-      expectedProbeIds,
-      remoteValues: currentValues,
-      sourceValues: [],
-      sourceCandidates: {},
-      candidateAssets: [],
-      sourceState: structuredClone(guard.sourceState || {}),
-      sourceErrors: [],
-      zone: { id: resolved.zone.id || '', name: resolved.zone.name, providerZoneId: resolved.zone.providerZoneId || '' },
-      normalizedBinding: { recordName: resolved.normalizedBinding.recordName, providerRecordId: resolved.normalizedBinding.providerRecordId || '', providerRecordIds: resolved.normalizedBinding.providerRecordIds || [] },
-      checks: currentValues.map(createDnsGuardCheck)
-    };
-    deps.updateState((draft) => updateDnsGuard(draft, guardId, {
-      status: 'checking',
-      message: currentValues.length ? `正在检查活动 IP：0/${currentValues.length}` : '正在寻找替补',
-      currentValues, cycle, lastError: '', nextCheckAt: addSeconds(guard.interval)
-    }));
-    return { guard, cycle, currentValues };
-  }, Number.POSITIVE_INFINITY);
+  // Preparation only reads the provider. Keeping it outside the write lock lets
+  // an operator manage IPs immediately; the version check below discards a
+  // stale read if a manual write starts while this request is in flight.
+  const preparationVersion = dnsGuardPreparationVersions.get(guardId) || 0;
+  const preparationKey = dnsGuardPreparationKey(guard);
+  const account = state.dnsAccounts.find((item) => item.id === guard.accountId && item.enabled !== false);
+  if (!account) throw new Error('DNS 服务商账号不可用');
+  const credentials = decryptCredentials(account, deps);
+  const resolved = await resolveDnsBinding(state, account, credentials, guardBinding(guard));
+  const before = await readDnsRecord(account, credentials, resolved.zone, resolved.normalizedBinding);
+  state = deps.readState();
+  guard = state.dnsGuards.find((item) => item.id === guardId && item.enabled !== false);
+  if (!guard
+    || dnsGuardPreparationKey(guard) !== preparationKey
+    || (dnsGuardPreparationVersions.get(guardId) || 0) !== preparationVersion) return;
+  expectedProbeIds = activeDnsGuardProbeIds(guard, state);
+  if (!expectedProbeIds.length) {
+    deps.updateState((draft) => updateDnsGuard(draft, guardId, { status: 'waiting_probe', message: '等待负责探针上线', cycle: null, nextCheckAt: addSeconds(guard.interval) }));
+    return;
+  }
+  const currentValues = filterAddressFamily(before.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
+  const providerRecordIds = cleanTexts(before.recordIds || (before.recordId ? [before.recordId] : []), 500);
+  const cycle = {
+    id: uuidv4(),
+    startedAt: nowIso(),
+    phase: 'remote',
+    expectedProbeIds,
+    remoteValues: currentValues,
+    sourceValues: [],
+    sourceCandidates: {},
+    candidateAssets: [],
+    sourceState: structuredClone(guard.sourceState || {}),
+    sourceErrors: [],
+    zone: { id: resolved.zone.id || '', name: resolved.zone.name, providerZoneId: resolved.zone.providerZoneId || '' },
+    normalizedBinding: { recordName: resolved.normalizedBinding.recordName, providerRecordId: providerRecordIds[0] || '', providerRecordIds },
+    checks: currentValues.map(createDnsGuardCheck)
+  };
+  deps.updateState((draft) => updateDnsGuard(draft, guardId, {
+    status: 'checking',
+    message: currentValues.length ? `正在检查活动 IP：0/${currentValues.length}` : '正在寻找替补',
+    currentValues, providerRecordId: providerRecordIds[0] || '', providerRecordIds,
+    cycle, lastError: '', nextCheckAt: addSeconds(guard.interval)
+  }));
+  const prepared = { guard, cycle, currentValues };
   if (prepared && !prepared.currentValues.length) await startDnsGuardReplacement(prepared.guard, prepared.cycle, [], deps);
 }
 
 function activeDnsGuardProbeIds(guard, state) {
-  return (guard.probeIds || []).filter((probeId) => state.probes.some((probe) => probe.id === probeId && probe.enabled !== false && probe.agentSecretHash && Date.now() - Date.parse(probe.lastSeenAt || 0) <= 90000));
+  // Match ordinary target checks: a registered, enabled probe remains
+  // responsible for failures even if a delayed heartbeat temporarily looks stale.
+  return (guard.probeIds || []).filter((probeId) => state.probes.some((probe) => probe.id === probeId && probe.enabled !== false && probe.agentSecretHash));
 }
 
 function createDnsGuardCheck(address) {
@@ -1495,8 +1568,11 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
       if (!active) return { canceled: true, stale: false, recordIds: [] };
       const latest = await readDnsRecord(account, credentials, zone, binding);
       if (!sameStringSet(filterAddressFamily(latest.values, guard.recordType), remote)) return { canceled: false, stale: true, recordIds: [] };
+      const latestRecordIds = cleanTexts(latest.recordIds || (latest.recordId ? [latest.recordId] : []), 500);
       const recordIds = await replaceDnsRecordSafely({
-        account, credentials, zone, binding, beforeValues: remote, afterValues: desired,
+        account, credentials, zone,
+        binding: { ...binding, providerRecordId: latestRecordIds[0] || '', providerRecordIds: latestRecordIds },
+        beforeValues: remote, afterValues: desired,
         recordType: guard.recordType, readDnsRecord, writeDnsRecord
       });
       return { canceled: false, stale: false, recordIds };
@@ -2343,6 +2419,8 @@ async function applyDnsBinding(binding, allocatedIps, incidentId, deps) {
   const { zone, normalizedBinding } = await resolveDnsBinding(state, account, credentials, binding);
   const before = await readDnsRecord(account, credentials, zone, normalizedBinding);
   const current = normalizeDnsRecordValues(before.values, binding.recordType);
+  const currentRecordIds = cleanTexts(before.recordIds || (before.recordId ? [before.recordId] : []), 500);
+  const providerBinding = { ...normalizedBinding, providerRecordId: currentRecordIds[0] || '', providerRecordIds: currentRecordIds };
   const replacementIps = filterAddressFamily(allocatedIps, binding.recordType);
   if (!replacementIps.length) throw new Error(`解析绑定 ${binding.name} 没有匹配的 ${binding.recordType} 备用 IP`);
   const after = dnsBindingDesiredValues(binding, current, replacementIps);
@@ -2350,7 +2428,7 @@ async function applyDnsBinding(binding, allocatedIps, incidentId, deps) {
   let writeStarted = false;
   try {
     writeStarted = true;
-    providerRecordIds = await writeDnsRecord(account, credentials, zone, normalizedBinding, after);
+    providerRecordIds = await writeDnsRecord(account, credentials, zone, providerBinding, after);
     const savedAt = nowIso();
     deps.updateState((draft) => {
       const currentBinding = draft.dnsBindings.find((item) => item.id === binding.id);
@@ -2366,7 +2444,7 @@ async function applyDnsBinding(binding, allocatedIps, incidentId, deps) {
   } catch (error) {
     if (writeStarted) {
       try {
-        const restoredRecordIds = await writeDnsRecord(account, credentials, zone, { ...normalizedBinding, providerRecordId: before.recordId || normalizedBinding.providerRecordId, providerRecordIds: before.recordIds || normalizedBinding.providerRecordIds }, current);
+        const restoredRecordIds = await writeDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || providerBinding.providerRecordId, providerRecordIds: providerRecordIds || providerBinding.providerRecordIds }, current);
         await verifyProviderDnsValues(account, credentials, zone, { ...normalizedBinding, providerRecordIds: restoredRecordIds }, current, '服务商记录未恢复到写入前内容', readDnsRecord);
       } catch (rollbackError) {
         const failedAt = nowIso();
@@ -2719,7 +2797,8 @@ async function updateDnsRecord(account, credentials, zone, binding, values) {
   const recordIds = account.provider === 'huawei' ? [] : await discoverProviderRecordIds(account, credentials, zone, binding);
   if (!values.length) {
     if (account.provider === 'huawei') {
-      const recordset = await findHuaweiRecordset(account, credentials, zone, binding);
+      const recordId = cleanText(binding.providerRecordId || binding.providerRecordIds?.[0], 200);
+      const recordset = recordId ? { id: recordId } : await findHuaweiRecordset(account, credentials, zone, binding);
       if (recordset?.id) await huaweiRequest(account, credentials, 'DELETE', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets/${encodeURIComponent(recordset.id)}`);
       return [];
     }
@@ -2739,7 +2818,8 @@ async function updateDnsRecord(account, credentials, zone, binding, values) {
     });
   }
   if (account.provider === 'huawei') {
-    const recordset = await findHuaweiRecordset(account, credentials, zone, binding);
+    const recordId = cleanText(binding.providerRecordId || binding.providerRecordIds?.[0], 200);
+    const recordset = recordId ? { id: recordId } : await findHuaweiRecordset(account, credentials, zone, binding);
     const payload = { name: `${binding.domain}.`, type: binding.recordType, ttl: binding.ttl, records: values };
     if (recordset?.id) {
       await huaweiRequest(account, credentials, 'PUT', `/v2/zones/${encodeURIComponent(zone.providerZoneId)}/recordsets/${encodeURIComponent(recordset.id)}`, payload);

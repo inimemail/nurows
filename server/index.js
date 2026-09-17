@@ -24,6 +24,7 @@ import {
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
   requestWaitingDnsGuardChecks,
+  requestWaitingDnsGuardProbeChecks,
   requestWaitingIncidentRechecks,
   runDueDnsGuards,
   processReadyDnsGuards,
@@ -118,6 +119,7 @@ const orchestrationDeps = {
   onTelegramChanged: () => restartTelegramPolling(),
   onIpAvailabilityChanged: () => { requestWaitingIncidentRechecks(orchestrationDeps); requestWaitingDnsGuardChecks(orchestrationDeps); runDueDnsGuards(orchestrationDeps).catch(() => {}); },
   onDnsGuardChanged: (guardId) => runDueDnsGuards(orchestrationDeps, guardId).catch(() => {}),
+  onProbeAvailable: (probeId, state) => requestWaitingDnsGuardProbeChecks(orchestrationDeps, probeId, state),
   onDnsGuardRetry: (guardId) => scheduleDnsGuardRetry(guardId),
   syncDnsBinding
 };

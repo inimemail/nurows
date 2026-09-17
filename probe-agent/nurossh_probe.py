@@ -13,7 +13,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
@@ -194,10 +194,16 @@ def main():
         register(config)
     schedules = {}
     check_now_markers = {}
+    last_heartbeat_at = 0.0
+    heartbeat_interval = 20
     while True:
         try:
             payload = request(config, "GET", "/probe/config")
             targets = payload.get("targets", [])
+            try:
+                heartbeat_interval = max(10, int(payload.get("heartbeatInterval", heartbeat_interval)))
+            except (TypeError, ValueError):
+                heartbeat_interval = 20
             now = time.time()
             for target in targets:
                 marker = str(target.get("checkNowAt", ""))
@@ -207,7 +213,10 @@ def main():
             due = [target for target in targets if now >= schedules.get(target["id"], 0)]
             if due:
                 run_due_checks(config, due, schedules, now)
-            request(config, "POST", "/probe/heartbeat", {"version": VERSION})
+            now = time.time()
+            if now - last_heartbeat_at >= heartbeat_interval:
+                request(config, "POST", "/probe/heartbeat", {"version": VERSION})
+                last_heartbeat_at = now
         except HTTPError as error:
             if error.code == 401 and config.get("token") and config.get("secret"):
                 config.pop("secret", None)

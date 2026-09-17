@@ -183,7 +183,7 @@ export function registerProbePublicRoutes(app, deps) {
     const guardChecks = auth.state.dnsGuards.flatMap((guard) => {
       if (guard.enabled === false || !guard.cycle?.expectedProbeIds?.includes(auth.probe.id)) return [];
       return (guard.cycle.checks || [])
-        .filter((check) => !completeGuardEvidence(check.observations?.[auth.probe.id], guard))
+        .filter((check) => !dnsGuardCheckReady(check, guard) && !completeGuardEvidence(check.observations?.[auth.probe.id], guard))
         .slice(0, guard.maxParallel)
         .map((check) => ({
           id: check.id,
@@ -1022,13 +1022,15 @@ export async function runDueDnsGuards(deps, requestedId = '') {
   const due = state.dnsGuards.filter((guard) => {
     if (guard.enabled === false || dnsGuardRuntime.has(guard.id)) return false;
     if (requestedId && guard.id !== requestedId) return false;
+    let cycleStale = false;
     if (guard.cycle) {
       const batchCount = Math.max(1, Math.ceil((guard.cycle.checks?.length || 1) / Math.max(1, guard.maxParallel)));
       const batchWindow = guard.checkRounds * guard.timeout * 1000 + Math.max(0, guard.checkRounds - 1) * 1000 + 15000;
       const maxAge = Math.max(120000, batchCount * batchWindow + 60000);
-      if (now - Date.parse(guard.cycle.startedAt || 0) <= maxAge) return false;
+      cycleStale = now - Date.parse(guard.cycle.startedAt || 0) > maxAge;
+      if (!cycleStale) return false;
     }
-    return !guard.nextCheckAt || Date.parse(guard.nextCheckAt) <= now;
+    return cycleStale || !guard.nextCheckAt || Date.parse(guard.nextCheckAt) <= now;
   });
   for (const guard of due) {
     dnsGuardRuntime.add(guard.id);
@@ -1074,7 +1076,6 @@ async function prepareDnsGuardCycle(guardId, deps) {
   const expectedProbeIds = (guard.probeIds || []).filter((probeId) => state.probes.some((probe) => probe.id === probeId && probe.enabled !== false && probe.agentSecretHash && Date.now() - Date.parse(probe.lastSeenAt || 0) <= 90000));
   if (!expectedProbeIds.length) {
     deps.updateState((draft) => updateDnsGuard(draft, guardId, { status: 'waiting_probe', message: '等待负责探针上线', cycle: null, nextCheckAt: addSeconds(guard.interval) }));
-    if (guard.status !== 'waiting_probe') deps.notifyDnsGuard?.(guardId);
     return;
   }
   const account = state.dnsAccounts.find((item) => item.id === guard.accountId && item.enabled !== false);
@@ -1092,7 +1093,6 @@ async function prepareDnsGuardCycle(guardId, deps) {
       status: 'waiting_ip', message: '没有解析值或可用备用 IP', currentValues: [], sourceState: sourceResult.state,
       sourceErrors: sourceResult.errors, cycle: null, lastCheckAt: nowIso(), nextCheckAt: addSeconds(guard.interval), lastError: ''
     }));
-    if (guard.status !== 'waiting_ip') deps.notifyDnsGuard?.(guardId);
     return;
   }
   const cycle = {
@@ -1231,7 +1231,17 @@ export function buildDnsGuardCheckAddresses(currentValues, sourceValues, candida
 export function dnsGuardCycleReady(guard) {
   const expected = guard.cycle?.expectedProbeIds || [];
   if (!expected.length || !guard.cycle?.checks?.length) return false;
-  return guard.cycle.checks.every((check) => expected.every((probeId) => completeGuardEvidence(check.observations?.[probeId], guard)));
+  return guard.cycle.checks.every((check) => dnsGuardCheckReady(check, guard));
+}
+
+export function dnsGuardCheckReady(check, guard) {
+  const expected = guard.cycle?.expectedProbeIds || [];
+  if (!expected.length) return false;
+  const observations = expected.map((probeId) => check?.observations?.[probeId]);
+  // One successful probe settles this IP immediately; slow probes no longer block the cycle.
+  if (observations.some((evidence) => evidence?.ok && evidence.attempts >= 1)) return true;
+  // A failed IP is removable only after every responsible probe completes all failed rounds.
+  return observations.every((evidence) => completeGuardEvidence(evidence, guard));
 }
 
 export function completeGuardEvidence(evidence, guard) {
@@ -1284,7 +1294,6 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
       recordType: guard.recordType, readDnsRecord, writeDnsRecord
     });
   }
-  const previousStatus = guard.status;
   const finishedAt = nowIso();
   state = deps.updateState((draft) => {
     const item = draft.dnsGuards.find((entry) => entry.id === guardId && entry.cycle?.id === cycleId);
@@ -1330,8 +1339,9 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
     pushAudit(draft, 'dnsGuard.check', 'dnsGuard', guardId, `${item.domain} 检查 ${remote.length} 个记录，故障 ${failedRemote.length} 个，补位 ${usedAssets.length} 个`, 'system');
     return draft;
   });
-  const next = state.dnsGuards.find((item) => item.id === guardId);
-  if (next && (next.status !== previousStatus || ['replaced', 'degraded', 'waiting_ip'].includes(next.status))) deps.notifyDnsGuard?.(guardId);
+  // Routine checks stay silent. Notify only after unhealthy remote IPs were
+  // successfully removed from the provider record.
+  if (changed && failedRemote.some((address) => !desired.includes(address))) deps.notifyDnsGuard?.(guardId);
 }
 
 export function calculateDnsGuardOwnership(guard, remoteValues, desiredValues, healthySourceValues, usedAssets = []) {
@@ -1387,7 +1397,6 @@ function recordDnsGuardError(guardId, error, deps) {
     pushAudit(draft, 'dnsGuard.error', 'dnsGuard', guardId, message, 'system');
     return draft;
   });
-  deps.notifyDnsGuard?.(guardId);
 }
 
 function updateDnsGuard(state, id, patch) {

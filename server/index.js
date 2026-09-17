@@ -2191,7 +2191,10 @@ function notifyDnsGuardViaTelegram(guardId) {
   const state = readState();
   const guard = state.dnsGuards?.find((item) => item.id === guardId);
   if (!guard) return;
-  const text = `DNS 守护：${guard.name}\n域名：${guard.domain} · ${guard.recordType}\n状态：${STATUS_LABELS[guard.status] || guard.status}\n${guard.message || guard.lastError || ''}`;
+  const latestRun = state.dnsGuardRuns?.find((item) => item.guardId === guardId);
+  const removed = latestRun?.failedValues || [];
+  if (!removed.length) return;
+  const text = `DNS 守护：${guard.name}\n域名：${guard.domain} · ${guard.recordType}\n已删除不健康 IP：${removed.join(', ')}\n${guard.message || ''}`;
   for (const settings of (state.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc && telegramMenuAllowed(bot, 'probes'))) {
     let token = '';
     try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }

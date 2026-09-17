@@ -3,11 +3,14 @@ import test from 'node:test';
 import {
   buildDnsGuardCheckAddresses,
   calculateDnsGuardOwnership,
+  dnsGuardCheckReady,
+  dnsGuardCycleReady,
   normalizeOrchestrationState,
   orchestrationDefaults,
   processReadyDnsGuards,
   resolveDnsGuardSources,
   roundRobinDnsGuardSourceValues,
+  runDueDnsGuards,
   selectHealthyDnsGuardSources,
   syncDnsGuardRemote,
   writeDnsGuardRemoteValues
@@ -99,6 +102,58 @@ test('uses a healthy backup source only when the primary source has no healthy a
   ]));
   assert.deepEqual(recovered.values, ['198.51.100.20']);
   assert.equal(recovered.state.home.activeSide, 'primary');
+});
+
+test('settles an IP as soon as any responsible probe succeeds', () => {
+  const guard = {
+    checkRounds: 3,
+    attemptsPerRound: 3,
+    cycle: { expectedProbeIds: ['probe-1', 'probe-2'] }
+  };
+  const check = { observations: {
+    'probe-1': { ok: true, attempts: 1, rounds: 3, attemptsPerRound: 3, roundsCompleted: 1 },
+    'probe-2': undefined
+  } };
+
+  assert.equal(dnsGuardCheckReady(check, guard), true);
+  assert.equal(dnsGuardCycleReady({ ...guard, cycle: { ...guard.cycle, checks: [check] } }), true);
+});
+
+test('waits for every responsible probe to finish three failed rounds', () => {
+  const guard = {
+    checkRounds: 3,
+    attemptsPerRound: 3,
+    cycle: { expectedProbeIds: ['probe-1', 'probe-2'] }
+  };
+  const failed = { ok: false, attempts: 9, rounds: 3, attemptsPerRound: 3, roundsCompleted: 3 };
+  const check = { observations: { 'probe-1': failed, 'probe-2': undefined } };
+
+  assert.equal(dnsGuardCheckReady(check, guard), false);
+  check.observations['probe-2'] = failed;
+  assert.equal(dnsGuardCheckReady(check, guard), true);
+});
+
+test('restarts a stale DNS guard cycle without waiting for the regular interval', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: [],
+    checkRounds: 3,
+    attemptsPerRound: 3,
+    timeout: 5,
+    maxParallel: 20,
+    status: 'checking',
+    nextCheckAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    cycle: {
+      id: 'stale-cycle',
+      startedAt: new Date(Date.now() - 3 * 60 * 1000).toISOString(),
+      checks: [{ id: 'check-1', address: '198.51.100.10', observations: {} }]
+    }
+  });
+  const deps = remoteDeps(state);
+
+  assert.equal(await runDueDnsGuards(deps), 1);
+  assert.equal(deps.getState().dnsGuards[0].status, 'waiting_probe');
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
 });
 
 test('gives every configured source a primary and backup probe slot before extra addresses', () => {
@@ -207,6 +262,8 @@ test('removes the last failed remote IP during an automatic guard cycle', async 
     }
   });
   const deps = remoteDeps(state);
+  let notifications = 0;
+  deps.notifyDnsGuard = () => { notifications += 1; };
 
   await processReadyDnsGuards(deps);
 
@@ -215,7 +272,45 @@ test('removes the last failed remote IP during an automatic guard cycle', async 
   assert.deepEqual(guard.currentValues, []);
   assert.equal(guard.status, 'waiting_ip');
   assert.equal(guard.cycle, null);
+  assert.equal(notifications, 1);
   assert.equal(Object.values(guard.sourceState).some((entry) => entry?.blocked?.length), false);
+});
+
+test('does not notify after a routine healthy DNS guard check', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    checkRounds: 1,
+    attemptsPerRound: 1,
+    maxParallel: 20,
+    status: 'checking',
+    currentValues: ['198.51.100.10'],
+    cycle: {
+      id: 'healthy-cycle',
+      startedAt: new Date().toISOString(),
+      expectedProbeIds: ['probe-1'],
+      remoteValues: ['198.51.100.10'],
+      sourceValues: [],
+      sourceCandidates: {},
+      candidateAssets: [],
+      sourceState: {},
+      sourceErrors: [],
+      zone: { id: 'zone-1', name: 'example.com', providerZoneId: 'provider-zone-1' },
+      normalizedBinding: { recordName: 'edge', providerRecordId: 'record-1', providerRecordIds: ['record-1'] },
+      checks: [{
+        id: 'check-1',
+        address: '198.51.100.10',
+        observations: { 'probe-1': { ok: true, rounds: 1, attemptsPerRound: 1, roundsCompleted: 1, attempts: 1 } }
+      }]
+    }
+  });
+  const deps = remoteDeps(state);
+  let notifications = 0;
+  deps.notifyDnsGuard = () => { notifications += 1; };
+
+  await processReadyDnsGuards(deps);
+
+  assert.equal(deps.getState().dnsGuards[0].status, 'healthy');
+  assert.equal(notifications, 0);
 });
 
 test('checks every selected pool candidate instead of discarding untested assets', () => {

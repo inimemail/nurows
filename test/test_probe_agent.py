@@ -1,5 +1,6 @@
 import importlib.util
 import pathlib
+import threading
 import unittest
 from unittest import mock
 
@@ -80,6 +81,42 @@ class ProbeCheckWindowTests(unittest.TestCase):
         self.assertEqual(result["successfulAddress"], "198.51.100.40")
         self.assertEqual(result["resolvedAddresses"], ["198.51.100.40", "203.0.113.10"])
         self.assertEqual(result["checkMarker"], "marker-1")
+
+    def test_parallel_batch_reports_each_ip_as_soon_as_it_finishes(self):
+        release_slow = threading.Event()
+        fast_reported = threading.Event()
+        reports = []
+        due = [
+            {"id": "slow", "interval": 30},
+            {"id": "fast", "interval": 30},
+        ]
+
+        def check(target):
+            if target["id"] == "slow":
+                release_slow.wait(2)
+            return {"targetId": target["id"], "ok": True}
+
+        def report(_config, _method, _path, payload=None):
+            target_id = payload["results"][0]["targetId"]
+            reports.append(target_id)
+            if target_id == "fast":
+                fast_reported.set()
+            return {"ok": True}
+
+        schedules = {}
+        with mock.patch.object(PROBE, "check_target", side_effect=check), \
+                mock.patch.object(PROBE, "request", side_effect=report):
+            worker = threading.Thread(target=PROBE.run_due_checks, args=({"maxConcurrency": 2}, due, schedules, 100))
+            worker.start()
+            self.assertTrue(fast_reported.wait(1))
+            self.assertTrue(worker.is_alive())
+            self.assertEqual(reports, ["fast"])
+            release_slow.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(reports, ["fast", "slow"])
+        self.assertEqual(schedules, {"fast": 130, "slow": 130})
 
 
 if __name__ == "__main__":

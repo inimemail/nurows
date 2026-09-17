@@ -13,7 +13,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
@@ -168,6 +168,19 @@ def check_target(target):
     }
 
 
+def run_due_checks(config, due, schedules, now):
+    workers = min(max(1, int(config.get("maxConcurrency", 100))), len(due))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(check_target, target): target for target in due}
+        for future in concurrent.futures.as_completed(futures):
+            target = futures[future]
+            result = future.result()
+            # Report each IP as it finishes so one fast success is not held up
+            # by another slow or failing IP in the same parallel batch.
+            request(config, "POST", "/probe/report", {"version": VERSION, "results": [result]})
+            schedules[target["id"]] = now + max(5, int(target.get("interval", 30)))
+
+
 def main():
     with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
         config = json.load(handle)
@@ -190,12 +203,7 @@ def main():
                     schedules[target["id"]] = 0
             due = [target for target in targets if now >= schedules.get(target["id"], 0)]
             if due:
-                workers = min(max(1, int(config.get("maxConcurrency", 100))), len(due))
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                    results = list(executor.map(check_target, due))
-                request(config, "POST", "/probe/report", {"version": VERSION, "results": results})
-                for target in due:
-                    schedules[target["id"]] = now + max(5, int(target.get("interval", 30)))
+                run_due_checks(config, due, schedules, now)
             request(config, "POST", "/probe/heartbeat", {"version": VERSION})
         except HTTPError as error:
             if error.code == 401 and config.get("token") and config.get("secret"):

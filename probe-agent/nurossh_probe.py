@@ -11,10 +11,10 @@ import threading
 import time
 import urllib.request
 from urllib.error import HTTPError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
@@ -225,6 +225,11 @@ def start_check_batch(config, due, schedules, now):
     return thread
 
 
+def update_config_cache(payload, targets, version):
+    next_targets = targets if payload.get("unchanged") else payload.get("targets", [])
+    return next_targets, str(payload.get("version", version))
+
+
 def main():
     with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
         config = json.load(handle)
@@ -237,12 +242,15 @@ def main():
     check_now_markers = {}
     last_heartbeat_at = 0.0
     heartbeat_interval = 20
+    config_version = ""
+    targets = []
     guard_worker = None
     ordinary_worker = None
     while True:
         try:
-            payload = request(config, "GET", "/probe/config")
-            targets = payload.get("targets", [])
+            config_path = "/probe/config" + (f"?version={quote(config_version, safe='')}" if config_version else "")
+            payload = request(config, "GET", config_path)
+            targets, config_version = update_config_cache(payload, targets, config_version)
             try:
                 heartbeat_interval = max(10, int(payload.get("heartbeatInterval", heartbeat_interval)))
             except (TypeError, ValueError):

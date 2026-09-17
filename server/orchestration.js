@@ -49,6 +49,7 @@ const DNS_ZONE_CACHE_TTL_MS = 10 * 60 * 1000;
 // user-configured interval between complete DNS guard cycles.
 const DNS_GUARD_PROBE_POLL_INTERVAL_SECONDS = 5;
 const DNS_GUARD_PROVIDER_OPERATION_WAIT_MS = 30000;
+const DNS_GUARD_MANUAL_OPERATION_WAIT_MS = 1000;
 const DNS_PROVIDER_VERIFY_DELAYS_MS = [0, 500, 1500, 3000];
 const dnsZoneCache = new Map();
 
@@ -184,11 +185,11 @@ export function registerProbePublicRoutes(app, deps) {
   });
 
   app.get('/probe/config', (req, res) => {
-    const auth = authenticateProbe(req, deps.readState());
+    const auth = authenticateProbe(req, deps.readProbeState?.() || deps.readState());
     if (!auth) return res.status(401).json({ error: '探针凭证无效' });
     const targets = auth.state.probeTargets
       .filter((target) => target.enabled !== false && target.probeIds?.includes(auth.probe.id))
-      .map(({ observations, ...target }) => target);
+      .map(probeTargetConfiguration);
     const guardChecks = auth.state.dnsGuards.flatMap((guard) => {
       if (guard.enabled === false || !guard.cycle?.expectedProbeIds?.includes(auth.probe.id)) return [];
       return (guard.cycle.checks || [])
@@ -211,18 +212,21 @@ export function registerProbePublicRoutes(app, deps) {
     // DNS guard cycles are latency-sensitive: start them before ordinary
     // targets so a busy probe cannot make a two-IP guard wait behind a queue.
     const checks = [...guardChecks, ...targets];
+    const version = configVersion(checks);
+    const unchanged = cleanText(req.query?.version, 100) === version;
     res.json({
       ok: true,
-      version: configVersion(checks),
+      version,
       probeId: auth.probe.id,
       heartbeatInterval: 20,
       maxConcurrency: auth.probe.maxConcurrency || 100,
-      targets: checks
+      unchanged,
+      targets: unchanged ? undefined : checks
     });
   });
 
   app.post('/probe/heartbeat', (req, res) => {
-    const auth = authenticateProbe(req, deps.readState());
+    const auth = authenticateProbe(req, deps.readProbeState?.() || deps.readState());
     if (!auth) return res.status(401).json({ error: '探针凭证无效' });
     const agentVersion = cleanText(req.body.version, 40);
     const lastSeenAt = Date.parse(auth.probe.lastSeenAt || 0);
@@ -254,12 +258,25 @@ export function registerProbePublicRoutes(app, deps) {
     const state = deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === auth.probe.id);
       if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), agentVersion: cleanText(req.body.version, 40) || probe.agentVersion, updatedAt: nowIso() });
+      const targetById = new Map((draft.probeTargets || []).map((item) => [item.id, item]));
+      const guardCheckById = new Map();
+      const enabledProbeIds = new Set((draft.probes || []).filter((item) => item.enabled !== false).map((item) => item.id));
+      const policyById = new Map((draft.failoverPolicies || []).filter((item) => item.enabled !== false).map((item) => [item.id, item]));
+      const activeIncidentTargetIds = new Set((draft.incidents || [])
+        .filter((item) => ACTIVE_INCIDENT_STATES.has(item.status) || item.status === 'failed')
+        .map((item) => item.targetId));
+      for (const guard of draft.dnsGuards || []) {
+        if (guard.enabled === false || !guard.cycle?.expectedProbeIds?.includes(auth.probe.id)) continue;
+        for (const check of guard.cycle.checks || []) guardCheckById.set(check.id, { guard, check });
+      }
       for (const raw of reports) {
-        const target = draft.probeTargets.find((item) => item.id === cleanId(raw.targetId) && item.probeIds?.includes(auth.probe.id));
+        const targetId = cleanId(raw.targetId);
+        const candidateTarget = targetById.get(targetId);
+        const target = candidateTarget?.probeIds?.includes(auth.probe.id) ? candidateTarget : null;
         if (!target) {
-          const guard = draft.dnsGuards.find((item) => item.enabled !== false && item.cycle?.expectedProbeIds?.includes(auth.probe.id) && item.cycle.checks?.some((check) => check.id === cleanId(raw.targetId)));
-          const check = guard?.cycle?.checks?.find((item) => item.id === cleanId(raw.targetId));
-          if (!guard || !check) continue;
+          const guardEntry = guardCheckById.get(targetId);
+          if (!guardEntry) continue;
+          const { guard, check } = guardEntry;
           acceptedGuardReport = true;
           check.observations ||= {};
           check.observations[auth.probe.id] = normalizeCheckEvidence(raw, guard);
@@ -296,18 +313,19 @@ export function registerProbePublicRoutes(app, deps) {
           checkMarker: cleanText(raw.checkMarker, 100)
         };
         target.updatedAt = nowIso();
-        const transition = evaluateTargetHealth(target, draft.probes);
+        const transition = evaluateTargetHealth(target, draft.probes, enabledProbeIds);
         target.health = transition.health;
         target.lastCheckAt = checkedAt;
         const stabilizationResult = settleStabilizingIncidentForTarget(draft, target);
         if (stabilizationResult.action === 'retry') retryIncidentIds.push(stabilizationResult.incidentId);
         if (['succeeded', 'timed_out'].includes(stabilizationResult.action)) notifyIncidentIds.push(stabilizationResult.incidentId);
         if (transition.failed && target.policyId) {
-          const active = draft.incidents.some((item) => item.targetId === target.id && (ACTIVE_INCIDENT_STATES.has(item.status) || (item.status === 'failed' && target.health === 'down')));
-          const policy = draft.failoverPolicies.find((item) => item.id === target.policyId && item.enabled !== false);
+          const active = activeIncidentTargetIds.has(target.id);
+          const policy = policyById.get(target.policyId);
           if (!active && policy) {
             const incident = createIncident(target, policy, auth.probe.id);
             draft.incidents.unshift(incident);
+            activeIncidentTargetIds.add(target.id);
             createdIncidentIds.push(incident.id);
             pushAudit(draft, 'incident.created', 'incident', incident.id, `${target.name} 所有探针完成 ${checkRounds}×${attemptsPerRound} 检查且全部失败`, 'probe');
           }
@@ -319,16 +337,18 @@ export function registerProbePublicRoutes(app, deps) {
     for (const incidentId of createdIncidentIds) deps.onIncidentCreated?.(incidentId);
     for (const incidentId of [...new Set(retryIncidentIds)]) deps.onIncidentCreated?.(incidentId);
     for (const incidentId of [...new Set(notifyIncidentIds)]) deps.notifyIncident?.(incidentId);
-    deps.onProbeAvailable?.(auth.probe.id, state);
-    if (acceptedGuardReport) deps.onDnsGuardReport?.();
-    if (acceptedTargetReport) deps.onProbeReport?.();
+    const waitingForThisProbe = auth.state.dnsGuards?.some((guard) => guard.enabled !== false
+      && guard.status === 'waiting_probe' && !guard.cycle && guard.probeIds?.includes(auth.probe.id));
+    if (auth.probe.status !== 'online' || waitingForThisProbe) deps.onProbeAvailable?.(auth.probe.id, state);
+    if (acceptedGuardReport) deps.onDnsGuardReport?.(state);
+    if (acceptedTargetReport) deps.onProbeReport?.(state);
     res.json({ ok: true, accepted: reports.length, incidents: createdIncidentIds });
   });
 }
 
 export function registerOrchestrationRoutes(app, deps) {
   app.get('/api/dns-guards/status', (req, res) => {
-    const state = deps.readState();
+    const state = deps.readDnsGuardStatusState?.() || deps.readState();
     res.json({
       dnsGuards: (state.dnsGuards || []).map(normalizeDnsGuardState),
       dnsGuardRuns: (state.dnsGuardRuns || []).slice(0, DNS_GUARD_HISTORY_LIMIT)
@@ -679,7 +699,11 @@ export async function syncDnsBinding(bindingId, deps, actor = 'system') {
 export async function syncDnsGuardRemote(guardId, deps, actor = 'system') {
   const current = deps.readState().dnsGuards.find((item) => item.id === guardId);
   if (!current) throw new Error('DNS 守护任务不存在');
-  return withDnsGuardProviderOperation(guardId, () => syncDnsGuardRemoteLocked(guardId, deps, actor));
+  return withDnsGuardProviderOperation(
+    guardId,
+    () => syncDnsGuardRemoteLocked(guardId, deps, actor),
+    DNS_GUARD_MANUAL_OPERATION_WAIT_MS
+  );
 }
 
 async function resolveDnsGuardRecord(state, guard, account, credentials, deps, ignoreRecordIds = false) {
@@ -743,7 +767,11 @@ export async function writeDnsGuardRemoteValues(guardId, input, deps, actor = 's
   const current = deps.readState().dnsGuards.find((item) => item.id === guardId);
   if (!current) throw new Error('DNS 守护任务不存在');
   dnsGuardPreparationVersions.set(guardId, (dnsGuardPreparationVersions.get(guardId) || 0) + 1);
-  return withDnsGuardProviderOperation(guardId, () => writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor));
+  return withDnsGuardProviderOperation(
+    guardId,
+    () => writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor),
+    DNS_GUARD_MANUAL_OPERATION_WAIT_MS
+  );
 }
 
 async function withDnsGuardProviderOperation(guardId, operation, waitMs = DNS_GUARD_PROVIDER_OPERATION_WAIT_MS) {
@@ -759,7 +787,7 @@ async function acquireDnsGuardProvider(guardId, waitMs) {
   const deadline = Number.isFinite(waitMs) ? Date.now() + waitMs : Number.POSITIVE_INFINITY;
   while (dnsGuardProviderRuntime.has(guardId)) {
     if (Date.now() >= deadline) {
-      const error = new Error('守护任务服务商操作超时，请稍后重试');
+      const error = new Error('守护任务正在读写远程 DNS，请稍后再试');
       error.statusCode = 409;
       throw error;
     }
@@ -791,12 +819,16 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
     providerRecordId: remote.recordId ? String(remote.recordId) : '',
     providerRecordIds: cleanTexts(remote.recordIds || (remote.recordId ? [remote.recordId] : []), 500)
   };
-  const providerRecordIds = await replaceDnsRecordSafely({
+  const replacement = await replaceDnsRecordSafely({
     account, credentials, zone, binding: providerBinding, beforeValues, afterValues: values,
-    recordType: guard.recordType, readDnsRecord, writeDnsRecord
+    recordType: guard.recordType, readDnsRecord, writeDnsRecord,
+    verificationMode: account.provider === 'huawei' ? 'provider_ack' : 'tolerant'
   });
+  const providerRecordIds = replacement.recordIds;
+  const verificationPending = replacement.verificationPending;
   const savedAt = nowIso();
-  const removed = new Set(beforeValues.filter((address) => !values.includes(address)));
+  const committedValues = verificationPending ? beforeValues : values;
+  const removed = new Set(beforeValues.filter((address) => !committedValues.includes(address)));
   const next = deps.updateState((draft) => {
     const item = draft.dnsGuards.find((entry) => entry.id === guard.id);
     if (!item) throw new Error('DNS 守护任务已被删除');
@@ -809,13 +841,13 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
       if (sourceValues.some((address) => removed.has(address))) current.pending = true;
     }
     const expectedProbeIds = activeDnsGuardProbeIds(item, draft);
-    const verifiedCycle = values.length && expectedProbeIds.length
-      ? createDnsGuardRemoteCycle(item, expectedProbeIds, values, zone, normalizedBinding, providerRecordIds)
+    const verifiedCycle = !verificationPending && committedValues.length && expectedProbeIds.length
+      ? createDnsGuardRemoteCycle(item, expectedProbeIds, committedValues, zone, normalizedBinding, providerRecordIds)
       : null;
     Object.assign(item, {
-      currentValues: values,
-      ownedValues: (item.ownedValues || []).filter((address) => values.includes(address)),
-      sourceOwnedValues: (item.sourceOwnedValues || []).filter((address) => values.includes(address)),
+      currentValues: committedValues,
+      ownedValues: (item.ownedValues || []).filter((address) => committedValues.includes(address)),
+      sourceOwnedValues: (item.sourceOwnedValues || []).filter((address) => committedValues.includes(address)),
       sourceState,
       providerRecordId: providerRecordIds?.[0] || '',
       providerRecordIds: providerRecordIds || [],
@@ -823,17 +855,36 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
       providerZoneId: zone.providerZoneId || '',
       cycle: verifiedCycle,
       status: verifiedCycle ? 'checking' : 'queued',
-      message: verifiedCycle ? `正在检查活动 IP：0/${values.length}` : '远程 IP 已更新，等待检查并修复',
+      message: verificationPending
+        ? '写入请求已提交，等待后台确认远程 IP'
+        : (verifiedCycle ? `正在检查活动 IP：0/${committedValues.length}` : '远程 IP 已更新，等待检查并修复'),
       nextCheckAt: verifiedCycle ? addSeconds(item.interval) : '',
-      lastError: '',
+      lastError: verificationPending ? cleanText(replacement.verificationError, 500) : '',
       updatedAt: savedAt
     });
-    draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', guardId: item.id, bindingId: '', accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: item.domain, recordType: item.recordType, provider: account.provider, beforeValues, afterValues: values, status: 'applied', createdAt: savedAt, rolledBackAt: '' });
-    draft.dnsChanges = draft.dnsChanges.slice(0, 3000);
-    pushAudit(draft, 'dnsGuard.push', 'dnsGuard', item.id, `${item.domain} 手工写入服务商 ${values.length} 个 IP`, actor);
+    if (!verificationPending) {
+      draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', guardId: item.id, bindingId: '', accountId: account.id, zoneId: zone.id || '', zoneName: zone.name, providerZoneId: zone.providerZoneId || '', domain: item.domain, recordType: item.recordType, provider: account.provider, beforeValues, afterValues: committedValues, status: 'applied', createdAt: savedAt, rolledBackAt: '' });
+      draft.dnsChanges = draft.dnsChanges.slice(0, 3000);
+    }
+    pushAudit(
+      draft,
+      verificationPending ? 'dnsGuard.push_pending' : 'dnsGuard.push',
+      'dnsGuard', item.id,
+      verificationPending
+        ? `${item.domain} 手工写入请求结果待确认，已交给后台重新读取`
+        : `${item.domain} 手工写入服务商 ${committedValues.length} 个 IP`,
+      actor
+    );
     return draft;
   });
-  return { values, beforeValues, direction: 'local_to_remote', state: next };
+  return {
+    values: committedValues,
+    requestedValues: values,
+    beforeValues,
+    verificationPending,
+    direction: 'local_to_remote',
+    state: next
+  };
 }
 
 export async function saveDnsBindingConfiguration(input, bindingId, deps, actor = 'system') {
@@ -1046,8 +1097,8 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
   }
 }
 
-export function retryWaitingIpIncidents(deps, encryptionKey = null) {
-  let state = deps.readState();
+export function retryWaitingIpIncidents(deps, encryptionKey = null, initialState = null) {
+  let state = initialState || deps.readState();
   const recovered = state.incidents.filter((incident) => {
     if (!['waiting_for_ip', 'observing', 'pending_approval'].includes(incident.status)) return false;
     const target = state.probeTargets.find((item) => item.id === incident.targetId);
@@ -1180,7 +1231,7 @@ export function requestWaitingDnsGuardProbeChecks(deps, probeId, snapshot = null
   return requestedIds.length;
 }
 
-export function processReadyDnsGuards(deps) {
+export function processReadyDnsGuards(deps, initialState = null) {
   const current = dnsGuardProcessors.get(deps);
   if (current) {
     current.rerun = true;
@@ -1189,10 +1240,12 @@ export function processReadyDnsGuards(deps) {
   const controller = { rerun: false, promise: null };
   controller.promise = (async () => {
     let processed = 0;
+    let stateSnapshot = initialState;
     const attempted = new Set();
     do {
       controller.rerun = false;
-      const state = deps.readState();
+      const state = stateSnapshot || deps.readState();
+      stateSnapshot = null;
       const ready = state.dnsGuards.filter((guard) => {
         if (guard.enabled === false || !guard.cycle || !dnsGuardCycleReady(guard) || dnsGuardRuntime.has(guard.id)) return false;
         const workId = dnsGuardWorkId(guard);
@@ -1623,13 +1676,13 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
       const latest = await readDnsRecord(account, credentials, zone, binding);
       if (!sameStringSet(filterAddressFamily(latest.values, guard.recordType), remote)) return { canceled: false, stale: true, recordIds: [] };
       const latestRecordIds = cleanTexts(latest.recordIds || (latest.recordId ? [latest.recordId] : []), 500);
-      const recordIds = await replaceDnsRecordSafely({
+      const replacement = await replaceDnsRecordSafely({
         account, credentials, zone,
         binding: { ...binding, providerRecordId: latestRecordIds[0] || '', providerRecordIds: latestRecordIds },
         beforeValues: remote, afterValues: desired,
         recordType: guard.recordType, readDnsRecord, writeDnsRecord
       });
-      return { canceled: false, stale: false, recordIds };
+      return { canceled: false, stale: false, recordIds: replacement.recordIds };
     }, Number.POSITIVE_INFINITY);
     if (writeResult.canceled) return;
     if (writeResult.stale) {
@@ -1712,17 +1765,32 @@ export function calculateDnsGuardOwnership(guard, remoteValues, desiredValues, h
   };
 }
 
-async function replaceDnsRecordSafely({ account, credentials, zone, binding, beforeValues, afterValues, recordType, readDnsRecord, writeDnsRecord }) {
+async function replaceDnsRecordSafely({
+  account, credentials, zone, binding, beforeValues, afterValues, recordType,
+  readDnsRecord, writeDnsRecord, verificationMode = 'strict'
+}) {
   let afterIds = [];
   try {
     afterIds = await writeDnsRecord(account, credentials, zone, binding, afterValues);
+    if (verificationMode === 'provider_ack') {
+      return { recordIds: afterIds || [], verificationPending: false, verificationError: '' };
+    }
     const verifyBinding = afterIds?.length
       ? { ...binding, providerRecordId: afterIds[0], providerRecordIds: afterIds }
       : withoutProviderRecordIds(binding);
     const verified = await readDnsRecord(account, credentials, zone, verifyBinding);
     if (!sameStringSet(filterAddressFamily(verified.values, recordType), afterValues)) throw new Error('服务商返回的记录值与写入内容不一致');
-    return afterIds || [];
+    return { recordIds: afterIds || [], verificationPending: false, verificationError: '' };
   } catch (error) {
+    if (verificationMode !== 'strict' && isTransientDnsGuardError(error)) {
+      return {
+        recordIds: afterIds?.length
+          ? afterIds
+          : cleanTexts(binding.providerRecordIds || (binding.providerRecordId ? [binding.providerRecordId] : []), 500),
+        verificationPending: true,
+        verificationError: cleanText(error.message || '服务商写入结果待确认', 500)
+      };
+    }
     try {
       const rollbackBinding = afterIds?.length
         ? { ...binding, providerRecordId: afterIds[0], providerRecordIds: afterIds }
@@ -2116,8 +2184,25 @@ function authenticateProbe(req, state) {
   return probe && safeHashEqual(probe.agentSecretHash, hashSecret(secret)) ? { probe, state } : null;
 }
 
-export function evaluateTargetHealth(target, probes) {
-  const assignedProbeIds = (target.probeIds || []).filter((probeId) => probes.some((probe) => probe.id === probeId && probe.enabled !== false));
+function probeTargetConfiguration(target) {
+  return {
+    id: target.id,
+    address: target.address,
+    allowPrivate: Boolean(target.allowPrivate),
+    checkType: target.checkType,
+    port: target.port,
+    timeout: target.timeout,
+    checkRounds: target.checkRounds,
+    attemptsPerRound: target.attemptsPerRound,
+    interval: target.interval,
+    checkNowAt: target.checkNowAt || ''
+  };
+}
+
+export function evaluateTargetHealth(target, probes, enabledProbeIds = null) {
+  const enabled = enabledProbeIds || new Set(probes.filter((probe) => probe.enabled !== false).map((probe) => probe.id));
+  const assignedProbeIds = (target.probeIds || []).filter((probeId) => enabled.has(probeId));
+  const assignedProbeIdSet = new Set(assignedProbeIds);
   const now = Date.now();
   const checkRounds = clampNumber(target.checkRounds, 1, MAX_TARGET_CHECK_ROUNDS, DEFAULT_TARGET_CHECK_ROUNDS);
   const attemptsPerRound = clampNumber(target.attemptsPerRound, 1, MAX_TARGET_ATTEMPTS_PER_ROUND, DEFAULT_TARGET_ATTEMPTS_PER_ROUND);
@@ -2127,7 +2212,7 @@ export function evaluateTargetHealth(target, probes) {
   const maxRoundSkewMs = intervalMs + checkWindowMs;
   const observations = Object.entries(target.observations || {}).filter(([probeId, observation]) => {
     const checkedAt = Date.parse(observation.checkedAt || 0);
-    return assignedProbeIds.includes(probeId) && Number.isFinite(checkedAt) && now - checkedAt >= 0 && now - checkedAt <= freshnessMs;
+    return assignedProbeIdSet.has(probeId) && Number.isFinite(checkedAt) && now - checkedAt >= 0 && now - checkedAt <= freshnessMs;
   });
   const completeRound = assignedProbeIds.length > 0 && observations.length === assignedProbeIds.length;
   const checkedTimes = observations.map(([, item]) => Date.parse(item.checkedAt));

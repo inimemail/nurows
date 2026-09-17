@@ -414,7 +414,7 @@ test('serializes a remote read against concurrent guard writes', async () => {
   await syncing;
   const written = await writing;
   assert.deepEqual(written.values, ['198.51.100.11']);
-  assert.equal(reads >= 3, true);
+  assert.equal(reads >= 2, true);
 });
 
 test('keeps automatic guard preparation healthy while a manual remote read is active', async () => {
@@ -513,10 +513,52 @@ test('starts probe checks from a verified manual write without rereading the pro
     expectedValues: ['198.51.100.10'], values: ['198.51.100.11']
   }, deps, 'tester');
 
-  assert.equal(reads, 2);
+  assert.equal(reads, 1);
   assert.equal(await runDueDnsGuards(deps, 'guard-1'), 0);
-  assert.equal(reads, 2);
+  assert.equal(reads, 1);
   assert.deepEqual(deps.getState().dnsGuards[0].cycle.checks.map((check) => check.address), ['198.51.100.11']);
+});
+
+test('releases a manual guard write after a transient provider timeout without rolling back', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20,
+    currentValues: ['198.51.100.10']
+  });
+  state.probes.push({ id: 'probe-1', enabled: true, agentSecretHash: 'registered' });
+  const deps = remoteDeps(state);
+  const readRemote = deps.readDnsRecord;
+  let reads = 0;
+  let writes = 0;
+  deps.readDnsRecord = async (...args) => {
+    reads += 1;
+    return readRemote(...args);
+  };
+  deps.writeDnsRecord = async () => {
+    writes += 1;
+    const error = new Error('The operation was aborted due to timeout');
+    error.name = 'TimeoutError';
+    throw error;
+  };
+
+  const result = await writeDnsGuardRemoteValues('guard-1', {
+    expectedValues: ['198.51.100.10'], values: ['198.51.100.11']
+  }, deps, 'tester');
+
+  const guard = deps.getState().dnsGuards[0];
+  assert.equal(result.verificationPending, true);
+  assert.equal(reads, 1);
+  assert.equal(writes, 1);
+  assert.deepEqual(guard.currentValues, ['198.51.100.10']);
+  assert.equal(guard.cycle, null);
+  assert.equal(guard.status, 'queued');
+  assert.match(guard.message, /等待后台确认/);
+  assert.equal(deps.getState().dnsChanges.length, 0);
+  assert.equal(deps.getState().auditLogs[0].action, 'dnsGuard.push_pending');
+
+  const pulled = await syncDnsGuardRemote('guard-1', deps, 'tester');
+  assert.deepEqual(pulled.values, ['198.51.100.10']);
+  assert.equal(reads, 2);
 });
 
 test('keeps the last healthy guard status when a provider read times out', async () => {
@@ -896,21 +938,38 @@ test('sends DNS guard checks before ordinary probe targets', () => {
     post: (path, handler) => routes.set(`POST ${path}`, handler)
   };
   registerProbePublicRoutes(app, {
-    readState: () => state,
+    readState: () => { throw new Error('full state should not be read for probe config'); },
+    readProbeState: () => state,
     updateState: (updater) => updater(state),
     allowProbeRegistration: () => true
   });
   let response;
   routes.get('GET /probe/config')({
-    headers: { 'x-probe-id': 'probe-1', authorization: `Bearer ${secret}` }
+    headers: { 'x-probe-id': 'probe-1', authorization: `Bearer ${secret}` },
+    query: {}
   }, {
     status: () => ({ json: (value) => { response = value; } }),
     json: (value) => { response = value; }
   });
 
   assert.deepEqual(response.targets.map((target) => target.id), ['guard-check-1', 'target-1']);
+  assert.equal(response.targets[1].name, undefined);
+  assert.equal(response.targets[1].probeIds, undefined);
+  assert.equal(response.unchanged, false);
   assert.equal(response.heartbeatInterval, 20);
   assert.equal(response.maxConcurrency, 100);
+
+  const version = response.version;
+  routes.get('GET /probe/config')({
+    headers: { 'x-probe-id': 'probe-1', authorization: `Bearer ${secret}` },
+    query: { version }
+  }, {
+    status: () => ({ json: (value) => { response = value; } }),
+    json: (value) => { response = value; }
+  });
+  assert.equal(response.version, version);
+  assert.equal(response.unchanged, true);
+  assert.equal(response.targets, undefined);
 });
 
 test('routes probe report follow-up work only to the matching subsystem', () => {
@@ -1052,7 +1111,9 @@ test('does not claim a pre-existing manual IP as DDNS-owned', () => {
 });
 
 test('verifies that a failed remote write was actually rolled back', async () => {
-  const deps = remoteDeps(guardState());
+  const state = guardState();
+  state.dnsAccounts[0].provider = 'cloudflare';
+  const deps = remoteDeps(state);
   let writes = 0;
   deps.writeDnsRecord = async (_account, _credentials, _zone, _binding, values) => {
     writes += 1;

@@ -107,6 +107,8 @@ const SHELL_PROMPT_PATTERNS = [
 
 const orchestrationDeps = {
   readState,
+  readProbeState,
+  readDnsGuardStatusState,
   updateState,
   sanitizeState: sanitizeStateForClient,
   encryptSecret,
@@ -224,8 +226,8 @@ app.use(cors());
 registerProbePublicRoutes(app, {
   ...orchestrationDeps,
   onIncidentCreated: (incidentId) => runIncidentWorkflow(incidentId, orchestrationDeps),
-  onProbeReport: () => retryWaitingIpIncidents(orchestrationDeps),
-  onDnsGuardReport: () => processReadyDnsGuards(orchestrationDeps).catch(() => {})
+  onProbeReport: (state) => retryWaitingIpIncidents(orchestrationDeps, null, state),
+  onDnsGuardReport: (state) => processReadyDnsGuards(orchestrationDeps, state).catch(() => {})
 });
 app.use('/api', authGuard);
 
@@ -1815,6 +1817,25 @@ function readState() {
   return structuredClone(cachedState);
 }
 
+function readProbeState() {
+  ensureStorage();
+  if (!cachedState) cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
+  return structuredClone({
+    probes: cachedState.probes || [],
+    probeTargets: cachedState.probeTargets || [],
+    dnsGuards: cachedState.dnsGuards || []
+  });
+}
+
+function readDnsGuardStatusState() {
+  ensureStorage();
+  if (!cachedState) cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
+  return structuredClone({
+    dnsGuards: cachedState.dnsGuards || [],
+    dnsGuardRuns: cachedState.dnsGuardRuns || []
+  });
+}
+
 function writeState(state) {
   ensureStorage();
   cachedState = normalizeStateRecord(state);
@@ -1823,10 +1844,11 @@ function writeState(state) {
 
 function updateState(mutator) {
   const draft = readState();
-  const next = mutator(structuredClone(draft));
+  const previousPoolInventory = snapshotPoolInventory(draft);
+  const next = mutator(draft);
   writeState(next);
   const saved = readState();
-  notifyPoolThresholdDrops(draft, saved);
+  notifyPoolThresholdDrops(previousPoolInventory, saved);
   return saved;
 }
 
@@ -2220,19 +2242,31 @@ function notifyDnsGuardViaTelegram(guardId) {
   }
 }
 
-function notifyPoolThresholdDrops(previous, next) {
-  const previousAssets = new Map((previous.ipAssets || []).map((item) => [item.id, item]));
+function snapshotPoolInventory(state) {
+  const alertPools = (state.ipPools || []).filter((pool) => pool.alertEnabled);
+  if (!alertPools.length) return new Map();
+  const assets = new Map((state.ipAssets || []).map((item) => [item.id, item]));
+  return new Map(alertPools.map((pool) => [
+    pool.id,
+    (pool.assetIds || []).filter((id) => {
+      const asset = assets.get(id);
+      return asset?.enabled !== false && asset?.health !== 'unhealthy';
+    }).length
+  ]));
+}
+
+function notifyPoolThresholdDrops(previousInventory, next) {
+  if (!previousInventory.size) return;
   const nextAssets = new Map((next.ipAssets || []).map((item) => [item.id, item]));
-  const available = (pool, assets) => (pool?.assetIds || []).filter((id) => {
-    const asset = assets.get(id);
+  const available = (pool) => (pool?.assetIds || []).filter((id) => {
+    const asset = nextAssets.get(id);
     return asset?.enabled !== false && asset?.health !== 'unhealthy';
   }).length;
   for (const pool of next.ipPools || []) {
     if (!pool.alertEnabled) continue;
-    const beforePool = (previous.ipPools || []).find((item) => item.id === pool.id);
-    if (!beforePool) continue;
-    const before = available(beforePool, previousAssets);
-    const after = available(pool, nextAssets);
+    const before = previousInventory.get(pool.id);
+    if (before === undefined) continue;
+    const after = available(pool);
     if (after >= before) continue;
     const crossed = crossedInventoryThresholds(before, after, pool.alertThresholds);
     if (!crossed.length) continue;

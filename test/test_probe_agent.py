@@ -159,6 +159,21 @@ class ProbeCheckWindowTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(schedules, {"first": 0, "second": 0})
 
+    def test_unchanged_config_keeps_the_cached_targets(self):
+        targets = [{"id": "target-1"}]
+        cached, version = PROBE.update_config_cache(
+            {"version": "config-1", "unchanged": True}, targets, "old-config"
+        )
+
+        self.assertIs(cached, targets)
+        self.assertEqual(version, "config-1")
+
+        replaced, version = PROBE.update_config_cache(
+            {"version": "config-2", "targets": [{"id": "target-2"}]}, cached, version
+        )
+        self.assertEqual(replaced, [{"id": "target-2"}])
+        self.assertEqual(version, "config-2")
+
     def test_guard_checks_are_prioritized_with_a_small_worker_pool(self):
         started = []
         release_first = threading.Event()

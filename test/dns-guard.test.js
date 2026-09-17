@@ -8,6 +8,7 @@ import {
   normalizeOrchestrationState,
   orchestrationDefaults,
   processReadyDnsGuards,
+  registerOrchestrationRoutes,
   resolveDnsGuardSources,
   roundRobinDnsGuardSourceValues,
   runDueDnsGuards,
@@ -48,6 +49,58 @@ function remoteDeps(initialState, initialRemote = ['198.51.100.10']) {
     getState: () => state
   };
 }
+
+test('allows editing a DNS guard while it is waiting for probe reports', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    status: 'checking',
+    message: '正在检查 1 个 IP',
+    nextCheckAt: new Date(Date.now() + 30000).toISOString(),
+    cycle: {
+      id: 'old-cycle',
+      startedAt: new Date().toISOString(),
+      expectedProbeIds: ['probe-1'],
+      checks: [{ id: 'old-check', address: '198.51.100.10', observations: {} }]
+    }
+  });
+  state.probes.push({ id: 'probe-1', name: '英国探针', enabled: true });
+
+  const routes = {};
+  const app = Object.fromEntries(['get', 'post', 'put', 'delete'].map((method) => [method, (path, handler) => { routes[`${method} ${path}`] = handler; }]));
+  let changedId = '';
+  const deps = {
+    readState: () => state,
+    updateState: (updater) => updater(state),
+    sanitizeState: (value) => value,
+    onDnsGuardChanged: (id) => { changedId = id; }
+  };
+  registerOrchestrationRoutes(app, deps);
+
+  let response;
+  let routeError;
+  await routes['put /api/orchestration/:resource/:id']({
+    params: { resource: 'dns-guards', id: 'guard-1' },
+    body: {
+      ...state.dnsGuards[0],
+      interval: 60,
+      probeIds: ['probe-1'],
+      poolIds: [],
+      checkRounds: 3,
+      attemptsPerRound: 3,
+      maxParallel: 20
+    },
+    auth: { username: 'tester' }
+  }, { json: (value) => { response = value; } }, (error) => { routeError = error; });
+
+  assert.equal(routeError, undefined);
+  assert.equal(response.ok, true);
+  assert.equal(state.dnsGuards[0].cycle, null);
+  assert.equal(state.dnsGuards[0].status, 'queued');
+  assert.equal(state.dnsGuards[0].message, '配置已更新，等待重新检查');
+  assert.equal(state.dnsGuards[0].interval, 60);
+  assert.equal(state.dnsGuards[0].nextCheckAt, '');
+  assert.equal(changedId, 'guard-1');
+});
 
 test('keeps primary and backup DDNS domains paired during normalization', () => {
   const normalized = normalizeOrchestrationState({

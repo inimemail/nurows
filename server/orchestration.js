@@ -336,7 +336,10 @@ export function registerOrchestrationRoutes(app, deps) {
   app.put('/api/orchestration/:resource/:id', asyncRoute(async (req, res) => {
     const key = RESOURCE_MAP[req.params.resource];
     if (!key) return res.status(404).json({ error: '未知资源类型' });
-    if (key === 'dnsGuards') assertDnsGuardIdle(req.params.id, deps, '守护检查正在执行，请结束后再编辑规则');
+    // A pending probe cycle is safe to cancel: saving the rule creates a new
+    // cycle with new check IDs, so late reports from the old cycle are ignored.
+    // Only block during the short remote DNS read/write critical section.
+    if (key === 'dnsGuards') assertDnsGuardRuntimeIdle(req.params.id, deps, '正在读写远程 DNS，请稍后再编辑规则');
     if (key === 'dnsBindings') {
       const result = await saveDnsBindingConfiguration(req.body, req.params.id, deps, req.auth.username);
       return res.json({ ok: true, item: sanitizeResource(key, result.item), state: deps.sanitizeState(result.state, req.auth) });
@@ -1019,6 +1022,15 @@ function assertDnsGuardIdle(guardId, deps, message) {
   throw error;
 }
 
+function assertDnsGuardRuntimeIdle(guardId, deps, message) {
+  const guard = deps.readState().dnsGuards.find((item) => item.id === guardId);
+  if (!guard) throw new Error('DNS 守护任务不存在');
+  if (!dnsGuardRuntime.has(guardId)) return guard;
+  const error = new Error(message);
+  error.statusCode = 409;
+  throw error;
+}
+
 export async function runDueDnsGuards(deps, requestedId = '') {
   const state = deps.readState();
   const now = Date.now();
@@ -1513,8 +1525,8 @@ function normalizeResource(key, input = {}, existing = null, deps) {
       pruneStale: input.pruneStale !== false,
       sources,
       enabled: input.enabled !== false,
-      status: identityChanged ? 'queued' : (existing?.status || 'queued'),
-      message: identityChanged ? '配置已更新，等待检查' : (existing?.message || ''),
+      status: 'queued',
+      message: existing ? '配置已更新，等待重新检查' : '',
       currentValues: targetChanged ? [] : (existing?.currentValues || []),
       ownedValues: targetChanged ? [] : (existing?.ownedValues || []),
       sourceOwnedValues: targetChanged ? [] : (existing?.sourceOwnedValues || []),
@@ -1524,8 +1536,8 @@ function normalizeResource(key, input = {}, existing = null, deps) {
       providerRecordIds: targetChanged ? [] : (existing?.providerRecordIds || []),
       cycle: null,
       lastCheckAt: identityChanged ? '' : (existing?.lastCheckAt || ''),
-      nextCheckAt: identityChanged ? '' : (existing?.nextCheckAt || ''),
-      lastError: identityChanged ? '' : (existing?.lastError || '')
+      nextCheckAt: '',
+      lastError: ''
     });
   }
   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };

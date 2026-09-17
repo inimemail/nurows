@@ -45,6 +45,7 @@ const DNS_GUARD_HISTORY_LIMIT = 1000;
 const DNS_GUARD_MAX_VALUES = 50;
 const DNS_GUARD_PREPARE_CONCURRENCY = 10;
 const DNS_GUARD_APPLY_CONCURRENCY = 10;
+const DNS_GUARD_MAX_ACTIVE_CYCLES = 10;
 const DNS_ZONE_CACHE_TTL_MS = 10 * 60 * 1000;
 // Probe agents poll the server for cycle progress. This is not the guard's
 // user-configured interval between complete DNS guard cycles.
@@ -350,9 +351,13 @@ export function registerProbePublicRoutes(app, deps) {
 export function registerOrchestrationRoutes(app, deps) {
   app.get('/api/dns-guards/status', (req, res) => {
     const state = deps.readDnsGuardStatusState?.() || deps.readState();
+    const latestRunByGuard = new Map();
+    for (const run of state.dnsGuardRuns || []) {
+      if (run.guardId && !latestRunByGuard.has(run.guardId)) latestRunByGuard.set(run.guardId, run);
+    }
     res.json({
-      dnsGuards: (state.dnsGuards || []).map(normalizeDnsGuardState),
-      dnsGuardRuns: (state.dnsGuardRuns || []).slice(0, DNS_GUARD_HISTORY_LIMIT)
+      dnsGuards: (state.dnsGuards || []).map(dnsGuardStatusSummary),
+      dnsGuardRuns: [...latestRunByGuard.values()]
     });
   });
 
@@ -1186,19 +1191,19 @@ export async function runDueDnsGuards(deps, requestedId = '') {
     });
     state = deps.readState();
   }
+  const activeGuardIds = new Set(state.dnsGuards
+    .filter((guard) => guard.enabled !== false && guard.cycle && !dnsGuardCycleStale(guard, now))
+    .map((guard) => guard.id));
+  for (const guardId of dnsGuardRuntime) activeGuardIds.add(guardId);
+  const availableSlots = Math.max(0, DNS_GUARD_MAX_ACTIVE_CYCLES - activeGuardIds.size);
+  if (!availableSlots) return 0;
   const due = state.dnsGuards.filter((guard) => {
     if (guard.enabled === false || dnsGuardRuntime.has(guard.id)) return false;
     if (requestedIds.size && !requestedIds.has(guard.id)) return false;
-    let cycleStale = false;
-    if (guard.cycle) {
-      const batchCount = Math.max(1, Math.ceil((guard.cycle.checks?.length || 1) / Math.max(1, guard.maxParallel)));
-      const batchWindow = guard.checkRounds * guard.timeout * 1000 + Math.max(0, guard.checkRounds - 1) * 1000 + 15000;
-      const maxAge = Math.max(120000, batchCount * batchWindow + 60000);
-      cycleStale = now - Date.parse(guard.cycle.startedAt || 0) > maxAge;
-      if (!cycleStale) return false;
-    }
+    const cycleStale = dnsGuardCycleStale(guard, now);
+    if (guard.cycle && !cycleStale) return false;
     return cycleStale || !guard.nextCheckAt || Date.parse(guard.nextCheckAt) <= now;
-  });
+  }).sort((left, right) => Date.parse(left.nextCheckAt || 0) - Date.parse(right.nextCheckAt || 0)).slice(0, availableSlots);
   for (const guard of due) dnsGuardRuntime.add(guard.id);
   let cursor = 0;
   const workers = Array.from({ length: Math.min(DNS_GUARD_PREPARE_CONCURRENCY, due.length) }, async () => {
@@ -1212,6 +1217,14 @@ export async function runDueDnsGuards(deps, requestedId = '') {
   });
   await Promise.all(workers);
   return due.length;
+}
+
+function dnsGuardCycleStale(guard, now = Date.now()) {
+  if (!guard.cycle) return false;
+  const batchCount = Math.max(1, Math.ceil((guard.cycle.checks?.length || 1) / Math.max(1, guard.maxParallel)));
+  const batchWindow = guard.checkRounds * guard.timeout * 1000 + Math.max(0, guard.checkRounds - 1) * 1000 + 15000;
+  const maxAge = Math.max(120000, batchCount * batchWindow + 60000);
+  return now - Date.parse(guard.cycle.startedAt || 0) > maxAge;
 }
 
 export function requestWaitingDnsGuardChecks(deps) {
@@ -3212,6 +3225,18 @@ function normalizeDnsGuardState(value = {}) {
     lastCheckAt: cleanText(value.lastCheckAt, 40),
     nextCheckAt: cleanText(value.nextCheckAt, 40),
     lastError: cleanText(value.lastError, 500)
+  };
+}
+
+function dnsGuardStatusSummary(value = {}) {
+  const guard = normalizeDnsGuardState(value);
+  return {
+    ...guard,
+    cycle: guard.cycle ? {
+      id: cleanText(guard.cycle.id, 100),
+      phase: cleanText(guard.cycle.phase, 40),
+      startedAt: cleanText(guard.cycle.startedAt, 40)
+    } : null
   };
 }
 

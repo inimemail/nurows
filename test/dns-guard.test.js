@@ -894,6 +894,58 @@ test('prepares multiple due DNS guards concurrently', async () => {
   assert.equal(await running, 2);
 });
 
+test('limits globally active DNS guard cycles to ten', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20
+  });
+  for (let index = 2; index <= 12; index += 1) {
+    state.dnsGuards.push({
+      ...structuredClone(state.dnsGuards[0]),
+      id: `guard-${index}`,
+      name: `守护 ${index}`,
+      domain: `edge-${index}.example.com`
+    });
+  }
+  state.probes.push({
+    id: 'probe-1', enabled: true, agentSecretHash: 'registered', status: 'online', lastSeenAt: new Date().toISOString()
+  });
+  const deps = remoteDeps(state, ['198.51.100.10']);
+
+  assert.equal(await runDueDnsGuards(deps), 10);
+  assert.equal(deps.getState().dnsGuards.filter((guard) => guard.cycle).length, 10);
+  assert.equal(await runDueDnsGuards(deps), 0);
+  assert.equal(deps.getState().dnsGuards.filter((guard) => guard.cycle).length, 10);
+});
+
+test('returns lightweight guard polling state and only the latest run per guard', () => {
+  const state = guardState();
+  state.dnsGuards[0].cycle = {
+    id: 'cycle-1', phase: 'remote', startedAt: new Date().toISOString(),
+    expectedProbeIds: ['probe-1'], checks: Array.from({ length: 50 }, (_, index) => ({
+      id: `check-${index}`, address: `198.51.100.${index + 1}`, observations: { 'probe-1': { ok: true } }
+    }))
+  };
+  state.dnsGuardRuns = [
+    { id: 'new-run', guardId: 'guard-1', finishedAt: '2026-09-18T00:00:00.000Z' },
+    { id: 'old-run', guardId: 'guard-1', finishedAt: '2026-09-17T00:00:00.000Z' }
+  ];
+  const routes = {};
+  const app = Object.fromEntries(['get', 'post', 'put', 'delete'].map((method) => [method, (path, handler) => { routes[`${method} ${path}`] = handler; }]));
+  registerOrchestrationRoutes(app, {
+    readState: () => state,
+    readDnsGuardStatusState: () => state
+  });
+  let response;
+
+  routes['get /api/dns-guards/status']({}, { json: (value) => { response = value; } });
+
+  assert.deepEqual(response.dnsGuards[0].cycle, {
+    id: 'cycle-1', phase: 'remote', startedAt: state.dnsGuards[0].cycle.startedAt
+  });
+  assert.deepEqual(response.dnsGuardRuns.map((run) => run.id), ['new-run']);
+});
+
 test('processes ready DNS guards concurrently with a fixed worker pool', async () => {
   const state = guardState();
   const readyCycle = (id, address) => ({

@@ -1822,17 +1822,53 @@ function readProbeState() {
   if (!cachedState) cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
   return structuredClone({
     probes: cachedState.probes || [],
-    probeTargets: cachedState.probeTargets || [],
-    dnsGuards: cachedState.dnsGuards || []
+    probeTargets: (cachedState.probeTargets || []).map((target) => ({
+      id: target.id,
+      enabled: target.enabled,
+      probeIds: target.probeIds,
+      address: target.address,
+      allowPrivate: target.allowPrivate,
+      checkType: target.checkType,
+      port: target.port,
+      timeout: target.timeout,
+      checkRounds: target.checkRounds,
+      attemptsPerRound: target.attemptsPerRound,
+      interval: target.interval,
+      checkNowAt: target.checkNowAt
+    })),
+    dnsGuards: (cachedState.dnsGuards || []).map((guard) => ({
+      id: guard.id,
+      enabled: guard.enabled,
+      status: guard.status,
+      probeIds: guard.probeIds,
+      checkType: guard.checkType,
+      port: guard.port,
+      timeout: guard.timeout,
+      checkRounds: guard.checkRounds,
+      attemptsPerRound: guard.attemptsPerRound,
+      maxParallel: guard.maxParallel,
+      cycle: guard.cycle
+    }))
   });
 }
 
 function readDnsGuardStatusState() {
   ensureStorage();
   if (!cachedState) cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
+  const latestRunByGuard = new Map();
+  for (const run of cachedState.dnsGuardRuns || []) {
+    if (run.guardId && !latestRunByGuard.has(run.guardId)) latestRunByGuard.set(run.guardId, run);
+  }
   return structuredClone({
-    dnsGuards: cachedState.dnsGuards || [],
-    dnsGuardRuns: cachedState.dnsGuardRuns || []
+    dnsGuards: (cachedState.dnsGuards || []).map((guard) => ({
+      ...guard,
+      cycle: guard.cycle ? {
+        id: guard.cycle.id,
+        phase: guard.cycle.phase,
+        startedAt: guard.cycle.startedAt
+      } : null
+    })),
+    dnsGuardRuns: [...latestRunByGuard.values()]
   });
 }
 

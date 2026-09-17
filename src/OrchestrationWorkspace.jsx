@@ -59,7 +59,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       }
     };
     refresh();
-    const timer = window.setInterval(refresh, guardCheckActive ? 2000 : 10000);
+    const timer = window.setInterval(refresh, guardCheckActive ? 5000 : 10000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [api, onState, tab, guardCheckActive]);
 

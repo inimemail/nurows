@@ -276,25 +276,138 @@ test('allows remote IP management while waiting for guard checks', async () => {
   assert.equal(guard.nextCheckAt, '');
 });
 
+test('does not revive a canceled guard cycle after manual remote management', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    checkRounds: 1,
+    attemptsPerRound: 1,
+    maxParallel: 20,
+    status: 'checking',
+    currentValues: ['198.51.100.10'],
+    cycle: {
+      id: 'cycle-1',
+      startedAt: new Date().toISOString(),
+      expectedProbeIds: ['probe-1'],
+      remoteValues: ['198.51.100.10'],
+      sourceValues: [],
+      sourceCandidates: {},
+      candidateAssets: [],
+      sourceState: {},
+      sourceErrors: [],
+      zone: { id: 'zone-1', name: 'example.com', providerZoneId: 'provider-zone-1' },
+      normalizedBinding: { recordName: 'edge', providerRecordId: 'record-1', providerRecordIds: ['record-1'] },
+      checks: [{
+        id: 'check-1',
+        address: '198.51.100.10',
+        observations: { 'probe-1': { ok: false, rounds: 1, attemptsPerRound: 1, roundsCompleted: 1, attempts: 1 } }
+      }]
+    }
+  });
+  const deps = remoteDeps(state);
+  let releaseRead;
+  let markReadStarted;
+  let reads = 0;
+  let notifications = 0;
+  const readStarted = new Promise((resolve) => { markReadStarted = resolve; });
+  const readRemote = deps.readDnsRecord;
+  deps.readDnsRecord = async () => {
+    reads += 1;
+    if (reads === 1) {
+      markReadStarted();
+      await new Promise((resolve) => { releaseRead = resolve; });
+    }
+    return readRemote();
+  };
+  deps.notifyDnsGuard = () => { notifications += 1; };
+
+  const writing = writeDnsGuardRemoteValues('guard-1', {
+    expectedValues: ['198.51.100.10'],
+    values: ['198.51.100.11']
+  }, deps, 'tester');
+  await readStarted;
+  const processing = processReadyDnsGuards(deps);
+  releaseRead();
+  await Promise.all([writing, processing]);
+
+  const guard = deps.getState().dnsGuards[0];
+  assert.deepEqual(deps.getRemote(), ['198.51.100.11']);
+  assert.deepEqual(guard.currentValues, ['198.51.100.11']);
+  assert.equal(guard.cycle, null);
+  assert.equal(guard.status, 'queued');
+  assert.equal(guard.message, '远程 IP 已更新，等待检查并修复');
+  assert.equal(notifications, 0);
+});
+
 test('serializes a remote read against concurrent guard writes', async () => {
   const deps = remoteDeps(guardState());
   let releaseRead;
   let markReadStarted;
+  let reads = 0;
   const readStarted = new Promise((resolve) => { markReadStarted = resolve; });
+  const readRemote = deps.readDnsRecord;
   deps.readDnsRecord = async () => {
-    markReadStarted();
-    await new Promise((resolve) => { releaseRead = resolve; });
-    return { values: ['198.51.100.10'], recordId: 'record-1', recordIds: ['record-1'] };
+    reads += 1;
+    if (reads === 1) {
+      markReadStarted();
+      await new Promise((resolve) => { releaseRead = resolve; });
+    }
+    return readRemote();
   };
 
   const syncing = syncDnsGuardRemote('guard-1', deps, 'tester');
   await readStarted;
-  await assert.rejects(
-    writeDnsGuardRemoteValues('guard-1', { expectedValues: ['198.51.100.10'], values: ['198.51.100.11'] }, deps, 'tester'),
-    /正在执行/
-  );
+  let writeSettled = false;
+  const writing = writeDnsGuardRemoteValues(
+    'guard-1',
+    { expectedValues: ['198.51.100.10'], values: ['198.51.100.11'] },
+    deps,
+    'tester'
+  ).finally(() => { writeSettled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(writeSettled, false);
   releaseRead();
   await syncing;
+  const written = await writing;
+  assert.deepEqual(written.values, ['198.51.100.11']);
+  assert.equal(reads >= 3, true);
+});
+
+test('keeps automatic guard preparation healthy while a manual remote read is active', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20
+  });
+  state.probes.push({
+    id: 'probe-1', name: '英国探针', enabled: true, agentSecretHash: 'registered',
+    lastSeenAt: new Date().toISOString()
+  });
+  const deps = remoteDeps(state);
+  let releaseRead;
+  let markReadStarted;
+  let reads = 0;
+  const readStarted = new Promise((resolve) => { markReadStarted = resolve; });
+  const readRemote = deps.readDnsRecord;
+  deps.readDnsRecord = async () => {
+    reads += 1;
+    if (reads === 1) {
+      markReadStarted();
+      await new Promise((resolve) => { releaseRead = resolve; });
+    }
+    return readRemote();
+  };
+
+  const syncing = syncDnsGuardRemote('guard-1', deps, 'tester');
+  await readStarted;
+  const checking = runDueDnsGuards(deps);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.notEqual(deps.getState().dnsGuards[0].status, 'error');
+  releaseRead();
+  await Promise.all([syncing, checking]);
+
+  const guard = deps.getState().dnsGuards[0];
+  assert.equal(guard.status, 'checking');
+  assert.equal(guard.lastError || '', '');
+  assert.deepEqual(guard.cycle.checks.map((check) => check.address), ['198.51.100.10']);
 });
 
 test('allows the last remote IP to be removed manually without blacklisting it', async () => {

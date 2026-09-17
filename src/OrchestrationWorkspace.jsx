@@ -99,32 +99,20 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
     guardRemoteRequest.current += 1;
     setGuardRemote({ open: false, guardId: '', name: '', recordType: 'A', values: '', expectedValues: [], busy: false, saving: false, ready: false, error: '' });
   };
-  const openGuardRemote = async (guard) => {
-    const requestId = guardRemoteRequest.current + 1;
-    guardRemoteRequest.current = requestId;
-    const cachedValues = guard.currentValues || [];
+  const openGuardRemote = (guard) => {
+    guardRemoteRequest.current += 1;
+    const latestGuard = state.dnsGuards?.find((item) => item.id === guard.id) || guard;
+    const cachedValues = latestGuard.currentValues || [];
     setGuardRemote({
-      open: true, guardId: guard.id, name: guard.name, recordType: guard.recordType,
-      values: cachedValues.join('\n'), expectedValues: cachedValues, busy: true, saving: false, ready: false, error: ''
+      open: true, guardId: latestGuard.id, name: latestGuard.name, recordType: latestGuard.recordType,
+      values: cachedValues.join('\n'), expectedValues: cachedValues, busy: false, saving: false, ready: true, error: ''
     });
-    try {
-      const data = await syncGuardRemote(guard.id, false);
-      if (guardRemoteRequest.current !== requestId) return;
-      setGuardRemote({
-        open: true, guardId: guard.id, name: guard.name, recordType: guard.recordType,
-        values: (data.values || []).join('\n'), expectedValues: data.values || [], busy: false, saving: false, ready: true, error: ''
-      });
-    } catch (error) {
-      if (guardRemoteRequest.current !== requestId) return;
-      setGuardRemote((current) => ({ ...current, busy: false, ready: false, error: error.message }));
-      toast(error.message);
-    }
   };
   const refreshGuardRemote = async () => {
     if (!guardRemote.guardId || guardRemote.busy) return;
     const requestId = guardRemoteRequest.current + 1;
     guardRemoteRequest.current = requestId;
-    setGuardRemote((current) => ({ ...current, busy: true, ready: false, error: '' }));
+    setGuardRemote((current) => ({ ...current, busy: true, error: '' }));
     try {
       const data = await syncGuardRemote(guardRemote.guardId, false);
       if (guardRemoteRequest.current !== requestId) return;
@@ -132,7 +120,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       toast(`已重新读取远程 ${data.values?.length || 0} 个 IP`);
     } catch (error) {
       if (guardRemoteRequest.current !== requestId) return;
-      setGuardRemote((current) => ({ ...current, busy: false, ready: false, error: error.message }));
+      setGuardRemote((current) => ({ ...current, busy: false, error: error.message }));
       toast(error.message);
     }
   };
@@ -147,7 +135,8 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       closeGuardRemote();
       toast(`已写入远程 ${data.values?.length || 0} 个 IP，等待检查并修复`);
     } catch (error) {
-      setGuardRemote((current) => ({ ...current, busy: false, saving: false, ready: false, error: error.message }));
+      const stale = error.message.includes('远程 IP 已发生变化');
+      setGuardRemote((current) => ({ ...current, busy: false, saving: false, ready: !stale, error: error.message }));
       toast(error.message);
     }
   };
@@ -237,7 +226,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
 
       {editor.open ? <Dialog title={`${editor.value.id ? '编辑' : '新增'}${typeLabel(editor.type)}`} className="ops-editor-dialog" wide={editor.type !== 'target' && editor.type !== 'policy' && editor.type !== 'guard'} xwide={editor.type === 'target' || editor.type === 'policy' || editor.type === 'guard'} onClose={() => !editorBusy && closeEditor()} footer={<><div>{editor.value.id ? <button className="danger-text" disabled={editorBusy} onClick={remove}>删除</button> : null}</div><div className="dialog-actions"><button className="ghost" disabled={editorBusy} onClick={closeEditor}>取消</button><button className="primary" disabled={editorBusy} onClick={save}>{editorBusy ? (editor.type === 'binding' ? '写入远端中...' : '保存中...') : editor.type === 'guard' ? '保存规则' : '保存'}</button></div></>}>{renderEditor(editor.type, editor.value, (patch) => setEditor((current) => ({ ...current, value: { ...current.value, ...patch } })), state, api, toast)}</Dialog> : null}
       {guardView ? <GuardDetails guard={state.dnsGuards?.find((item) => item.id === guardView.id) || guardView} runs={(state.dnsGuardRuns || []).filter((item) => item.guardId === guardView.id)} Dialog={Dialog} onClose={() => setGuardView(null)} onCheck={() => { checkGuardNow(guardView.id); setGuardView(null); }} onManage={() => { openGuardRemote(guardView); setGuardView(null); }} /> : null}
-      {guardRemote.open ? <Dialog title={`管理远程 IP · ${guardRemote.name}`} className="ops-editor-dialog" wide onClose={() => !guardRemote.saving && closeGuardRemote()} footer={<><button className="ghost" disabled={guardRemote.busy} onClick={refreshGuardRemote}>{guardRemote.busy && !guardRemote.saving ? '读取中...' : '重新读取远程'}</button><div className="dialog-actions"><button className="ghost" disabled={guardRemote.saving} onClick={closeGuardRemote}>取消</button><button className="primary" disabled={guardRemote.busy || !guardRemote.ready} onClick={saveGuardRemote}>{guardRemote.saving ? '写入中...' : '写入远程'}</button></div></>}><div className="guard-remote-editor"><div className="confirm-copy">{guardRemote.busy && !guardRemote.saving ? '正在读取服务商记录...' : guardRemote.ready ? `当前快照包含 ${guardRemote.expectedValues.length} 个 ${guardRemote.recordType} 地址。` : '远程记录尚未加载。'}</div>{guardRemote.error ? <div className="guard-error">{guardRemote.error}</div> : null}<Field label={`${guardRemote.recordType} 地址（每行一个）`} full><textarea rows="14" readOnly={!guardRemote.ready || guardRemote.saving} value={guardRemote.values} onChange={(event) => setGuardRemote((current) => ({ ...current, values: event.target.value }))} placeholder={guardRemote.recordType === 'AAAA' ? '2001:db8::1' : '1.1.1.1'} /></Field></div></Dialog> : null}
+      {guardRemote.open ? <Dialog title={`管理远程 IP · ${guardRemote.name}`} className="ops-editor-dialog" wide onClose={() => !guardRemote.saving && closeGuardRemote()} footer={<><button className="ghost" disabled={guardRemote.busy} onClick={refreshGuardRemote}>{guardRemote.busy && !guardRemote.saving ? '读取中...' : '重新读取远程'}</button><div className="dialog-actions"><button className="ghost" disabled={guardRemote.saving} onClick={closeGuardRemote}>取消</button><button className="primary" disabled={guardRemote.busy || !guardRemote.ready} onClick={saveGuardRemote}>{guardRemote.saving ? '写入中...' : '写入远程'}</button></div></>}><div className="guard-remote-editor"><div className="confirm-copy">{guardRemote.busy && !guardRemote.saving ? '正在读取服务商记录...' : guardRemote.ready ? (guardRemote.expectedValues.length ? `当前快照包含 ${guardRemote.expectedValues.length} 个 ${guardRemote.recordType} 地址。` : `当前没有活动 ${guardRemote.recordType} 地址，可直接填写。`) : '远程快照已变化，请重新读取。'}</div>{guardRemote.error ? <div className="guard-error">{guardRemote.error}</div> : null}<Field label={`${guardRemote.recordType} 地址（每行一个）`} full><textarea rows="14" readOnly={!guardRemote.ready || guardRemote.busy} value={guardRemote.values} onChange={(event) => setGuardRemote((current) => ({ ...current, values: event.target.value }))} placeholder={guardRemote.recordType === 'AAAA' ? '2001:db8::1' : '1.1.1.1'} /></Field></div></Dialog> : null}
       {install ? <Dialog title="探针安装 / 升级" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装 / 升级命令" value={install.installCommand} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>重复执行安装命令会下载最新代理并重启探针服务，现有长期注册令牌继续使用。</span></div></Dialog> : null}
       {assetImport.open ? <Dialog title="批量导入 IP 资产" className="ops-editor-dialog" wide onClose={() => setAssetImport((current) => ({ ...current, open: false }))} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setAssetImport((current) => ({ ...current, open: false }))}>取消</button><button className="primary" onClick={importAssets}>导入</button></div></>}><EditorGrid><Field label="IP 地址" full><textarea className="ops-batch-ip-input" rows="12" value={assetImport.addresses} onChange={(e) => setAssetImport((current) => ({ ...current, addresses: e.target.value }))} placeholder={'每行一个，也支持空格或逗号分隔\n1.1.1.1\n2001:db8::1'} /></Field><Field label="地区（选填，批量设置）"><input value={assetImport.region} onChange={(e) => setAssetImport((current) => ({ ...current, region: e.target.value }))} /></Field><Field label="运营商（选填，批量设置）"><input value={assetImport.carrier} onChange={(e) => setAssetImport((current) => ({ ...current, carrier: e.target.value }))} /></Field><Field label="标签（选填，逗号分隔）" full><input value={assetImport.labels} onChange={(e) => setAssetImport((current) => ({ ...current, labels: e.target.value }))} /></Field></EditorGrid></Dialog> : null}
       {incidentCleanup.open ? <Dialog title={incidentCleanup.all ? '清理故障事件' : '删除故障事件'} onClose={() => !incidentCleanup.busy && setIncidentCleanup({ open: false, id: '', all: false, busy: false })} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={incidentCleanup.busy} onClick={() => setIncidentCleanup({ open: false, id: '', all: false, busy: false })}>取消</button><button className="primary danger-action" disabled={incidentCleanup.busy} onClick={confirmIncidentCleanup}>{incidentCleanup.busy ? '清理中...' : '确认清理'}</button></div></>}><div className="confirm-copy">{incidentCleanup.all ? '将清理全部非执行中的故障事件，正在运行的自动化、DNS 更新和回滚事件会自动保留。' : '将删除这条故障事件；IP 使用记录、DNS 变更记录和审计记录仍会保留。'}</div></Dialog> : null}

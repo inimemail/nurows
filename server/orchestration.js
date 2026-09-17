@@ -692,8 +692,8 @@ async function syncDnsGuardRemoteLocked(guardId, deps, actor) {
 export async function writeDnsGuardRemoteValues(guardId, input, deps, actor = 'system') {
   const current = deps.readState().dnsGuards.find((item) => item.id === guardId);
   if (!current) throw new Error('DNS 守护任务不存在');
-  if (current.cycle || dnsGuardRuntime.has(guardId)) {
-    const error = new Error('守护检查正在执行，请结束后再编辑远程 IP');
+  if (dnsGuardRuntime.has(guardId)) {
+    const error = new Error('守护任务正在执行服务商读写，请稍后再试');
     error.statusCode = 409;
     throw error;
   }
@@ -709,11 +709,6 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
   const state = deps.readState();
   const guard = state.dnsGuards.find((item) => item.id === guardId);
   if (!guard) throw new Error('DNS 守护任务不存在');
-  if (guard.cycle) {
-    const error = new Error('守护检查正在执行，请结束后再编辑远程 IP');
-    error.statusCode = 409;
-    throw error;
-  }
   const values = normalizeGuardRemoteValues(input.values, guard.recordType);
   const expectedValues = Array.isArray(input.expectedValues) ? normalizeGuardRemoteValues(input.expectedValues, guard.recordType) : null;
   const account = state.dnsAccounts.find((item) => item.id === guard.accountId && item.enabled !== false);
@@ -743,7 +738,7 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
   const removed = new Set(beforeValues.filter((address) => !values.includes(address)));
   const next = deps.updateState((draft) => {
     const item = draft.dnsGuards.find((entry) => entry.id === guard.id);
-    if (!item || item.cycle) throw new Error('守护任务状态已变化，请重新读取后再保存');
+    if (!item) throw new Error('DNS 守护任务已被删除');
     const sourceState = structuredClone(item.sourceState || {});
     for (const source of item.sources || []) {
       const key = source.id || source.domain;
@@ -759,6 +754,7 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
       sourceState,
       providerRecordId: providerRecordIds?.[0] || '',
       providerRecordIds: providerRecordIds || [],
+      cycle: null,
       status: 'queued',
       message: '远程 IP 已更新，等待检查并修复',
       nextCheckAt: '',

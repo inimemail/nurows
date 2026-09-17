@@ -250,6 +250,32 @@ test('reads and safely writes guard remote IPs with snapshot conflict detection'
   );
 });
 
+test('allows remote IP management while waiting for guard checks', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    status: 'checking',
+    currentValues: ['198.51.100.10'],
+    cycle: {
+      id: 'active-cycle', phase: 'remote', startedAt: new Date().toISOString(),
+      expectedProbeIds: ['probe-1'], remoteValues: ['198.51.100.10'],
+      checks: [{ id: 'check-1', address: '198.51.100.10', observations: {} }]
+    }
+  });
+  const deps = remoteDeps(state, ['198.51.100.10']);
+
+  const written = await writeDnsGuardRemoteValues('guard-1', {
+    expectedValues: ['198.51.100.10'],
+    values: ['198.51.100.11']
+  }, deps, 'tester');
+
+  const guard = deps.getState().dnsGuards[0];
+  assert.deepEqual(written.values, ['198.51.100.11']);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.11']);
+  assert.equal(guard.cycle, null);
+  assert.equal(guard.status, 'queued');
+  assert.equal(guard.nextCheckAt, '');
+});
+
 test('serializes a remote read against concurrent guard writes', async () => {
   const deps = remoteDeps(guardState());
   let releaseRead;

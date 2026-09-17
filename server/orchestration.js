@@ -31,6 +31,7 @@ const DEFAULT_TARGET_CHECK_ROUNDS = 3;
 const DEFAULT_TARGET_ATTEMPTS_PER_ROUND = 3;
 const MAX_TARGET_CHECK_ROUNDS = 10;
 const MAX_TARGET_ATTEMPTS_PER_ROUND = 10;
+const PROBE_OFFLINE_AFTER_MS = 90000;
 
 const DNS_PROVIDERS = new Set([
   'huawei', 'aliyun', 'tencent', 'dnspod', 'cloudflare', 'godaddy', 'porkbun', 'cloudns', 'callback',
@@ -142,7 +143,7 @@ export function sanitizeOrchestrationState(state = {}) {
     ...domain,
     probes: domain.probes.map(({ tokenHash, tokenEnc, agentSecretHash, ...item }) => ({
       ...item,
-      status: item.status === 'online' && (!item.lastSeenAt || Date.now() - Date.parse(item.lastSeenAt) > 90000) ? 'offline' : item.status
+      status: item.status === 'online' && (!item.lastSeenAt || Date.now() - Date.parse(item.lastSeenAt) > PROBE_OFFLINE_AFTER_MS) ? 'offline' : item.status
     })),
     dnsAccounts: domain.dnsAccounts.map(({ credentialsEnc, ...item }) => ({ ...item, configured: Boolean(credentialsEnc) })),
     telegramBots: domain.telegramBots.map(({ tokenEnc, tokenHash, ...item }) => ({ ...item, configured: Boolean(tokenEnc) })),
@@ -1162,9 +1163,29 @@ function assertDnsGuardProviderIdle(guardId, deps, message) {
 }
 
 export async function runDueDnsGuards(deps, requestedId = '') {
-  const state = deps.readState();
+  let state = deps.readState();
   const now = Date.now();
   const requestedIds = new Set(Array.isArray(requestedId) ? requestedId : (requestedId ? [requestedId] : []));
+  const interrupted = state.dnsGuards.filter((guard) => guard.enabled !== false && guard.cycle && !dnsGuardProbeReadiness(guard, state, now).ready);
+  if (interrupted.length) {
+    const interruptedIds = new Set(interrupted.map((guard) => guard.id));
+    deps.updateState((draft) => {
+      for (const guard of draft.dnsGuards) {
+        if (!interruptedIds.has(guard.id) || !guard.cycle) continue;
+        const readiness = dnsGuardProbeReadiness(guard, draft, now);
+        if (readiness.ready) continue;
+        Object.assign(guard, {
+          status: 'waiting_probe',
+          message: dnsGuardWaitingProbeMessage(readiness),
+          cycle: null,
+          nextCheckAt: addSeconds(guard.interval),
+          updatedAt: nowIso()
+        });
+      }
+      return draft;
+    });
+    state = deps.readState();
+  }
   const due = state.dnsGuards.filter((guard) => {
     if (guard.enabled === false || dnsGuardRuntime.has(guard.id)) return false;
     if (requestedIds.size && !requestedIds.has(guard.id)) return false;
@@ -1210,15 +1231,17 @@ export function requestWaitingDnsGuardChecks(deps) {
 }
 
 export function requestWaitingDnsGuardProbeChecks(deps, probeId, snapshot = null) {
-  const waiting = (snapshot || deps.readState()).dnsGuards.some((guard) => guard.enabled !== false
+  const current = snapshot || deps.readState();
+  const waiting = current.dnsGuards.some((guard) => guard.enabled !== false
     && guard.status === 'waiting_probe'
     && !guard.cycle
-    && guard.probeIds?.includes(probeId));
+    && guard.probeIds?.includes(probeId)
+    && dnsGuardProbeReadiness(guard, current).ready);
   if (!waiting) return 0;
   const requestedIds = [];
   deps.updateState((draft) => {
     for (const guard of draft.dnsGuards) {
-      if (guard.enabled === false || guard.status !== 'waiting_probe' || guard.cycle || !guard.probeIds?.includes(probeId)) continue;
+      if (guard.enabled === false || guard.status !== 'waiting_probe' || guard.cycle || !guard.probeIds?.includes(probeId) || !dnsGuardProbeReadiness(guard, draft).ready) continue;
       guard.status = 'queued';
       guard.message = '探针已上线，等待检查';
       guard.nextCheckAt = '';
@@ -1304,9 +1327,10 @@ async function prepareDnsGuardCycle(guardId, deps) {
   let state = deps.readState();
   let guard = state.dnsGuards.find((item) => item.id === guardId && item.enabled !== false);
   if (!guard) return;
-  let expectedProbeIds = activeDnsGuardProbeIds(guard, state);
-  if (!expectedProbeIds.length) {
-    deps.updateState((draft) => updateDnsGuard(draft, guardId, { status: 'waiting_probe', message: '等待负责探针上线', cycle: null, nextCheckAt: addSeconds(guard.interval) }));
+  let readiness = dnsGuardProbeReadiness(guard, state);
+  let expectedProbeIds = readiness.activeIds;
+  if (!readiness.ready) {
+    deps.updateState((draft) => updateDnsGuard(draft, guardId, { status: 'waiting_probe', message: dnsGuardWaitingProbeMessage(readiness), cycle: null, nextCheckAt: addSeconds(guard.interval) }));
     return;
   }
   // Preparation only reads the provider. Keeping it outside the write lock lets
@@ -1324,9 +1348,10 @@ async function prepareDnsGuardCycle(guardId, deps) {
   if (!guard
     || dnsGuardPreparationKey(guard) !== preparationKey
     || (dnsGuardPreparationVersions.get(guardId) || 0) !== preparationVersion) return;
-  expectedProbeIds = activeDnsGuardProbeIds(guard, state);
-  if (!expectedProbeIds.length) {
-    deps.updateState((draft) => updateDnsGuard(draft, guardId, { status: 'waiting_probe', message: '等待负责探针上线', cycle: null, nextCheckAt: addSeconds(guard.interval) }));
+  readiness = dnsGuardProbeReadiness(guard, state);
+  expectedProbeIds = readiness.activeIds;
+  if (!readiness.ready) {
+    deps.updateState((draft) => updateDnsGuard(draft, guardId, { status: 'waiting_probe', message: dnsGuardWaitingProbeMessage(readiness), cycle: null, nextCheckAt: addSeconds(guard.interval) }));
     return;
   }
   const currentValues = filterAddressFamily(before.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
@@ -1344,9 +1369,32 @@ async function prepareDnsGuardCycle(guardId, deps) {
 }
 
 function activeDnsGuardProbeIds(guard, state) {
-  // Match ordinary target checks: a registered, enabled probe remains
-  // responsible for failures even if a delayed heartbeat temporarily looks stale.
-  return (guard.probeIds || []).filter((probeId) => state.probes.some((probe) => probe.id === probeId && probe.enabled !== false && probe.agentSecretHash));
+  const readiness = dnsGuardProbeReadiness(guard, state);
+  return readiness.ready ? readiness.activeIds : [];
+}
+
+function dnsGuardProbeReadiness(guard, state, now = Date.now()) {
+  const probes = new Map((state.probes || []).map((probe) => [probe.id, probe]));
+  const assignedIds = (guard.probeIds || []).filter((probeId) => probes.get(probeId)?.enabled !== false);
+  const activeIds = assignedIds.filter((probeId) => {
+    const probe = probes.get(probeId);
+    if (!probe?.agentSecretHash || probe.status === 'offline') return false;
+    if (!probe.lastSeenAt) return true;
+    const lastSeenAt = Date.parse(probe.lastSeenAt);
+    return Number.isFinite(lastSeenAt) && now - lastSeenAt >= 0 && now - lastSeenAt <= PROBE_OFFLINE_AFTER_MS;
+  });
+  return {
+    assignedIds,
+    activeIds,
+    missing: Math.max(0, assignedIds.length - activeIds.length),
+    ready: assignedIds.length > 0 && activeIds.length === assignedIds.length
+  };
+}
+
+function dnsGuardWaitingProbeMessage(readiness) {
+  return readiness.assignedIds.length && readiness.missing
+    ? `等待 ${readiness.missing} 个负责探针上线`
+    : '等待负责探针上线';
 }
 
 function createDnsGuardCheck(address) {
@@ -2222,7 +2270,10 @@ export function evaluateTargetHealth(target, probes, enabledProbeIds = null) {
     item.roundsCompleted === checkRounds &&
     item.attempts === checkRounds * attemptsPerRound;
   const failed = alignedRound && observations.every(([, item]) => !item.ok && completedConfiguredCheck(item));
-  const healthy = alignedRound && observations.some(([, item]) => item.ok);
+  // Match DNS guard checks: one fresh success is enough to establish health.
+  // We still require every assigned probe to complete all configured failed
+  // attempts before declaring the target down.
+  const healthy = observations.some(([, item]) => item.ok && item.attempts >= 1);
   return { failed, health: failed ? 'down' : healthy ? 'healthy' : 'observing' };
 }
 

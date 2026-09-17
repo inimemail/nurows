@@ -14,7 +14,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
@@ -248,6 +248,10 @@ def main():
     ordinary_worker = None
     while True:
         try:
+            now = time.time()
+            if now - last_heartbeat_at >= heartbeat_interval:
+                request(config, "POST", "/probe/heartbeat", {"version": VERSION})
+                last_heartbeat_at = now
             config_path = "/probe/config" + (f"?version={quote(config_version, safe='')}" if config_version else "")
             payload = request(config, "GET", config_path)
             targets, config_version = update_config_cache(payload, targets, config_version)
@@ -269,10 +273,6 @@ def main():
                 guard_worker = start_check_batch(runtime_config, guard_due, schedules, now)
             if ordinary_due and (ordinary_worker is None or not ordinary_worker.is_alive()):
                 ordinary_worker = start_check_batch(runtime_config, ordinary_due, schedules, now)
-            now = time.time()
-            if now - last_heartbeat_at >= heartbeat_interval:
-                request(config, "POST", "/probe/heartbeat", {"version": VERSION})
-                last_heartbeat_at = now
         except HTTPError as error:
             if error.code == 401 and config.get("token") and config.get("secret"):
                 config.pop("secret", None)

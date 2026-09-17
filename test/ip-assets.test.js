@@ -279,6 +279,9 @@ test('uses all assigned probes for a round, with any success winning the round',
     p2: { ok: true, rounds: 3, attemptsPerRound: 3, roundsCompleted: 1, attempts: 1, checkedAt }
   } }, probes), { failed: false, health: 'healthy' });
   assert.deepEqual(evaluateTargetHealth({ ...base, observations: {
+    p1: { ok: true, rounds: 3, attemptsPerRound: 3, roundsCompleted: 1, attempts: 1, checkedAt }
+  } }, probes), { failed: false, health: 'healthy' });
+  assert.deepEqual(evaluateTargetHealth({ ...base, observations: {
     p1: failedCheck,
     p2: failedCheck
   } }, probes), { failed: true, health: 'down' });

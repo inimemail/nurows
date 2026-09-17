@@ -190,7 +190,7 @@ test('waits for every responsible probe to finish three failed rounds', () => {
   assert.equal(dnsGuardCheckReady(check, guard), true);
 });
 
-test('restarts a stale DNS guard cycle without waiting for the regular interval', async () => {
+test('clears a stale DNS guard cycle when no responsible probe is online', async () => {
   const state = guardState();
   Object.assign(state.dnsGuards[0], {
     probeIds: [],
@@ -208,12 +208,12 @@ test('restarts a stale DNS guard cycle without waiting for the regular interval'
   });
   const deps = remoteDeps(state);
 
-  assert.equal(await runDueDnsGuards(deps), 1);
+  assert.equal(await runDueDnsGuards(deps), 0);
   assert.equal(deps.getState().dnsGuards[0].status, 'waiting_probe');
   assert.equal(deps.getState().dnsGuards[0].cycle, null);
 });
 
-test('uses a registered guard probe even when its heartbeat timestamp is stale', async () => {
+test('waits instead of starting a guard cycle with a stale registered probe', async () => {
   const state = guardState();
   Object.assign(state.dnsGuards[0], {
     probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20
@@ -225,8 +225,34 @@ test('uses a registered guard probe even when its heartbeat timestamp is stale',
   const deps = remoteDeps(state);
 
   assert.equal(await runDueDnsGuards(deps), 1);
-  assert.equal(deps.getState().dnsGuards[0].status, 'checking');
-  assert.deepEqual(deps.getState().dnsGuards[0].cycle.expectedProbeIds, ['probe-1']);
+  assert.equal(deps.getState().dnsGuards[0].status, 'waiting_probe');
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+  assert.match(deps.getState().dnsGuards[0].message, /等待 1 个负责探针上线/);
+});
+
+test('stops an active guard cycle when one responsible probe goes offline', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1', 'probe-2'], status: 'checking', currentValues: ['198.51.100.10'],
+    checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20,
+    cycle: {
+      id: 'active-cycle', startedAt: new Date().toISOString(), phase: 'remote',
+      expectedProbeIds: ['probe-1', 'probe-2'], remoteValues: ['198.51.100.10'],
+      checks: [{ id: 'check-1', address: '198.51.100.10', observations: {} }]
+    }
+  });
+  state.probes.push(
+    { id: 'probe-1', enabled: true, agentSecretHash: 'registered', status: 'online', lastSeenAt: new Date().toISOString() },
+    { id: 'probe-2', enabled: true, agentSecretHash: 'registered', status: 'online', lastSeenAt: new Date(Date.now() - 5 * 60 * 1000).toISOString() }
+  );
+  const deps = remoteDeps(state);
+
+  assert.equal(await runDueDnsGuards(deps), 0);
+  const guard = deps.getState().dnsGuards[0];
+  assert.equal(guard.status, 'waiting_probe');
+  assert.equal(guard.cycle, null);
+  assert.deepEqual(guard.currentValues, ['198.51.100.10']);
+  assert.match(guard.message, /等待 1 个负责探针上线/);
 });
 
 test('wakes a waiting DNS guard as soon as its probe becomes available', async () => {
@@ -235,7 +261,7 @@ test('wakes a waiting DNS guard as soon as its probe becomes available', async (
     probeIds: ['probe-1'], status: 'waiting_probe', message: '等待负责探针上线',
     nextCheckAt: new Date(Date.now() + 30000).toISOString()
   });
-  state.probes.push({ id: 'probe-1', enabled: true, agentSecretHash: 'registered' });
+  state.probes.push({ id: 'probe-1', enabled: true, agentSecretHash: 'registered', status: 'online', lastSeenAt: new Date().toISOString() });
   const deps = remoteDeps(state);
 
   assert.equal(requestWaitingDnsGuardProbeChecks(deps, 'probe-1'), 1);

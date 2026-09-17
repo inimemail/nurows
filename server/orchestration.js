@@ -1025,6 +1025,7 @@ export function requestWaitingIncidentRechecks(deps) {
 
 const dnsGuardRuntime = new Set();
 const dnsGuardProviderRuntime = new Set();
+const dnsGuardProcessors = new WeakMap();
 
 function assertDnsGuardIdle(guardId, deps, message) {
   const guard = deps.readState().dnsGuards.find((item) => item.id === guardId);
@@ -1091,16 +1092,45 @@ export function requestWaitingDnsGuardChecks(deps) {
   return requestedIds.length;
 }
 
-export async function processReadyDnsGuards(deps) {
-  const state = deps.readState();
-  const ready = state.dnsGuards.filter((guard) => guard.enabled !== false && guard.cycle && dnsGuardCycleReady(guard) && !dnsGuardRuntime.has(guard.id));
-  for (const guard of ready) {
-    dnsGuardRuntime.add(guard.id);
-    try { await applyDnsGuardCycle(guard.id, guard.cycle.id, deps); }
-    catch (error) { recordDnsGuardError(guard.id, error, deps); }
-    finally { dnsGuardRuntime.delete(guard.id); }
+export function processReadyDnsGuards(deps) {
+  const current = dnsGuardProcessors.get(deps);
+  if (current) {
+    current.rerun = true;
+    return current.promise;
   }
-  return ready.length;
+  const controller = { rerun: false, promise: null };
+  controller.promise = (async () => {
+    let processed = 0;
+    const attempted = new Set();
+    do {
+      controller.rerun = false;
+      const state = deps.readState();
+      const ready = state.dnsGuards.filter((guard) => {
+        if (guard.enabled === false || !guard.cycle || !dnsGuardCycleReady(guard) || dnsGuardRuntime.has(guard.id)) return false;
+        const workId = dnsGuardWorkId(guard);
+        if (attempted.has(workId)) return false;
+        attempted.add(workId);
+        return true;
+      });
+      for (const guard of ready) {
+        dnsGuardRuntime.add(guard.id);
+        try { await applyDnsGuardCycle(guard.id, guard.cycle.id, deps); }
+        catch (error) { recordDnsGuardError(guard.id, error, deps); }
+        finally { dnsGuardRuntime.delete(guard.id); }
+      }
+      processed += ready.length;
+    } while (controller.rerun);
+    return processed;
+  })().finally(() => {
+    if (dnsGuardProcessors.get(deps) === controller) dnsGuardProcessors.delete(deps);
+  });
+  dnsGuardProcessors.set(deps, controller);
+  return controller.promise;
+}
+
+function dnsGuardWorkId(guard) {
+  const checkIds = (guard.cycle?.checks || []).map((check) => check.id).join(',');
+  return `${guard.id}:${guard.cycle?.id || ''}:${guard.cycle?.phase || ''}:${checkIds}`;
 }
 
 async function prepareDnsGuardCycle(guardId, deps) {
@@ -1582,11 +1612,42 @@ async function replaceDnsRecordSafely({ account, credentials, zone, binding, bef
 
 function recordDnsGuardError(guardId, error, deps) {
   const message = cleanText(error?.message || 'DNS 守护执行失败', 500);
+  let retryReadyCycle = false;
   deps.updateState((draft) => {
+    const guard = draft.dnsGuards.find((item) => item.id === guardId);
+    if (!guard) return draft;
+    if (isTransientDnsGuardError(error)) {
+      if (guard.cycle) {
+        updateDnsGuard(draft, guardId, { status: 'checking', message: '服务商请求超时，等待自动重试', lastError: '' });
+        retryReadyCycle = true;
+      } else {
+        const stableStatus = ['healthy', 'replaced', 'degraded', 'waiting_ip'].includes(guard.status);
+        updateDnsGuard(draft, guardId, {
+          status: stableStatus ? guard.status : 'queued',
+          message: stableStatus ? guard.message : '服务商请求超时，等待自动重试',
+          lastError: '',
+          nextCheckAt: addSeconds(Math.min(10, Math.max(1, Number(guard.interval) || 30)))
+        });
+      }
+      pushAudit(draft, 'dnsGuard.retry', 'dnsGuard', guardId, `服务商请求暂时失败，已安排重试：${message}`, 'system');
+      return draft;
+    }
     updateDnsGuard(draft, guardId, { status: 'error', message: '检查失败', lastError: message, cycle: null, lastCheckAt: nowIso(), nextCheckAt: addSeconds(draft.dnsGuards.find((item) => item.id === guardId)?.interval || 30) });
     pushAudit(draft, 'dnsGuard.error', 'dnsGuard', guardId, message, 'system');
     return draft;
   });
+  if (retryReadyCycle) deps.onDnsGuardRetry?.(guardId);
+}
+
+function isTransientDnsGuardError(error) {
+  const name = String(error?.name || '');
+  const code = String(error?.code || error?.cause?.code || '');
+  const message = String(error?.message || '');
+  if (message.includes('自动恢复失败')) return false;
+  return name === 'TimeoutError'
+    || name === 'AbortError'
+    || /^(?:ETIMEDOUT|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT)$/i.test(code)
+    || /aborted due to timeout|timed?\s*out|timeout|socket hang up|network socket disconnected/i.test(message);
 }
 
 function updateDnsGuard(state, id, patch) {

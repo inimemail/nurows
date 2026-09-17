@@ -410,6 +410,89 @@ test('keeps automatic guard preparation healthy while a manual remote read is ac
   assert.deepEqual(guard.cycle.checks.map((check) => check.address), ['198.51.100.10']);
 });
 
+test('keeps the last healthy guard status when a provider read times out', async () => {
+  const state = guardState();
+  const lastCheckAt = new Date(Date.now() - 30000).toISOString();
+  Object.assign(state.dnsGuards[0], {
+    probeIds: ['probe-1'], checkRounds: 3, attemptsPerRound: 3, timeout: 5, maxParallel: 20,
+    status: 'healthy', message: '全部解析 IP 正常', lastCheckAt, nextCheckAt: ''
+  });
+  state.probes.push({
+    id: 'probe-1', name: '英国探针', enabled: true, agentSecretHash: 'registered',
+    lastSeenAt: new Date().toISOString()
+  });
+  const deps = remoteDeps(state);
+  deps.readDnsRecord = async () => {
+    const error = new Error('The operation was aborted due to timeout');
+    error.name = 'TimeoutError';
+    throw error;
+  };
+
+  assert.equal(await runDueDnsGuards(deps), 1);
+
+  const guard = deps.getState().dnsGuards[0];
+  assert.equal(guard.status, 'healthy');
+  assert.equal(guard.message, '全部解析 IP 正常');
+  assert.equal(guard.lastCheckAt, lastCheckAt);
+  assert.equal(guard.lastError, '');
+  assert.equal(guard.cycle, null);
+  assert.equal(deps.getState().auditLogs[0].action, 'dnsGuard.retry');
+});
+
+test('retains a ready guard cycle when a provider write check times out', async () => {
+  const state = guardState();
+  Object.assign(state.dnsGuards[0], {
+    checkRounds: 1,
+    attemptsPerRound: 1,
+    maxParallel: 20,
+    status: 'checking',
+    currentValues: ['198.51.100.10'],
+    cycle: {
+      id: 'cycle-timeout',
+      startedAt: new Date().toISOString(),
+      expectedProbeIds: ['probe-1'],
+      remoteValues: ['198.51.100.10'],
+      sourceValues: [],
+      sourceCandidates: {},
+      candidateAssets: [],
+      sourceState: {},
+      sourceErrors: [],
+      zone: { id: 'zone-1', name: 'example.com', providerZoneId: 'provider-zone-1' },
+      normalizedBinding: { recordName: 'edge', providerRecordId: 'record-1', providerRecordIds: ['record-1'] },
+      checks: [{
+        id: 'check-1',
+        address: '198.51.100.10',
+        observations: { 'probe-1': { ok: false, rounds: 1, attemptsPerRound: 1, roundsCompleted: 1, attempts: 1 } }
+      }]
+    }
+  });
+  const deps = remoteDeps(state);
+  let releaseRead;
+  let markReadStarted;
+  const readStarted = new Promise((resolve) => { markReadStarted = resolve; });
+  deps.readDnsRecord = async () => {
+    markReadStarted();
+    await new Promise((resolve) => { releaseRead = resolve; });
+    const error = new Error('The operation was aborted due to timeout');
+    error.name = 'TimeoutError';
+    throw error;
+  };
+
+  const processing = processReadyDnsGuards(deps);
+  await readStarted;
+  const duplicate = processReadyDnsGuards(deps);
+  assert.equal(duplicate, processing);
+  releaseRead();
+  assert.equal(await processing, 1);
+
+  const guard = deps.getState().dnsGuards[0];
+  assert.equal(guard.status, 'checking');
+  assert.equal(guard.message, '服务商请求超时，等待自动重试');
+  assert.equal(guard.lastError, '');
+  assert.equal(guard.cycle.id, 'cycle-timeout');
+  assert.equal(deps.getState().auditLogs[0].action, 'dnsGuard.retry');
+});
+
 test('allows the last remote IP to be removed manually without blacklisting it', async () => {
   const state = guardState();
   state.dnsGuards[0].sources = [{ id: 'home', name: '家庭宽带', domain: 'home.example.com', backupDomain: '' }];

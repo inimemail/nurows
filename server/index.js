@@ -71,6 +71,7 @@ const terminalSessions = new Map();
 const authAttempts = new Map();
 const probeRegistrationAttempts = new Map();
 const commandJobs = new Map();
+const dnsGuardRetryTimers = new Map();
 const telegramRuntime = {
   timer: null,
   offsets: new Map(),
@@ -117,8 +118,19 @@ const orchestrationDeps = {
   onTelegramChanged: () => restartTelegramPolling(),
   onIpAvailabilityChanged: () => { requestWaitingIncidentRechecks(orchestrationDeps); requestWaitingDnsGuardChecks(orchestrationDeps); runDueDnsGuards(orchestrationDeps).catch(() => {}); },
   onDnsGuardChanged: (guardId) => runDueDnsGuards(orchestrationDeps, guardId).catch(() => {}),
+  onDnsGuardRetry: (guardId) => scheduleDnsGuardRetry(guardId),
   syncDnsBinding
 };
+
+function scheduleDnsGuardRetry(guardId) {
+  if (dnsGuardRetryTimers.has(guardId)) return;
+  const timer = setTimeout(() => {
+    dnsGuardRetryTimers.delete(guardId);
+    processReadyDnsGuards(orchestrationDeps).catch(() => {});
+  }, 5000);
+  timer.unref();
+  dnsGuardRetryTimers.set(guardId, timer);
+}
 orchestrationDeps.allowProbeRegistration = (ip) => {
   const key = String(ip || 'unknown');
   const now = Date.now();
@@ -1049,6 +1061,7 @@ server.listen(PORT, HOST, () => {
   restartTelegramPolling();
   resumePendingIncidents();
   runDueDnsGuards(orchestrationDeps).catch(() => {});
+  processReadyDnsGuards(orchestrationDeps).catch(() => {});
   setInterval(() => runDueDnsGuards(orchestrationDeps).catch(() => {}), 5000).unref();
   console.log(`NuroSSH server running at http://localhost:${PORT}`);
 });

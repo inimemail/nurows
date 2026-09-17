@@ -42,6 +42,9 @@ const DNS_RECORD_TYPES = new Set(['A', 'AAAA', 'CNAME', 'TXT', 'NS', 'CAA']);
 const ALLOCATION_LOCK_TTL_MS = 24 * 60 * 60 * 1000;
 const DNS_GUARD_HISTORY_LIMIT = 1000;
 const DNS_GUARD_MAX_VALUES = 50;
+// Probe agents poll the server for cycle progress. This is not the guard's
+// user-configured interval between complete DNS guard cycles.
+const DNS_GUARD_PROBE_POLL_INTERVAL_SECONDS = 5;
 const DNS_PROVIDER_VERIFY_DELAYS_MS = [0, 500, 1500, 3000];
 
 export function orchestrationDefaults() {
@@ -195,7 +198,7 @@ export function registerProbePublicRoutes(app, deps) {
           timeout: guard.timeout,
           checkRounds: guard.checkRounds,
           attemptsPerRound: guard.attemptsPerRound,
-          interval: 5,
+          interval: DNS_GUARD_PROBE_POLL_INTERVAL_SECONDS,
           checkNowAt: guard.cycle.id
         }));
     });

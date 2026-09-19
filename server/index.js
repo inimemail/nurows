@@ -3,6 +3,7 @@ import path from 'node:path';
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import { HISTORY_RETENTION_DAYS, HISTORY_STATE_KEYS, pruneHistory } from './history.js';
 import { commandJobDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
 import express from 'express';
 import cors from 'cors';
@@ -363,6 +364,17 @@ app.post('/api/auth/account', (req, res) => {
 
 app.get('/api/state', (req, res) => {
   res.json(sanitizeStateForClient(readState(), req.auth));
+});
+
+app.delete('/api/history', (req, res) => {
+  if (req.body?.confirm !== 'clear-history') return res.status(400).json({ error: '请确认清空历史记录' });
+  const activeJobIds = new Set([...commandJobs.values()].filter((job) => job.status !== 'done').map((job) => job.id));
+  let result;
+  const state = updateState((draft) => {
+    result = pruneHistory(draft, { all: true, activeJobIds });
+    return draft;
+  });
+  res.json({ ok: true, ...result, retentionDays: HISTORY_RETENTION_DAYS, state: sanitizeStateForClient(state, req.auth) });
 });
 
 registerOrchestrationRoutes(app, orchestrationDeps);
@@ -1080,12 +1092,14 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, HOST, () => {
+  cleanupHistoryRecords();
   restartTelegramPolling();
   resumePendingIncidents();
   runDueDnsGuards(orchestrationDeps).catch(() => {});
   processReadyDnsGuards(orchestrationDeps).catch(() => {});
   setInterval(() => runDueDnsGuards(orchestrationDeps).catch(() => {}), 5000).unref();
   setInterval(cleanupRuntimeCaches, 60000).unref();
+  setInterval(cleanupHistoryRecords, 60 * 60 * 1000).unref();
   console.log(`NuroSSH server running at http://localhost:${PORT}`);
 });
 
@@ -1639,6 +1653,24 @@ function cleanupRuntimeCaches() {
   }
   for (const [key, entry] of telegramRuntime.pending) {
     if (Number(entry.expiresAt || 0) <= now) telegramRuntime.pending.delete(key);
+  }
+}
+
+function cleanupHistoryRecords() {
+  try {
+    const activeJobIds = new Set([...commandJobs.values()].filter((job) => job.status !== 'done').map((job) => job.id));
+    const history = readState(HISTORY_STATE_KEYS);
+    const result = pruneHistory(history, { activeJobIds });
+    // Do not rewrite the database on an idle maintenance tick.
+    if (!result.changed) return result;
+    updateState((draft) => {
+      for (const key of HISTORY_STATE_KEYS) if (Object.hasOwn(history, key)) draft[key] = history[key];
+      return draft;
+    });
+    return result;
+  } catch (error) {
+    console.error('History cleanup failed:', error.message);
+    return null;
   }
 }
 

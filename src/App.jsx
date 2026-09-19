@@ -1135,6 +1135,23 @@ export default function App() {
     }
   }
 
+  function requestHistoryCleanup() {
+    setConfirmDialog({
+      open: true,
+      title: '清空所有历史记录',
+      message: '将删除自动化执行、DNS 守护检查、故障事件、IP 使用、DNS 变更和审计历史，删除后不可恢复，相关历史回滚入口也将移除。正在执行、等待处理和故障恢复依赖的记录会保留。服务器、域名、IP 资产、规则配置及当前终端不受影响。',
+      onConfirm: async () => {
+        setActionBusy('clearHistory', true);
+        try {
+          const data = await api('/api/history', { method: 'DELETE', body: JSON.stringify({ confirm: 'clear-history' }) });
+          setState(data.state);
+          toast(`已清理 ${data.removed} 条历史记录${data.kept ? `，保留 ${data.kept} 条任务及恢复依赖记录` : ''}`);
+        } catch (error) { toast(error.message); }
+        finally { setActionBusy('clearHistory', false); }
+      }
+    });
+  }
+
   function resetCreateDraft(type) {
     if (type === 'server') {
       setServerDraft({ ...EMPTY_SERVER, groupId: state.groups[0]?.id || 'group-default' });
@@ -3043,7 +3060,7 @@ export default function App() {
 
       {settingsDialogOpen ? (
         <Dialog
-          title="账户设置"
+          title="设置"
           onClose={() => {
             setSettingsDialogOpen(false);
             setAccountError('');
@@ -3095,6 +3112,14 @@ export default function App() {
             </Field>
           </div>
           {accountError ? <div className="auth-error inline-error">{accountError}</div> : null}
+          <div className="field-grid single">
+            <Field label="历史记录">
+              <p className="confirm-copy">默认保留 7 天，启动时及每小时自动清理过期记录；达到现有条数上限时可提前清理。执行中及恢复所需记录自动保留。</p>
+              <button className="ghost danger-text" disabled={busy.clearHistory} onClick={requestHistoryCleanup}>
+                {busy.clearHistory ? '清理中...' : '一键清空所有历史记录'}
+              </button>
+            </Field>
+          </div>
         </Dialog>
       ) : null}
 

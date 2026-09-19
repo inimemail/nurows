@@ -3,6 +3,7 @@ import path from 'node:path';
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import { commandJobDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
 import express from 'express';
 import cors from 'cors';
 import Database from 'better-sqlite3';
@@ -85,6 +86,7 @@ let sqliteDb = null;
 let cachedAuth = null;
 let cachedState = null;
 let cachedSecretHex = '';
+let storageInitialized = false;
 const MAX_AUTH_ATTEMPTS = 6;
 const AUTH_WINDOW_MS = 1000 * 60 * 10;
 const COMMAND_EXIT_MARKER = '__NUROSSH_EXIT__';
@@ -364,6 +366,9 @@ registerOrchestrationRoutes(app, orchestrationDeps);
 
 app.post('/api/workspace', (req, res) => {
   const workspaceInput = normalizeWorkspaceInput(req.body);
+  // Running output already lives in commandJobs. Never round-trip it through
+  // the large application state on each poll.
+  workspaceInput.executionResults = workspaceResultPreviews(workspaceInput.executionResults);
   const state = updateState((draft) => {
     if (!draft.workspaces || typeof draft.workspaces !== 'object') {
       draft.workspaces = {};
@@ -376,7 +381,7 @@ app.post('/api/workspace', (req, res) => {
   });
   res.json({
     ok: true,
-    workspace: getWorkspaceForUser(state, req.auth)
+    updatedAt: state.workspaces[req.auth.username].updatedAt
   });
 });
 
@@ -771,6 +776,7 @@ app.post('/api/commands/execute', async (req, res) => {
 
   const selectedServers = state.servers.filter((item) => serverIds.includes(item.id));
   const job = createCommandJob(selectedServers, finalCommand, interactiveKeywords);
+  job.serverById = new Map(selectedServers.map((item) => [item.id, item]));
   commandJobs.set(job.id, job);
   runInteractiveCommandJob(job, state.proxies, req.auth.encryptionKey);
 
@@ -804,10 +810,17 @@ app.get('/api/commands/jobs/:id', (req, res) => {
     command: job.command,
     interactiveKeywords: job.interactiveKeywords,
     status: job.status,
-    results: job.results,
+    ...(req.query.view === 'summary' ? commandJobDelta(job, req.query.since) : { results: job.results }),
     startedAt: job.startedAt,
     finishedAt: job.finishedAt
   });
+});
+
+app.get('/api/commands/jobs/:id/results/:serverId', (req, res) => {
+  const job = commandJobs.get(req.params.id);
+  const result = job?.results.find((item) => item.serverId === req.params.serverId);
+  if (!result) return res.status(404).json({ error: '执行结果不存在或已过期' });
+  res.json({ result });
 });
 
 app.post('/api/commands/jobs/:id/input', (req, res) => {
@@ -852,9 +865,10 @@ app.post('/api/commands/jobs/:id/input', (req, res) => {
     : [];
   const payload = typeof req.body.data === 'string' ? req.body.data : '';
   const raw = Boolean(req.body.raw);
-  const targetServerIds = (requestedServerIds.length ? requestedServerIds : job.results.map((item) => item.serverId))
+  const resultByServerId = new Map(job.results.map((item) => [item.serverId, item]));
+  const targetServerIds = [...new Set(requestedServerIds.length ? requestedServerIds : job.results.map((item) => item.serverId))]
     .filter((serverId) => {
-      const resultItem = job.results.find((item) => item.serverId === serverId);
+      const resultItem = resultByServerId.get(serverId);
       return resultItem && (resultItem.status === 'running' || resultItem.status === 'awaiting_input');
     });
 
@@ -864,19 +878,19 @@ app.post('/api/commands/jobs/:id/input', (req, res) => {
   }
 
   const normalizedInput = raw ? payload : normalizeCommandInput(payload);
-  let sent = 0;
+  const sentServerIds = [];
 
   for (const serverId of targetServerIds) {
     const runtime = job.sessions.get(serverId);
-    const resultItem = job.results.find((item) => item.serverId === serverId);
+    const resultItem = resultByServerId.get(serverId);
     if (!runtime || !resultItem || !runtime.shellStream || runtime.closed) {
       continue;
     }
     writeCommandSessionInput(job, runtime, resultItem, normalizedInput);
-    sent += 1;
+    sentServerIds.push(serverId);
   }
 
-  res.json({ ok: true, sent });
+  res.json({ ok: true, sent: sentServerIds.length, serverIds: sentServerIds });
 });
 
 app.post('/api/commands/jobs/:id/cancel', (req, res) => {
@@ -1370,6 +1384,7 @@ function attachWebSocketHeartbeat(ws) {
 }
 
 function ensureStorage() {
+  if (storageInitialized) return;
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
@@ -1389,6 +1404,7 @@ function ensureStorage() {
   `);
 
   migrateLegacyStorage();
+  storageInitialized = true;
 }
 
 function getSqliteDb() {
@@ -1718,7 +1734,10 @@ function authGuard(req, res, next) {
       return;
     }
 
-    migrateLegacySecrets(session);
+    if (!session.secretsMigrated) {
+      migrateLegacySecrets(session);
+      session.secretsMigrated = true;
+    }
     req.auth = session;
     next();
   } catch (error) {
@@ -1973,7 +1992,8 @@ function getWorkspaceForUser(state, auth = null) {
             exitCode: Number.isFinite(item.exitCode) ? item.exitCode : null,
             error: typeof item.error === 'string' ? item.error : '',
             awaitingInput: Boolean(item.awaitingInput),
-            inputRequestCount: Number.isInteger(item.inputRequestCount) ? item.inputRequestCount : 0
+            inputRequestCount: Number.isInteger(item.inputRequestCount) ? item.inputRequestCount : 0,
+            outputTruncated: Boolean(item.outputTruncated)
           }))
       : [],
     lastExecutedCommand: typeof source.lastExecutedCommand === 'string' ? source.lastExecutedCommand : '',
@@ -2031,7 +2051,8 @@ function normalizeWorkspaceInput(input = {}) {
             exitCode: Number.isFinite(item.exitCode) ? item.exitCode : null,
             error: typeof item.error === 'string' ? item.error : '',
             awaitingInput: Boolean(item.awaitingInput),
-            inputRequestCount: Number.isInteger(item.inputRequestCount) ? item.inputRequestCount : 0
+            inputRequestCount: Number.isInteger(item.inputRequestCount) ? item.inputRequestCount : 0,
+            outputTruncated: Boolean(item.outputTruncated)
           }))
       : [],
     lastExecutedCommand: typeof input.lastExecutedCommand === 'string' ? input.lastExecutedCommand : '',
@@ -3159,11 +3180,27 @@ function startInteractiveCommandSession(job, resultItem, serverItem, proxies, en
 }
 
 function appendCommandRuntimeOutput(job, runtime, resultItem, text) {
-  resultItem.stdout += text;
+  const output = resultItem.stdout + text;
+  if (output.length > COMMAND_HISTORY_LIMIT) resultItem.outputTruncated = true;
+  resultItem.stdout = output.slice(-COMMAND_HISTORY_LIMIT);
+  // Preserve raw marker bytes across SSH chunks, independently of the short
+  // human-readable prompt tail. Scan only new output plus the marker overlap.
+  const markerText = (runtime.markerTail || '') + text;
+  const exitCode = extractCommandExitCode(markerText);
+  runtime.markerTail = markerText.slice(-100);
   runtime.tailText = `${runtime.tailText}${stripAnsi(String(text || ''))}`.slice(-1200);
   broadcastCommandSession(runtime, { type: 'output', data: text });
 
+  if (resultItem.status === 'done' || resultItem.status === 'error') return;
+  if (exitCode !== null) {
+    resultItem.stdout = stripCommandExitMarker(resultItem.stdout);
+    runtime.markerTail = '';
+    finalizeCommandResult(job, runtime, resultItem, exitCode);
+    return;
+  }
+
   if (job.type === 'automation' && runtime.shellStream && !runtime.closed) {
+    if (runtime.awaitingAutomationResponder) return;
     const responderIndex = Number(runtime.automationResponderIndex) || 0;
     const responder = job.automationResponders?.[responderIndex];
     if (responder && runtime.tailText.toLowerCase().includes(responder.waitText.toLowerCase())) {
@@ -3172,6 +3209,7 @@ function appendCommandRuntimeOutput(job, runtime, resultItem, text) {
       if (responder.action === 'finish') {
         finalizeCommandResult(job, runtime, resultItem, 0);
         runtime.finish?.();
+        return;
       } else if (responder.action === 'ctrl_c') {
         writeCommandSessionInput(job, runtime, resultItem, '\u0003');
       } else if (responder.inputMode === 'per-server') {
@@ -3181,6 +3219,7 @@ function appendCommandRuntimeOutput(job, runtime, resultItem, text) {
         runtime.awaitingAutomationResponder = responder;
         broadcastCommandSession(runtime, { type: 'state', status: resultItem.status, awaitingInput: true, inputMode: 'per-server' });
         refreshCommandJobStatus(job);
+        return;
       } else {
         writeCommandSessionInput(job, runtime, resultItem, normalizeCommandInput(responder.input));
       }
@@ -3369,6 +3408,8 @@ function writeCommandSessionInput(job, runtime, resultItem, data) {
     resultItem.status = 'running';
     resultItem.awaitingInput = false;
   }
+  runtime.tailText = '';
+  runtime.awaitingAutomationResponder = null;
   runtime.shellStream.write(data);
   broadcastCommandSession(runtime, { type: 'state', status: resultItem.status, awaitingInput: false });
   if (resultItem.status !== 'done') {
@@ -3393,7 +3434,7 @@ function normalizeCommandInput(value) {
 }
 
 function extractCommandExitCode(text) {
-  const match = String(text || '').match(new RegExp(`${COMMAND_EXIT_MARKER}:(-?\\d+)`));
+  const match = String(text || '').match(new RegExp(`${COMMAND_EXIT_MARKER}:(-?\\d+)(?=\\r?\\n)`));
   if (!match) {
     return null;
   }
@@ -3442,14 +3483,9 @@ function finalizeCommandResult(job, runtime, resultItem, exitCode) {
 }
 
 function tryFinalizeCommandResult(job, runtime, resultItem) {
-  const exitCode = extractCommandExitCode(resultItem.stdout);
-  if (exitCode !== null) {
-    resultItem.stdout = stripCommandExitMarker(resultItem.stdout);
-    finalizeCommandResult(job, runtime, resultItem, exitCode);
-    return true;
-  }
-
-  const tailSource = runtime?.tailText || stripAnsi(resultItem.stdout);
+  if (resultItem.status === 'done' || resultItem.status === 'error') return true;
+  if (runtime?.awaitingAutomationResponder) return false;
+  const tailSource = runtime ? runtime.tailText : stripAnsi(resultItem.stdout.slice(-1200));
   const lastLine = getLastNonEmptyLine(tailSource);
   if (resultItem.inputRequestCount > 0 && looksLikeShellPromptLine(lastLine)) {
     finalizeCommandResult(job, runtime, resultItem, 0);

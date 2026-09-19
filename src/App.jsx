@@ -2,6 +2,7 @@
 import { Terminal } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { parsePerServerInputLines } from '../shared/command-input.js';
+import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
 
 const EMPTY_SERVER = {
@@ -15,6 +16,7 @@ const EMPTY_SERVER = {
   proxyId: '',
   note: ''
 };
+const EMPTY_RESULTS = [];
 
 const EMPTY_COMMAND = {
   id: '',
@@ -274,6 +276,7 @@ function formatExecutionResultOutput(resultItem, serverItem, commandText = '') {
     `[系统] 已连接 ${name}${host ? ` (${host})` : ''}`,
     `${prompt}${commandLine ? ` ${commandLine}` : ''}`
   ];
+  if (resultItem?.outputTruncated) transcript.push('[系统] 当前显示最近日志，较早输出未包含在此预览中。');
 
   if (resultItem?.error) {
     transcript.push(outputText || '[错误] 执行失败');
@@ -357,7 +360,8 @@ function normalizeWorkspacePayload(workspace = {}) {
             exitCode: Number.isFinite(item.exitCode) ? item.exitCode : null,
             error: typeof item.error === 'string' ? item.error : '',
             awaitingInput: Boolean(item.awaitingInput),
-            inputRequestCount: Number.isInteger(item.inputRequestCount) ? item.inputRequestCount : 0
+            inputRequestCount: Number.isInteger(item.inputRequestCount) ? item.inputRequestCount : 0,
+            outputTruncated: Boolean(item.outputTruncated)
           }))
       : [],
     lastExecutedCommand: typeof workspace.lastExecutedCommand === 'string' ? workspace.lastExecutedCommand : '',
@@ -440,6 +444,10 @@ export default function App() {
   const [terminalFullscreenOpen, setTerminalFullscreenOpen] = useState(false);
   const [resultTerminalServerId, setResultTerminalServerId] = useState('');
   const [batchInputDialog, setBatchInputDialog] = useState(EMPTY_BATCH_INPUT_DIALOG);
+  const batchInputValueRef = useRef('');
+  const batchInputSendingRef = useRef(false);
+  const commandInputEpochRef = useRef(0);
+  const [resultHistory, setResultHistory] = useState(null);
   const [handledBatchInputSignature, setHandledBatchInputSignature] = useState('');
   const [interactiveKeywordsDialogOpen, setInteractiveKeywordsDialogOpen] = useState(false);
   const [interactiveKeywordsText, setInteractiveKeywordsText] = useState(() => readInteractiveKeywords().join('\n'));
@@ -602,6 +610,9 @@ export default function App() {
     localStorage.setItem(ACTIVE_TERMINAL_STORAGE_KEY, activeTerminalId);
   }, [activeTerminalId]);
 
+  const workspaceExecutionResults = useMemo(() => commandJobStatus === 'running'
+    ? EMPTY_RESULTS : workspaceResultPreviews(executionResults), [commandJobStatus, executionResults]);
+
   useEffect(() => {
     if (!auth.authenticated || !stateLoaded) {
       return;
@@ -618,7 +629,7 @@ export default function App() {
           selectedServerIds,
           commandText,
           collapsedGroups,
-          executionResults,
+          executionResults: workspaceExecutionResults,
           lastExecutedCommand,
           commandJobId,
           commandInteractiveKeywords,
@@ -628,7 +639,7 @@ export default function App() {
         }),
         onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
       }).catch(() => undefined);
-    }, 250);
+    }, 750);
     return () => window.clearTimeout(timer);
   }, [
     auth.authenticated,
@@ -641,7 +652,7 @@ export default function App() {
     selectedServerIds,
     commandText,
     collapsedGroups,
-    executionResults,
+    workspaceExecutionResults,
     lastExecutedCommand,
     commandJobId,
     commandInteractiveKeywords,
@@ -666,41 +677,53 @@ export default function App() {
     }
 
     let cancelled = false;
-    const timer = window.setInterval(async () => {
+    let timer;
+    let revision = -1;
+    let failures = 0;
+    const controller = new AbortController();
+    const poll = async () => {
+      const epoch = commandInputEpochRef.current;
       try {
-        const data = await api(`/api/commands/jobs/${commandJobId}`, {
+        const data = await api(`/api/commands/jobs/${commandJobId}?view=summary&since=${revision}`, {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
           onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
         });
         if (cancelled) {
           return;
         }
-        const nextResults = reconcileExecutionResults(data.results || []);
-        setExecutionResults(nextResults);
+        if (epoch !== commandInputEpochRef.current || batchInputSendingRef.current) {
+          timer = window.setTimeout(poll, 700);
+          return;
+        }
+        revision = data.revision;
+        failures = 0;
+        setExecutionResults((current) => mergeCommandDelta(current, data));
         setLastExecutedCommand(data.command || '');
-        setCommandInteractiveKeywords(sanitizeInteractiveKeywords(data.interactiveKeywords, { fallbackToDefault: false }));
-        const nextStatus = nextResults.every((item) => ['done', 'error'].includes(item.status)) ? 'done' : (data.status || 'done');
+        setCommandInteractiveKeywords((current) => JSON.stringify(current) === JSON.stringify(data.interactiveKeywords || []) ? current : sanitizeInteractiveKeywords(data.interactiveKeywords, { fallbackToDefault: false }));
+        const nextStatus = data.status;
         setCommandJobStatus(nextStatus);
         if (nextStatus === 'done') {
           setBusy((current) => ({ ...current, runCommand: false }));
-          window.clearInterval(timer);
+          return;
         }
-      } catch (_error) {
-        if (!cancelled) {
-          const nextResults = reconcileExecutionResults(executionResults);
-          if (nextResults.every((item) => ['done', 'error'].includes(item.status))) {
-            setExecutionResults(nextResults);
-            setCommandJobStatus('done');
-            setCommandJobId('');
-          }
+      } catch (error) {
+        if (cancelled) return;
+        if ([401, 404].includes(error.status)) {
+          setCommandJobStatus('done');
           setBusy((current) => ({ ...current, runCommand: false }));
-          window.clearInterval(timer);
+          if (error.status === 404) toast('执行会话已过期，保留最后一次结果');
+          return;
         }
+        failures += 1;
       }
-    }, 700);
+      if (!cancelled) timer = window.setTimeout(poll, Math.min(5000, 700 * (2 ** Math.min(failures, 3))));
+    };
+    poll();
 
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      controller.abort();
+      window.clearTimeout(timer);
     };
   }, [commandJobId, commandJobStatus]);
 
@@ -823,46 +846,52 @@ export default function App() {
     resultTerminalResult &&
     ['queued', 'running', 'awaiting_input'].includes(resultTerminalResult.status)
   );
-  const resultTerminalSession = resultTerminalServerId
+  useEffect(() => {
+    if (!commandJobId || !resultTerminalServerId || resultTerminalIsLive) return;
+    let cancelled = false;
+    api(`/api/commands/jobs/${commandJobId}/results/${resultTerminalServerId}`)
+      .then(({ result }) => {
+        if (!cancelled) setResultHistory({ jobId: commandJobId, serverId: resultTerminalServerId, result });
+      })
+      .catch(() => { /* The saved preview remains available after job expiry. */ });
+    return () => { cancelled = true; };
+  }, [commandJobId, resultTerminalServerId, resultTerminalIsLive]);
+  const resultTerminalSession = useMemo(() => resultTerminalServerId
     ? {
         id: `result-${resultTerminalServerId}`,
         serverId: resultTerminalServerId,
         title: resultTerminalResult?.name || resultTerminalServer?.name || resultTerminalServerId,
         jobId: resultTerminalIsLive ? commandJobId : '',
         mode: resultTerminalIsLive ? 'command-job' : 'result',
-        content: formatExecutionResultOutput(resultTerminalResult, resultTerminalServer, lastExecutedCommand)
+        content: formatExecutionResultOutput(resultHistory?.jobId === commandJobId && resultHistory?.serverId === resultTerminalServerId ? resultHistory.result : resultTerminalResult, resultTerminalServer, lastExecutedCommand)
       }
-    : null;
+    : null, [resultTerminalServerId, resultTerminalResult, resultTerminalServer, resultTerminalIsLive, commandJobId, resultHistory, lastExecutedCommand]);
   const proxyUsage = state.servers.filter((item) => item.proxyId === selectedProxyId);
   const boundProxyCount = state.servers.filter((item) => item.proxyId).length;
-  const awaitingInputResults = executionResults.filter((item) => item.status === 'awaiting_input' || item.awaitingInput);
-  const awaitingInputPreview = cleanTerminalOutput(
+  const awaitingInputResults = useMemo(() => executionResults.filter((item) => item.status === 'awaiting_input' || item.awaitingInput), [executionResults]);
+  const awaitingInputPreview = useMemo(() => batchInputDialog.open && batchInputDialog.mode === 'broadcast' ? (
     awaitingInputResults
       .map((item) => {
-        const body = cleanTerminalOutput([item.stdout, item.stderr].filter(Boolean).join('\n'));
+        const body = cleanTerminalOutput([item.stdout, item.stderr].filter(Boolean).join('\n').slice(-1200));
         return `# ${item.name} (${item.host})\n${body || '[暂无日志]'}`;
       })
       .join('\n\n')
-  );
+  ) : '', [awaitingInputResults, batchInputDialog.open, batchInputDialog.mode]);
   const awaitingInputSignature = awaitingInputResults
     .map((item) => `${item.serverId}:${item.inputRequestCount || 0}`)
     .sort()
     .join('|');
-  const batchInputAwaitingResults = batchInputDialog.awaitingServerIds
+  const batchInputAwaitingResults = useMemo(() => batchInputDialog.awaitingServerIds
     .map((serverId) => executionResults.find((item) => item.serverId === serverId))
-    .filter(Boolean);
-  const perServerInputPreview = cleanTerminalOutput(
+    .filter(Boolean), [batchInputDialog.awaitingServerIds, executionResults]);
+  const perServerInputPreview = useMemo(() => batchInputDialog.open && batchInputDialog.mode === 'per-server' ? (
     batchInputAwaitingResults
       .map((item, index) => {
-        const body = cleanTerminalOutput([item.stdout, item.stderr].filter(Boolean).join('\n'));
+        const body = cleanTerminalOutput([item.stdout, item.stderr].filter(Boolean).join('\n').slice(-1200));
         return `# ${index + 1}. ${item.name} (${item.host})\n${body || '[暂无日志]'}`;
       })
       .join('\n\n')
-  );
-  const perServerInputLines = parsePerServerInputLines(
-    batchInputDialog.value,
-    batchInputDialog.awaitingServerIds.length
-  );
+  ) : '', [batchInputAwaitingResults, batchInputDialog.open, batchInputDialog.mode]);
   const visibleBatchInputAwaitingResults = batchInputAwaitingResults.slice(0, BATCH_INPUT_SERVER_BUTTON_LIMIT);
   const hiddenBatchInputAwaitingResultsCount = Math.max(0, batchInputAwaitingResults.length - visibleBatchInputAwaitingResults.length);
   const resolvedCommandResultCount = executionResults.filter((item) => ['done', 'error', 'awaiting_input'].includes(item.status)).length;
@@ -905,6 +934,9 @@ export default function App() {
     if (!commandJobId || !awaitingInputSignature || !allCommandResultsPausedOrFinished) {
       return;
     }
+    // Keep the draft and its server-to-line mapping stable while the user edits.
+    if (batchInputDialog.open && ['broadcast', 'per-server'].includes(batchInputDialog.mode)) return;
+    if (batchInputSendingRef.current) return;
     if (awaitingInputSignature === handledBatchInputSignature) {
       return;
     }
@@ -921,7 +953,9 @@ export default function App() {
     awaitingInputResults,
     awaitingInputSignature,
     commandJobId,
-    handledBatchInputSignature
+    handledBatchInputSignature,
+    batchInputDialog.open,
+    batchInputDialog.mode
   ]);
 
   async function bootstrap() {
@@ -1814,6 +1848,12 @@ export default function App() {
     setBatchInputDialog(EMPTY_BATCH_INPUT_DIALOG);
   }
 
+  function markInputSent(serverIds) {
+    const sent = new Set(serverIds);
+    setExecutionResults((current) => current.map((item) => sent.has(item.serverId)
+      ? { ...item, status: 'running', awaitingInput: false } : item));
+  }
+
   function openBroadcastInputDialog() {
     setBatchInputDialog((current) => ({
       ...current,
@@ -1854,36 +1894,43 @@ export default function App() {
   }
 
   async function submitBatchInput() {
+    if (batchInputSendingRef.current) return;
     if (!batchInputReady || !commandJobId || !batchInputDialog.awaitingServerIds.length) {
-      closeBatchInputDialog();
+      toast('服务器状态已变化，请等待执行暂停后再发送，输入内容已保留');
       return;
     }
     try {
+      batchInputSendingRef.current = true;
+      commandInputEpochRef.current += 1;
       setActionBusy('submitBatchInput', true);
       const data = await api(`/api/commands/jobs/${commandJobId}/input`, {
         method: 'POST',
         body: JSON.stringify({
           serverIds: batchInputDialog.awaitingServerIds,
-          data: batchInputDialog.value
+          data: batchInputValueRef.current
         }),
         onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
       });
+      markInputSent(data.serverIds || batchInputDialog.awaitingServerIds);
       closeBatchInputDialog();
       toast(`已向 ${data.sent || 0} 台服务器发送输入`);
     } catch (error) {
       toast(error.message);
     } finally {
+      batchInputSendingRef.current = false;
+      commandInputEpochRef.current += 1;
       setActionBusy('submitBatchInput', false);
     }
   }
 
   async function submitPerServerInput() {
+    if (batchInputSendingRef.current) return;
     if (!batchInputReady || !commandJobId || !batchInputDialog.awaitingServerIds.length) {
-      closeBatchInputDialog();
+      toast('服务器状态已变化，请等待执行暂停后再发送，输入内容已保留');
       return;
     }
     const lines = parsePerServerInputLines(
-      batchInputDialog.value,
+      batchInputValueRef.current,
       batchInputDialog.awaitingServerIds.length
     );
     if (lines.length !== batchInputDialog.awaitingServerIds.length) {
@@ -1891,6 +1938,8 @@ export default function App() {
       return;
     }
     try {
+      batchInputSendingRef.current = true;
+      commandInputEpochRef.current += 1;
       setActionBusy('submitBatchInput', true);
       const data = await api(`/api/commands/jobs/${commandJobId}/input`, {
         method: 'POST',
@@ -1902,11 +1951,14 @@ export default function App() {
         }),
         onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
       });
+      markInputSent(batchInputDialog.awaitingServerIds);
       closeBatchInputDialog();
       toast(`已向 ${data.sent || 0} 台服务器分别发送输入`);
     } catch (error) {
       toast(error.message);
     } finally {
+      batchInputSendingRef.current = false;
+      commandInputEpochRef.current += 1;
       setActionBusy('submitBatchInput', false);
     }
   }
@@ -2612,7 +2664,7 @@ export default function App() {
                         <div className="result-tip">
                           {item.status === 'awaiting_input'
                             ? '这台服务器正在等待输入，点击后可以直接进入真实会话继续输入。'
-                            : '点击直接打开当前执行会话'}
+                            : item.outputTruncated ? '列表显示最近日志，点击查看执行详情' : '点击直接打开当前执行会话'}
                         </div>
                         {(item.status === 'queued' || item.status === 'running') ? (
                           <>
@@ -3405,12 +3457,12 @@ export default function App() {
                   ? '等待执行结果'
                   : '检测到交互输入'
           }
-          onClose={closeBatchInputDialog}
+          onClose={() => { if (!batchInputSendingRef.current) closeBatchInputDialog(); }}
           footer={
             batchInputDialog.mode === 'broadcast'
               ? (
                 <>
-                  <button className="ghost" onClick={closeBatchInputDialog}>取消</button>
+                  <button className="ghost" onClick={closeBatchInputDialog} disabled={busy.submitBatchInput}>取消</button>
                   <button
                     className={'primary ' + (busy.submitBatchInput ? 'is-loading' : '')}
                     onClick={submitBatchInput}
@@ -3423,7 +3475,7 @@ export default function App() {
               : batchInputDialog.mode === 'per-server'
               ? (
                 <>
-                  <button className="ghost" onClick={closeBatchInputDialog}>取消</button>
+                  <button className="ghost" onClick={closeBatchInputDialog} disabled={busy.submitBatchInput}>取消</button>
                   <button
                     className={'primary ' + (busy.submitBatchInput ? 'is-loading' : '')}
                     onClick={submitPerServerInput}
@@ -3463,12 +3515,7 @@ export default function App() {
                 </Field>
               ) : null}
               <Field label="输入内容">
-                <textarea
-                  rows={5}
-                  value={batchInputDialog.value}
-                  onChange={(event) => setBatchInputDialog((current) => ({ ...current, value: event.target.value }))}
-                  placeholder="留空表示直接发送一个回车"
-                />
+                <BatchInputText key={`broadcast:${batchInputDialog.signature}`} valueRef={batchInputValueRef} disabled={busy.submitBatchInput} />
               </Field>
               <div className="confirm-copy">会把这段输入同时发给所有仍在等待输入的服务器。</div>
             </form>
@@ -3486,15 +3533,10 @@ export default function App() {
                 </Field>
               ) : null}
               <Field label="输入内容">
-                <textarea
-                  rows={5}
-                  value={batchInputDialog.value}
-                  onChange={(event) => setBatchInputDialog((current) => ({ ...current, value: event.target.value }))}
-                  placeholder="一行对应一台服务器，空行表示直接发送一个回车"
-                />
+                <BatchInputText key={`per-server:${batchInputDialog.signature}`} valueRef={batchInputValueRef} expectedCount={batchInputDialog.awaitingServerIds.length} disabled={busy.submitBatchInput} />
               </Field>
               <div className="confirm-copy">
-                目标 {batchInputDialog.awaitingServerIds.length} 台，当前 {perServerInputLines.length} 行。输入行数必须与服务器数量一致。
+                输入行数必须与服务器数量一致；空行会发送一个回车。
               </div>
             </form>
           ) : batchInputDialog.mode === 'wait' ? (
@@ -3616,6 +3658,15 @@ function ServerOverview({ selectedServer, state, selectedServerIds, openTerminal
       </div>
     </div>
   );
+}
+
+function BatchInputText({ valueRef, expectedCount, disabled }) {
+  const [value, setValue] = useState('');
+  useEffect(() => { valueRef.current = ''; }, [valueRef]);
+  return <><textarea rows={5} value={value} disabled={disabled}
+    onChange={(event) => { valueRef.current = event.target.value; setValue(event.target.value); }}
+    placeholder={expectedCount ? '一行对应一台服务器，空行表示直接发送一个回车' : '留空表示直接发送一个回车'} />
+    {expectedCount ? <span>目标 {expectedCount} 台，当前 {parsePerServerInputLines(value, expectedCount).length} 行</span> : null}</>;
 }
 
 function AutoScrollPre({ text, className = '' }) {
@@ -4411,7 +4462,9 @@ async function api(url, options = {}) {
     if (response.status === 401 && !authFree && onUnauthorized) {
       onUnauthorized();
     }
-    throw new Error(data.error || '请求失败');
+    const error = new Error(data.error || '请求失败');
+    error.status = response.status;
+    throw error;
   }
   return data;
 }

@@ -731,11 +731,16 @@ export default function App() {
     if (!automationJobId) return;
     let cancelled = false;
     let timer = null;
+    let revision = -1;
+    const controller = new AbortController();
     const poll = async () => {
       try {
-        const data = await api(`/api/commands/jobs/${automationJobId}`);
+        const data = await api(`/api/commands/jobs/${automationJobId}?view=delta&since=${revision}`, {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)])
+        });
         if (cancelled) return;
-        setAutomationResults(data.results || []);
+        revision = data.revision;
+        setAutomationResults((current) => mergeCommandDelta(current, data));
         if (data.status === 'done') {
           api('/api/state').then((nextState) => setState(nextState)).catch(() => undefined);
           if (automationCompletionNotifiedJobIdRef.current !== automationJobId) {
@@ -745,12 +750,12 @@ export default function App() {
           return;
         }
         timer = window.setTimeout(poll, 900);
-      } catch (_error) {
-        // Stop polling when the job expires or the request fails.
+      } catch (error) {
+        if (!cancelled && ![401, 404].includes(error.status)) timer = window.setTimeout(poll, 3000);
       }
     };
     poll();
-    return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
+    return () => { cancelled = true; controller.abort(); if (timer) window.clearTimeout(timer); };
   }, [automationJobId]);
 
   const filteredServers = useMemo(() => {
@@ -2505,7 +2510,7 @@ export default function App() {
                   </div>
                   <div className="surface automation-results-panel">
                     <div className="workspace-head"><div><strong>当前执行进度</strong><span>{automationCounts.total ? `已处理 ${automationCounts.success + automationCounts.failed} / ${automationCounts.total}` : '暂无执行结果'}</span></div><div className="toolbar">{automationAwaitingResults.length ? <><button className="ghost" onClick={() => openAutomationInputDialog('per-server')}>按行输入</button><button className="ghost" onClick={() => openAutomationInputDialog('broadcast')}>统一输入</button></> : null}{automationCounts.failed ? <button className="ghost" onClick={retryAutomationFailed} disabled={automationIsRunning}>重试失败</button> : null}<button className={'ghost ' + (busy.clearAutomation ? 'is-loading' : '')} onClick={clearAutomationResults} disabled={!automationResults.length || busy.clearAutomation}>{automationIsRunning ? '取消并清空' : '清空'}</button></div></div>
-                    {automationResults.length ? <><div className="automation-progress automation-progress-detailed"><div className="total"><strong>{automationCounts.total}</strong><span>总数</span></div><div className="running"><strong>{automationCounts.queued + automationCounts.running}</strong><span>执行中</span></div><div className="awaiting"><strong>{automationCounts.awaiting}</strong><span>等待输入</span></div><div className="success"><strong>{automationCounts.success}</strong><span>成功</span></div><div className="failed"><strong>{automationCounts.failed}</strong><span>失败</span></div></div><div className="automation-progress-track"><span style={{ width: `${automationCounts.total ? ((automationCounts.success + automationCounts.failed) / automationCounts.total) * 100 : 0}%` }} /></div><div ref={automationResultListRef} className="automation-result-list">{automationResults.map((item) => { const expanded = automationExpandedServerId === item.serverId; const output = cleanTerminalOutput([item.stdout, item.stderr, item.error].filter(Boolean).join('\n')); const statusClass = item.status === 'error' ? 'error' : item.ok ? 'ok' : item.status === 'awaiting_input' ? 'awaiting' : 'running'; return <div key={item.serverId} className={'automation-result-item ' + statusClass}><div className="automation-result-row" onClick={() => setAutomationExpandedServerId(expanded ? '' : item.serverId)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setAutomationExpandedServerId(expanded ? '' : item.serverId); }} role="button" tabIndex={0}><div className="automation-result-host"><i /><span>{item.host}</span></div><div>{item.status === 'awaiting_input' ? <button className="ghost automation-input-button" onClick={(event) => { event.stopPropagation(); openSingleAutomationInputDialog(item.serverId); }}>输入</button> : null}<em>{item.status === 'queued' ? '排队' : item.status === 'running' ? '执行中' : item.status === 'awaiting_input' ? '等待输入' : item.ok ? '成功' : '失败'}</em><ChevronIcon collapsed={!expanded} /></div></div>{expanded ? <AutoScrollPre text={output || '暂无日志'} /> : null}</div>; })}</div></> : <div className="empty-state automation-result-empty"><span className="automation-empty-icon"><AutomationIcon /></span><strong>等待执行</strong><span>输入目标 IP 并启动任务后，这里显示实时进度。</span></div>}
+                    {automationResults.length ? <><div className="automation-progress automation-progress-detailed"><div className="total"><strong>{automationCounts.total}</strong><span>总数</span></div><div className="running"><strong>{automationCounts.queued + automationCounts.running}</strong><span>执行中</span></div><div className="awaiting"><strong>{automationCounts.awaiting}</strong><span>等待输入</span></div><div className="success"><strong>{automationCounts.success}</strong><span>成功</span></div><div className="failed"><strong>{automationCounts.failed}</strong><span>失败</span></div></div><div className="automation-progress-track"><span style={{ width: `${automationCounts.total ? ((automationCounts.success + automationCounts.failed) / automationCounts.total) * 100 : 0}%` }} /></div><div ref={automationResultListRef} className="automation-result-list">{automationResults.map((item) => { const expanded = automationExpandedServerId === item.serverId; const output = expanded ? cleanTerminalOutput([item.stdout, item.stderr, item.error].filter(Boolean).join('\n')) : ''; const statusClass = item.status === 'error' ? 'error' : item.ok ? 'ok' : item.status === 'awaiting_input' ? 'awaiting' : 'running'; return <div key={item.serverId} className={'automation-result-item ' + statusClass}><div className="automation-result-row" onClick={() => setAutomationExpandedServerId(expanded ? '' : item.serverId)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setAutomationExpandedServerId(expanded ? '' : item.serverId); }} role="button" tabIndex={0}><div className="automation-result-host"><i /><span>{item.host}</span></div><div>{item.status === 'awaiting_input' ? <button className="ghost automation-input-button" onClick={(event) => { event.stopPropagation(); openSingleAutomationInputDialog(item.serverId); }}>输入</button> : null}<em>{item.status === 'queued' ? '排队' : item.status === 'running' ? '执行中' : item.status === 'awaiting_input' ? '等待输入' : item.ok ? '成功' : '失败'}</em><ChevronIcon collapsed={!expanded} /></div></div>{expanded ? <AutoScrollPre text={output || '暂无日志'} /> : null}</div>; })}</div></> : <div className="empty-state automation-result-empty"><span className="automation-empty-icon"><AutomationIcon /></span><strong>等待执行</strong><span>输入目标 IP 并启动任务后，这里显示实时进度。</span></div>}
                   </div>
                   </>}
                 </div>

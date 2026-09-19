@@ -87,6 +87,8 @@ let cachedAuth = null;
 let cachedState = null;
 let cachedSecretHex = '';
 let storageInitialized = false;
+let sqliteReadStatement = null;
+let sqliteWriteStatement = null;
 const MAX_AUTH_ATTEMPTS = 6;
 const AUTH_WINDOW_MS = 1000 * 60 * 10;
 const COMMAND_EXIT_MARKER = '__NUROSSH_EXIT__';
@@ -111,6 +113,7 @@ const orchestrationDeps = {
   readState,
   readProbeState,
   readDnsGuardStatusState,
+  readOrchestrationStatusState,
   updateState,
   sanitizeState: sanitizeStateForClient,
   encryptSecret,
@@ -810,7 +813,8 @@ app.get('/api/commands/jobs/:id', (req, res) => {
     command: job.command,
     interactiveKeywords: job.interactiveKeywords,
     status: job.status,
-    ...(req.query.view === 'summary' ? commandJobDelta(job, req.query.since) : { results: job.results }),
+    ...(['summary', 'delta'].includes(req.query.view)
+      ? commandJobDelta(job, req.query.since, req.query.view === 'delta') : { results: job.results }),
     startedAt: job.startedAt,
     finishedAt: job.finishedAt
   });
@@ -1081,6 +1085,7 @@ server.listen(PORT, HOST, () => {
   runDueDnsGuards(orchestrationDeps).catch(() => {});
   processReadyDnsGuards(orchestrationDeps).catch(() => {});
   setInterval(() => runDueDnsGuards(orchestrationDeps).catch(() => {}), 5000).unref();
+  setInterval(cleanupRuntimeCaches, 60000).unref();
   console.log(`NuroSSH server running at http://localhost:${PORT}`);
 });
 
@@ -1301,9 +1306,11 @@ function closeTerminalRuntime(runtime, notifyClients) {
 }
 
 function broadcastTerminalSession(runtime, payload) {
+  let message;
   for (const client of runtime.clients) {
     if (client.readyState === client.OPEN) {
-      client.send(JSON.stringify(payload));
+      message ??= JSON.stringify(payload);
+      client.send(message);
     }
   }
 }
@@ -1446,23 +1453,21 @@ function migrateLegacyStorage() {
 }
 
 function dbGetRaw(key) {
-  const row = getSqliteDb()
-    .prepare(`SELECT value FROM ${SQLITE_KV_TABLE} WHERE key = ? LIMIT 1`)
-    .get(key);
+  sqliteReadStatement ||= getSqliteDb().prepare(`SELECT value FROM ${SQLITE_KV_TABLE} WHERE key = ? LIMIT 1`);
+  const row = sqliteReadStatement.get(key);
   return row?.value ?? null;
 }
 
 function dbSetRaw(key, value) {
   const now = new Date().toISOString();
-  getSqliteDb()
-    .prepare(`
+  sqliteWriteStatement ||= getSqliteDb().prepare(`
       INSERT INTO ${SQLITE_KV_TABLE} (key, value, updated_at)
       VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET
         value = excluded.value,
         updated_at = excluded.updated_at
-    `)
-    .run(key, value, now);
+    `);
+  sqliteWriteStatement.run(key, value, now);
 }
 
 function dbGetJson(key, fallback, normalizer = (value) => value) {
@@ -1626,8 +1631,18 @@ function cleanupExpiredSessions() {
   }
 }
 
-function getSessionFromRequest(req) {
+function cleanupRuntimeCaches() {
   cleanupExpiredSessions();
+  const now = Date.now();
+  for (const cache of [authAttempts, probeRegistrationAttempts]) {
+    for (const [key, entry] of cache) if (entry.until <= now) cache.delete(key);
+  }
+  for (const [key, entry] of telegramRuntime.pending) {
+    if (Number(entry.expiresAt || 0) <= now) telegramRuntime.pending.delete(key);
+  }
+}
+
+function getSessionFromRequest(req) {
   const token = getCookie(req.headers.cookie || '', 'nurossh_session');
   if (!token) {
     return null;
@@ -1828,12 +1843,12 @@ function sanitizeTelegramForClient(item) {
   };
 }
 
-function readState() {
+function readState(keys = null) {
   ensureStorage();
   if (!cachedState) {
     cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
   }
-  return structuredClone(cachedState);
+  return structuredClone(keys ? Object.fromEntries(keys.map((key) => [key, cachedState[key]])) : cachedState);
 }
 
 function readProbeState() {
@@ -1866,7 +1881,13 @@ function readProbeState() {
       checkRounds: guard.checkRounds,
       attemptsPerRound: guard.attemptsPerRound,
       maxParallel: guard.maxParallel,
-      cycle: guard.cycle
+      cycle: guard.cycle ? {
+        id: guard.cycle.id,
+        phase: guard.cycle.phase,
+        expectedProbeIds: guard.cycle.expectedProbeIds,
+        replacementNeeded: guard.cycle.replacementNeeded,
+        checks: guard.cycle.checks
+      } : null
     }))
   });
 }
@@ -1891,10 +1912,39 @@ function readDnsGuardStatusState() {
   });
 }
 
+function readOrchestrationStatusState(keys) {
+  ensureStorage();
+  if (!cachedState) cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
+  const selected = Object.fromEntries(keys.map((key) => [key, cachedState[key]]));
+  if (selected.dnsGuards) selected.dnsGuards = selected.dnsGuards.map((guard) => ({
+    ...guard, cycle: guard.cycle ? { id: guard.cycle.id, phase: guard.cycle.phase, startedAt: guard.cycle.startedAt } : null
+  }));
+  if (selected.dnsGuardRuns) {
+    const latest = new Map();
+    for (const run of selected.dnsGuardRuns) if (!latest.has(run.guardId)) latest.set(run.guardId, run);
+    selected.dnsGuardRuns = [...latest.values()];
+  }
+  const countKeys = ['probes', 'probeTargets', 'dnsGuards', 'failoverPolicies', 'incidents', 'telegramBots', 'ipAssets', 'ipPools', 'ipUsageRecords', 'dnsAccounts', 'dnsBindings', 'dnsChanges'];
+  const counts = Object.fromEntries(countKeys.map((key) => [key, cachedState[key]?.length || 0]));
+  counts.incidents = Math.min(counts.incidents, 200);
+  counts.dnsChanges = Math.min(counts.dnsChanges, 300);
+  const now = Date.now();
+  selected.orchestrationSummary = {
+    counts,
+    onlineProbes: (cachedState.probes || []).filter((item) => item.status === 'online' && item.lastSeenAt && now - Date.parse(item.lastSeenAt) <= 90000).length,
+    enabledGuards: (cachedState.dnsGuards || []).filter((item) => item.enabled !== false).length,
+    checkingGuards: (cachedState.dnsGuards || []).filter((item) => item.cycle).length,
+    activeIncidents: (cachedState.incidents || []).slice(0, 200).filter((item) => !['succeeded', 'recovered', 'rolled_back'].includes(item.status)).length,
+    enabledBots: (cachedState.telegramBots || []).filter((item) => item.enabled && item.tokenEnc).length
+  };
+  return structuredClone(selected);
+}
+
 function writeState(state) {
   ensureStorage();
-  cachedState = normalizeStateRecord(state);
-  dbSetJson(STORAGE_KEYS.state, cachedState);
+  const next = normalizeStateRecord(state);
+  dbSetJson(STORAGE_KEYS.state, next);
+  cachedState = next;
 }
 
 function updateState(mutator) {
@@ -2946,14 +2996,24 @@ async function rollbackIncidentFromTelegram(id) {
 function scheduleTelegramProgress(chatId, messageId, jobId, token) {
   const key = `${chatId}:${messageId}`;
   if (telegramRuntime.progressTimers.has(key)) clearInterval(telegramRuntime.progressTimers.get(key));
+  let busy = false;
+  let lastText = '';
   const timer = setInterval(async () => {
+    if (busy) return;
     const job = commandJobs.get(jobId);
     if (!job) { clearInterval(timer); telegramRuntime.progressTimers.delete(key); return; }
     const counts = { total: job.results.length, ok: job.results.filter((item) => item.ok).length, error: job.results.filter((item) => item.status === 'error').length, running: job.results.filter((item) => ['queued', 'running', 'awaiting_input'].includes(item.status)).length };
     const title = job.status === 'done' ? (job.cancelled ? '自动化已取消' : '自动化已完成') : '自动化执行中';
     const text = `${title}\n总数：${counts.total}\n成功：${counts.ok}\n失败：${counts.error}\n执行中：${counts.running}`;
-    try { await telegramCall(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: job.status === 'done' ? { inline_keyboard: [] } : { inline_keyboard: [[{ text: '取消任务', callback_data: `canceljob:${job.id}` }]] } }); } catch (_error) { /* stale message */ }
-    if (job.status === 'done') { clearInterval(timer); telegramRuntime.progressTimers.delete(key); }
+    const done = job.status === 'done';
+    if (text === lastText && !done) return;
+    busy = true;
+    try {
+      await telegramCall(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: done ? { inline_keyboard: [] } : { inline_keyboard: [[{ text: '取消任务', callback_data: `canceljob:${job.id}` }]] } });
+      lastText = text;
+    } catch (_error) { /* stale message */ }
+    finally { busy = false; }
+    if (done) { clearInterval(timer); telegramRuntime.progressTimers.delete(key); }
   }, 2500);
   telegramRuntime.progressTimers.set(key, timer);
 }
@@ -3005,6 +3065,7 @@ async function configureTelegramMenu(token) {
 }
 
 function startInteractiveCommandSession(job, resultItem, serverItem, proxies, encryptionKeyHex) {
+  if (job.cancelled) return;
   const proxy = proxies.find((item) => item.id === serverItem.proxyId) || null;
   let serverPassword = '';
   let proxyPassword = '';
@@ -3287,6 +3348,11 @@ function cancelCommandJob(job) {
     clearTimeout(job.cleanupTimer);
     job.cleanupTimer = null;
   }
+  if (job.automationInterval) {
+    clearInterval(job.automationInterval);
+    job.automationInterval = null;
+  }
+  job.cleanupTimer = setTimeout(() => commandJobs.delete(job.id), 1000 * 60 * 10);
 
   for (const resultItem of job.results) {
     if (!['done', 'error'].includes(resultItem.status)) {
@@ -3302,6 +3368,10 @@ function cancelCommandJob(job) {
 
   for (const [, runtime] of job.sessions) {
     runtime.cancelRequested = true;
+    if (runtime.executionTimer) {
+      clearTimeout(runtime.executionTimer);
+      runtime.executionTimer = null;
+    }
     if (runtime.awaitingTimer) {
       clearTimeout(runtime.awaitingTimer);
       runtime.awaitingTimer = null;
@@ -3418,9 +3488,11 @@ function writeCommandSessionInput(job, runtime, resultItem, data) {
 }
 
 function broadcastCommandSession(runtime, payload) {
+  let message;
   for (const client of runtime.clients) {
     if (client.readyState === client.OPEN) {
-      client.send(JSON.stringify(payload));
+      message ??= JSON.stringify(payload);
+      client.send(message);
     }
   }
 }

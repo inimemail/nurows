@@ -13,6 +13,21 @@ SPEC.loader.exec_module(PROBE)
 
 
 class ProbeCheckWindowTests(unittest.TestCase):
+    def test_old_guard_ids_do_not_accumulate_or_reset_live_schedules(self):
+        schedules = {f"old-{index}": index for index in range(10000)}
+        schedules.update({"running": float("inf"), "regular": 12345})
+        markers = {"old": "old-cycle", "running": "current", "regular": "requested"}
+        targets = [{"id": "running"}, {"id": "regular"}]
+        PROBE.prune_check_cache(targets, schedules, markers)
+        self.assertEqual(schedules, {"running": float("inf"), "regular": 12345})
+        self.assertEqual(markers, {"running": "current", "regular": "requested"})
+        schedules["late-old-worker"] = 99999
+        PROBE.prune_check_cache(targets, schedules, markers)
+        self.assertEqual(len(schedules), 2)
+        PROBE.prune_check_cache([], schedules, markers)
+        self.assertEqual(schedules, {})
+        self.assertEqual(markers, {})
+
     def setUp(self):
         self.target = {
             "id": "target-1",

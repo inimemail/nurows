@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { startPolling } from '../shared/polling.js';
 
 const PROVIDERS = {
   huawei: '华为云 DNS', aliyun: '阿里云 DNS', tencent: '腾讯云 DNSPod API', dnspod: 'DNSPod 独立 API', cloudflare: 'Cloudflare',
@@ -41,27 +42,17 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
         ? [['bots', '机器人配置']]
         : [['accounts', '服务商账号'], ['bindings', '解析绑定'], ['changes', '变更记录']];
   const active = sections.some(([key]) => key === section) ? section : sections[0][0];
-  const guardCheckActive = tab === 'probes' && state.dnsGuards?.some((guard) => Boolean(guard.cycle));
+  const guardCheckActive = tab === 'probes' && Boolean(state.orchestrationSummary
+    ? state.orchestrationSummary.checkingGuards : state.dnsGuards?.some((guard) => Boolean(guard.cycle)));
 
   useEffect(() => {
     let cancelled = false;
-    const refresh = async () => {
-      try {
-        if (guardCheckActive) {
-          const data = await api('/api/dns-guards/status');
-          if (!cancelled) onState((current) => ({ ...current, ...data }));
-        } else {
-          const data = await api('/api/state');
-          if (!cancelled) onState(data);
-        }
-      } catch (_error) {
-        // The main application handles authentication and connectivity errors.
-      }
-    };
-    refresh();
-    const timer = window.setInterval(refresh, guardCheckActive ? 5000 : 10000);
-    return () => { cancelled = true; window.clearInterval(timer); };
-  }, [api, onState, tab, guardCheckActive]);
+    const stop = startPolling(async (signal) => {
+      const data = await api(`/api/orchestration/status/${active}`, { signal });
+      if (!cancelled) onState((current) => ({ ...current, ...data }));
+    }, guardCheckActive ? 5000 : 10000);
+    return () => { cancelled = true; stop(); };
+  }, [api, onState, active, guardCheckActive]);
 
   const openCreate = (type) => { setEditorBusy(false); setEditor({ open: true, type, value: structuredClone(EMPTY[type]) }); };
   const openEdit = (type, value) => { setEditorBusy(false); setEditor({ open: true, type, value: normalizeDraft(type, value) }); };
@@ -330,10 +321,12 @@ function GuardEditor({ value, patch, state, api }) {
   const [sourceChecks, setSourceChecks] = useState({});
   const updateSource = (index, next) => {
     const key = sources[index]?.id || index;
+    const sourceState = { ...(value.sourceState || {}) };
     if (Object.prototype.hasOwnProperty.call(next, 'domain') || Object.prototype.hasOwnProperty.call(next, 'backupDomain')) {
       setSourceChecks((current) => ({ ...current, [`${key}:primary`]: null, [`${key}:backup`]: null }));
+      delete sourceState[key];
     }
-    patch({ sources: sources.map((item, current) => current === index ? { ...item, ...next } : item) });
+    patch({ sources: sources.map((item, current) => current === index ? { ...item, ...next } : item), sourceState });
   };
   const checkSource = async (index, side = 'primary') => {
     const source = sources[index];
@@ -341,12 +334,15 @@ function GuardEditor({ value, patch, state, api }) {
     const domain = String(source?.[field] || '').trim();
     if (!domain) return;
     const key = `${source.id || index}:${side}`;
-    setSourceChecks((current) => ({ ...current, [key]: { domain, checking: true, addresses: [] } }));
+    const requestId = crypto.randomUUID();
+    setSourceChecks((current) => ({ ...current, [key]: { domain, requestId, checking: true, addresses: [] } }));
     try {
       const data = await api('/api/dns-sources/resolve', { method: 'POST', body: JSON.stringify({ domain, recordType: value.recordType }) });
-      setSourceChecks((current) => ({ ...current, [key]: { domain, checking: false, addresses: data.addresses || [] } }));
-    } catch (_error) {
-      setSourceChecks((current) => ({ ...current, [key]: { domain, checking: false, addresses: [] } }));
+      setSourceChecks((current) => current[key]?.requestId === requestId
+        ? { ...current, [key]: { domain, checking: false, addresses: data.addresses || [] } } : current);
+    } catch (error) {
+      setSourceChecks((current) => current[key]?.requestId === requestId
+        ? { ...current, [key]: { domain, checking: false, addresses: [], error: error.message || '域名解析失败' } } : current);
     }
   };
   return <EditorGrid>
@@ -369,7 +365,7 @@ function GuardEditor({ value, patch, state, api }) {
     <Multi label="负责探针（任意一个成功即正常）" items={state.probes || []} value={value.probeIds || []} onChange={(probeIds) => patch({ probeIds })} secondary={(item) => item.region || item.carrier} searchable selectable />
 
     <EditorSection title="DDNS 来源域名" />
-    <div className="ops-multi"><div className="ops-multi-head"><strong>来源域名</strong><span>{sources.length} 个来源</span></div><div className="ops-source-list">{sources.map((source, index) => { const key = source.id || index; const primaryCheck = sourceChecks[`${key}:primary`]; const backupCheck = sourceChecks[`${key}:backup`]; const sourceStatus = value.sourceState?.[key]; return <div className="ops-source-item" key={key}><div className="ops-source-row"><input value={source.name || ''} placeholder="来源名称（选填）" onChange={(e) => updateSource(index, { name: e.target.value })} /><div className="ops-source-domain"><input value={source.domain || ''} placeholder="主 DDNS 完整域名" onChange={(e) => updateSource(index, { domain: e.target.value })} /><button type="button" className="ghost ops-source-check" disabled={!source.domain || primaryCheck?.checking} onClick={() => checkSource(index, 'primary')}>{primaryCheck?.checking ? '检测中' : '检测主'}</button></div><div className="ops-source-domain"><input value={source.backupDomain || ''} placeholder="备用 DDNS 域名（选填）" onChange={(e) => updateSource(index, { backupDomain: e.target.value })} /><button type="button" className="ghost ops-source-check" disabled={!source.backupDomain || backupCheck?.checking} onClick={() => checkSource(index, 'backup')}>{backupCheck?.checking ? '检测中' : '检测备'}</button></div><button type="button" className="icon-button danger" title="删除来源" onClick={() => patch({ sources: sources.filter((_, current) => current !== index) })}>×</button></div>{primaryCheck?.addresses?.length || backupCheck?.addresses?.length || sourceStatus ? <div className="ops-source-addresses">{primaryCheck?.addresses?.map((address) => <span key={`primary-${address}`}>主 · {address}</span>)}{backupCheck?.addresses?.map((address) => <span key={`backup-${address}`}>备 · {address}</span>)}{sourceStatus ? <em className={sourceStatus.pending ? 'warn' : 'ok'}>{sourceStatus.pending ? '待重试' : sourceStatus.activeSide === 'backup' ? '备用活动' : '主来源活动'}</em> : null}</div> : null}</div>; })}<button type="button" className="ghost ops-add-source" onClick={() => patch({ sources: [...sources, { id: crypto.randomUUID(), name: '', domain: '', backupDomain: '' }] })}>添加来源</button></div></div>
+    <div className="ops-multi"><div className="ops-multi-head"><strong>来源域名</strong><span>{sources.length} 个来源</span></div><div className="ops-source-list">{sources.map((source, index) => { const key = source.id || index; const primaryCheck = sourceChecks[`${key}:primary`]; const backupCheck = sourceChecks[`${key}:backup`]; const sourceStatus = value.sourceState?.[key]; return <div className="ops-source-item" key={key}><div className="ops-source-row"><input value={source.name || ''} placeholder="来源名称（选填）" onChange={(e) => updateSource(index, { name: e.target.value })} /><div className="ops-source-domain"><input value={source.domain || ''} placeholder="主 DDNS 完整域名" onChange={(e) => updateSource(index, { domain: e.target.value })} /><button type="button" className="ghost ops-source-check" disabled={!source.domain || primaryCheck?.checking} onClick={() => checkSource(index, 'primary')}>{primaryCheck?.checking ? '检测中' : '检测主'}</button></div><div className="ops-source-domain"><input value={source.backupDomain || ''} placeholder="备用 DDNS 域名（选填）" onChange={(e) => updateSource(index, { backupDomain: e.target.value })} /><button type="button" className="ghost ops-source-check" disabled={!source.backupDomain || backupCheck?.checking} onClick={() => checkSource(index, 'backup')}>{backupCheck?.checking ? '检测中' : '检测备'}</button></div><button type="button" className="icon-button danger" title="删除来源" onClick={() => patch({ sources: sources.filter((_, current) => current !== index) })}>×</button></div>{primaryCheck || backupCheck || sourceStatus ? <div className="ops-source-addresses">{primaryCheck?.addresses?.map((address) => <span key={`primary-${address}`}>主 · {address}</span>)}{backupCheck?.addresses?.map((address) => <span key={`backup-${address}`}>备 · {address}</span>)}{primaryCheck?.error ? <em className="warn">主：{primaryCheck.error}</em> : null}{backupCheck?.error ? <em className="warn">备：{backupCheck.error}</em> : null}{sourceStatus ? <em className={sourceStatusTone(sourceStatus)}>{sourceStatusLabel(sourceStatus)}</em> : null}{primaryCheck?.addresses?.length || backupCheck?.addresses?.length ? <em>仅检测域名解析；保存后由守护检查 IP 并同步</em> : null}</div> : null}</div>; })}<button type="button" className="ghost ops-add-source" onClick={() => patch({ sources: [...sources, { id: crypto.randomUUID(), name: '', domain: '', backupDomain: '' }] })}>添加来源</button></div></div>
     <Toggle checked={value.pruneStale} onChange={(pruneStale) => patch({ pruneStale })}>移除来源已不再提供的旧 IP</Toggle>
 
     <EditorSection title="备用池补位" />
@@ -402,11 +398,22 @@ function PoolEditor({ value, patch, state }) {
 
 function EditorSection({ title }) { return <div className="ops-editor-section"><strong>{title}</strong></div>; }
 
+function sourceStatusLabel(current) {
+  if (!current) return '未解析';
+  const labels = { resolving: '正在解析', checking: '等待探针检查', resolve_error: '解析失败 · 待重试',
+    probe_failed: '检查失败 · 待重试', capacity: '达到 IP 上限', ready: '检查通过 · 待写入' };
+  return labels[current.status] || (current.pending ? '待重试' : current.activeSide === 'backup' ? '备用来源已同步' : '主来源已同步');
+}
+
+function sourceStatusTone(current) {
+  return !current || current.pending || ['resolving', 'checking', 'capacity', 'ready'].includes(current.status) ? 'warn' : 'ok';
+}
+
 function GuardDetails({ guard, runs, Dialog, onClose, onCheck, onManage }) {
   const latest = runs[0];
   const sourceOwned = new Set(guard.sourceOwnedValues || []);
   const owned = new Set(guard.ownedValues || []);
-  return <Dialog title={guard.name} className="ops-guard-dialog" wide onClose={onClose} footer={<><button className="ghost" onClick={onManage}>管理远程 IP</button><div className="dialog-actions"><button className="ghost" onClick={onClose}>关闭</button><button className="primary" disabled={Boolean(guard.cycle)} onClick={onCheck}>检查并修复</button></div></>}><div className="guard-detail-summary"><div><span>当前状态</span><strong>{STATUS[guard.status] || guard.status}</strong></div><div><span>活动解析</span><strong>{guard.currentValues?.length || 0} / {guard.maxActiveIps || 50}</strong></div><div><span>最近检查</span><strong>{formatTime(guard.lastCheckAt)}</strong></div></div><div className="guard-detail-section"><strong>服务商当前记录</strong><div className="guard-ip-grid">{guard.currentValues?.length ? guard.currentValues.map((address) => <div key={address}><i className="ops-dot ok" /><span>{address}</span><em>{sourceOwned.has(address) ? '域名来源' : owned.has(address) ? '备用池' : '手工/外部'}</em></div>) : <p>尚未读取到记录</p>}</div></div><div className="guard-detail-section"><strong>DDNS 来源状态</strong><div className="guard-source-status">{guard.sources?.length ? guard.sources.map((source) => { const current = guard.sourceState?.[source.id || source.domain]; const active = current?.activeSide === 'backup' ? '备用活动' : '主来源活动'; return <div key={source.id || source.domain}><div><strong>{source.name || source.domain}</strong><span>主：{source.domain}{source.backupDomain ? ` · 备：${source.backupDomain}` : ''}</span></div><em className={current?.pending ? 'warn' : 'ok'}>{current?.pending ? '待重试' : current ? active : '未检查'}</em>{current?.lastError ? <p>{current.lastError}</p> : null}</div>; }) : <p>未配置来源域名</p>}</div></div><div className="guard-detail-section"><strong>最近执行</strong>{latest ? <div className="guard-run"><span>{formatTime(latest.finishedAt)} · {STATUS[latest.status] || latest.status}</span><p>{latest.message}</p>{latest.failedValues?.length ? <em>故障：{latest.failedValues.join(', ')}</em> : null}</div> : <div className="guard-run"><p>尚无执行记录</p></div>}</div>{guard.lastError ? <div className="guard-error">{guard.lastError}</div> : null}</Dialog>;
+  return <Dialog title={guard.name} className="ops-guard-dialog" wide onClose={onClose} footer={<><button className="ghost" onClick={onManage}>管理远程 IP</button><div className="dialog-actions"><button className="ghost" onClick={onClose}>关闭</button><button className="primary" disabled={Boolean(guard.cycle)} onClick={onCheck}>检查并修复</button></div></>}><div className="guard-detail-summary"><div><span>当前状态</span><strong>{STATUS[guard.status] || guard.status}</strong></div><div><span>活动解析</span><strong>{guard.currentValues?.length || 0} / {guard.maxActiveIps || 50}</strong></div><div><span>最近检查</span><strong>{formatTime(guard.lastCheckAt)}</strong></div></div><div className="guard-detail-section"><strong>服务商当前记录</strong><div className="guard-ip-grid">{guard.currentValues?.length ? guard.currentValues.map((address) => <div key={address}><i className="ops-dot ok" /><span>{address}</span><em>{sourceOwned.has(address) ? '域名来源' : owned.has(address) ? '备用池' : '手工/外部'}</em></div>) : <p>尚未读取到记录</p>}</div></div><div className="guard-detail-section"><strong>DDNS 来源状态</strong><div className="guard-source-status">{guard.sources?.length ? guard.sources.map((source) => { const current = guard.sourceState?.[source.id || source.domain]; return <div key={source.id || source.domain}><div><strong>{source.name || source.domain}</strong><span>主：{source.domain}{source.backupDomain ? ` · 备：${source.backupDomain}` : ''}</span></div><em className={sourceStatusTone(current)}>{sourceStatusLabel(current)}</em>{current?.lastError ? <p>{current.lastError}</p> : null}</div>; }) : <p>未配置来源域名</p>}</div></div><div className="guard-detail-section"><strong>最近执行</strong>{latest ? <div className="guard-run"><span>{formatTime(latest.finishedAt)} · {STATUS[latest.status] || latest.status}</span><p>{latest.message}</p>{latest.failedValues?.length ? <em>故障：{latest.failedValues.join(', ')}</em> : null}</div> : <div className="guard-run"><p>尚无执行记录</p></div>}</div>{guard.lastError ? <div className="guard-error">{guard.lastError}</div> : null}</Dialog>;
 }
 
 function AccountEditor({ value, patch, api, toast }) {
@@ -516,12 +523,24 @@ function resourceFor(type) { return ({ probe: 'probes', target: 'probe-targets',
 function typeLabel(type) { return ({ probe: '探针', target: '检查目标', guard: 'DNS 守护任务', asset: 'IP 资产', pool: '备用池', account: 'DNS 账号', binding: '解析绑定', policy: '切换策略', bot: 'Telegram 机器人' })[type]; }
 function normalizeDraft(type, value) { const draft = { ...structuredClone(EMPTY[type]), ...structuredClone(value) }; if (type === 'target') { delete draft.failureThreshold; delete draft.recoveryThreshold; } if (type === 'guard') { draft.sources = Array.isArray(draft.sources) ? draft.sources : []; draft.probeIds = Array.isArray(draft.probeIds) ? draft.probeIds : []; draft.poolIds = Array.isArray(draft.poolIds) ? draft.poolIds : []; } if (type === 'asset') draft.labels = (value.labels || []).join(', '); if (type === 'pool') { delete draft.alertChatIds; if (!['ordered', 'random'].includes(draft.selectionMode)) draft.selectionMode = 'ordered'; draft.assetIds = Array.isArray(draft.assetIds) ? draft.assetIds : []; draft.alertThresholds = Array.isArray(draft.alertThresholds) ? draft.alertThresholds : []; draft.alertBotIds = Array.isArray(draft.alertBotIds) ? draft.alertBotIds : []; } if (type === 'account') draft.credentials = {}; if (type === 'bot') { draft.name = value.name || ''; draft.token = ''; draft.userIds = (value.userIds || []).join('\n'); draft.rolesText = Object.entries(value.roles || {}).map(([id, role]) => `${id}=${role}`).join('\n'); } return draft; }
 function serializeDraft(type, value) { const draft = structuredClone(value); if (type === 'target') { delete draft.failureThreshold; delete draft.recoveryThreshold; } if (type === 'guard') { draft.sources = Array.isArray(draft.sources) ? draft.sources.filter((item) => item.domain?.trim()) : []; draft.probeIds = Array.isArray(draft.probeIds) ? draft.probeIds : []; draft.poolIds = Array.isArray(draft.poolIds) ? draft.poolIds : []; } if (type === 'asset') draft.labels = String(draft.labels || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); if (type === 'pool') { delete draft.alertChatIds; draft.alertThresholds = Array.isArray(draft.alertThresholds) ? draft.alertThresholds : []; draft.alertBotIds = Array.isArray(draft.alertBotIds) ? draft.alertBotIds : []; } if (type === 'bot') { draft.userIds = String(draft.userIds || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); draft.roles = Object.fromEntries(String(draft.rolesText || '').split(/\n+/).map((line) => line.split('=').map((part) => part.trim())).filter(([id, role]) => id && role)); } return draft; }
-function countFor(section, state) { return ({ nodes: state.probes, targets: state.probeTargets, guards: state.dnsGuards, policies: state.failoverPolicies, incidents: state.incidents, bots: state.telegramBots, assets: state.ipAssets, pools: state.ipPools, usage: state.ipUsageRecords, accounts: state.dnsAccounts, bindings: state.dnsBindings, changes: state.dnsChanges })[section]?.length || 0; }
-function summary(tab, state) { if (tab === 'probes') return `${state.probes?.filter((item) => item.status === 'online').length || 0} 个在线探针 · ${state.dnsGuards?.filter((item) => item.enabled !== false).length || 0} 个 DNS 守护 · ${state.incidents?.filter((item) => !['succeeded', 'recovered', 'rolled_back'].includes(item.status)).length || 0} 个活动事件`; if (tab === 'pools') return `${state.ipAssets?.length || 0} 个可用 IP · ${state.ipUsageRecords?.length || 0} 条使用记录`; if (tab === 'telegram') return `${state.telegramBots?.filter((item) => item.enabled && item.configured).length || 0} 个运行中机器人`; return `${state.dnsAccounts?.length || 0} 个账号 · ${state.dnsBindings?.length || 0} 条解析绑定`; }
+function countFor(section, state) {
+  const key = { nodes: 'probes', targets: 'probeTargets', guards: 'dnsGuards', policies: 'failoverPolicies', incidents: 'incidents', bots: 'telegramBots', assets: 'ipAssets', pools: 'ipPools', usage: 'ipUsageRecords', accounts: 'dnsAccounts', bindings: 'dnsBindings', changes: 'dnsChanges' }[section];
+  return state.orchestrationSummary?.counts[key] ?? state[key]?.length ?? 0;
+}
+function summary(tab, state) {
+  const current = state.orchestrationSummary;
+  if (current) {
+    if (tab === 'probes') return `${current.onlineProbes} 个在线探针 · ${current.enabledGuards} 个 DNS 守护 · ${current.activeIncidents} 个活动事件`;
+    if (tab === 'pools') return `${current.counts.ipAssets} 个可用 IP · ${current.counts.ipUsageRecords} 条使用记录`;
+    if (tab === 'telegram') return `${current.enabledBots} 个运行中机器人`;
+    return `${current.counts.dnsAccounts} 个账号 · ${current.counts.dnsBindings} 条解析绑定`;
+  }
+  if (tab === 'probes') return `${state.probes?.filter((item) => item.status === 'online').length || 0} 个在线探针 · ${state.dnsGuards?.filter((item) => item.enabled !== false).length || 0} 个 DNS 守护 · ${state.incidents?.filter((item) => !['succeeded', 'recovered', 'rolled_back'].includes(item.status)).length || 0} 个活动事件`; if (tab === 'pools') return `${state.ipAssets?.length || 0} 个可用 IP · ${state.ipUsageRecords?.length || 0} 条使用记录`; if (tab === 'telegram') return `${state.telegramBots?.filter((item) => item.enabled && item.configured).length || 0} 个运行中机器人`; return `${state.dnsAccounts?.length || 0} 个账号 · ${state.dnsBindings?.length || 0} 条解析绑定`;
+}
 function allocationLabel(item) { return item.allocationMode === 'all' ? '全部取用' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '一次取一个'; }
 function assetSubtitle(item) { return [item.name && item.name !== item.address ? item.address : '', item.region, item.carrier].filter(Boolean).join(' · '); }
 function targetSubtitle(item) { const rounds = Number(item.checkRounds) || 3; const perRound = Number(item.attemptsPerRound) || 3; const expectedAttempts = rounds * perRound; const observations = Object.values(item.observations || {}).sort((a, b) => Date.parse(b.checkedAt || 0) - Date.parse(a.checkedAt || 0)); const latest = observations[0]; const result = !latest ? '尚未检查' : latest.ok ? `第 ${latest.successfulRound || 1} 轮第 ${latest.successfulAttempt || 1} 次成功` : latest.attempts === expectedAttempts ? `${expectedAttempts} 次全部失败` : '等待探针升级'; return `${item.checkType === 'ping' ? 'PING' : `TCP:${item.port}`} · ${item.address || '未填写地址'} · ${item.probeIds?.length || 0} 个探针 · ${rounds}轮×${perRound}次 · ${result} · ${formatTime(item.lastCheckAt)}`; }
-function probeVersionCurrent(version) { const [major = 0, minor = 0, patch = 0] = String(version || '').split('.').map(Number); return major > 1 || (major === 1 && (minor > 4 || (minor === 4 && patch >= 7))); }
+function probeVersionCurrent(version) { const [major = 0, minor = 0, patch = 0] = String(version || '').split('.').map(Number); return major > 1 || (major === 1 && (minor > 4 || (minor === 4 && patch >= 8))); }
 function probeVersionLabel(version) { return version ? `${version}${probeVersionCurrent(version) ? '' : '（需升级）'}` : '未接入'; }
 function updateModeLabel(mode) { return ({ append: '追加 IP', managed_replace: '覆盖托管值', replace: '完全替换' })[mode] || mode; }
 function formatTime(value) { if (!value) return '-'; return new Date(value).toLocaleString('zh-CN', { hour12: false }); }

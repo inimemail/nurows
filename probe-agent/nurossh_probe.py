@@ -14,7 +14,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.4.7"
+VERSION = "1.4.8"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
@@ -200,7 +200,7 @@ def run_due_checks(config, due, schedules, now):
                 results = [future.result() for future in batch]
                 request(config, "POST", "/probe/report", {"version": VERSION, "results": results})
                 for future in batch:
-                    target = futures[future]
+                    target = futures.pop(future)
                     schedules[target["id"]] = now + max(5, int(target.get("interval", 30)))
 
 
@@ -230,6 +230,17 @@ def update_config_cache(payload, targets, version):
     return next_targets, str(payload.get("version", version))
 
 
+def prune_check_cache(targets, schedules, markers):
+    # Guard check IDs change every cycle. Retaining every old ID leaks memory
+    # over weeks of uptime. Worker threads may finish an old ID later; it is
+    # safely pruned on the next poll without changing any current schedule.
+    active_ids = {target["id"] for target in targets}
+    for cache in (schedules, markers):
+        for target_id in list(cache):
+            if target_id not in active_ids:
+                cache.pop(target_id, None)
+
+
 def main():
     with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
         config = json.load(handle)
@@ -255,6 +266,7 @@ def main():
             config_path = "/probe/config" + (f"?version={quote(config_version, safe='')}" if config_version else "")
             payload = request(config, "GET", config_path)
             targets, config_version = update_config_cache(payload, targets, config_version)
+            prune_check_cache(targets, schedules, check_now_markers)
             try:
                 heartbeat_interval = max(10, int(payload.get("heartbeatInterval", heartbeat_interval)))
             except (TypeError, ValueError):

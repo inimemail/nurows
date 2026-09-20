@@ -911,8 +911,12 @@ svg {
 .ops-content { min-height: 0; flex: 1 1 0; display: flex; flex-direction: column; overflow: hidden; padding: 18px; border-radius: 18px; }
 .ops-content-head { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
 .ops-content-actions { display: flex; align-items: center; gap: 8px; }
-.ops-usage-filters { width: min(520px, 52vw); display: grid; grid-template-columns: minmax(220px, 1fr) 150px; gap: 8px; }
-.ops-usage-filters input, .ops-usage-filters select { min-height: 40px; }
+.ops-usage-head { flex-wrap: wrap; }
+.ops-usage-head > div:first-child { flex: 1 1 240px; min-width: 0; }
+.ops-usage-filters { flex: 0 1 640px; min-width: 0; margin-left: auto; display: grid; grid-template-columns: minmax(160px, 1fr) 140px auto; align-items: center; gap: 8px; }
+.ops-usage-filters input, .ops-usage-filters select { min-width: 0; min-height: 40px; }
+.ops-usage-filters .ops-usage-clear { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 40px; padding: 9px 12px; border-radius: 12px; white-space: nowrap; }
+.ops-usage-clear svg { flex-shrink: 0; }
 .ops-content-head strong { display: block; color: var(--text-strong); font-size: 15px; }
 .ops-content-head span { display: block; margin-top: 4px; color: var(--text-soft); font-size: 11px; }
 .ops-list { min-height: 0; flex: 1 1 0; overflow: auto; overscroll-behavior: contain; padding-top: 8px; }
@@ -2647,7 +2651,11 @@ button.danger-action:hover:not(:disabled) {
   .ops-content-head { align-items: stretch; flex-direction: column; }
   .ops-content-actions { width: 100%; }
   .ops-content-actions .primary, .ops-content-actions .ghost { min-width: 0; flex: 1 1 0; }
-  .ops-usage-filters { width: 100%; grid-template-columns: 1fr; }
+  .ops-usage-head > div:first-child { flex: none; }
+  .ops-usage-filters { flex: none; width: 100%; grid-template-columns: minmax(0, 1fr) auto; }
+  .ops-usage-filters input { grid-column: 1 / -1; }
+  .ops-usage-filters input, .ops-usage-filters select { min-height: 44px; font-size: 16px; }
+  .ops-usage-filters .ops-usage-clear { min-height: 44px; }
   .ops-list { overflow: visible; }
   .ops-row { align-items: flex-start; flex-direction: column; gap: 10px; padding: 13px 2px; }
   .ops-row-side { width: 100%; justify-content: space-between; }

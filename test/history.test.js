@@ -11,7 +11,7 @@ const fixture = () => Object.fromEntries(HISTORY_KEYS.map((key) => [key, [
   { id: `${key}-recent`, status: 'done', createdAt: date(6) }
 ]]));
 
-test('all six history types expire at seven days while configurations and inventory stay intact', () => {
+test('all history types expire at seven days while configurations and inventory stay intact', () => {
   const state = fixture();
   state.servers = [{ id: 'server' }];
   state.dnsGuards = [{ cycle: { id: 'live' }, currentValues: ['192.0.2.1'] }];
@@ -20,8 +20,8 @@ test('all six history types expire at seven days while configurations and invent
   state.workspaces = { user: { sessions: ['terminal'] } };
   const original = structuredClone(state);
   const result = pruneHistory(state, { now });
-  assert.equal(result.removed, 6);
-  assert.equal(result.kept, 6);
+  assert.equal(result.removed, HISTORY_KEYS.length);
+  assert.equal(result.kept, HISTORY_KEYS.length);
   for (const key of HISTORY_KEYS) assert.deepEqual(state[key].map((item) => item.id), [`${key}-recent`]);
   for (const key of ['servers', 'dnsGuards', 'ipAssets', 'ipLeases', 'workspaces']) assert.deepEqual(state[key], original[key]);
   assert.equal(pruneHistory(state, { now }).changed, false);
@@ -52,7 +52,7 @@ test('manual clear preserves active incidents, job histories, usage and the enti
   state.dnsChanges.push({ id: 'linked-change', status: 'applied', createdAt: date(20) }, { id: 'other-change', incidentId: 'active', status: 'applied', createdAt: date(20) });
   state.ipUsageRecords.push({ id: 'usage', incidentId: 'active', status: 'consumed', finishedAt: date(20) });
   const result = pruneHistory(state, { all: true, now });
-  assert.equal(result.removed, 12);
+  assert.equal(result.removed, HISTORY_KEYS.length * 2);
   assert.deepEqual(state.incidents.map((item) => item.id), ['active']);
   assert.deepEqual(state.automationRuns.map((item) => item.id), ['linked-run', 'live-run']);
   assert.equal(state.dnsChanges.length, 2);
@@ -182,7 +182,7 @@ test('clear-history route requires explicit confirmation and returns sanitized r
   assert.equal(state.dnsChanges.length, 2);
   assert.equal(writes, 1);
   handler({ body: { confirm: 'clear-history' }, auth: { username: 'test' } }, response);
-  assert.equal(result.removed, 10);
+  assert.equal(result.removed, HISTORY_KEYS.length * 2 - 2);
   assert.equal(result.kept, 0);
   assert.equal(result.retentionDays, 7);
   assert.equal(result.state.sanitized, true);

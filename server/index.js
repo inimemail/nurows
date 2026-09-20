@@ -4,6 +4,7 @@ import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { HISTORY_RETENTION_DAYS, HISTORY_KEYS, HISTORY_STATE_KEYS, pruneHistory } from './history.js';
+import { createDynamicGuardService, registerDynamicGuardRoutes, sanitizeDynamicGuard } from './dynamic-guard.js';
 import { commandJobDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
 import express from 'express';
 import cors from 'cors';
@@ -132,6 +133,12 @@ const orchestrationDeps = {
   syncDnsBinding
 };
 
+const dynamicGuardService = createDynamicGuardService({
+  readState, updateState, updateDynamicGuardState, encryptSecret, decryptSecret, readDynamicGuard, readDynamicGuardSchedule, readDynamicProbeStatus,
+  notifyDynamicGuard: notifyDynamicGuardViaTelegram,
+  logError: (error) => console.error('Dynamic IP guard:', error.message)
+});
+
 function scheduleDnsGuardRetry(guardId) {
   if (dnsGuardRetryTimers.has(guardId)) return;
   const timer = setTimeout(() => {
@@ -233,7 +240,8 @@ registerProbePublicRoutes(app, {
   ...orchestrationDeps,
   onIncidentCreated: (incidentId) => runIncidentWorkflow(incidentId, orchestrationDeps),
   onProbeReport: (state) => retryWaitingIpIncidents(orchestrationDeps, null, state),
-  onDnsGuardReport: (state) => processReadyDnsGuards(orchestrationDeps, state).catch(() => {})
+  onDnsGuardReport: (state) => processReadyDnsGuards(orchestrationDeps, state).catch(() => {}),
+  onDynamicGuardReport: () => dynamicGuardService.tick()
 });
 app.use('/api', authGuard);
 
@@ -370,7 +378,7 @@ app.get('/api/history/:scope', (req, res) => {
   const { scope } = req.params;
   if (!HISTORY_KEYS.includes(scope)) return res.status(400).json({ error: '未知历史记录类别' });
   const state = readState([scope]);
-  const records = scope === 'automationRuns' ? state.automationRuns || [] : sanitizeOrchestrationState(state)[scope];
+  const records = ['automationRuns', 'dynamicGuardRuns'].includes(scope) ? state[scope] || [] : sanitizeOrchestrationState(state)[scope];
   const pageSize = 50;
   const pages = Math.max(1, Math.ceil(records.length / pageSize));
   const requestedPage = Number(req.query.page);
@@ -392,6 +400,7 @@ app.delete('/api/history', (req, res) => {
 });
 
 registerOrchestrationRoutes(app, orchestrationDeps);
+registerDynamicGuardRoutes(app, { ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus }, dynamicGuardService);
 
 app.post('/api/workspace', (req, res) => {
   const workspaceInput = normalizeWorkspaceInput(req.body);
@@ -1109,6 +1118,8 @@ server.listen(PORT, HOST, () => {
   cleanupHistoryRecords();
   restartTelegramPolling();
   resumePendingIncidents();
+  dynamicGuardService.tick();
+  setInterval(() => { try { dynamicGuardService.tick(); } catch (error) { console.error('Dynamic IP guard:', error.message); } }, 1000).unref();
   runDueDnsGuards(orchestrationDeps).catch(() => {});
   processReadyDnsGuards(orchestrationDeps).catch(() => {});
   setInterval(() => runDueDnsGuards(orchestrationDeps).catch(() => {}), 5000).unref();
@@ -1897,11 +1908,62 @@ function readState(keys = null) {
   return structuredClone(keys ? Object.fromEntries(keys.map((key) => [key, cachedState[key]])) : cachedState);
 }
 
+function readDynamicGuard(id) {
+  ensureStorage();
+  return structuredClone(cachedState?.dynamicGuards?.find((guard) => guard.id === id));
+}
+
+function readDynamicGuardSchedule() {
+  ensureStorage();
+  return (cachedState?.dynamicGuards || []).map((guard) => ({ id: guard.id, revision: guard.revision,
+    enabled: guard.enabled, nextAt: guard.nextAt, manualRequested: guard.manualRequested, pendingChange: Boolean(guard.pendingChange), cycle: guard.cycle ? { result: guard.cycle.result, startedAt: guard.cycle.startedAt } : null,
+    flow: guard.flow ? { commandState: guard.flow.commandState } : null }));
+}
+
+function readDynamicProbeStatus() {
+  ensureStorage();
+  return (cachedState?.probes || []).map(({ id, enabled, status, lastSeenAt }) => ({ id, enabled, status, lastSeenAt }));
+}
+
+function readDynamicGuardStatus() {
+  ensureStorage();
+  // Sanitize before cloning, avoiding encrypted commands and probe secrets in
+  // frequently polled snapshots. Histories are loaded separately by page.
+  return structuredClone({ guards: (cachedState.dynamicGuards || []).map((guard) => sanitizeDynamicGuard(guard)),
+    probes: (cachedState.probes || []).map(({ id, name, enabled, status, lastSeenAt }) => ({ id, name, enabled, status, lastSeenAt })),
+    bots: (cachedState.telegramBots || []).map(({ id, name, enabled, tokenEnc }) => ({ id, name, enabled, configured: Boolean(tokenEnc) })),
+    serverTime: Date.now() });
+}
+
+function readDynamicGuardHistory(id) {
+  ensureStorage();
+  // Read-only route projection; the response serializer never mutates records.
+  return (cachedState?.dynamicGuardRuns || []).filter((run) => run.guardId === id);
+}
+
+// This private writer only permits mutations of dynamic guards and, when
+// requested, their history. Keep other collections shared and publish after
+// persistence succeeds; a failed write must never modify the live cache.
+function updateDynamicGuardState(mutator, withHistory = false, guardId = null) {
+  ensureStorage();
+  const selected = { dynamicGuards: (cachedState.dynamicGuards || []).map((guard) =>
+    !guardId || guard.id === guardId ? structuredClone(guard) : guard) };
+  if (withHistory) selected.dynamicGuardRuns = structuredClone(cachedState.dynamicGuardRuns || []);
+  mutator(selected);
+  const next = { ...cachedState, ...selected };
+  dbSetJson(STORAGE_KEYS.state, next);
+  cachedState = next;
+}
+
 function readProbeState() {
   ensureStorage();
   if (!cachedState) cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
   return structuredClone({
     probes: cachedState.probes || [],
+    dynamicGuards: (cachedState.dynamicGuards || []).filter((guard) => guard.enabled !== false && guard.cycle).map((guard) => ({
+      id: guard.id, enabled: guard.enabled, checkType: guard.checkType, port: guard.port,
+      timeout: guard.timeout, checkRounds: guard.checkRounds, attemptsPerRound: guard.attemptsPerRound, cycle: guard.cycle
+    })),
     probeTargets: (cachedState.probeTargets || []).map((target) => ({
       id: target.id,
       enabled: target.enabled,
@@ -2375,6 +2437,18 @@ function notifyIncidentViaTelegram(incidentId) {
       telegramCall(token, 'sendMessage', { chat_id: chatId, text }).catch(() => {});
     }
   }
+}
+
+async function notifyDynamicGuardViaTelegram(guard, message) {
+  const { telegramBots = [] } = readState(['telegramBots']);
+  const bots = telegramBots.filter((bot) => guard.botIds?.includes(bot.id) && bot.enabled !== false && bot.tokenEnc);
+  await Promise.allSettled(bots.flatMap((bot) => {
+    let token;
+    try { token = decryptSecret(bot.tokenEnc); } catch { return []; }
+    return [...new Set(bot.userIds || [])].map((chatId) => telegramCall(token, 'sendMessage', {
+      chat_id: chatId, text: `动态 IP 守护：${guard.name}\n域名：${guard.domain}\n${message}`
+    }));
+  }));
 }
 
 function notifyDnsGuardViaTelegram(guardId) {

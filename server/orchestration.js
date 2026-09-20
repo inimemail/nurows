@@ -6,6 +6,7 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 import { promisify } from 'node:util';
 import { v4 as uuidv4 } from 'uuid';
+import { sanitizeDynamicGuard, dynamicProbeTargets, acceptDynamicReports } from './dynamic-guard.js';
 
 const execFile = promisify(execFileCallback);
 
@@ -63,6 +64,8 @@ export function orchestrationDefaults() {
     probes: [],
     probeTargets: [],
     dnsGuards: [],
+    dynamicGuards: [],
+    dynamicGuardRuns: [],
     ipAssets: [],
     ipPools: [],
     dnsAccounts: [],
@@ -145,6 +148,8 @@ export function sanitizeOrchestrationState(state = {}) {
   const domain = normalizeOrchestrationState(state);
   return {
     ...domain,
+    dynamicGuards: domain.dynamicGuards.map((guard) => sanitizeDynamicGuard(guard)),
+    dynamicGuardRuns: domain.dynamicGuardRuns.slice(0, 30).map(({ output, ...run }) => run),
     probes: domain.probes.map(({ tokenHash, tokenEnc, agentSecretHash, ...item }) => ({
       ...item,
       status: item.status === 'online' && (!item.lastSeenAt || Date.now() - Date.parse(item.lastSeenAt) > PROBE_OFFLINE_AFTER_MS) ? 'offline' : item.status
@@ -216,7 +221,7 @@ export function registerProbePublicRoutes(app, deps) {
     });
     // DNS guard cycles are latency-sensitive: start them before ordinary
     // targets so a busy probe cannot make a two-IP guard wait behind a queue.
-    const checks = [...guardChecks, ...targets];
+    const checks = [...guardChecks, ...dynamicProbeTargets(auth.state.dynamicGuards, auth.probe.id), ...targets];
     const version = configVersion(checks);
     const unchanged = cleanText(req.query?.version, 100) === version;
     res.json({
@@ -260,9 +265,11 @@ export function registerProbePublicRoutes(app, deps) {
     const notifyIncidentIds = [];
     let acceptedGuardReport = false;
     let acceptedTargetReport = false;
+    let acceptedDynamicReport = false;
     const state = deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === auth.probe.id);
       if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), agentVersion: cleanText(req.body.version, 40) || probe.agentVersion, updatedAt: nowIso() });
+      acceptedDynamicReport = acceptDynamicReports(draft, auth.probe.id, reports);
       const targetById = new Map((draft.probeTargets || []).map((item) => [item.id, item]));
       const guardCheckById = new Map();
       const touchedGuards = new Set();
@@ -350,6 +357,7 @@ export function registerProbePublicRoutes(app, deps) {
       && guard.status === 'waiting_probe' && !guard.cycle && guard.probeIds?.includes(auth.probe.id));
     if (auth.probe.status !== 'online' || waitingForThisProbe) deps.onProbeAvailable?.(auth.probe.id, state);
     if (acceptedGuardReport) deps.onDnsGuardReport?.(state);
+    if (acceptedDynamicReport) deps.onDynamicGuardReport?.();
     if (acceptedTargetReport) deps.onProbeReport?.(state);
     res.json({ ok: true, accepted: reports.length, incidents: createdIncidentIds });
   });

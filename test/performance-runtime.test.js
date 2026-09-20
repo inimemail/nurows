@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import test from 'node:test';
 import { commandJobDelta, mergeCommandDelta } from '../shared/command-output.js';
 import { startPolling } from '../shared/polling.js';
+import { sanitizeDynamicGuard } from '../server/dynamic-guard.js';
 import { collectDnsGuardPoolCandidates, orchestrationDefaults, registerOrchestrationRoutes } from '../server/orchestration.js';
 
 // Load individual runtime functions without opening storage or starting services.
@@ -41,6 +42,51 @@ test('failed persistence never publishes an uncommitted cache value', () => {
   ctx.dbSetJson = () => {};
   ctx.writeState({ name: 'after' });
   assert.equal(ctx.readState().name, 'after');
+});
+
+test('dynamic guard updates copy only their own record and preserve cache on persistence failure', () => {
+  const before = { dynamicGuards: [{ id: 'one', status: 'queued' }, { id: 'two' }], dynamicGuardRuns: [{ id: 'run', status: 'processing' }], auditLogs: [{ content: 'large history' }] };
+  let saved;
+  const cloned = [];
+  const ctx = runtime(['updateDynamicGuardState'], {
+    ensureStorage() {}, cachedState: before, STORAGE_KEYS: { state: 'state' },
+    structuredClone(value) { cloned.push(value); return structuredClone(value); },
+    dbSetJson(_key, next) { saved = next; }
+  });
+  ctx.updateDynamicGuardState((draft) => { draft.dynamicGuards[0].status = 'checking'; }, false, 'one');
+  assert.equal(cloned.length, 1);
+  assert.equal(cloned[0], before.dynamicGuards[0]);
+  assert.equal(saved.auditLogs, before.auditLogs);
+  assert.equal(saved.dynamicGuardRuns, before.dynamicGuardRuns);
+  assert.equal(saved.dynamicGuards[1], before.dynamicGuards[1]);
+  assert.equal(before.dynamicGuards[0].status, 'queued');
+  const committed = ctx.cachedState;
+  ctx.dbSetJson = () => { throw Error('disk full'); };
+  assert.throws(() => ctx.updateDynamicGuardState((draft) => { draft.dynamicGuards[0].status = 'failed'; draft.dynamicGuardRuns[0].status = 'succeeded'; }, true, 'one'), /disk full/);
+  assert.equal(ctx.cachedState, committed);
+  assert.equal(ctx.cachedState.dynamicGuards[0].status, 'checking');
+  assert.equal(ctx.cachedState.dynamicGuardRuns[0].status, 'processing');
+});
+
+test('dynamic probe status reads only readiness fields and skips credential payloads', () => {
+  const probe = { id: 'p', status: 'online', enabled: true, lastSeenAt: '2026-09-20' };
+  Object.defineProperty(probe, 'tokenEnc', { enumerable: true, get() { throw Error('credentials copied'); } });
+  const ctx = runtime(['readDynamicProbeStatus'], { ensureStorage() {}, cachedState: { probes: [probe] } });
+  assert.equal(ctx.readDynamicProbeStatus()[0].id, 'p');
+  assert.equal(ctx.readDynamicProbeStatus()[0].tokenEnc, undefined);
+});
+
+test('dynamic status polling excludes command bodies, probe secrets, and unrelated histories before cloning', () => {
+  const state = { dynamicGuards: [{ id: 'guard', commandEnc: { cipher: 'secret'.repeat(5000) }, cycle: { id: 'cycle', address: '192.0.2.1', startedAt: 1, observations: { p: { ok: true } } } }],
+    probes: [{ id: 'p', tokenEnc: 'probe-secret' }], telegramBots: [{ id: 'bot', tokenEnc: 'bot-secret' }] };
+  Object.defineProperty(state, 'dynamicGuardRuns', { get() { throw Error('history loaded'); } });
+  const ctx = runtime(['readDynamicGuardStatus'], { ensureStorage() {}, cachedState: state, sanitizeDynamicGuard,
+    structuredClone(value) { assert.ok(!JSON.stringify(value).includes('secret')); return structuredClone(value); } });
+  const snapshot = ctx.readDynamicGuardStatus();
+  assert.equal(snapshot.guards[0].commandConfigured, true);
+  assert.equal(snapshot.guards[0].cycle.observations, undefined);
+  snapshot.guards[0].cycle.address = 'changed';
+  assert.equal(state.dynamicGuards[0].cycle.address, '192.0.2.1');
 });
 
 test('probe config snapshots keep evidence but omit provider and source payloads', () => {

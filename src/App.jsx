@@ -1144,7 +1144,7 @@ export default function App() {
     setConfirmDialog({
       open: true,
       title: `清空${label}`,
-      message: (scope === 'all' ? '将删除自动化执行、DNS 守护检查、故障事件、IP 使用、DNS 变更和审计历史。' : `将清理全部${label}，包括当前未显示的记录；其他类别不受影响。`)
+      message: (scope === 'all' ? '将删除自动化执行、DNS 守护检查、动态 IP 守护执行、故障事件、IP 使用、DNS 变更和审计历史。' : `将清理全部${label}，包括当前未显示的记录；其他类别不受影响。`)
         + '删除后不可恢复。' + (['all', 'incidents'].includes(scope) ? '已删除故障事件的历史回滚入口也将移除。' : '')
         + '正在执行、等待处理和故障恢复依赖的记录会保留。服务器、域名、IP 资产、规则配置及当前终端不受影响。',
       onConfirm: async () => {

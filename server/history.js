@@ -1,6 +1,6 @@
 export const HISTORY_RETENTION_DAYS = 7;
-export const HISTORY_KEYS = ['automationRuns', 'dnsGuardRuns', 'incidents', 'ipUsageRecords', 'dnsChanges', 'auditLogs'];
-export const HISTORY_STATE_KEYS = [...HISTORY_KEYS, 'ipLeases'];
+export const HISTORY_KEYS = ['automationRuns', 'dnsGuardRuns', 'incidents', 'ipUsageRecords', 'dnsChanges', 'auditLogs', 'dynamicGuardRuns'];
+export const HISTORY_STATE_KEYS = [...HISTORY_KEYS, 'ipLeases', 'dynamicGuards'];
 const ACTIVE_INCIDENTS = new Set(['observing', 'pending_approval', 'queued', 'waiting_for_ip', 'allocating', 'automating', 'dns_updating', 'verifying', 'stabilizing', 'rolling_back']);
 const ACTIVE_RUNS = new Set(['queued', 'running', 'paused', 'awaiting_input']);
 
@@ -38,10 +38,12 @@ export function pruneHistory(state, { all = false, scope = 'all', now = Date.now
   const referencedJobs = new Set(keptIncidents.map((item) => item.automationJobId).filter(Boolean));
   const activeLeaseIds = new Set((state.ipLeases || []).filter((lease) => ['locked', 'active'].includes(lease.status)
     && (Date.parse(lease.expiresAt) > now || protectedIncidents.has(lease.incidentId))).map((lease) => lease.id));
+  const activeDynamicRuns = new Set((state.dynamicGuards || []).map((guard) => guard.flow?.id).filter(Boolean));
   const isProtected = {
     incidents: (item) => protectedIncidents.has(item.id),
     automationRuns: (item) => activeJobIds.has(item.id) || ACTIVE_RUNS.has(item.status) || referencedJobs.has(item.id),
     dnsGuardRuns: () => false,
+    dynamicGuardRuns: (item) => item.status === 'processing' || activeDynamicRuns.has(item.id),
     ipUsageRecords: (item) => item.status === 'processing' || activeLeaseIds.has(item.leaseId) || keptIncidentIds.has(item.incidentId),
     dnsChanges: (item) => item.status === 'recovery_pending' || referencedChanges.has(item.id) || keptIncidentIds.has(item.incidentId),
     auditLogs: () => false

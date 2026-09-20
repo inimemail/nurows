@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { startPolling } from '../shared/polling.js';
+import DynamicGuardWorkspace from './DynamicGuardWorkspace.jsx';
 
 const PROVIDERS = {
   huawei: '华为云 DNS', aliyun: '阿里云 DNS', tencent: '腾讯云 DNSPod API', dnspod: 'DNSPod 独立 API', cloudflare: 'Cloudflare',
@@ -35,7 +36,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
   const guardSyncingRef = useRef(new Set());
   const [guardSyncingIds, setGuardSyncingIds] = useState([]);
   const sections = tab === 'probes'
-    ? [['nodes', '探针节点'], ['targets', '检查目标'], ['guards', 'DNS 守护'], ['policies', '切换策略'], ['incidents', '故障事件']]
+    ? [['nodes', '探针节点'], ['targets', '检查目标'], ['guards', 'DNS 守护'], ['dynamic', '动态 IP 守护'], ['policies', '切换策略'], ['incidents', '故障事件']]
     : tab === 'pools'
       ? [['assets', 'IP 资产'], ['pools', '备用池'], ['usage', '使用记录']]
       : tab === 'telegram'
@@ -46,7 +47,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
     ? state.orchestrationSummary.checkingGuards : state.dnsGuards?.some((guard) => Boolean(guard.cycle)));
 
   useEffect(() => {
-    if (historyClearing) return;
+    if (historyClearing || active === 'dynamic') return;
     let cancelled = false;
     const stop = startPolling(async (signal) => {
       const data = await api(`/api/orchestration/status/${active}`, { signal });
@@ -230,7 +231,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       </header>
       <div className="ops-tabs" role="tablist">{sections.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setSection(key)}>{label}<em>{countFor(key, state)}</em></button>)}</div>
       <div className="surface ops-content">
-        {renderSection(active, { state, onHistoryCleanup, onOpenHistory, historyClearing, guardSyncingIds, openCreate, openEdit, duplicateRecord, checkTargetNow, checkGuardNow, syncGuardRemote, openGuardRemote, openGuardView: setGuardView, openProbeInstall, rotateProbe, executeIncident, rollbackIncident, requestIncidentDelete: (id) => setIncidentCleanup({ open: true, id, all: false, busy: false }), requestIncidentClear: () => onHistoryCleanup('incidents'), openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
+        {active === 'dynamic' ? <DynamicGuardWorkspace onState={onState} api={api} toast={toast} Dialog={Dialog} onOpenHistory={onOpenHistory} /> : renderSection(active, { state, onHistoryCleanup, onOpenHistory, historyClearing, guardSyncingIds, openCreate, openEdit, duplicateRecord, checkTargetNow, checkGuardNow, syncGuardRemote, openGuardRemote, openGuardView: setGuardView, openProbeInstall, rotateProbe, executeIncident, rollbackIncident, requestIncidentDelete: (id) => setIncidentCleanup({ open: true, id, all: false, busy: false }), requestIncidentClear: () => onHistoryCleanup('incidents'), openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
       </div>
 
       {editor.open ? <Dialog title={`${editor.value.id ? '编辑' : '新增'}${typeLabel(editor.type)}`} className="ops-editor-dialog" wide={editor.type !== 'target' && editor.type !== 'policy' && editor.type !== 'guard'} xwide={editor.type === 'target' || editor.type === 'policy' || editor.type === 'guard'} onClose={() => !editorBusy && closeEditor()} footer={<><div>{editor.value.id ? <button className="danger-text" disabled={editorBusy} onClick={remove}>删除</button> : null}</div><div className="dialog-actions"><button className="ghost" disabled={editorBusy} onClick={closeEditor}>取消</button><button className="primary" disabled={editorBusy} onClick={save}>{editorBusy ? (editor.type === 'binding' ? '写入远端中...' : '保存中...') : editor.type === 'guard' ? '保存规则' : '保存'}</button></div></>}>{renderEditor(editor.type, editor.value, (patch) => setEditor((current) => ({ ...current, value: { ...current.value, ...patch } })), state, api, toast)}</Dialog> : null}
@@ -525,7 +526,8 @@ function typeLabel(type) { return ({ probe: '探针', target: '检查目标', gu
 function normalizeDraft(type, value) { const draft = { ...structuredClone(EMPTY[type]), ...structuredClone(value) }; if (type === 'target') { delete draft.failureThreshold; delete draft.recoveryThreshold; } if (type === 'guard') { draft.sources = Array.isArray(draft.sources) ? draft.sources : []; draft.probeIds = Array.isArray(draft.probeIds) ? draft.probeIds : []; draft.poolIds = Array.isArray(draft.poolIds) ? draft.poolIds : []; } if (type === 'asset') draft.labels = (value.labels || []).join(', '); if (type === 'pool') { delete draft.alertChatIds; if (!['ordered', 'random'].includes(draft.selectionMode)) draft.selectionMode = 'ordered'; draft.assetIds = Array.isArray(draft.assetIds) ? draft.assetIds : []; draft.alertThresholds = Array.isArray(draft.alertThresholds) ? draft.alertThresholds : []; draft.alertBotIds = Array.isArray(draft.alertBotIds) ? draft.alertBotIds : []; } if (type === 'account') draft.credentials = {}; if (type === 'bot') { draft.name = value.name || ''; draft.token = ''; draft.userIds = (value.userIds || []).join('\n'); draft.rolesText = Object.entries(value.roles || {}).map(([id, role]) => `${id}=${role}`).join('\n'); } return draft; }
 function serializeDraft(type, value) { const draft = structuredClone(value); if (type === 'target') { delete draft.failureThreshold; delete draft.recoveryThreshold; } if (type === 'guard') { draft.sources = Array.isArray(draft.sources) ? draft.sources.filter((item) => item.domain?.trim()) : []; draft.probeIds = Array.isArray(draft.probeIds) ? draft.probeIds : []; draft.poolIds = Array.isArray(draft.poolIds) ? draft.poolIds : []; } if (type === 'asset') draft.labels = String(draft.labels || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); if (type === 'pool') { delete draft.alertChatIds; draft.alertThresholds = Array.isArray(draft.alertThresholds) ? draft.alertThresholds : []; draft.alertBotIds = Array.isArray(draft.alertBotIds) ? draft.alertBotIds : []; } if (type === 'bot') { draft.userIds = String(draft.userIds || '').split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean); draft.roles = Object.fromEntries(String(draft.rolesText || '').split(/\n+/).map((line) => line.split('=').map((part) => part.trim())).filter(([id, role]) => id && role)); } return draft; }
 function countFor(section, state) {
-  const key = { nodes: 'probes', targets: 'probeTargets', guards: 'dnsGuards', policies: 'failoverPolicies', incidents: 'incidents', bots: 'telegramBots', assets: 'ipAssets', pools: 'ipPools', usage: 'ipUsageRecords', accounts: 'dnsAccounts', bindings: 'dnsBindings', changes: 'dnsChanges' }[section];
+  if (section === 'dynamic') return state.dynamicGuardsCount ?? state.dynamicGuards?.length ?? 0;
+  const key = { nodes: 'probes', targets: 'probeTargets', guards: 'dnsGuards', dynamic: 'dynamicGuards', policies: 'failoverPolicies', incidents: 'incidents', bots: 'telegramBots', assets: 'ipAssets', pools: 'ipPools', usage: 'ipUsageRecords', accounts: 'dnsAccounts', bindings: 'dnsBindings', changes: 'dnsChanges' }[section];
   return state.orchestrationSummary?.counts[key] ?? state[key]?.length ?? 0;
 }
 function summary(tab, state) {

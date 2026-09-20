@@ -643,6 +643,14 @@ svg {
   padding-top: 10px;
 }
 
+.temporary-command-card span {
+  display: block;
+  margin-top: 5px;
+  font-size: 11px;
+}
+
+.command-composer-actions { flex-wrap: wrap; justify-content: flex-end; }
+
 .stack-card {
   width: 100%;
   padding: 12px;

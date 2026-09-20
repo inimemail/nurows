@@ -2106,6 +2106,7 @@ function getWorkspaceForUser(state, auth = null) {
       selectedProxyId: '',
       selectedServerIds: [],
       commandText: '',
+      temporaryCommandText: '',
       collapsedGroups: {},
       executionResults: [],
       lastExecutedCommand: '',
@@ -2127,6 +2128,7 @@ function getWorkspaceForUser(state, auth = null) {
       selectedProxyId: '',
       selectedServerIds: [],
       commandText: '',
+      temporaryCommandText: '',
       collapsedGroups: {},
       executionResults: [],
       lastExecutedCommand: '',
@@ -2148,6 +2150,8 @@ function getWorkspaceForUser(state, auth = null) {
       ? source.selectedServerIds.filter((item) => typeof item === 'string')
       : [],
     commandText: typeof source.commandText === 'string' ? source.commandText : '',
+    temporaryCommandText: typeof source.temporaryCommandText === 'string' ? source.temporaryCommandText
+      : (!source.selectedCommandId && typeof source.commandText === 'string' ? source.commandText : ''),
     collapsedGroups: source.collapsedGroups && typeof source.collapsedGroups === 'object'
       ? Object.fromEntries(
           Object.entries(source.collapsedGroups).filter(([, value]) => typeof value === 'boolean')
@@ -2207,6 +2211,8 @@ function normalizeWorkspaceInput(input = {}) {
       ? input.selectedServerIds.filter((item) => typeof item === 'string')
       : [],
     commandText: typeof input.commandText === 'string' ? input.commandText : '',
+    temporaryCommandText: typeof input.temporaryCommandText === 'string' ? input.temporaryCommandText
+      : (!input.selectedCommandId && typeof input.commandText === 'string' ? input.commandText : ''),
     collapsedGroups: input.collapsedGroups && typeof input.collapsedGroups === 'object'
       ? Object.fromEntries(
           Object.entries(input.collapsedGroups).filter(([, value]) => typeof value === 'boolean')

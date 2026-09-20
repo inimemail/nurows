@@ -344,6 +344,8 @@ function normalizeWorkspacePayload(workspace = {}) {
       ? workspace.selectedServerIds.filter((item) => typeof item === 'string')
       : [],
     commandText: typeof workspace.commandText === 'string' ? workspace.commandText : '',
+    temporaryCommandText: typeof workspace.temporaryCommandText === 'string' ? workspace.temporaryCommandText
+      : (!workspace.selectedCommandId && typeof workspace.commandText === 'string' ? workspace.commandText : ''),
     collapsedGroups: workspace.collapsedGroups && typeof workspace.collapsedGroups === 'object'
       ? Object.fromEntries(
           Object.entries(workspace.collapsedGroups).filter(([, value]) => typeof value === 'boolean')
@@ -409,6 +411,7 @@ export default function App() {
   const [selectedProxyId, setSelectedProxyId] = useState('');
   const [selectedServerIds, setSelectedServerIds] = useState([]);
   const [commandText, setCommandText] = useState('');
+  const [temporaryCommandText, setTemporaryCommandText] = useState('');
   const [automationTaskId, setAutomationTaskId] = useState('');
   const [automationDraft, setAutomationDraft] = useState(EMPTY_AUTOMATION_TASK);
   const [automationHosts, setAutomationHosts] = useState('');
@@ -538,9 +541,6 @@ export default function App() {
     }
     const selected = state.commands.find((item) => item.id === selectedCommandId);
     setCommandDraft(selected ? { ...selected } : { ...EMPTY_COMMAND });
-    if (selected?.command && !restoringWorkspaceRef.current) {
-      setCommandText(selected.command);
-    }
   }, [selectedCommandId, state.commands, editorDialog]);
 
   useEffect(() => {
@@ -558,15 +558,19 @@ export default function App() {
     if (selectedServerId && !state.servers.some((item) => item.id === selectedServerId)) {
       setSelectedServerId('');
     }
-    if (selectedCommandId && !state.commands.some((item) => item.id === selectedCommandId)) {
-      setSelectedCommandId('');
-    }
     if (selectedProxyId && !state.proxies.some((item) => item.id === selectedProxyId)) {
       setSelectedProxyId('');
     }
     setSelectedServerIds((current) => current.filter((id) => state.servers.some((item) => item.id === id)));
     setTerminalSessions((current) => current.filter((session) => state.servers.some((item) => item.id === session.serverId)));
   }, [state, selectedServerId, selectedCommandId, selectedProxyId, stateLoaded]);
+
+  useEffect(() => {
+    if (stateLoaded && selectedCommandId && !state.commands.some((item) => item.id === selectedCommandId)) {
+      setSelectedCommandId('');
+      setCommandText(temporaryCommandText);
+    }
+  }, [state.commands, selectedCommandId, stateLoaded, temporaryCommandText]);
 
   useEffect(() => {
     if (!terminalSessions.some((item) => item.id === activeTerminalId)) {
@@ -636,6 +640,7 @@ export default function App() {
           selectedProxyId,
           selectedServerIds,
           commandText,
+          temporaryCommandText,
           collapsedGroups,
           executionResults: workspaceExecutionResults,
           lastExecutedCommand,
@@ -659,6 +664,7 @@ export default function App() {
     selectedProxyId,
     selectedServerIds,
     commandText,
+    temporaryCommandText,
     collapsedGroups,
     workspaceExecutionResults,
     lastExecutedCommand,
@@ -1008,16 +1014,17 @@ export default function App() {
         Boolean(serverWorkspace.selectedCommandId) ||
         Boolean(serverWorkspace.selectedProxyId) ||
         serverWorkspace.selectedServerIds.length > 0 ||
-        Boolean(serverWorkspace.commandText);
+        Boolean(serverWorkspace.commandText) || Boolean(serverWorkspace.temporaryCommandText);
       if (hasServerWorkspace || !terminalSessions.length) {
         restoringWorkspaceRef.current = true;
         setTab(serverWorkspace.tab);
         setSearch(serverWorkspace.search);
         setSelectedServerId(serverWorkspace.selectedServerId);
-        setSelectedCommandId(serverWorkspace.selectedCommandId);
+        setSelectedCommandId('');
         setSelectedProxyId(serverWorkspace.selectedProxyId);
         setSelectedServerIds(serverWorkspace.selectedServerIds);
-        setCommandText(serverWorkspace.commandText);
+        setTemporaryCommandText(serverWorkspace.temporaryCommandText);
+        setCommandText(serverWorkspace.temporaryCommandText);
         setCollapsedGroups((current) => ({ ...current, ...serverWorkspace.collapsedGroups }));
         setExecutionResults(reconcileExecutionResults(serverWorkspace.executionResults));
         setLastExecutedCommand(serverWorkspace.lastExecutedCommand);
@@ -1498,10 +1505,27 @@ export default function App() {
     }
   }
 
+  function selectCommand(item = null) {
+    setSelectedCommandId(item?.id || '');
+    setCommandText(item ? item.command : temporaryCommandText);
+    closeAssetDrawerOnMobile();
+  }
+
+  function updateCommandText(value) {
+    setCommandText(value);
+    if (!selectedCommandId) setTemporaryCommandText(value);
+  }
+
+  function saveTemporaryCommandAsTemplate() {
+    if (!commandText.trim() || selectedCommandId) return;
+    setCommandDraft({ ...EMPTY_COMMAND, command: commandText });
+    setEditorDialog({ open: true, type: 'command', mode: 'create' });
+  }
+
   async function saveCommand() {
     try {
       setActionBusy('saveCommand', true);
-      const payload = { ...commandDraft, command: commandDraft.command || commandText };
+      const payload = { ...commandDraft };
       const data = await api(commandDraft.id ? `/api/commands/${commandDraft.id}` : '/api/commands', {
         method: commandDraft.id ? 'PUT' : 'POST',
         body: JSON.stringify(payload),
@@ -1509,6 +1533,7 @@ export default function App() {
       });
       setState(data.state);
       setSelectedCommandId(commandDraft.id || data.item?.id || '');
+      setCommandText(payload.command);
       closeEditor();
       toast(commandDraft.id ? '命令已保存' : '命令已新增');
     } catch (error) {
@@ -1536,7 +1561,8 @@ export default function App() {
       }
       setState(nextState);
       if (targetIds.includes(selectedCommandId)) {
-        setSelectedCommandId(nextState.commands[0]?.id || '');
+        setSelectedCommandId('');
+        setCommandText(temporaryCommandText);
       }
       setExecutionResults([]);
       closeEditor();
@@ -1611,16 +1637,14 @@ export default function App() {
     }
 
     if (type === 'command') {
-      const targetIds = selectedCommandId ? [selectedCommandId] : state.commands.map((item) => item.id);
+      const targetIds = selectedCommandId ? [selectedCommandId] : [];
       if (!targetIds.length) {
         toast('暂无可删除命令');
         return;
       }
       openConfirm({
-        title: selectedCommandId ? '删除命令' : '全部删除命令',
-        message: selectedCommandId
-          ? '确认删除当前命令吗？'
-          : `当前未选择命令，确认删除全部 ${targetIds.length} 条命令吗？`,
+        title: '删除命令',
+        message: '确认删除当前命令吗？',
         onConfirm: () => removeCommand(targetIds)
       });
       return;
@@ -2407,9 +2431,9 @@ export default function App() {
                     if (requireSelectedItem('command')) {
                       openEditor('command', selectedCommand);
                     }
-                  }}>编辑</button>
+                  }} disabled={!selectedCommand}>编辑</button>
                   <button className="primary" onClick={() => resetCreateDraft('command')}>新增</button>
-                  <button className="ghost danger-text-button" onClick={() => confirmSidebarDelete('command')}>删除</button>
+                  <button className="ghost danger-text-button" disabled={!selectedCommand} onClick={() => confirmSidebarDelete('command')}>删除</button>
                 </>
               ) : null}
               {tab === 'automation' ? (
@@ -2522,15 +2546,19 @@ export default function App() {
 
           {tab === 'commands' ? (
             <div className="panel-scroll stack-list">
+              <button
+                className={'stack-card temporary-command-card ' + (!selectedCommandId ? 'selected' : '')}
+                aria-pressed={!selectedCommandId}
+                onClick={() => selectCommand()}
+              >
+                <strong>临时命令</strong>
+                <span>直接输入，无需保存模板</span>
+              </button>
               {filteredCommands.map((item) => (
                 <button
                   key={item.id}
                   className={'stack-card ' + (selectedCommandId === item.id ? 'selected' : '')}
-                  onClick={() => {
-                    setSelectedCommandId(item.id);
-                    setCommandText(item.command);
-                    closeAssetDrawerOnMobile();
-                  }}
+                  onClick={() => selectCommand(item)}
                 >
                   <strong>{item.name}</strong>
                 </button>
@@ -2644,16 +2672,19 @@ export default function App() {
                 <div className="workspace-head">
                   <div>
                     <strong>批量执行中心</strong>
-                    <span>命令</span>
+                    <span>{selectedCommand ? selectedCommand.name : '临时命令 · 无需保存模板'}</span>
                   </div>
-                  <button className={`primary ${busy.runCommand ? 'is-loading' : ''}`} onClick={openRunCommandConfirm} disabled={!canRunCommand || busy.runCommand}>
-                    {busy.runCommand ? '执行中...' : '执行到已选服务器'}
-                  </button>
+                  <div className="toolbar command-composer-actions">
+                    {!selectedCommandId ? <button className="ghost" onClick={saveTemporaryCommandAsTemplate} disabled={!commandText.trim()}>保存为模板</button> : null}
+                    <button className={`primary ${busy.runCommand ? 'is-loading' : ''}`} onClick={openRunCommandConfirm} disabled={!canRunCommand || busy.runCommand}>
+                      {busy.runCommand ? '执行中...' : '执行到已选服务器'}
+                    </button>
+                  </div>
                 </div>
                 <textarea
                   rows={7}
                   value={commandText}
-                  onChange={(event) => setCommandText(event.target.value)}
+                  onChange={(event) => updateCommandText(event.target.value)}
                   placeholder="例如：systemctl status nginx && df -h"
                 />
               </div>
@@ -3055,7 +3086,6 @@ export default function App() {
                 onChange={(event) => {
                   const value = event.target.value;
                   setCommandDraft((current) => ({ ...current, command: value }));
-                  setCommandText(value);
                 }}
               />
             </Field>

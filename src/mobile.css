@@ -147,6 +147,10 @@
   .command-board { height: auto; overflow: visible; }
   .command-composer, .command-target-board, .command-result-board { min-width: 0; flex: 0 0 auto; }
   .command-composer textarea { min-height: 160px; }
+  .command-composer .workspace-head { flex-wrap: wrap; }
+  .command-composer-actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .command-composer-actions > button { min-width: 0; white-space: normal; }
+  .command-composer-actions > button:only-child { grid-column: 1 / -1; }
   .target-summary { min-height: 96px; }
   .result-list { gap: 12px; }
   .result-card { min-width: 0; padding: 14px; }

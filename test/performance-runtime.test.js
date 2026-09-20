@@ -76,6 +76,27 @@ test('dynamic probe status reads only readiness fields and skips credential payl
   assert.equal(ctx.readDynamicProbeStatus()[0].tokenEnc, undefined);
 });
 
+test('guard history pages project only requested summaries without copying evidence or unrelated histories', () => {
+  const runs = Array.from({ length: 25 }, (_, index) => ({ id: String(index), guardId: index % 2 ? 'other' : 'g', status: 'healthy', message: 'x'.repeat(1000),
+    get checks() { assert.fail('probe evidence loaded'); }, get commandOutput() { assert.fail('command output loaded'); } }));
+  const cachedState = { dnsGuardRuns: runs, dynamicGuardRuns: runs, get auditLogs() { assert.fail('audit loaded'); } };
+  const ctx = runtime(['readGuardHistoryPage'], { ensureStorage() {}, cachedState });
+  for (const key of ['dnsGuardRuns', 'dynamicGuardRuns']) {
+    const first = ctx.readGuardHistoryPage(key, 'g');
+    assert.equal(first.total, 13);
+    assert.equal(first.pages, 2);
+    assert.equal(first.records.length, 8);
+    assert.equal(first.records[0].message.length, 180);
+    first.records[0].status = 'changed';
+    assert.equal(runs[0].status, 'healthy');
+    const last = ctx.readGuardHistoryPage(key, 'g', 99);
+    assert.equal(last.page, 1);
+    assert.equal(last.records.length, 5);
+    assert.equal(ctx.readGuardHistoryPage(key, 'missing').records.length, 0);
+  }
+  assert.throws(() => ctx.readGuardHistoryPage('auditLogs', 'g'), /不支持/);
+});
+
 test('dynamic status polling excludes command bodies, probe secrets, and unrelated histories before cloning', () => {
   const state = { dynamicGuards: [{ id: 'guard', commandEnc: { cipher: 'secret'.repeat(5000) }, cycle: { id: 'cycle', address: '192.0.2.1', startedAt: 1, observations: { p: { ok: true } } } }],
     probes: [{ id: 'p', tokenEnc: 'probe-secret' }], telegramBots: [{ id: 'bot', tokenEnc: 'bot-secret' }] };
@@ -211,7 +232,7 @@ test('maintenance removes expired cache entries while preserving active limits a
   const sessions = new Map([['old', { expiresAt: old }], ['active', { expiresAt: future }]]);
   const authAttempts = new Map([['old', { until: old }], ['active', { until: future }]]);
   const pending = new Map([['old', { expiresAt: old }], ['active', { expiresAt: future }]]);
-  runtime(['cleanupExpiredSessions', 'cleanupRuntimeCaches'], { sessions, sessionSockets: { revoke: (token) => sessions.delete(token) }, authAttempts, probeRegistrationAttempts: new Map(), telegramRuntime: { pending } }).cleanupRuntimeCaches();
+  runtime(['cleanupExpiredSessions', 'cleanupRuntimeCaches'], { sessions, sessionSockets: { revoke: (token) => sessions.delete(token) }, webSocketTickets: { cleanup() {} }, authAttempts, probeRegistrationAttempts: new Map(), telegramRuntime: { pending } }).cleanupRuntimeCaches();
   for (const map of [sessions, authAttempts, pending]) assert.deepEqual([...map.keys()], ['active']);
 });
 
@@ -245,6 +266,26 @@ test('progress updates never overlap and still send completion if the job finish
   release();
   await final;
   assert.equal(cleared, true);
+});
+
+test('Telegram progress timers are isolated by bot and stop after task permission is revoked', async () => {
+  const ticks = [], cleared = [], calls = [];
+  const bots = ['one', 'two'].map((id) => ({ id, enabled: true, automationTaskIds: ['t'] }));
+  const timers = new Map();
+  const ctx = runtime(['scheduleTelegramProgress'], {
+    telegramRuntime: { progressTimers: timers }, commandJobs: new Map([['job', { status: 'running', results: [] }]]),
+    readState: () => ({ telegramBots: bots }), telegramAuthorized: (bot) => bot?.enabled, telegramMenuAllowed: () => true,
+    setInterval(callback) { ticks.push(callback); return ticks.length; }, clearInterval(id) { cleared.push(id); },
+    telegramCall: async (...args) => calls.push(args)
+  });
+  for (const bot of bots) ctx.scheduleTelegramProgress('chat', 'message', 'job', 'token', { botId: bot.id, taskId: 't' });
+  assert.equal(timers.size, 2);
+  assert.equal(cleared.length, 0);
+  bots[0].automationTaskIds = [];
+  await ticks[0](); await ticks[1]();
+  assert.deepEqual(cleared, [1]);
+  assert.equal(calls.length, 1);
+  assert.equal(timers.size, 1);
 });
 
 test('workspace polling does not overlap slow requests and cleanup aborts pending I/O', async (t) => {

@@ -11,6 +11,7 @@ services:
       PORT: ${PORT:-38471}
       SQLITE_DB_PATH: ${SQLITE_DB_PATH:-/app/data/app.db}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-}
     ports:
       - "${PORT:-38471}:${PORT:-38471}"
     volumes:

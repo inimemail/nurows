@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { telegramScopes } from '../shared/telegram-permissions.js';
 import { execFile as execFileCallback } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -85,6 +86,7 @@ export function orchestrationDefaults() {
 export function normalizeOrchestrationState(parsed = {}) {
   const defaults = orchestrationDefaults();
   const normalized = Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
+  normalized.telegramBots = normalized.telegramBots.map((bot) => ({ ...bot, menuScopes: telegramScopes(bot), menuScopeVersion: 2 }));
   normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, alertChatIds, ...pool }) => pool);
   normalized.ipPools = normalized.ipPools.map((pool) => {
     const hasAlertConfig = ['alertEnabled', 'alertThresholds', 'alertBotIds'].some((key) => Object.prototype.hasOwnProperty.call(pool, key));
@@ -164,6 +166,50 @@ export function sanitizeOrchestrationState(state = {}) {
   };
 }
 
+function probeHeartbeatExpired(probe, now) {
+  return probe.enabled !== false && probe.status === 'online'
+    && (!Number.isFinite(Date.parse(probe.lastSeenAt)) || now - Date.parse(probe.lastSeenAt) > PROBE_OFFLINE_AFTER_MS);
+}
+
+function recordProbePresence(state, probe, status, now) {
+  const previousStatus = probe.status;
+  probe.status = status;
+  probe.updatedAt = new Date(now).toISOString();
+  const event = { probeId: probe.id, name: probe.name, region: probe.region, carrier: probe.carrier,
+    status, previousStatus, at: probe.updatedAt, lastSeenAt: probe.lastSeenAt,
+    alertBotIds: [...(probe.alertBotIds || [])] };
+  pushAudit(state, `probe.${status}`, 'probe', probe.id, `${probe.name} ${status === 'online' ? '上线' : '离线'}`, 'system');
+  return event;
+}
+
+function markProbeOnline(state, probe, now = Date.now()) {
+  const events = [];
+  if (probe.enabled === false) {
+    Object.assign(probe, { status: 'online', lastSeenAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString() });
+    return events;
+  }
+  // A heartbeat can arrive between expiry scans; preserve both transitions.
+  if (probeHeartbeatExpired(probe, now)) events.push(recordProbePresence(state, probe, 'offline', now));
+  probe.lastSeenAt = new Date(now).toISOString();
+  if (probe.status !== 'online') events.push(recordProbePresence(state, probe, 'online', now));
+  probe.updatedAt = probe.lastSeenAt;
+  return events;
+}
+
+export function scanOfflineProbes(deps, now = Date.now()) {
+  const probes = deps.readState(['probes']).probes || [];
+  if (!probes.some((probe) => probeHeartbeatExpired(probe, now))) return [];
+  const events = [];
+  deps.updateState((draft) => {
+    for (const probe of draft.probes || []) {
+      if (probeHeartbeatExpired(probe, now)) events.push(recordProbePresence(draft, probe, 'offline', now));
+    }
+    return draft;
+  });
+  deps.notifyProbePresence?.(events);
+  return events;
+}
+
 export function registerProbePublicRoutes(app, deps) {
   const agentDir = path.join(process.cwd(), 'probe-agent');
   app.get('/probe/agent.py', (_req, res) => res.sendFile(path.join(agentDir, 'nurossh_probe.py')));
@@ -175,6 +221,7 @@ export function registerProbePublicRoutes(app, deps) {
     const token = String(req.body.token || '');
     let agentSecret = '';
     let found = false;
+    let presenceEvents = [];
     if (!deps.allowProbeRegistration(req.ip)) return res.status(429).json({ error: '注册请求过于频繁，请稍后再试' });
     const state = deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === probeId);
@@ -182,14 +229,13 @@ export function registerProbePublicRoutes(app, deps) {
       agentSecret = randomSecret(32);
       probe.agentSecretHash = hashSecret(agentSecret);
       probe.registeredAt = nowIso();
-      probe.status = 'online';
-      probe.lastSeenAt = nowIso();
-      probe.updatedAt = nowIso();
+      presenceEvents = markProbeOnline(draft, probe);
       found = true;
       pushAudit(draft, 'probe.register', 'probe', probe.id, '探针完成注册或重新注册', 'agent');
       return draft;
     });
     if (!found) return res.status(401).json({ error: '注册凭证无效、已使用或已过期' });
+    deps.notifyProbePresence?.(presenceEvents);
     deps.onProbeAvailable?.(probeId, state);
     res.json({ ok: true, probeId, agentSecret, heartbeatInterval: 20 });
   });
@@ -245,13 +291,18 @@ export function registerProbePublicRoutes(app, deps) {
       && Number.isFinite(lastSeenAt)
       && Date.now() - lastSeenAt < 15000;
     let state = auth.state;
+    let presenceEvents = [];
     if (!heartbeatFresh) {
       state = deps.updateState((draft) => {
         const probe = draft.probes.find((item) => item.id === auth.probe.id);
-        if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), agentVersion, updatedAt: nowIso() });
+        if (probe) {
+          presenceEvents = markProbeOnline(draft, probe);
+          probe.agentVersion = agentVersion;
+        }
         return draft;
       });
     }
+    deps.notifyProbePresence?.(presenceEvents);
     deps.onProbeAvailable?.(auth.probe.id, state);
     res.json({ ok: true, serverTime: nowIso() });
   });
@@ -266,9 +317,13 @@ export function registerProbePublicRoutes(app, deps) {
     let acceptedGuardReport = false;
     let acceptedTargetReport = false;
     let acceptedDynamicReport = false;
+    let presenceEvents = [];
     const state = deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === auth.probe.id);
-      if (probe) Object.assign(probe, { status: 'online', lastSeenAt: nowIso(), agentVersion: cleanText(req.body.version, 40) || probe.agentVersion, updatedAt: nowIso() });
+      if (probe) {
+        presenceEvents = markProbeOnline(draft, probe);
+        probe.agentVersion = cleanText(req.body.version, 40) || probe.agentVersion;
+      }
       acceptedDynamicReport = acceptDynamicReports(draft, auth.probe.id, reports);
       const targetById = new Map((draft.probeTargets || []).map((item) => [item.id, item]));
       const guardCheckById = new Map();
@@ -350,6 +405,7 @@ export function registerProbePublicRoutes(app, deps) {
       draft.incidents = draft.incidents.slice(0, 500);
       return draft;
     });
+    deps.notifyProbePresence?.(presenceEvents);
     for (const incidentId of createdIncidentIds) deps.onIncidentCreated?.(incidentId);
     for (const incidentId of [...new Set(retryIncidentIds)]) deps.onIncidentCreated?.(incidentId);
     for (const incidentId of [...new Set(notifyIncidentIds)]) deps.notifyIncident?.(incidentId);
@@ -366,7 +422,7 @@ export function registerProbePublicRoutes(app, deps) {
 export function registerOrchestrationRoutes(app, deps) {
   app.get('/api/orchestration/status/:section', (req, res) => {
     const views = {
-      nodes: ['probes'], targets: ['probes', 'probeTargets', 'failoverPolicies'],
+      nodes: ['probes', 'telegramBots'], targets: ['probes', 'probeTargets', 'failoverPolicies'],
       guards: ['probes', 'dnsGuards', 'dnsGuardRuns', 'dnsAccounts', 'ipPools', 'telegramBots'],
       policies: ['failoverPolicies', 'ipPools', 'dnsBindings', 'telegramBots', 'automationTasks'], incidents: ['incidents', 'probeTargets'],
       assets: ['ipAssets', 'ipPools', 'telegramBots'], pools: ['ipPools', 'ipAssets', 'telegramBots'],
@@ -489,6 +545,9 @@ export function registerOrchestrationRoutes(app, deps) {
       }
       if (key === 'telegramBots') {
         for (const pool of draft.ipPools) pool.alertBotIds = (pool.alertBotIds || []).filter((id) => id !== req.params.id);
+        for (const probe of draft.probes) probe.alertBotIds = (probe.alertBotIds || []).filter((id) => id !== req.params.id);
+        for (const guard of draft.dnsGuards) guard.alertBotIds = (guard.alertBotIds || []).filter((id) => id !== req.params.id);
+        for (const guard of draft.dynamicGuards || []) guard.botIds = (guard.botIds || []).filter((id) => id !== req.params.id);
       }
       pushAudit(draft, `${key}.delete`, key, req.params.id, '删除记录', req.auth.username);
       return draft;
@@ -707,6 +766,24 @@ export function registerOrchestrationRoutes(app, deps) {
     const result = await rollbackIncident(req.params.id, deps, req.auth.username);
     res.json({ ok: true, ...result, state: deps.sanitizeState(deps.readState(), req.auth) });
   }));
+}
+
+export function clearFinishedIncidents(deps, ids, actor = 'system') {
+  const selected = new Set(ids);
+  let removed = 0, kept = 0;
+  deps.updateState((draft) => {
+    const protectedIds = new Set(draft.ipLeases.filter((lease) => ['locked', 'active'].includes(lease.status)).map((lease) => lease.incidentId));
+    for (const change of draft.dnsChanges) if (change.status === 'recovery_pending') protectedIds.add(change.incidentId);
+    const removable = new Set(draft.incidents.filter((item) => selected.has(item.id)
+      && !item.executionId && ['succeeded', 'recovered', 'rolled_back', 'cancelled', 'done', 'failed'].includes(item.status)
+      && !protectedIds.has(item.id)).map((item) => item.id));
+    removed = removable.size; kept = selected.size - removed;
+    draft.incidents = draft.incidents.filter((item) => !removable.has(item.id));
+    draft.ipLeases = draft.ipLeases.filter((lease) => !removable.has(lease.incidentId));
+    pushAudit(draft, 'incident.clear', 'incident', '', `清理 ${removed} 条已结束事件，保留 ${kept} 条`, actor);
+    return draft;
+  });
+  return { removed, kept };
 }
 
 export async function syncDnsBinding(bindingId, deps, actor = 'system') {
@@ -931,6 +1008,9 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
 }
 
 export async function saveDnsBindingConfiguration(input, bindingId, deps, actor = 'system') {
+  const resolveDnsBinding = deps.resolveDnsBinding || resolveManagedDnsZone;
+  const readDnsRecord = deps.readDnsRecord || getDnsRecord;
+  const writeDnsRecord = deps.writeDnsRecord || updateDnsRecord;
   const state = deps.readState();
   const existing = bindingId ? state.dnsBindings.find((item) => item.id === bindingId) : null;
   if (bindingId && !existing) throw new Error('解析绑定不存在');
@@ -939,14 +1019,19 @@ export async function saveDnsBindingConfiguration(input, bindingId, deps, actor 
   const account = state.dnsAccounts.find((item) => item.id === candidate.accountId && item.enabled !== false);
   if (!account) throw new Error('DNS 账号不可用');
   const credentials = decryptCredentials(account, deps);
-  const { zone, normalizedBinding } = await resolveManagedDnsZone(state, account, credentials, candidate);
-  const remote = await getDnsRecord(account, credentials, zone, withoutProviderRecordIds(normalizedBinding));
+  const { zone, normalizedBinding } = await resolveDnsBinding(state, account, credentials, candidate);
+  const remote = await readDnsRecord(account, credentials, zone, withoutProviderRecordIds(normalizedBinding));
   const providerBinding = {
     ...normalizedBinding,
     providerRecordId: remote.recordId ? String(remote.recordId) : '',
     providerRecordIds: cleanTexts(remote.recordIds || (remote.recordId ? [remote.recordId] : []), 500)
   };
   const beforeValues = normalizeDnsRecordValues(remote.values, candidate.recordType);
+  if (Array.isArray(input.expectedValues)) {
+    if (!sameStringSet(beforeValues, input.expectedValues)) throw new Error('远程记录已变化，请重新读取并确认');
+    const current = deps.readState(['dnsBindings']).dnsBindings.find((item) => item.id === bindingId);
+    if (bindingId && (!current || current.updatedAt !== existing?.updatedAt || current.accountId !== existing?.accountId || current.domain !== existing?.domain || current.recordType !== existing?.recordType)) throw new Error('解析配置已变化，请重新读取并确认');
+  }
   const configuredValues = await resolveBindingSources(candidate);
   const desiredValues = dnsBindingDesiredValues(candidate, beforeValues, configuredValues);
   if (!desiredValues.length) throw new Error(`${candidate.domain} 没有可写入的 ${candidate.recordType} 记录值`);
@@ -955,13 +1040,13 @@ export async function saveDnsBindingConfiguration(input, bindingId, deps, actor 
   let writeStarted = false;
   try {
     writeStarted = true;
-    providerRecordIds = await updateDnsRecord(account, credentials, zone, providerBinding, desiredValues);
-    const verified = await getDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || '', providerRecordIds });
+    providerRecordIds = await writeDnsRecord(account, credentials, zone, providerBinding, desiredValues);
+    const verified = await readDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || '', providerRecordIds });
     const verifiedValues = normalizeDnsRecordValues(verified.values, candidate.recordType);
     if (!sameStringSet(verifiedValues, desiredValues)) throw new Error('服务商返回的记录值与保存内容不一致');
   } catch (error) {
     if (writeStarted) {
-      try { await updateDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || providerBinding.providerRecordId, providerRecordIds: providerRecordIds || providerBinding.providerRecordIds }, beforeValues); }
+      try { await writeDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || providerBinding.providerRecordId, providerRecordIds: providerRecordIds || providerBinding.providerRecordIds }, beforeValues); }
       catch (rollbackError) { throw new Error(`远端保存失败，且自动恢复失败：${cleanText(error.message, 240)}；${cleanText(rollbackError.message, 240)}`); }
     }
     throw new Error(`远端保存失败，已恢复原记录：${cleanText(error.message, 300)}`);
@@ -994,7 +1079,7 @@ export async function saveDnsBindingConfiguration(input, bindingId, deps, actor 
       return draft;
     });
   } catch (error) {
-    try { await updateDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || providerBinding.providerRecordId, providerRecordIds: providerRecordIds || providerBinding.providerRecordIds }, beforeValues); }
+    try { await writeDnsRecord(account, credentials, zone, { ...providerBinding, providerRecordId: providerRecordIds?.[0] || providerBinding.providerRecordId, providerRecordIds: providerRecordIds || providerBinding.providerRecordIds }, beforeValues); }
     catch (rollbackError) { throw new Error(`本地保存失败，且远端自动恢复失败：${cleanText(error.message, 240)}；${cleanText(rollbackError.message, 240)}`); }
     throw new Error(`本地保存失败，远端已恢复原记录：${cleanText(error.message, 300)}`);
   }
@@ -2168,7 +2253,7 @@ function targetCompletedCheckSince(target, probes, requestedAt) {
 function normalizeResource(key, input = {}, existing = null, deps) {
   const now = nowIso();
   const base = { id: existing?.id || cleanId(input.id) || uuidv4(), createdAt: existing?.createdAt || now, updatedAt: now };
-  if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', tokenEnc: existing?.tokenEnc || null, agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
+  if (key === 'probes') return { ...base, name: requiredText(input.name, '探针名称'), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), maxConcurrency: clampNumber(input.maxConcurrency, 1, 1000, 100), enabled: input.enabled !== false, alertBotIds: cleanIds(input.alertBotIds ?? existing?.alertBotIds, 50), status: existing?.status || 'pending', lastSeenAt: existing?.lastSeenAt || '', tokenHash: existing?.tokenHash || '', tokenEnc: existing?.tokenEnc || null, agentSecretHash: existing?.agentSecretHash || '', tokenExpiresAt: existing?.tokenExpiresAt || '', tokenUsedAt: existing?.tokenUsedAt || '', registeredAt: existing?.registeredAt || '', agentVersion: existing?.agentVersion || '' };
   if (key === 'probeTargets') {
     const address = validateHost(input.address, Boolean(input.allowPrivate));
     const checkType = input.checkType === 'tcp' ? 'tcp' : 'ping';
@@ -2227,6 +2312,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
       maxActiveIps: clampNumber(input.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50),
       probeIds,
       poolIds,
+      alertBotIds: cleanIds(input.alertBotIds ?? existing?.alertBotIds, 50),
       checkType: input.checkType === 'tcp' ? 'tcp' : 'ping',
       port: clampNumber(input.port, 1, 65535, 443),
       interval: clampNumber(input.interval, 10, 86400, 30),
@@ -2292,7 +2378,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     else if (!tokenHash && existing?.tokenEnc) {
       try { tokenHash = hashSecret(deps.decryptSecret(existing.tokenEnc)); } catch (_error) { tokenHash = ''; }
     }
-    return { ...base, name: requiredText(input.name || 'Telegram 机器人', '机器人名称'), tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, tokenHash, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: [], roles: normalizeRoles(input.roles), menuScopes: cleanTexts(input.menuScopes, 30), automationTaskIds: cleanIds(input.automationTaskIds, 500), lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
+    return { ...base, name: requiredText(input.name || 'Telegram 机器人', '机器人名称'), tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, tokenHash, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: [], roles: normalizeRoles(input.roles), menuScopes: telegramScopes({ ...input, menuScopeVersion: input.menuScopeVersion ?? existing?.menuScopeVersion }), menuScopeVersion: 2, automationTaskIds: cleanIds(input.automationTaskIds, 500), lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
   }
   throw new Error('未知资源类型');
 }
@@ -2394,6 +2480,9 @@ export function createDnsBinding(state, accountId, domain, recordType, values, a
 }
 
 function ensureResourceReferences(state, key, item, deps) {
+  if (key === 'probes' && item.alertBotIds.some((id) => !state.telegramBots.some((bot) => bot.id === id))) {
+    throw new Error('探针通知关联的 Telegram 机器人不存在');
+  }
   const exists = (collection, id) => !id || state[collection]?.some((entry) => entry.id === id);
   if (key === 'probeTargets') {
     if (!item.probeIds.length || item.probeIds.some((id) => !exists('probes', id))) throw new Error('至少关联一个有效探针');
@@ -2401,6 +2490,7 @@ function ensureResourceReferences(state, key, item, deps) {
   }
   if (key === 'dnsGuards') {
     if (!exists('dnsAccounts', item.accountId)) throw new Error('DNS 账号不存在');
+    if (item.alertBotIds.some((id) => !exists('telegramBots', id))) throw new Error('DNS 守护通知关联的 Telegram 机器人不存在');
     if (!item.probeIds.length || item.probeIds.some((id) => !exists('probes', id))) throw new Error('至少关联一个有效探针');
     if (item.poolIds.some((id) => !exists('ipPools', id))) throw new Error('关联的备用池不存在');
   }
@@ -3439,6 +3529,7 @@ function normalizeDnsGuardState(value = {}) {
     maxActiveIps: clampNumber(value.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50),
     probeIds: cleanIds(value.probeIds, 500),
     poolIds: cleanIds(value.poolIds, 100),
+    alertBotIds: cleanIds(value.alertBotIds, 50),
     checkType: value.checkType === 'tcp' ? 'tcp' : 'ping',
     port: clampNumber(value.port, 1, 65535, 443),
     interval: clampNumber(value.interval, 10, 86400, 30),

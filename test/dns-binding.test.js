@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { addIpsToPool, createDnsBinding, createPoolWithIps, dnsBindingDesiredValues, dnsRecordLayout, normalizeRecordName, setDnsBindingIps, withRecordName } from '../server/orchestration.js';
+import { addIpsToPool, createDnsBinding, createPoolWithIps, dnsBindingDesiredValues, dnsRecordLayout, normalizeRecordName, setDnsBindingIps, withRecordName, orchestrationDefaults, saveDnsBindingConfiguration } from '../server/orchestration.js';
 
 test('derives the root record from a complete domain', () => {
   assert.equal(withRecordName({ domain: 'example.com' }, 'example.com').recordName, '@');
@@ -54,4 +54,34 @@ test('applies DNS editor values according to the selected remote update mode', (
   assert.deepEqual(dnsBindingDesiredValues({ ...base, updateMode: 'managed_replace' }, ['1.1.1.1', '2.2.2.2'], ['3.3.3.3']), ['1.1.1.1', '3.3.3.3']);
   assert.deepEqual(dnsBindingDesiredValues({ ...base, updateMode: 'replace' }, ['1.1.1.1'], ['4.4.4.4']), ['4.4.4.4']);
   assert.deepEqual(dnsBindingDesiredValues({ recordType: 'TXT' }, ['old'], ['new']), ['new']);
+});
+
+test('confirmed DNS writes reject stale remote values and edited configuration before any provider write', async () => {
+  for (const scenario of ['match', 'changed-remote', 'changed-config', 'create-empty', 'create-existing']) {
+    let state = { ...orchestrationDefaults(), dnsAccounts: [{ id: 'a', enabled: true, provider: 'cloudflare', credentialsEnc: 'synthetic' }],
+      dnsBindings: [{ id: 'b', name: '解析', accountId: 'a', domain: 'test.example.com', recordType: 'A', updatedAt: 'before' }] };
+    let remote = scenario === 'create-empty' ? [] : ['192.0.2.1'], reads = 0, writes = 0;
+    const creating = scenario.startsWith('create-');
+    const bindingId = creating ? '' : 'b';
+    const input = { ...state.dnsBindings[0], backupIps: ['192.0.2.2'], updateMode: 'replace', expectedValues: creating ? [] : ['192.0.2.1'] };
+    if (creating) { state.dnsBindings = []; delete input.id; }
+    const deps = {
+      readState: () => structuredClone(state), updateState(fn) { state = fn(structuredClone(state)); return state; },
+      decryptSecret: () => '{}', resolveDnsBinding: async (_state, _account, _credentials, binding) => ({ zone: { name: 'example.com' }, normalizedBinding: binding }),
+      readDnsRecord: async () => {
+        reads++;
+        if (scenario === 'changed-config') state.dnsBindings[0].updatedAt = 'edited';
+        return { values: scenario === 'changed-remote' ? ['192.0.2.3'] : [...remote] };
+      },
+      writeDnsRecord: async (_account, _credentials, _zone, _binding, values) => { writes++; remote = values; return ['record']; }
+    };
+    const promise = saveDnsBindingConfiguration(input, bindingId, deps, 'test');
+    if (scenario === 'match' || scenario === 'create-empty') {
+      await promise; assert.equal(reads, 2); assert.equal(writes, 1);
+      assert.deepEqual(state.dnsBindings[0].currentValues, ['192.0.2.2']);
+    } else {
+      await assert.rejects(promise, /已变化/); assert.equal(reads, 1); assert.equal(writes, 0);
+      assert.deepEqual(remote, ['192.0.2.1']);
+    }
+  }
 });

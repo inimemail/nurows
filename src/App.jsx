@@ -2,6 +2,8 @@
 import { Terminal } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { parsePerServerInputLines } from '../shared/command-input.js';
+import { openAuthenticatedWebSocket } from '../shared/websocket-client.js';
+import { workspaceSearchPlaceholder } from '../shared/workspace-search.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
 import { HISTORY_LABELS } from './HistoryRecords.jsx';
@@ -405,6 +407,7 @@ export default function App() {
   const [state, setState] = useState({ groups: [], servers: [], commands: [], proxies: [], automationTasks: [], telegram: {}, probes: [], probeTargets: [], failoverPolicies: [], incidents: [], ipAssets: [], ipPools: [], ipLeases: [], ipUsageRecords: [], dnsAccounts: [], dnsZones: [], dnsBindings: [], dnsChanges: [], auditLogs: [], telegramBots: [] });
   const [tab, setTab] = useState('servers');
   const [search, setSearch] = useState('');
+  const [workspaceSearchScope, setWorkspaceSearchScope] = useState(null);
   const [busy, setBusy] = useState({});
   const [selectedServerId, setSelectedServerId] = useState('');
   const [selectedCommandId, setSelectedCommandId] = useState('');
@@ -928,14 +931,7 @@ export default function App() {
   const canClearCommandResults = hasCommandResults || isCommandRunning;
   const canRunCommand = !isCommandRunning && selectedServerIds.length > 0 && String(commandText || '').trim().length > 0;
   const workspaceFullscreenActive = Boolean(terminalFullscreenOpen && tab === 'servers' && activeTerminal);
-  const searchPlaceholder =
-    tab === 'servers'
-      ? '搜索服务器名称、IP'
-      : tab === 'commands'
-        ? '搜索命令名称'
-        : tab === 'automation'
-          ? '搜索自动化任务'
-        : '搜索代理名称、地址';
+  const searchPlaceholder = workspaceSearchPlaceholder(tab, workspaceSearchScope?.tab === tab ? workspaceSearchScope.section : undefined);
 
   useEffect(() => {
     if (!activeTerminal) {
@@ -1041,6 +1037,9 @@ export default function App() {
           restoringWorkspaceRef.current = false;
         }, 0);
       }
+      const telegramSection = new URLSearchParams(window.location.search).get('tgSection');
+      const telegramTab = { guards: 'probes', dynamic: 'probes', probes: 'probes', targets: 'probes', policies: 'probes', incidents: 'probes', assets: 'pools', pools: 'pools', usage: 'pools', dns: 'dns', automation: 'automation' }[telegramSection];
+      if (telegramTab) setTab(telegramTab);
       setStateLoaded(true);
     } catch (error) {
       setStateLoaded(true);
@@ -2366,7 +2365,7 @@ export default function App() {
         <div className="top-actions">
           <div className="search-shell">
             <SearchIcon />
-            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={searchPlaceholder} />
+            <input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={searchPlaceholder} aria-label={searchPlaceholder} />
           </div>
           <button
             className="ghost theme-toggle"
@@ -2594,7 +2593,7 @@ export default function App() {
         </aside>
 
           <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-main' : '')}>
-          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
+          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} search={search} onSearchChange={setSearch} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
           {tab === 'automation' ? (
             <section className="automation-board">
               <div className="automation-page-head surface">
@@ -4282,9 +4281,8 @@ function TerminalWorkspace({
       }
       return '/ws/terminal?serverId=' + encodeURIComponent(session.serverId) + '&terminalId=' + encodeURIComponent(session.id || session.serverId);
     };
-    const createSocket = () => new WebSocket(protocol + '//' + window.location.host + buildSocketPath());
-    const socket = createSocket();
-    socketRef.current = socket;
+    const controller = new AbortController();
+    let socket;
 
     setReady(false);
     setCanReconnect(false);
@@ -4302,69 +4300,76 @@ function TerminalWorkspace({
       terminal.writeln('\r\n[系统] ' + message);
     }
 
-    socket.addEventListener('open', () => {
-      if (!cleanedUp) {
-        setStatus('握手中...');
-      }
-    });
-
-    socket.addEventListener('message', (event) => {
-      const message = JSON.parse(event.data);
-      if (message.type === 'ready') {
-        setStatus('已连接');
-        setReady(true);
-        setCanReconnect(false);
-        if (connectNonce) {
-          terminal.writeln('\r\n[系统] 已重新连接。');
+    const connect = async () => {
+      socket = await openAuthenticatedWebSocket(protocol + '//' + window.location.host + buildSocketPath(), { signal: controller.signal });
+      if (cleanedUp) { socket.close(); return; }
+      socketRef.current = socket;
+      socket.addEventListener('open', () => {
+        if (!cleanedUp) {
+          setStatus('握手中...');
         }
-        resizeRef.current();
-      }
-      if (message.type === 'history') {
-        terminal.reset();
-        terminal.write(String(message.data || ''));
-        resizeRef.current();
-      }
-      if (message.type === 'output') {
-        terminal.write(message.data);
-      }
-      if (message.type === 'state') {
-        if (message.awaitingInput) {
-          setStatus('等待输入');
-        } else if (message.status === 'done') {
-          setStatus('已完成');
-        } else if (message.status === 'error') {
-          setStatus('执行失败');
-        }
-      }
-      if (message.type === 'error') {
-        handleDisconnect(message.message || '连接失败，按任意键重连');
-      }
-      if (message.type === 'closed') {
-        if (disconnectHandled || cleanedUp) {
-          return;
-        }
-        disconnectHandled = true;
-        setReady(false);
-        setCanReconnect(false);
-        setStatus(mode === 'command-job' ? '会话已结束' : '连接已关闭');
-        terminal.writeln('\r\n[系统] ' + (mode === 'command-job' ? '当前执行会话已结束。' : '连接已关闭，按任意键重连'));
-      }
-    });
+      });
 
-    socket.addEventListener('close', () => {
-      handleDisconnect(mode === 'command-job' ? '连接已断开，按任意键恢复执行会话' : '连接已关闭，按任意键重连');
-    });
+      socket.addEventListener('message', (event) => {
+        const message = JSON.parse(event.data);
+        if (message.type === 'ready') {
+          setStatus('已连接');
+          setReady(true);
+          setCanReconnect(false);
+          if (connectNonce) {
+            terminal.writeln('\r\n[系统] 已重新连接。');
+          }
+          resizeRef.current();
+        }
+        if (message.type === 'history') {
+          terminal.reset();
+          terminal.write(String(message.data || ''));
+          resizeRef.current();
+        }
+        if (message.type === 'output') {
+          terminal.write(message.data);
+        }
+        if (message.type === 'state') {
+          if (message.awaitingInput) {
+            setStatus('等待输入');
+          } else if (message.status === 'done') {
+            setStatus('已完成');
+          } else if (message.status === 'error') {
+            setStatus('执行失败');
+          }
+        }
+        if (message.type === 'error') {
+          handleDisconnect(message.message || '连接失败，按任意键重连');
+        }
+        if (message.type === 'closed') {
+          if (disconnectHandled || cleanedUp) {
+            return;
+          }
+          disconnectHandled = true;
+          setReady(false);
+          setCanReconnect(false);
+          setStatus(mode === 'command-job' ? '会话已结束' : '连接已关闭');
+          terminal.writeln('\r\n[系统] ' + (mode === 'command-job' ? '当前执行会话已结束。' : '连接已关闭，按任意键重连'));
+        }
+      });
 
-    socket.addEventListener('error', () => {
-      handleDisconnect('连接失败，按任意键重连');
-    });
+      socket.addEventListener('close', () => {
+        handleDisconnect(mode === 'command-job' ? '连接已断开，按任意键恢复执行会话' : '连接已关闭，按任意键重连');
+      });
+
+      socket.addEventListener('error', () => {
+        handleDisconnect('终端通道连接失败，请检查反向代理是否启用 WebSocket；按任意键重连');
+      });
+    };
+    connect().catch((error) => { if (!cleanedUp) handleDisconnect(error.message || '连接失败，按任意键重连'); });
 
     return () => {
       cleanedUp = true;
+      controller.abort();
       if (socketRef.current === socket) {
         socketRef.current = null;
       }
-      socket.close();
+      socket?.close();
     };
   }, [connectNonce, isLiveSession, mode, session.jobId, session.serverId, session.title]);
 

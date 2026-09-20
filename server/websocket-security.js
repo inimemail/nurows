@@ -1,3 +1,7 @@
+import { randomBytes } from 'node:crypto';
+
+const socketPaths = new Set(['/ws/terminal', '/ws/command-job']);
+
 export function isAllowedWebSocketOrigin(req, { allowedOrigins = [], production = true, devPort = '5173' } = {}) {
   try {
     const raw = req.headers.origin;
@@ -55,7 +59,7 @@ export function createSessionSocketRegistry(sessions, now = Date.now) {
   };
 }
 
-export function createWebSocketUpgradeHandler({ wss, getSession, sessionSockets, originOptions }) {
+export function createWebSocketUpgradeHandler({ wss, getSession, sessionSockets, originOptions, tickets }) {
   return (req, socket, head) => {
     const reject = (status) => {
       try { socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); } catch {}
@@ -63,14 +67,54 @@ export function createWebSocketUpgradeHandler({ wss, getSession, sessionSockets,
     };
     try {
       const url = new URL(req.url || '', 'http://localhost');
-      if (!['/ws/terminal', '/ws/command-job'].includes(url.pathname)) { reject('404 Not Found'); return; }
-      if (!isAllowedWebSocketOrigin(req, originOptions)) { reject('403 Forbidden'); return; }
+      if (!socketPaths.has(url.pathname)) { reject('404 Not Found'); return; }
+      const protocols = String(req.headers['sec-websocket-protocol'] || '').split(',').map((value) => value.trim());
+      const proof = protocols.find((value) => value.startsWith('nurossh-ticket.'));
+      if (!proof && !isAllowedWebSocketOrigin(req, originOptions)) { reject('403 Forbidden'); return; }
       const session = getSession(req);
       if (!session) { reject('401 Unauthorized'); return; }
+      if (proof && !tickets?.consume(proof.slice('nurossh-ticket.'.length), req, session, url.pathname)) { reject('403 Forbidden'); return; }
       wss.handleUpgrade(req, socket, head, (ws) => {
         // A session may be revoked between accepting and completing a handshake.
         if (sessionSockets.bind(ws, session)) wss.emit('connection', ws, req);
       });
     } catch { reject('400 Bad Request'); }
+  };
+}
+// A same-origin authenticated HTTP request proves the browser's public origin,
+// even when a TLS-terminating proxy rewrites the upstream Host or protocol.
+export function createWebSocketTickets(sessions, { now = Date.now, ttl = 30000, limit = 4096 } = {}) {
+  const tickets = new Map();
+  function cleanup() {
+    for (const [token, entry] of tickets) {
+      if (entry.expiresAt > now()) break;
+      tickets.delete(token);
+    }
+  }
+  return {
+    cleanup,
+    issue(req, session, path, originOptions) {
+      const site = req.headers['sec-fetch-site'];
+      const origin = req.headers.origin;
+      let validOrigin = false;
+      try { const parsed = new URL(origin); validOrigin = ['https:', 'http:'].includes(parsed.protocol) && parsed.origin === origin; } catch {}
+      if (!session || sessions.get(session.token) !== session || session.expiresAt <= now()) throw Object.assign(new Error('登录已失效，请重新登录'), { statusCode: 401 });
+      if (!socketPaths.has(path) || !validOrigin || req.headers['x-nurossh-websocket'] !== '1'
+        || (site ? site !== 'same-origin' : !isAllowedWebSocketOrigin(req, originOptions))) {
+        throw Object.assign(new Error('终端连接来源校验失败，请从面板页面重试'), { statusCode: 403 });
+      }
+      cleanup();
+      while (tickets.size >= limit) tickets.delete(tickets.keys().next().value);
+      const ticket = randomBytes(32).toString('hex');
+      tickets.set(ticket, { session, path, origin, expiresAt: now() + ttl });
+      return ticket;
+    },
+    consume(ticket, req, session, path) {
+      const entry = tickets.get(ticket);
+      tickets.delete(ticket);
+      return Boolean(entry && entry.expiresAt > now() && entry.session === session
+        && sessions.get(session.token) === session && session.expiresAt > now()
+        && entry.path === path && entry.origin === req.headers.origin);
+    }
   };
 }

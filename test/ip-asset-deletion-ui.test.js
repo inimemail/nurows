@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import { transformSync } from 'esbuild';
+import * as telegramPermissions from '../shared/telegram-permissions.js';
+import * as workspaceSearch from '../shared/workspace-search.js';
 
 const compiled = transformSync(fs.readFileSync(new URL('../src/OrchestrationWorkspace.jsx', import.meta.url), 'utf8'), { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
 function harness(api) {
@@ -20,6 +22,8 @@ function harness(api) {
     if (path === 'react') return { useState, useRef: (initial) => useState({ current: initial })[0], useEffect() {}, useMemo: (fn) => fn() };
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
     if (path.endsWith('polling.js')) return { startPolling() {} };
+    if (path.endsWith('telegram-permissions.js')) return telegramPermissions;
+    if (path.endsWith('workspace-search.js')) return workspaceSearch;
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     throw Error(path);
   } });

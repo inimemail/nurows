@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { transformSync } from 'esbuild';
+import * as workspaceSearch from '../shared/workspace-search.js';
 
 // Exercise the actual component handlers with deterministic hooks and deferred
 // HTTP responses. No server, production data, DOM, or user command is started.
@@ -14,9 +15,9 @@ const fixture = () => ({ guards: [{ id: 'one', name: '测试 VPS', domain: 'test
   todayCount: 1, maxDaily: 5, checkType: 'ping', port: 443, interval: 30, checkRounds: 3, attemptsPerRound: 3, timeout: 5,
   waitTimeout: 120, queryInterval: 5, commandTimeout: 90, cooldown: 0 }],
   probes: [{ id: 'p1', name: '测试探针', enabled: true, status: 'online', lastSeenAt: new Date().toISOString() }], bots: [] });
-function harness(api, data = fixture()) {
+function harness(api, data = fixture(), initialSearch = '') {
   const slots = [], effects = [];
-  let cursor = 0, tree, poll;
+  let cursor = 0, tree, poll, search = initialSearch;
   const hooks = {
     useState(initial) {
       const index = cursor++;
@@ -24,6 +25,7 @@ function harness(api, data = fixture()) {
       return [slots[index], (next) => { slots[index] = typeof next === 'function' ? next(slots[index]) : next; }];
     },
     useRef(initial) { const index = cursor++; slots[index] ||= { current: initial }; return slots[index]; },
+    useMemo(fn) { return fn(); },
     useEffect(callback) { effects.push(callback); }
   };
   const jsx = (type, props) => ({ type, props });
@@ -33,11 +35,12 @@ function harness(api, data = fixture()) {
       if (name === 'react') return hooks;
       if (name === 'react/jsx-runtime') return { jsx, jsxs: jsx, Fragment: 'fragment' };
       if (name.endsWith('polling.js')) return { startPolling(callback) { poll = callback; return () => {}; } };
+      if (name.endsWith('workspace-search.js')) return workspaceSearch;
       if (name.endsWith('.css')) return {};
       if (name.endsWith('HistoryRecords.jsx')) return () => null;
       throw Error(`Unexpected import ${name}`);
     } });
-  const render = () => { cursor = 0; effects.length = 0; tree = module.exports.default({ api, toast() {}, Dialog: 'dialog', onOpenHistory() {} }); return tree; };
+  const render = () => { cursor = 0; effects.length = 0; tree = module.exports.default({ api, toast() {}, Dialog: 'dialog', onOpenHistory() {}, search }); return tree; };
   render();
   function nodes(value = tree) {
     if (Array.isArray(value)) return value.flatMap((item) => nodes(item));
@@ -46,8 +49,23 @@ function harness(api, data = fixture()) {
   }
   const text = (value) => Array.isArray(value) ? value.map(text).join('') : value && typeof value === 'object' ? text(value.props?.children) : String(value ?? '');
   const button = (label) => nodes().find((node) => node.type === 'button' && text(node) === label);
-  return { render, nodes, button, data: () => slots[0], startPoll: () => { effects[1](); }, poll: () => poll(new AbortController().signal) };
+  return { render, nodes, button, data: () => slots[0], setSearch(value) { search = value; render(); }, startPoll: () => { effects[1](); }, poll: () => poll(new AbortController().signal) };
 }
+
+test('dynamic guard search filters displayed tasks and leaves editor and polling data complete', () => {
+  const data = fixture();
+  data.guards.push({ ...data.guards[0], id: 'two', name: '另一台', domain: 'other.example.com', currentIp: '192.0.2.2' });
+  const view = harness(() => assert.fail('search must not request the server'), data, ' 192.0.2.2 ');
+  assert.equal(view.nodes().filter((node) => node.props?.className === 'dynamic-card').length, 1);
+  view.button('编辑').props.onClick(); view.render();
+  assert.ok(view.nodes().some((node) => node.type === 'input' && node.props.value === 'other.example.com'));
+  assert.equal(view.data().guards.length, 2);
+  view.setSearch('absent');
+  assert.equal(view.nodes().filter((node) => node.props?.className === 'dynamic-card').length, 0);
+  assert.ok(view.nodes().some((node) => node.type === 'strong' && node.props.children === '没有匹配的动态 IP 守护任务'));
+  view.setSearch('');
+  assert.equal(view.nodes().filter((node) => node.props?.className === 'dynamic-card').length, 2);
+});
 
 test('waiting task remains editable, cannot manually duplicate a pending change, and saving keeps the encrypted command', async () => {
   const calls = [];

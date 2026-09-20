@@ -4,8 +4,11 @@ import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { HISTORY_RETENTION_DAYS, HISTORY_KEYS, HISTORY_STATE_KEYS, pruneHistory } from './history.js';
+import { createTelegramWorkspace } from './telegram-workspace.js';
+import { createTelegramActions } from './telegram-actions.js';
+import { telegramScopeAllowed } from '../shared/telegram-permissions.js';
 import { createDynamicGuardService, registerDynamicGuardRoutes, sanitizeDynamicGuard } from './dynamic-guard.js';
-import { createSessionSocketRegistry, createWebSocketUpgradeHandler } from './websocket-security.js';
+import { createSessionSocketRegistry, createWebSocketUpgradeHandler, createWebSocketTickets } from './websocket-security.js';
 import { commandJobDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
 import express from 'express';
 import cors from 'cors';
@@ -27,6 +30,8 @@ import {
   orchestrationDefaults,
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
+  scanOfflineProbes,
+  clearFinishedIncidents,
   requestWaitingDnsGuardChecks,
   requestWaitingDnsGuardProbeChecks,
   requestWaitingIncidentRechecks,
@@ -73,6 +78,11 @@ const TERMINAL_REATTACH_GRACE_MS = 1000 * 60 * 60 * 12;
 const TERMINAL_HISTORY_LIMIT = 1000 * 1000;
 const sessions = new Map();
 const sessionSockets = createSessionSocketRegistry(sessions);
+const webSocketTickets = createWebSocketTickets(sessions);
+const webSocketOriginOptions = {
+  production: process.env.NODE_ENV === 'production', devPort: DEV_SERVER_PORT,
+  allowedOrigins: String(process.env.ALLOWED_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean)
+};
 const terminalSessions = new Map();
 const authAttempts = new Map();
 const probeRegistrationAttempts = new Map();
@@ -127,6 +137,7 @@ const orchestrationDeps = {
   runIncident: (incidentId, encryptionKey) => runIncidentWorkflow(incidentId, orchestrationDeps, encryptionKey),
   notifyIncident: notifyIncidentViaTelegram,
   notifyDnsGuard: notifyDnsGuardViaTelegram,
+  notifyProbePresence: notifyProbePresenceViaTelegram,
   onTelegramChanged: () => restartTelegramPolling(),
   onIpAvailabilityChanged: () => { requestWaitingIncidentRechecks(orchestrationDeps); requestWaitingDnsGuardChecks(orchestrationDeps); runDueDnsGuards(orchestrationDeps).catch(() => {}); },
   onDnsGuardChanged: (guardId) => runDueDnsGuards(orchestrationDeps, guardId).catch(() => {}),
@@ -139,6 +150,16 @@ const dynamicGuardService = createDynamicGuardService({
   readState, updateState, updateDynamicGuardState, encryptSecret, decryptSecret, readDynamicGuard, readDynamicGuardSchedule, readDynamicProbeStatus,
   notifyDynamicGuard: notifyDynamicGuardViaTelegram,
   logError: (error) => console.error('Dynamic IP guard:', error.message)
+});
+
+const telegramActions = createTelegramActions({ ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus }, dynamicGuardService);
+const telegramWorkspace = createTelegramWorkspace({
+  readState, readGuardHistoryPage, invoke: telegramActions, call: telegramCall, authorized: telegramAuthorized,
+  clearFinishedIncidents: (ids, actor) => clearFinishedIncidents(orchestrationDeps, ids, actor),
+  role: (settings, from, chat) => resolveTelegramRole(null, settings, from, chat),
+  liveJob: (id) => commandJobs.get(id), cancelJob: (id) => { const job = commandJobs.get(id); if (job?.type !== 'automation') throw new Error('任务已结束或不存在'); cancelCommandJob(job); },
+  publicUrl: /^https?:\/\//i.test(process.env.PUBLIC_APP_URL || '') ? process.env.PUBLIC_APP_URL : '',
+  cancelLegacy: (settings, chat, from) => telegramRuntime.pending.delete(telegramSessionKey(chat, from, settings))
 });
 
 function scheduleDnsGuardRetry(guardId) {
@@ -217,6 +238,9 @@ cleanupExpiredSessions();
 
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
+  // This authenticated endpoint verifies browser Fetch Metadata and Origin itself;
+  // upstream Host rewriting must not reject it before that check can run.
+  if (req.method === 'POST' && req.path === '/api/auth/ws-ticket') { next(); return; }
   const origin = String(req.headers.origin || '');
   if (origin) {
     try {
@@ -255,6 +279,11 @@ app.get('/api/auth/status', (req, res) => {
     authenticated: Boolean(session),
     username: session?.username || ''
   });
+});
+
+app.post('/api/auth/ws-ticket', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ticket: webSocketTickets.issue(req, req.auth, req.body?.path, webSocketOriginOptions) });
 });
 
 app.post('/api/auth/setup', (req, res) => {
@@ -985,11 +1014,8 @@ app.use((error, _req, res, _next) => {
 });
 
 server.on('upgrade', createWebSocketUpgradeHandler({
-  wss, getSession: getSessionFromRequest, sessionSockets,
-  originOptions: {
-    production: process.env.NODE_ENV === 'production', devPort: DEV_SERVER_PORT,
-    allowedOrigins: String(process.env.ALLOWED_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean)
-  }
+  wss, getSession: getSessionFromRequest, sessionSockets, tickets: webSocketTickets,
+  originOptions: webSocketOriginOptions
 }));
 
 wss.on('connection', (ws, req) => {
@@ -1132,6 +1158,8 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, HOST, () => {
   cleanupHistoryRecords();
   restartTelegramPolling();
+  checkProbePresence();
+  setInterval(() => telegramWorkspace.cleanup(), 60000).unref();
   resumePendingIncidents();
   dynamicGuardService.tick();
   setInterval(() => { try { dynamicGuardService.tick(); } catch (error) { console.error('Dynamic IP guard:', error.message); } }, 1000).unref();
@@ -1139,6 +1167,7 @@ server.listen(PORT, HOST, () => {
   processReadyDnsGuards(orchestrationDeps).catch(() => {});
   setInterval(() => runDueDnsGuards(orchestrationDeps).catch(() => {}), 5000).unref();
   setInterval(cleanupRuntimeCaches, 60000).unref();
+  setInterval(checkProbePresence, 10000).unref();
   setInterval(cleanupHistoryRecords, 60 * 60 * 1000).unref();
   console.log(`NuroSSH server running at http://localhost:${PORT}`);
 });
@@ -1689,6 +1718,7 @@ function cleanupExpiredSessions() {
 
 function cleanupRuntimeCaches() {
   cleanupExpiredSessions();
+  webSocketTickets.cleanup();
   const now = Date.now();
   for (const cache of [authAttempts, probeRegistrationAttempts]) {
     for (const [key, entry] of cache) if (entry.until <= now) cache.delete(key);
@@ -1956,6 +1986,19 @@ function readDynamicGuardHistory(id) {
   ensureStorage();
   // Read-only route projection; the response serializer never mutates records.
   return (cachedState?.dynamicGuardRuns || []).filter((run) => run.guardId === id);
+}
+
+function readGuardHistoryPage(key, guardId, requestedPage = 0) {
+  if (!['dnsGuardRuns', 'dynamicGuardRuns'].includes(key)) throw new Error('不支持的守护记录类型');
+  ensureStorage();
+  const matches = (cachedState?.[key] || []).filter((run) => run.guardId === guardId);
+  const pages = Math.max(1, Math.ceil(matches.length / 8));
+  const page = Math.min(pages - 1, Math.max(0, Math.trunc(Number(requestedPage)) || 0));
+  // Project only one page before cloning; large probe evidence and API output
+  // stay in the cache and are never copied just to display a history summary.
+  const records = matches.slice(page * 8, page * 8 + 8).map(({ id, startedAt, finishedAt, status, message }) =>
+    ({ id, startedAt, finishedAt, status, message: String(message || '').slice(0, 180) }));
+  return { records, page, pages, total: matches.length };
 }
 
 // This private writer only permits mutations of dynamic guards and, when
@@ -2447,6 +2490,36 @@ function waitForAutomationJob(jobId, timeoutSeconds = 1800) {
   });
 }
 
+function checkProbePresence() {
+  try { scanOfflineProbes(orchestrationDeps); }
+  catch (error) { console.error('Probe presence:', error.message); }
+}
+
+function notifyProbePresenceViaTelegram(events) {
+  const selectedEvents = events.filter((event) => event.alertBotIds?.length);
+  if (!selectedEvents.length) return;
+  const { telegramBots = [] } = readState(['telegramBots']);
+  const bots = new Map(telegramBots.filter((bot) => bot.enabled !== false && bot.tokenEnc).map((bot) => [bot.id, bot]));
+  // Send each batch in order without delaying heartbeats or waiting on Telegram.
+  void (async () => {
+    for (const event of selectedEvents) {
+      const label = event.status === 'offline' ? '探针离线' : event.previousStatus === 'offline' ? '探针恢复上线' : '探针上线';
+      const text = `${label}：${event.name || event.probeId}\n地区 / 线路：${[event.region, event.carrier].filter(Boolean).join(' / ') || '未填写'}\n时间：${event.at}\n最后心跳：${event.lastSeenAt || '无'}${event.status === 'offline' ? '\n超过 90 秒未收到心跳' : ''}`;
+      for (const botId of new Set(event.alertBotIds)) {
+        const bot = bots.get(botId);
+        if (!bot) continue;
+        let token;
+        try { token = decryptSecret(bot.tokenEnc); } catch { continue; }
+        for (const chatId of new Set(bot.userIds || [])) {
+          try {
+            await telegramCall(token, 'sendMessage', { chat_id: chatId, text }, { signal: AbortSignal.timeout(10000) });
+          } catch { /* Notification failures must not interfere with probe processing. */ }
+        }
+      }
+    }
+  })();
+}
+
 function notifyIncidentViaTelegram(incidentId) {
   const state = readState();
   const incident = state.incidents?.find((item) => item.id === incidentId);
@@ -2475,19 +2548,20 @@ async function notifyDynamicGuardViaTelegram(guard, message) {
 }
 
 function notifyDnsGuardViaTelegram(guardId) {
-  const state = readState();
-  const guard = state.dnsGuards?.find((item) => item.id === guardId);
-  if (!guard) return;
+  const guard = readState(['dnsGuards']).dnsGuards?.find((item) => item.id === guardId);
+  if (!guard?.alertBotIds?.length) return;
+  const selectedBotIds = new Set(guard.alertBotIds);
+  const state = readState(['dnsGuardRuns', 'telegramBots']);
   const latestRun = state.dnsGuardRuns?.find((item) => item.guardId === guardId);
   const removed = latestRun?.failedValues || [];
   if (!removed.length) return;
   const remaining = guard.currentValues?.length || 0;
   const text = `DNS 守护：${guard.name}\n域名：${guard.domain} · ${guard.recordType}\n已删除不健康 IP（${removed.length} 个）：${removed.join(', ')}\n当前活动 IP：${remaining} 个（上限 ${guard.maxActiveIps || 50} 个）\n${guard.message || ''}`;
-  for (const settings of (state.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc && telegramMenuAllowed(bot, 'probes'))) {
+  for (const settings of (state.telegramBots || []).filter((bot) => selectedBotIds.has(bot.id) && bot.enabled !== false && bot.tokenEnc)) {
     let token = '';
     try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
     for (const chatId of [...new Set(settings.userIds || [])]) {
-      telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '立即检查', callback_data: `guard_check:${guard.id}` }], [{ text: '探针管理', callback_data: 'menu:probes' }]] } }).catch(() => {});
+      telegramCall(token, 'sendMessage', { chat_id: chatId, text, ...(telegramMenuAllowed(settings, 'guards') ? { reply_markup: { inline_keyboard: [[{ text: '立即检查', callback_data: `guard_check:${guard.id}` }], [{ text: 'DNS 守护', callback_data: 'menu:guards' }]] } } : {}) }, { signal: AbortSignal.timeout(10000) }).catch(() => {});
     }
   }
 }
@@ -2578,8 +2652,7 @@ function telegramAuthorized(settings, from, chat) {
 }
 
 function telegramMenuAllowed(settings, scope) {
-  const scopes = Array.isArray(settings?.menuScopes) ? settings.menuScopes : [];
-  return !scopes.length || scopes.includes(scope);
+  return telegramScopeAllowed(settings, scope);
 }
 
 function telegramPendingIsFresh(pending) {
@@ -2590,9 +2663,9 @@ function telegramApiUrl(token, method) {
   return `https://api.telegram.org/bot${token}/${method}`;
 }
 
-async function telegramCall(token, method, body = {}) {
+async function telegramCall(token, method, body = {}, { signal } = {}) {
   const response = await fetch(telegramApiUrl(token, method), {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: signal || AbortSignal.timeout(15000)
   });
   const payload = await response.json();
   if (!payload.ok) throw new Error(payload.description || 'Telegram API error');
@@ -2608,25 +2681,60 @@ function telegramAutomationTasks(state, settings) {
   return state.automationTasks.filter((item) => allowed.includes(item.id));
 }
 
-function telegramSessionKey(chat, from) {
-  return `${String(chat?.id || '')}:${String(from?.id || '')}`;
+function telegramSessionKey(chat, from, settings) {
+  return `${String(settings?.id || '')}:${String(chat?.id || '')}:${String(from?.id || '')}`;
+}
+
+function telegramLegacyScope(action, pending) {
+  if (['confirm', 'task', 'run', 'canceljob'].includes(action)) return 'automation';
+  if (action === 'confirm_write') return telegramLegacyScope(pending?.action || '', null);
+  if (action.startsWith('asset')) return 'assets';
+  if (action.startsWith('pool')) return 'pools';
+  if (action.startsWith('dns')) return 'dns';
+  if (action.startsWith('guard')) return 'guards';
+  if (action.startsWith('incident')) return 'incidents';
+  return '';
 }
 
 async function handleTelegramUpdate(update, token, botSettings = null) {
-  const state = readState();
   if (!botSettings) return;
-  const settings = botSettings;
+  let settings = readState(['telegramBots']).telegramBots.find((bot) => bot.id === botSettings.id);
   const message = update.message;
   const callback = update.callback_query;
   const from = message?.from || callback?.from;
   const chat = message?.chat || callback?.message?.chat;
   if (!telegramAuthorized(settings, from, chat)) return;
+  if (await telegramWorkspace.handle(update, token, settings)) return;
+  let state = callback ? null : readState();
   const chatId = chat.id;
-  const sessionKey = telegramSessionKey(chat, from);
+  const sessionKey = telegramSessionKey(chat, from, settings);
+  const activePending = telegramRuntime.pending.get(sessionKey);
+  if (activePending && !telegramPendingIsFresh(activePending)) telegramRuntime.pending.delete(sessionKey);
   if (callback) {
     await telegramCall(token, 'answerCallbackQuery', { callback_query_id: callback.id });
+    settings = readState(['telegramBots']).telegramBots.find((bot) => bot.id === botSettings.id);
+    if (!telegramAuthorized(settings, from, chat)) return;
+    state = readState();
     const [action, value] = String(callback.data || '').split(':');
     const pending = telegramRuntime.pending.get(sessionKey);
+    if (pending && !telegramPendingIsFresh(pending)) {
+      telegramRuntime.pending.delete(sessionKey);
+      return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '输入已过期，请重新操作。' });
+    }
+    const scope = telegramLegacyScope(action, pending);
+    if (action !== 'menu' && action !== 'cancel') {
+      if (!scope || !telegramMenuAllowed(settings, scope)) return telegramPermissionDenied(token, chatId);
+      if (!telegramCanOperate(state, settings, from, chat)) return telegramPermissionDenied(token, chatId);
+      if (scope === 'automation') {
+        const taskId = action === 'task' ? value : pending?.taskId || state.automationRuns?.find((run) => run.id === value)?.taskId;
+        if (!settings.automationTaskIds?.includes(taskId)) return telegramPermissionDenied(token, chatId);
+      }
+      if (['confirm', 'confirm_write', 'dns_create_confirm'].includes(action) && (!pending || pending.confirmMessageId !== callback.message?.message_id)) {
+        return telegramCall(token, 'sendMessage', { chat_id: chatId, text: '确认已过期，请重新操作。' });
+      }
+      if (['confirm', 'confirm_write', 'dns_create_confirm'].includes(action)) telegramRuntime.pending.delete(sessionKey);
+    }
+    if (['asset_add', 'pool_add', 'pool_create', 'pool_alert', 'dns_create', 'dns_add', 'dns_replace', 'task', 'menu', 'cancel'].includes(action)) telegramRuntime.pending.delete(sessionKey);
     if (pending && !telegramPendingIsFresh(pending)) telegramRuntime.pending.delete(sessionKey);
     if (action === 'menu') {
       if (value === 'root') return sendTelegramMenu(token, chatId, settings);
@@ -2805,7 +2913,7 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
       const job = startAutomationTask(task, pending.hosts, state, undefined);
       telegramRuntime.pending.delete(sessionKey);
       const sent = await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已启动：${task.name}\n总数：${job.results.length}\n并发：${job.concurrency}`, reply_markup: { inline_keyboard: [[{ text: '取消任务', callback_data: `canceljob:${job.id}` }]] } });
-      scheduleTelegramProgress(chatId, sent.message_id, job.id, token);
+      scheduleTelegramProgress(chatId, sent.message_id, job.id, token, { botId: settings.id, from, chat, taskId: task.id });
       return;
     }
     if (action === 'confirm_write' && pending?.addresses) {
@@ -2891,11 +2999,20 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
     telegramRuntime.pending.delete(sessionKey);
     return;
   }
+  if (pending) {
+    const scope = pending.taskId ? 'automation' : telegramLegacyScope(pending.action || '', null);
+    if (!scope || !telegramMenuAllowed(settings, scope) || !telegramCanOperate(state, settings, from, chat)
+      || (pending.taskId && !settings.automationTaskIds?.includes(pending.taskId))) {
+      telegramRuntime.pending.delete(sessionKey);
+      return telegramPermissionDenied(token, chatId);
+    }
+  }
   if (pending?.awaitingHosts && text) {
     const hosts = [...new Set(text.split(/[\s,，;；]+/).filter(Boolean))].slice(0, 5000);
     pending.hosts = hosts; pending.awaitingHosts = false;
     telegramRuntime.pending.set(sessionKey, pending);
-    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已接收 ${hosts.length} 个地址，确认执行？`, reply_markup: { inline_keyboard: [[{ text: '确认执行', callback_data: 'confirm:yes' }, { text: '取消', callback_data: 'cancel:no' }]] } });
+    const preview = await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已接收 ${hosts.length} 个地址，确认执行？`, reply_markup: { inline_keyboard: [[{ text: '确认执行', callback_data: 'confirm:yes' }, { text: '取消', callback_data: 'cancel:no' }]] } });
+    pending.confirmMessageId = preview.message_id;
     return;
   }
   if (pending?.action === 'pool_create_name' && text) {
@@ -2949,7 +3066,8 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
       }
       pending.values = values; pending.action = 'dns_create_confirm'; pending.expiresAt = Date.now() + 10 * 60 * 1000;
       telegramRuntime.pending.set(sessionKey, pending);
-      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `确认新建解析？\n${pending.domain} · ${pending.recordType}\n记录值：${values.length}`, reply_markup: { inline_keyboard: [[{ text: '确认新建', callback_data: 'dns_create_confirm:yes' }, { text: '取消', callback_data: 'cancel:dns' }]] } });
+      const preview = await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `确认新建解析？\n${pending.domain} · ${pending.recordType}\n记录值：${values.length}`, reply_markup: { inline_keyboard: [[{ text: '确认新建', callback_data: 'dns_create_confirm:yes' }, { text: '取消', callback_data: 'cancel:dns' }]] } });
+      pending.confirmMessageId = preview.message_id;
     } catch (error) {
       await telegramCall(token, 'sendMessage', { chat_id: chatId, text: error.message, reply_markup: telegramCancelButtons('menu:dns') });
     }
@@ -2965,7 +3083,8 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
       }
       pending.addresses = addresses;
       telegramRuntime.pending.set(sessionKey, pending);
-      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已识别 ${addresses.length} 个 IP，确认写入？`, reply_markup: { inline_keyboard: [[{ text: '确认写入', callback_data: 'confirm_write:yes' }, { text: '取消', callback_data: 'cancel:root' }]] } });
+      const preview = await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `已识别 ${addresses.length} 个 IP，确认写入？`, reply_markup: { inline_keyboard: [[{ text: '确认写入', callback_data: 'confirm_write:yes' }, { text: '取消', callback_data: 'cancel:root' }]] } });
+      pending.confirmMessageId = preview.message_id;
     } catch (error) {
       await telegramCall(token, 'sendMessage', { chat_id: chatId, text: error.message, reply_markup: telegramCancelButtons('menu:root') });
     }
@@ -2988,7 +3107,7 @@ async function sendTelegramMenu(token, chatId, settings) {
 }
 
 function telegramOverview(state) {
-  const activeIncidents = (state.incidents || []).filter((item) => !['succeeded', 'rolled_back'].includes(item.status)).length;
+  const activeIncidents = (state.incidents || []).filter((item) => !['succeeded', 'recovered', 'rolled_back', 'cancelled', 'done'].includes(item.status)).length;
   const onlineProbes = (state.probes || []).filter((item) => item.status === 'online').length;
   const availableIps = (state.ipAssets || []).filter((item) => item.enabled !== false && item.health !== 'unhealthy').length;
   return `系统总览\n在线探针：${onlineProbes}\n活动故障：${activeIncidents}\nIP 资产：${state.ipAssets?.length || 0}\n可用 IP：${availableIps}\nDNS 绑定：${state.dnsBindings?.length || 0}`;
@@ -3136,13 +3255,19 @@ async function rollbackIncidentFromTelegram(id) {
   return rollbackIncident(id, orchestrationDeps, 'telegram');
 }
 
-function scheduleTelegramProgress(chatId, messageId, jobId, token) {
-  const key = `${chatId}:${messageId}`;
+function scheduleTelegramProgress(chatId, messageId, jobId, token, authorization = null) {
+  const key = `${authorization?.botId || token}:${chatId}:${messageId}`;
   if (telegramRuntime.progressTimers.has(key)) clearInterval(telegramRuntime.progressTimers.get(key));
   let busy = false;
   let lastText = '';
   const timer = setInterval(async () => {
     if (busy) return;
+    if (authorization) {
+      const settings = readState(['telegramBots']).telegramBots.find((bot) => bot.id === authorization.botId);
+      if (!telegramAuthorized(settings, authorization.from, authorization.chat) || !telegramMenuAllowed(settings, 'automation') || !settings.automationTaskIds?.includes(authorization.taskId)) {
+        clearInterval(timer); telegramRuntime.progressTimers.delete(key); return;
+      }
+    }
     const job = commandJobs.get(jobId);
     if (!job) { clearInterval(timer); telegramRuntime.progressTimers.delete(key); return; }
     const counts = { total: job.results.length, ok: job.results.filter((item) => item.ok).length, error: job.results.filter((item) => item.status === 'error').length, running: job.results.filter((item) => ['queued', 'running', 'awaiting_input'].includes(item.status)).length };
@@ -3172,17 +3297,19 @@ function restartTelegramPolling() {
     await Promise.all(botConfigs.map(async (settings) => {
       let token = '';
       try { token = decryptSecret(settings.tokenEnc); } catch (_error) { return; }
-      if (!telegramRuntime.configuredTokens?.has(token)) {
-        telegramRuntime.configuredTokens ||= new Set();
+      const menuSignature = JSON.stringify([settings.menuScopeVersion, settings.menuScopes]);
+      if (telegramRuntime.configuredTokens?.get(token) !== menuSignature) {
+        telegramRuntime.configuredTokens ||= new Map();
         try {
-          await configureTelegramMenu(token);
-          telegramRuntime.configuredTokens.add(token);
+          await configureTelegramMenu(token, settings);
+          telegramRuntime.configuredTokens.set(token, menuSignature);
         } catch (_error) { /* retry on the next poll */ }
       }
       const offset = telegramRuntime.offsets.get(settings.id) || 0;
       try {
         const updates = await telegramCall(token, 'getUpdates', { offset, timeout: 4, allowed_updates: ['message', 'callback_query'] });
         for (const update of updates) {
+          if (generation !== telegramRuntime.generation) return;
           telegramRuntime.offsets.set(settings.id, update.update_id + 1);
           await handleTelegramUpdate(update, token, settings);
         }
@@ -3193,16 +3320,21 @@ function restartTelegramPolling() {
   poll();
 }
 
-async function configureTelegramMenu(token) {
+async function configureTelegramMenu(token, settings) {
   const commands = [
     { command: 'menu', description: '打开操作菜单' },
-    { command: 'status', description: '查看系统总览' },
-    { command: 'run', description: '自动化任务管理' },
-    { command: 'incidents', description: '故障事件' },
-    { command: 'probes', description: '探针管理' },
-    { command: 'pools', description: '备用 IP 池' },
-    { command: 'dns', description: '解析管理' }
-  ];
+    { command: 'status', description: '系统总览', scope: 'overview' },
+    { command: 'guards', description: 'DNS 守护', scope: 'guards' },
+    { command: 'dynamic', description: '动态 IP 守护', scope: 'dynamic' },
+    { command: 'probes', description: '探针与检查', scope: 'probes' },
+    { command: 'targets', description: '检查目标', scope: 'targets' },
+    { command: 'policies', description: '切换策略', scope: 'policies' },
+    { command: 'assets', description: 'IP 资产', scope: 'assets' },
+    { command: 'run', description: '自动化任务', scope: 'automation' },
+    { command: 'incidents', description: '故障事件', scope: 'incidents' },
+    { command: 'pools', description: '备用 IP 池', scope: 'pools' },
+    { command: 'dns', description: '解析管理', scope: 'dns' }
+  ].filter((item) => !item.scope || telegramMenuAllowed(settings, item.scope)).map(({ scope, ...item }) => item);
   await telegramCall(token, 'setMyCommands', { commands });
   await telegramCall(token, 'setChatMenuButton', { menu_button: { type: 'commands' } });
 }

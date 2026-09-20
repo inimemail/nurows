@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { startPolling } from '../shared/polling.js';
+import { filterWorkspaceRecords } from '../shared/workspace-search.js';
 import HistoryRecords from './HistoryRecords.jsx';
 import './dynamic-guard.css';
 
@@ -35,7 +36,7 @@ function GuardCountdown({ guard, offset }) {
   return remaining ? ` · ${remaining} 秒后仍无新 IP 则重试` : ' · 即将确认解析并重试';
 }
 
-export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistory, onState }) {
+export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistory, onState, search = '' }) {
   const [data, setData] = useState({ guards: [], probes: [], bots: [] });
   const [editor, setEditor] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -52,6 +53,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
   const actionLock = useRef(false);
   const saveLock = useRef(false);
   const time = Date.now() + offset.current;
+  const visibleGuards = useMemo(() => filterWorkspaceRecords('dynamic', data.guards, search), [data.guards, search]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; generation.current++; }; }, []);
   useEffect(() => {
     let cancelled = false;
@@ -74,6 +76,14 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
   };
   const patch = (value) => setEditor((current) => ({ ...current, ...value }));
   const openEditor = (guard) => { setFormError(''); setSettingsOpen(false); setEditor(guard ? { ...guard, command: '' } : structuredClone(DEFAULTS)); };
+  const telegramLinkOpened = useRef(false);
+  useEffect(() => {
+    if (telegramLinkOpened.current || typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('tgSection') !== 'dynamic') return;
+    const guard = data.guards.find((item) => item.id === params.get('tgItem'));
+    if (guard) { telegramLinkOpened.current = true; openEditor(guard); }
+  }, [data.guards]);
   const save = async (event) => {
     event.preventDefault();
     if (saveLock.current) return;
@@ -105,7 +115,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
     </div>
     {error ? <p className="auth-error" role="alert">读取失败：{error}，稍后自动重试</p> : null}
     <div className="ops-list dynamic-list">
-      {!data.guards.length ? <div className="ops-empty"><strong>还没有动态 IP 守护任务</strong><span>填写 DDNS 域名和换 IP API 命令即可开始。</span></div> : data.guards.map((guard) => {
+      {!visibleGuards.length ? <div className="ops-empty"><strong>{search.trim() ? '没有匹配的动态 IP 守护任务' : '还没有动态 IP 守护任务'}</strong><span>{search.trim() ? '请更换关键词或清空顶部搜索。' : '填写 DDNS 域名和换 IP API 命令即可开始。'}</span></div> : visibleGuards.map((guard) => {
         const bad = ['query_error', 'command_error', 'limit', 'waiting_probe'].includes(guard.status);
         const tone = guard.status === 'healthy' ? 'ok' : bad ? 'bad' : 'warn';
         const locked = Boolean(busyId) || guard.status === 'executing';

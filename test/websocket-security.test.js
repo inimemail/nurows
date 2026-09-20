@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import { createSessionSocketRegistry, createWebSocketUpgradeHandler, isAllowedWebSocketOrigin } from '../server/websocket-security.js';
+import { createSessionSocketRegistry, createWebSocketUpgradeHandler, createWebSocketTickets, isAllowedWebSocketOrigin } from '../server/websocket-security.js';
 
 const source = fs.readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
 function runtime(names, globals = {}) {
@@ -18,6 +18,97 @@ function socket() {
   return ws;
 }
 const request = (headers = {}) => ({ url: '/ws/terminal', socket: {}, headers: { host: 'panel.example', origin: 'https://panel.example', 'x-forwarded-proto': 'https', ...headers } });
+
+test('authenticated one-use tickets accept TLS termination and rewritten Host without weakening legacy Origin checks', () => {
+  const session = { token: 'a', expiresAt: Date.now() + 60000 }, sessions = new Map([['a', session]]);
+  const tickets = createWebSocketTickets(sessions);
+  for (const path of ['/ws/terminal', '/ws/command-job']) {
+    for (const host of ['panel.example', '127.0.0.1:38471']) {
+      const req = request({ host, 'x-forwarded-proto': '', 'sec-fetch-site': 'same-origin', 'x-nurossh-websocket': '1' });
+      req.url = path;
+      assert.equal(isAllowedWebSocketOrigin(req), false, 'reproduces the previous rejection');
+      const ticket = tickets.issue(req, session, path);
+      req.headers['sec-websocket-protocol'] = `nurossh-v1, nurossh-ticket.${ticket}`;
+      let connected = 0;
+      const responses = [];
+      const handler = createWebSocketUpgradeHandler({ tickets, getSession: () => session, sessionSockets: createSessionSocketRegistry(sessions),
+        wss: { handleUpgrade(_req, _socket, _head, done) { done(socket()); }, emit() { connected++; } } });
+      const tcp = { write: (value) => responses.push(value), destroy() {} };
+      handler(req, tcp, Buffer.alloc(0));
+      assert.equal(connected, 1);
+      handler(req, tcp, Buffer.alloc(0));
+      assert.equal(connected, 1, 'ticket cannot be replayed');
+      assert.match(responses.at(-1), /403/);
+    }
+  }
+});
+
+test('ticket issuance rejects cross-origin and same-site requests, missing proof headers and logged-out sessions', () => {
+  const session = { token: 'a', expiresAt: Date.now() + 60000 }, sessions = new Map([['a', session]]);
+  const tickets = createWebSocketTickets(sessions);
+  for (const headers of [
+    { 'sec-fetch-site': 'cross-site' }, { 'sec-fetch-site': 'same-site' }, { 'sec-fetch-site': 'none' },
+    { 'x-nurossh-websocket': undefined }, { origin: 'null' }, { origin: 'https://panel.example/path' },
+    { 'sec-fetch-site': undefined, origin: 'https://evil.example', 'x-forwarded-host': 'evil.example' }
+  ]) {
+    assert.throws(() => tickets.issue(request({ 'sec-fetch-site': 'same-origin', 'x-nurossh-websocket': '1', ...headers }), session, '/ws/terminal'), /来源/);
+  }
+  sessions.clear();
+  assert.throws(() => tickets.issue(request(), session, '/ws/terminal'), /登录已失效/);
+});
+
+test('actual ticket HTTP middleware accepts rewritten proxy Host but still requires authentication and same-origin proof', () => {
+  const session = { token: 'a', expiresAt: Date.now() + 60000, secretsMigrated: true }, sessions = new Map([['a', session]]);
+  const tickets = createWebSocketTickets(sessions);
+  let handler, originMiddleware;
+  const context = runtime(['isPublicAuthRoute', 'authGuard'], {
+    app: { use: (fn) => { originMiddleware = fn; }, post: (_path, fn) => { handler = fn; } },
+    webSocketTickets: tickets, webSocketOriginOptions: {}, readAuth: () => ({ configured: true }),
+    getSessionFromRequest: (req) => sessions.get(req.headers.cookie)
+  });
+  const originStart = source.indexOf('app.use((req, res, next) => {');
+  vm.runInContext(source.slice(originStart, source.indexOf('app.use(cors());', originStart)), context);
+  const routeStart = source.indexOf("app.post('/api/auth/ws-ticket'");
+  vm.runInContext(source.slice(routeStart, source.indexOf("app.post('/api/auth/setup'", routeStart)), context);
+  for (const scenario of ['allowed', 'unauthenticated', 'cross-site']) {
+    const req = request({ host: 'upstream.internal:38471', 'x-forwarded-proto': '', 'sec-fetch-site': scenario === 'cross-site' ? 'cross-site' : 'same-origin',
+      cookie: scenario === 'unauthenticated' ? 'missing' : 'a', 'x-nurossh-websocket': '1' });
+    Object.assign(req, { method: 'POST', path: '/api/auth/ws-ticket', body: { path: '/ws/terminal' } });
+    let result, status = 200;
+    const res = { set() {}, status(code) { status = code; return this; }, json(value) { result = value; } };
+    const run = () => originMiddleware(req, res, () => {
+      req.path = '/auth/ws-ticket';
+      context.authGuard(req, res, () => {
+        // Express catches route errors and forwards them to the error middleware.
+        try { handler(req, res); } catch (error) { res.status(error.statusCode || 400).json({ error: error.message }); }
+      });
+    });
+    run();
+    if (scenario === 'allowed') assert.match(result.ticket, /^[a-f0-9]{64}$/);
+    else {
+      assert.equal(result.ticket, undefined);
+      assert.equal(status, scenario === 'unauthenticated' ? 401 : 403);
+    }
+  }
+});
+
+test('tickets are bound to session, exact browser origin, path, lifetime, and have bounded storage', () => {
+  let now = 100;
+  const session = { token: 'a', expiresAt: 100000 }, other = { token: 'b', expiresAt: 100000 };
+  const sessions = new Map([['a', session], ['b', other]]), tickets = createWebSocketTickets(sessions, { now: () => now, limit: 2 });
+  const req = request({ 'sec-fetch-site': 'same-origin', 'x-nurossh-websocket': '1' });
+  const issue = () => tickets.issue(req, session, '/ws/terminal');
+  assert.equal(tickets.consume(issue(), req, other, '/ws/terminal'), false);
+  assert.equal(tickets.consume(issue(), request({ origin: 'https://other.example' }), session, '/ws/terminal'), false);
+  assert.equal(tickets.consume(issue(), req, session, '/ws/command-job'), false);
+  const expired = issue(); now += 30000; tickets.cleanup();
+  assert.equal(tickets.consume(expired, req, session, '/ws/terminal'), false);
+  const oldest = issue(), middle = issue(), newest = issue();
+  assert.equal(tickets.consume(oldest, req, session, '/ws/terminal'), false);
+  assert.equal(tickets.consume(middle, req, session, '/ws/terminal'), true);
+  sessions.delete('a');
+  assert.equal(tickets.consume(newest, req, session, '/ws/terminal'), false);
+});
 
 test('origin validation accepts direct and proxied same origin, rejects foreign, null, missing, and forged forwarded host', () => {
   assert.equal(isAllowedWebSocketOrigin(request()), true);

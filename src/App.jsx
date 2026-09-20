@@ -381,7 +381,10 @@ function normalizeWorkspacePayload(workspace = {}) {
 
 export default function App() {
   const restoringWorkspaceRef = useRef(false);
-  const [theme, setTheme] = useState(() => localStorage.getItem('nurossh-theme') || 'nuro-dark');
+  const [theme, setTheme] = useState(() => {
+    try { return localStorage.getItem('nurossh-theme') === 'nuro-dark' ? 'nuro-dark' : 'hbx-light'; }
+    catch { return 'hbx-light'; }
+  });
   const [auth, setAuth] = useState({ loading: true, configured: false, authenticated: false, username: '' });
   const [authForm, setAuthForm] = useState({ username: '', password: '', confirmPassword: '' });
   const [authError, setAuthError] = useState('');
@@ -475,7 +478,7 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('nurossh-theme', theme);
+    try { localStorage.setItem('nurossh-theme', theme); } catch { /* Theme still works when browser storage is unavailable. */ }
   }, [theme]);
 
   useEffect(() => {
@@ -2180,21 +2183,25 @@ export default function App() {
   if (!auth.configured || !auth.authenticated) {
     const isSetup = !auth.configured;
     return (
-      <div className="auth-shell">
-        <div className="auth-backdrop" />
+      <div className="auth-shell auth-welcome">
+        <div className="auth-backdrop" aria-hidden="true"><div className="auth-orb auth-orb-one" /><div className="auth-orb auth-orb-two" /><div className="auth-background-grid" /></div>
         <div className="auth-layout">
           <section className="auth-panel">
             <div className="auth-brand">
               <div className="brand-mark">N</div>
               <div>
                 <strong>NuroSSH</strong>
-                <span>Secure server workspace</span>
+                <span>你的服务器工作台</span>
               </div>
             </div>
             <div className="auth-copy">
-              <span className="label-chip">{isSetup ? '首次初始化' : '管理员登录'}</span>
-              <h1>{isSetup ? '创建管理员账号' : '登录 NuroSSH'}</h1>
-              <p>{isSetup ? '初始化完成后进入工作台。' : '登录后进入工作台。'}</p>
+              <span className="label-chip">{isSetup ? '从这里开始' : '欢迎回来'}</span>
+              <h1>{isSetup ? '开启你的运维工作台' : <>连接服务器，<br />让管理更从容。</>}</h1>
+              <p>终端、批量任务与网络管理，在一个工作台里完成。</p>
+            </div>
+            <div className="auth-terminal-preview" aria-hidden="true">
+              <div className="auth-terminal-top"><span><i /><i /><i /></span><span>NuroSSH / workspace</span></div>
+              <div className="auth-terminal-lines"><div><em>~</em> ssh your-server</div><div className="auth-terminal-note">终端 · 自动化 · 探针守护</div><div><em>❯</em> <span className="auth-terminal-cursor" /></div></div>
             </div>
             <div className="auth-grid">
               <div className="auth-kpi">
@@ -2202,25 +2209,30 @@ export default function App() {
                 <span>浏览器终端</span>
               </div>
               <div className="auth-kpi">
-                <strong>Batch</strong>
+                <strong>任务</strong>
                 <span>批量命令执行</span>
               </div>
               <div className="auth-kpi">
-                <strong>Proxy</strong>
+                <strong>网络</strong>
                 <span>代理接入</span>
               </div>
             </div>
           </section>
 
-          <form className="auth-form-card" onSubmit={handleAuthSubmit}>
+          <form className="auth-form-card" onSubmit={handleAuthSubmit} aria-labelledby="auth-title" aria-busy={Boolean(busy[isSetup ? 'setup' : 'login'])}>
             <div className="auth-form-head">
-              <strong>{isSetup ? '创建管理员账户' : '登录 NuroSSH'}</strong>
-              <span>{isSetup ? '密码至少 4 位' : '输入账号和密码'}</span>
+              <div className="auth-form-symbol" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="5" y="10" width="14" height="11" rx="3" /><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" /></svg></div>
+              <h2 id="auth-title">{isSetup ? '创建管理员账户' : '登录 NuroSSH'}</h2>
+              <span>{isSetup ? '设置登录凭证，密码至少 4 位。' : '输入账号和密码，继续进入工作台。'}</span>
             </div>
 
             <div className="field-grid single">
               <Field label="用户名">
                 <input
+                  name="username"
+                  autoComplete="username"
+                  autoCapitalize="none"
+                  spellCheck={false}
                   value={authForm.username}
                   onChange={(event) => setAuthForm((current) => ({ ...current, username: event.target.value }))}
                   onKeyDown={(event) => {
@@ -2235,6 +2247,8 @@ export default function App() {
               <Field label="密码">
                 <input
                   type="password"
+                  name="password"
+                  autoComplete={isSetup ? 'new-password' : 'current-password'}
                   value={authForm.password}
                   onChange={(event) => setAuthForm((current) => ({ ...current, password: event.target.value }))}
                   onKeyDown={(event) => {
@@ -2250,6 +2264,8 @@ export default function App() {
                 <Field label="确认密码">
                   <input
                     type="password"
+                    name="confirmPassword"
+                    autoComplete="new-password"
                     value={authForm.confirmPassword}
                     onChange={(event) => setAuthForm((current) => ({ ...current, confirmPassword: event.target.value }))}
                     onKeyDown={(event) => {
@@ -2264,15 +2280,17 @@ export default function App() {
               ) : null}
             </div>
 
-              {authError ? <div className="auth-error">{authError}</div> : null}
+              {authError ? <div className="auth-error" role="alert">{authError}</div> : null}
 
               <button
                 type="submit"
                 className={'primary auth-submit ' + (busy[isSetup ? 'setup' : 'login'] ? 'is-loading' : '')}
                 disabled={busy[isSetup ? 'setup' : 'login']}
               >
-              {busy[isSetup ? 'setup' : 'login'] ? '处理中...' : (isSetup ? '创建并进入控制台' : '登录')}
+              <span>{busy[isSetup ? 'setup' : 'login'] ? '处理中...' : (isSetup ? '创建并进入控制台' : '登录')}</span>
+              {!busy[isSetup ? 'setup' : 'login'] ? <svg className="auth-submit-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" /></svg> : null}
             </button>
+            <p className="auth-form-footnote">{isSetup ? '此账号用于管理你的服务器与任务。' : '登录你的工作台，接续手边的工作。'}</p>
           </form>
         </div>
       </div>

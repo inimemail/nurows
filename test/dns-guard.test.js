@@ -4,6 +4,7 @@ import dns from 'node:dns/promises';
 import test from 'node:test';
 import {
   buildDnsGuardCheckAddresses,
+  collectDnsGuardPoolCandidates,
   calculateDnsGuardOwnership,
   dnsGuardCheckReady,
   dnsGuardCycleReady,
@@ -13,6 +14,7 @@ import {
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
   requestWaitingDnsGuardProbeChecks,
+  requestWaitingDnsGuardChecks,
   resolveManagedDnsZone,
   resolveDnsGuardSources,
   roundRobinDnsGuardSourceValues,
@@ -98,6 +100,222 @@ async function nextSourceCycle(deps, succeeds) {
   await runDueDnsGuards(deps);
   return finishGuardChecks(deps, succeeds);
 }
+
+function addFillStock(deps, count, start = 1, poolId = 'fill-pool') {
+  const state = deps.getState();
+  let pool = state.ipPools.find((item) => item.id === poolId);
+  if (!pool) { pool = { id: poolId, enabled: true, assetIds: [], allocationMode: 'one', selectionMode: 'ordered' }; state.ipPools.push(pool); }
+  for (let i = start; i < start + count; i++) {
+    state.ipAssets.push({ id: `fill-${i}`, address: `203.0.113.${i}`, enabled: true });
+    pool.assetIds.push(`fill-${i}`);
+  }
+}
+
+test('fill mode tops up healthy records to fifty independently of the pool incident allocation mode', async () => {
+  const deps = sourceGuardFixture(['198.51.100.1'], { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 50 });
+  addFillStock(deps, 60);
+  let notifications = 0;
+  deps.notifyDnsGuard = () => notifications++;
+  await nextSourceCycle(deps);
+  assert.equal(deps.getRemote().length, 50);
+  assert.equal(deps.getState().ipAssets.length, 11);
+  assert.equal(deps.getState().dnsGuards[0].repairTargetCount, 0);
+  assert.match(deps.getState().dnsGuards[0].message, /已补充 49 个 IP/);
+  assert.equal(notifications, 0, 'routine filling does not send failure notifications');
+  assert.deepEqual(await nextSourceCycle(deps), deps.getRemote(), 'full guard only checks existing records');
+  assert.equal(deps.getState().ipAssets.length, 11);
+});
+
+test('forty-nine healthy records consume only one candidate and do not wait for slower candidates or probes', async () => {
+  const remote = Array.from({ length: 49 }, (_, i) => `198.51.100.${i + 1}`);
+  const deps = sourceGuardFixture(remote, { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 50 });
+  addFillStock(deps, 10);
+  await runDueDnsGuards(deps);
+  let guard = deps.getState().dnsGuards[0];
+  for (const check of guard.cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+  guard = deps.getState().dnsGuards[0];
+  assert.equal(guard.cycle.replacementNeeded, 1);
+  assert.ok(guard.cycle.checks.length > 1, 'candidate preflight remains parallel');
+  guard.cycle.checks[0].observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+  assert.equal(deps.getRemote().length, 50);
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+  assert.equal(deps.getState().ipAssets.length, 9);
+});
+
+test('partial fill survives restart and recalculates the deficit after another active IP fails', async () => {
+  let deps = sourceGuardFixture(['198.51.100.1'], { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 5 });
+  addFillStock(deps, 2);
+  await nextSourceCycle(deps);
+  assert.equal(deps.getRemote().length, 3);
+  assert.equal(deps.getState().dnsGuards[0].status, 'degraded');
+  assert.match(deps.getState().dnsGuards[0].message, /3\/5.*待补 2/);
+  deps = remoteDeps(deps.getState(), deps.getRemote());
+  addFillStock(deps, 3, 3);
+  await nextSourceCycle(deps, (address) => address !== '198.51.100.1');
+  assert.equal(deps.getRemote().length, 5);
+  assert.ok(!deps.getRemote().includes('198.51.100.1'));
+  assert.equal(deps.getState().ipAssets.length, 0);
+});
+
+test('lowering a fill target preserves healthy records and does not restore the old larger target', async () => {
+  const deps = sourceGuardFixture(['198.51.100.1', '198.51.100.2', '198.51.100.3'], {
+    sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 2, repairTargetCount: 50
+  });
+  let notifications = 0;
+  deps.notifyDnsGuard = () => notifications++;
+  addFillStock(deps, 5);
+  await nextSourceCycle(deps);
+  assert.equal(deps.getRemote().length, 3);
+  assert.equal(notifications, 0);
+  await nextSourceCycle(deps, (address) => address !== '198.51.100.3');
+  assert.equal(deps.getRemote().length, 2);
+  assert.equal(deps.getState().ipAssets.length, 5);
+  assert.equal(deps.getState().dnsGuards[0].status, 'healthy');
+  assert.match(deps.getState().dnsGuards[0].message, /已移除 1 个故障 IP.*2 个健康 IP.*已达到目标/);
+  assert.equal(notifications, 1, 'removing a failed IP still notifies when the lower target is already met');
+  await nextSourceCycle(deps, (address) => address !== '198.51.100.2');
+  assert.equal(deps.getRemote().length, 2);
+  assert.equal(deps.getState().ipAssets.length, 4);
+});
+
+test('source IPs satisfy the fill target before pool candidates are used', async () => {
+  const deps = sourceGuardFixture(['198.51.100.1'], { poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 3 });
+  addFillStock(deps, 5, 40);
+  const checked = await nextSourceCycle(deps);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.1', '203.0.113.20', '203.0.113.21']);
+  assert.equal(deps.getState().ipAssets.length, 5);
+  assert.ok(!checked.includes('203.0.113.40'));
+});
+
+test('empty records and failed pool candidates can partially fill and resume without blacklisting', async () => {
+  const deps = sourceGuardFixture([], { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 3 });
+  addFillStock(deps, 2);
+  await nextSourceCycle(deps, (address) => address !== '203.0.113.1');
+  assert.deepEqual(deps.getRemote(), ['203.0.113.2']);
+  assert.equal(deps.getState().ipUsageRecords.find((record) => record.address === '203.0.113.1').status, 'discarded');
+  addFillStock(deps, 1, 1);
+  await nextSourceCycle(deps);
+  assert.equal(deps.getRemote().length, 2);
+  assert.ok(deps.getRemote().includes('203.0.113.1'));
+});
+
+test('stock changes only wake related idle guards with a real deficit and available candidates', async () => {
+  const deps = sourceGuardFixture(['198.51.100.1'], { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 2, currentValues: ['198.51.100.1'], nextCheckAt: '2099-01-01' });
+  addFillStock(deps, 2);
+  const state = deps.getState(), base = state.dnsGuards[0];
+  state.dnsGuards.push(
+    { ...structuredClone(base), id: 'other', poolIds: ['other-pool'] },
+    { ...structuredClone(base), id: 'full', currentValues: ['198.51.100.1', '198.51.100.2'] },
+    { ...structuredClone(base), id: 'disabled', enabled: false },
+    { ...structuredClone(base), id: 'active', cycle: { id: 'keep', checks: [] } }
+  );
+  let writes = 0;
+  const update = deps.updateState;
+  deps.updateState = (fn) => { writes++; return update(fn); };
+  assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['other-pool'] }), 0);
+  assert.equal(writes, 0);
+  const prepared = Promise.withResolvers();
+  const read = deps.readDnsRecord;
+  deps.readDnsRecord = async (...args) => { await prepared.promise; return read(...args); };
+  assert.equal(requestWaitingDnsGuardChecks(deps, { assetIds: ['fill-1'] }), 1);
+  assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['fill-pool'] }), 0, 'running preparation is not duplicated');
+  assert.ok(state.dnsGuards.slice(1).every((guard) => guard.nextCheckAt === '2099-01-01'));
+  assert.equal(state.dnsGuards.at(-1).cycle.id, 'keep');
+  prepared.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  // The synthetic active record is unrelated to this guard and has no probes assigned.
+  state.dnsGuards = state.dnsGuards.slice(0, 1);
+  await finishGuardChecks(deps);
+  assert.equal(deps.getRemote().length, 2);
+});
+
+test('stock containing only an already active address does not wake a deficient guard', () => {
+  const deps = sourceGuardFixture(['203.0.113.1'], {
+    sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 2,
+    currentValues: ['203.0.113.1'], nextCheckAt: '2099-01-01'
+  });
+  addFillStock(deps, 1);
+  let writes = 0;
+  deps.updateState = () => { writes++; return deps.getState(); };
+  assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['fill-pool'] }), 0);
+  assert.equal(writes, 0);
+  assert.equal(deps.getState().dnsGuards[0].nextCheckAt, '2099-01-01');
+});
+
+test('fill configuration defaults safely, validates the target and clears obsolete fill deficits on mode change', async () => {
+  const legacy = normalizeOrchestrationState({ dnsGuards: [{ maxActiveIps: 20 }] }).dnsGuards[0];
+  assert.equal(legacy.poolFillMode, 'repair');
+  assert.equal(legacy.poolTargetCount, 20);
+  const deps = sourceGuardFixture(undefined, { sources: [], maxActiveIps: 20 });
+  deps.sanitizeState = (state) => state;
+  const routes = new Map();
+  registerOrchestrationRoutes(Object.fromEntries(['get', 'post', 'put', 'delete'].map((method) => [method, (path, fn) => routes.set(`${method} ${path}`, fn)])), deps);
+  const save = async (extra) => {
+    let result;
+    await routes.get('put /api/orchestration/:resource/:id')({ params: { resource: 'dns-guards', id: 'guard-1' }, auth: { username: 'test' }, body: { ...deps.getState().dnsGuards[0], ...extra } },
+      { json(value) { result = value; } }, (error) => { throw error; });
+    return result.item;
+  };
+  for (const poolTargetCount of [0, 21, 1.5, '']) await assert.rejects(save({ poolFillMode: 'fill', poolTargetCount }), /补满目标数量/);
+  const filled = await save({ poolFillMode: 'fill', poolTargetCount: '20' });
+  assert.equal(filled.poolTargetCount, 20);
+  assert.equal(filled.poolFillMode, 'fill');
+  deps.getState().dnsGuards[0].repairTargetCount = 20;
+  assert.equal((await save({ poolFillMode: 'repair' })).repairTargetCount, 0);
+  deps.getState().dnsGuards[0].repairTargetCount = 5;
+  assert.equal((await save({ name: 'renamed' })).repairTargetCount, 5, 'ordinary edits retain actual repair deficits');
+});
+
+test('shared pool candidates are reserved across concurrent guards and released after completion', async () => {
+  const deps = sourceGuardFixture([], { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 1 });
+  addFillStock(deps, 3);
+  const state = deps.getState();
+  state.dnsGuards.push({ ...structuredClone(state.dnsGuards[0]), id: 'second', domain: 'second.example.com' });
+  const remote = new Map(state.dnsGuards.map((guard) => [guard.domain, []]));
+  deps.readDnsRecord = async (_account, _credentials, _zone, binding) => ({ values: remote.get(binding.domain), recordIds: [] });
+  deps.writeDnsRecord = async (_account, _credentials, _zone, binding, values) => { remote.set(binding.domain, [...values]); return []; };
+  await runDueDnsGuards(deps);
+  const active = state.dnsGuards.filter((guard) => guard.cycle?.candidateAssets?.length);
+  assert.equal(active.length, 1);
+  const waiting = state.dnsGuards.find((guard) => guard.id !== active[0].id);
+  assert.equal(waiting.status, 'waiting_ip');
+  assert.equal(collectDnsGuardPoolCandidates(state, waiting).length, 0, 'in-flight candidates stay reserved');
+  active[0].cycle.checks[0].observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+  assert.equal(collectDnsGuardPoolCandidates(state, waiting).length, 2, 'unused candidates return after cycle ends');
+  waiting.nextCheckAt = '';
+  await runDueDnsGuards(deps, waiting.id);
+  waiting.cycle.checks[0].observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+  const written = [...remote.values()].flat();
+  assert.equal(written.length, 2);
+  assert.equal(new Set(written).size, 2);
+  assert.equal(state.ipAssets.length, 1);
+});
+
+test('fill mode supports IPv6 and multiple fallback pools with the same health rules', async () => {
+  const deps = sourceGuardFixture(['2001:db8::1'], { sources: [], recordType: 'AAAA', poolIds: ['a', 'b'], poolFillMode: 'fill', poolTargetCount: 3 });
+  const state = deps.getState();
+  state.ipAssets = [{ id: 'v4', address: '192.0.2.1' }, { id: 'v6-a', address: '2001:db8::2' }, { id: 'v6-b', address: '2001:db8::3' }];
+  state.ipPools = [{ id: 'a', assetIds: ['v4', 'v6-a'] }, { id: 'b', assetIds: ['v6-a', 'v6-b'] }];
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.getRemote(), ['2001:db8::1', '2001:db8::2', '2001:db8::3']);
+  assert.deepEqual(state.ipAssets.map((asset) => asset.id), ['v4']);
+});
+
+test('changing the fill target during preparation cannot publish the obsolete preparation', async () => {
+  const deps = sourceGuardFixture(['198.51.100.1'], { sources: [], poolFillMode: 'fill', poolTargetCount: 50 });
+  const read = deps.readDnsRecord, gate = Promise.withResolvers();
+  deps.readDnsRecord = async (...args) => { await gate.promise; return read(...args); };
+  const running = runDueDnsGuards(deps);
+  await Promise.resolve();
+  deps.getState().dnsGuards[0].poolTargetCount = 10;
+  gate.resolve(); await running;
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+  assert.equal(deps.getState().dnsGuards[0].poolTargetCount, 10);
+});
 
 test('new DDNS sources sync while current IPs are healthy and then use cached healthy addresses', async () => {
   const deps = sourceGuardFixture();

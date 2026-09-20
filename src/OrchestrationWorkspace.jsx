@@ -16,7 +16,7 @@ const STATUS = { online: '在线', offline: '离线', pending: '待接入', revo
 const EMPTY = {
   probe: { name: '', region: '', carrier: '', maxConcurrency: 100, enabled: true, alertBotIds: [] },
   target: { name: '', address: '', allowPrivate: false, checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, probeIds: [], policyId: '', enabled: true },
-  guard: { name: '', accountId: '', domain: '', recordType: 'A', recordLine: '默认', ttl: 60, maxActiveIps: 50, probeIds: [], poolIds: [], alertBotIds: [], checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, maxParallel: 20, pruneStale: true, sources: [], enabled: true },
+  guard: { name: '', accountId: '', domain: '', recordType: 'A', recordLine: '默认', ttl: 60, maxActiveIps: 50, poolFillMode: 'repair', poolTargetCount: 50, probeIds: [], poolIds: [], alertBotIds: [], checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, maxParallel: 20, pruneStale: true, sources: [], enabled: true },
   asset: { name: '', address: '', region: '', carrier: '', labels: '', health: 'unknown', enabled: true, note: '' },
   pool: { name: '', assetIds: [], newAssetAddresses: '', allocationMode: 'one', allocationCount: 1, selectionMode: 'ordered', enabled: true, alertEnabled: false, alertThresholds: [5, 3, 1, 0], alertBotIds: [], note: '' },
   account: { name: '', provider: 'huawei', enabled: true, credentials: {} },
@@ -396,7 +396,7 @@ function GuardEditor({ value, patch, state, api }) {
         ? { ...current, [key]: { domain, checking: false, addresses: [], error: error.message || '域名解析失败' } } : current);
     }
   };
-  return <EditorGrid>
+  return <EditorGrid className="ops-guard-editor">
     <EditorSection title="托管记录" />
     <Field label="任务名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field>
     <Field label="DNS 服务商账号"><select value={value.accountId} onChange={(e) => patch({ accountId: e.target.value })}><option value="">选择账号</option>{state.dnsAccounts?.filter((item) => item.enabled !== false).map((item) => <option key={item.id} value={item.id}>{item.name} · {PROVIDERS[item.provider] || item.provider}</option>)}</select></Field>
@@ -420,6 +420,9 @@ function GuardEditor({ value, patch, state, api }) {
     <Toggle checked={value.pruneStale} onChange={(pruneStale) => patch({ pruneStale })}>移除来源已不再提供的旧 IP</Toggle>
 
     <EditorSection title="备用池补位" />
+    <Field label="补位方式"><select value={value.poolFillMode || 'repair'} onChange={(e) => patch({ poolFillMode: e.target.value, poolTargetCount: Math.min(Number(value.poolTargetCount) || Number(value.maxActiveIps) || 50, Number(value.maxActiveIps) || 50) })}><option value="repair">故障补位</option><option value="fill">补满指定数量</option></select></Field>
+    {value.poolFillMode === 'fill' ? <Field label="目标 IP 数量"><input type="number" min="1" max={value.maxActiveIps || 50} step="1" value={value.poolTargetCount ?? value.maxActiveIps ?? 50} onChange={(e) => patch({ poolTargetCount: e.target.value })} /></Field> : null}
+    <div className="guard-notification-hint">{value.poolFillMode === 'fill' ? '按健康 IP 数量补足目标；库存不足先补一部分，后续有库存继续补。调低目标不会删除健康 IP。' : '删除不健康 IP 后补回缺口；库存不足时保留缺口，后续继续补。'}</div>
     <Multi label="备用池（按选择顺序兜底）" items={(state.ipPools || []).filter((item) => item.enabled !== false)} value={value.poolIds || []} onChange={(poolIds) => patch({ poolIds })} secondary={(item) => `${item.assetIds?.length || 0} 个 IP`} searchable selectable />
     <EditorSection title="TG 通知" />
     <Multi label="通知机器人（不选则不通知）" items={state.telegramBots || []} value={value.alertBotIds || []} onChange={(alertBotIds) => patch({ alertBotIds })} secondary={(item) => item.enabled === false ? '已停用' : !item.configured ? '未配置 Token' : !item.userIds?.length ? '未配置接收 ID' : '发送到机器人配置的接收 ID'} emptyLabel="请先在 Telegram 中添加机器人" />
@@ -431,11 +434,12 @@ function GuardEditor({ value, patch, state, api }) {
 function PoolEditor({ value, patch, state }) {
   const [thresholdText, setThresholdText] = useState((value.alertThresholds || []).join(' '));
   const setThresholds = (text) => { setThresholdText(text); patch({ alertThresholds: [...new Set(text.split(/[,，\s]+/).map(Number).filter((item) => Number.isInteger(item) && item >= 0))].sort((a, b) => b - a) }); };
-  return <EditorGrid>
+  return <EditorGrid className="ops-pool-editor">
     <EditorSection title="分配规则" />
     <Field label="备用池名称"><input value={value.name} onChange={(e) => patch({ name: e.target.value })} /></Field>
-    <Field label="取用方式"><select value={value.allocationMode} onChange={(e) => patch({ allocationMode: e.target.value })}><option value="one">一次取一个</option><option value="count">取指定数量</option><option value="all">取全部可用 IP</option></select></Field>
-    <Field label="取用数量"><input type="number" min="1" disabled={value.allocationMode !== 'count'} value={value.allocationCount} onChange={(e) => patch({ allocationCount: e.target.value })} /></Field>
+    <Field label="DNS 守护取用"><div className="ops-pool-follow">跟随守护设置</div></Field>
+    <Field label="故障切换取用"><select value={value.allocationMode} onChange={(e) => patch({ allocationMode: e.target.value })}><option value="one">每次取一个</option><option value="count">每次取指定数量</option><option value="all">取全部可用 IP</option></select></Field>
+    {value.allocationMode === 'count' ? <Field label="取用数量"><input type="number" min="1" value={value.allocationCount} onChange={(e) => patch({ allocationCount: e.target.value })} /></Field> : null}
     <Field label="选择顺序"><select value={value.selectionMode} onChange={(e) => patch({ selectionMode: e.target.value })}><option value="ordered">固定顺序</option><option value="random">随机</option></select></Field>
     <Toggle checked={value.enabled} onChange={(enabled) => patch({ enabled })}>启用备用池并允许新分配</Toggle>
 
@@ -564,7 +568,7 @@ function BindingEditor({ value, patch, state }) {
   </EditorGrid>;
 }
 
-function EditorGrid({ children }) { return <div className="ops-editor-grid">{children}</div>; }
+function EditorGrid({ children, className = '' }) { return <div className={`ops-editor-grid ${className}`.trim()}>{children}</div>; }
 function Field({ label, children, full }) { return <label className={full ? 'ops-field full' : 'ops-field'}><span>{label}</span>{children}</label>; }
 function Toggle({ checked, onChange, children }) { return <label className="ops-toggle"><input type="checkbox" checked={Boolean(checked)} onChange={(e) => onChange(e.target.checked)} /><span>{children}</span></label>; }
 function Multi({ label, items = [], value = [], onChange, secondary, searchable = false, selectable = false, emptyLabel = '没有匹配项' }) {
@@ -595,7 +599,7 @@ function summary(tab, state) {
   }
   if (tab === 'probes') return `${state.probes?.filter((item) => item.status === 'online').length || 0} 个在线探针 · ${state.incidents?.filter((item) => !['succeeded', 'recovered', 'rolled_back'].includes(item.status)).length || 0} 个活动事件`; if (tab === 'pools') return `${state.ipAssets?.length || 0} 个可用 IP · ${state.ipUsageRecords?.length || 0} 条使用记录`; if (tab === 'telegram') return `${state.telegramBots?.filter((item) => item.enabled && item.configured).length || 0} 个运行中机器人`; return `${state.dnsAccounts?.length || 0} 个账号 · ${state.dnsBindings?.length || 0} 条解析绑定`;
 }
-function allocationLabel(item) { return item.allocationMode === 'all' ? '全部取用' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '一次取一个'; }
+function allocationLabel(item) { return `DNS 守护跟随规则 · 故障切换${item.allocationMode === 'all' ? '取全部' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '取一个'}`; }
 function assetSubtitle(item) { return [item.name && item.name !== item.address ? item.address : '', item.region, item.carrier].filter(Boolean).join(' · '); }
 function targetSubtitle(item) { const rounds = Number(item.checkRounds) || 3; const perRound = Number(item.attemptsPerRound) || 3; const expectedAttempts = rounds * perRound; const observations = Object.values(item.observations || {}).sort((a, b) => Date.parse(b.checkedAt || 0) - Date.parse(a.checkedAt || 0)); const latest = observations[0]; const result = !latest ? '尚未检查' : latest.ok ? `第 ${latest.successfulRound || 1} 轮第 ${latest.successfulAttempt || 1} 次成功` : latest.attempts === expectedAttempts ? `${expectedAttempts} 次全部失败` : '等待探针升级'; return `${item.checkType === 'ping' ? 'PING' : `TCP:${item.port}`} · ${item.address || '未填写地址'} · ${item.probeIds?.length || 0} 个探针 · ${rounds}轮×${perRound}次 · ${result} · ${formatTime(item.lastCheckAt)}`; }
 function probeVersionCurrent(version) { const [major = 0, minor = 0, patch = 0] = String(version || '').split('.').map(Number); return major > 1 || (major === 1 && (minor > 4 || (minor === 4 && patch >= 8))); }

@@ -981,6 +981,7 @@ svg {
 .ops-editor-section { grid-column: 1 / -1; display: flex; align-items: center; min-height: 34px; margin-top: 4px; padding: 5px 0 8px; border-bottom: 1px solid var(--border-soft); }
 .ops-editor-section:first-child { margin-top: -4px; }
 .guard-notification-hint { grid-column: 1 / -1; min-width: 0; margin-top: -4px; color: var(--text-soft); font-size: 12px; line-height: 1.6; text-align: left; overflow-wrap: anywhere; }
+.ops-pool-follow { display: flex; align-items: center; min-height: 40px; padding: 9px 12px; border: 1px solid var(--border-soft); border-radius: 10px; color: var(--text-soft); background: var(--card-bg); line-height: 1.5; overflow-wrap: anywhere; }
 .tg-feature-picker { grid-column: 1 / -1; min-width: 0; }
 .tg-feature-picker .ops-multi-options { max-height: 320px; }
 .ops-editor-section strong { color: var(--text-strong); font-size: 12px; font-weight: 650; }
@@ -2655,6 +2656,17 @@ button.danger-action:hover:not(:disabled) {
   .dns-change-values { grid-column: 1 / -1; grid-row: 2; grid-template-columns: 1fr; }
   .dns-change-values code { overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
   .ops-editor-grid { grid-template-columns: 1fr; }
+  .ops-guard-editor .ops-field input,
+  .ops-guard-editor .ops-field select,
+  .ops-guard-editor .ops-field textarea,
+  .ops-pool-editor .ops-field input,
+  .ops-pool-editor .ops-field select,
+  .ops-pool-editor .ops-field textarea {
+    min-width: 0;
+    min-height: 44px;
+    font-size: 16px;
+  }
+  .ops-pool-editor .ops-pool-follow { min-height: 44px; }
   .ops-field.full, .ops-multi, .ops-toggle { grid-column: 1; }
   .ops-multi-options { grid-template-columns: 1fr; }
   .tg-feature-picker .ops-multi label { min-height: 44px; align-items: center; }

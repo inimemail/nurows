@@ -140,6 +140,7 @@ export function createTelegramWorkspace(deps) {
     if (item.address) lines.push(`地址：${short(item.address, 253)}`);
     if (section === 'guards') {
       lines.push(`活动 IP：${item.currentValues?.length || 0} / ${item.maxActiveIps || 50}`, `来源：${item.sources?.length || 0} 个`, `最近检查：${date(item.lastCheckAt)}`);
+      lines.push(`备用池补位：${item.poolFillMode === 'fill' ? `补满 ${item.poolTargetCount || item.maxActiveIps || 50} 个健康 IP` : '故障补位'}`);
       rows.push([...(canWrite(ctx) ? [action('检查并修复', 'action', 'check')] : []), action('管理 IP', 'ips')]);
       rows.push([action('来源状态', 'sources'), action('检查记录', 'history')]);
     } else if (section === 'dynamic') {
@@ -162,6 +163,7 @@ export function createTelegramWorkspace(deps) {
       if (canWrite(ctx)) rows.push([action('删除空闲 IP', 'confirm', 'delete')]);
     } else if (section === 'pools') {
       lines.push(`库存：${item.assetIds?.length || 0} 个 IP`, `预警数量：${item.alertEnabled ? (item.alertThresholds || []).join('、') : '未启用'}`);
+      lines.push('DNS 守护取用：跟随守护设置', `故障切换取用：${item.allocationMode === 'all' ? '全部可用 IP' : item.allocationMode === 'count' ? `每次 ${item.allocationCount} 个` : '每次一个'}`);
       rows.push([action('查看 IP', 'ips')]);
       if (canWrite(ctx)) rows.push([legacy('批量加入 IP', `pool_add:${id}`), legacy('修改预警', `pool_alert:${id}`)]);
     } else if (section === 'dns') {

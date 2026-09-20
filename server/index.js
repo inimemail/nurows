@@ -139,7 +139,7 @@ const orchestrationDeps = {
   notifyDnsGuard: notifyDnsGuardViaTelegram,
   notifyProbePresence: notifyProbePresenceViaTelegram,
   onTelegramChanged: () => restartTelegramPolling(),
-  onIpAvailabilityChanged: () => { requestWaitingIncidentRechecks(orchestrationDeps); requestWaitingDnsGuardChecks(orchestrationDeps); runDueDnsGuards(orchestrationDeps).catch(() => {}); },
+  onIpAvailabilityChanged: (change) => { requestWaitingIncidentRechecks(orchestrationDeps); requestWaitingDnsGuardChecks(orchestrationDeps, change); },
   onDnsGuardChanged: (guardId) => runDueDnsGuards(orchestrationDeps, guardId).catch(() => {}),
   onProbeAvailable: (probeId, state) => requestWaitingDnsGuardProbeChecks(orchestrationDeps, probeId, state),
   onDnsGuardRetry: (guardId) => scheduleDnsGuardRetry(guardId),
@@ -2933,19 +2933,24 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
         }
       }
       let resultText = '';
+      let inventoryChange;
       orchestrationDeps.updateState((draft) => {
         if (pending.action === 'asset_add') {
           const result = importIpAssets(draft, pending.addresses, {}, `telegram:${from.id}`);
+          inventoryChange = { assetIds: result.assetIds };
           resultText = `IP 资产已更新\n新增：${result.created}\n复用：${result.reused}`;
         } else if (pending.action === 'pool_add') {
           const result = addIpsToPool(draft, pending.poolId, pending.addresses, `telegram:${from.id}`);
+          inventoryChange = { poolIds: [result.pool.id] };
           resultText = `已加入备用池“${result.pool.name}”\n当前 IP：${result.pool.assetIds.length}`;
         } else if (pending.action === 'pool_create_ips') {
           const result = createPoolWithIps(draft, pending.poolName, pending.addresses, `telegram:${from.id}`);
+          inventoryChange = { poolIds: [result.pool.id] };
           resultText = `已创建备用池“${result.pool.name}”\nIP 数量：${result.pool.assetIds.length}`;
         }
         return draft;
       });
+      if (inventoryChange) orchestrationDeps.onIpAvailabilityChanged?.(inventoryChange);
       telegramRuntime.pending.delete(sessionKey);
       return telegramCall(token, 'sendMessage', { chat_id: chatId, text: resultText, reply_markup: telegramBackButtons(pending.action.startsWith('pool_') ? 'menu:pools' : 'menu:assets') });
     }

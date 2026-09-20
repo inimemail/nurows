@@ -459,7 +459,7 @@ export function registerOrchestrationRoutes(app, deps) {
       pushAudit(draft, 'ipAssets.batch_create', 'ipAssets', '', `批量导入 ${result.created} 个 IP，复用 ${result.reused} 个`, req.auth.username);
       return draft;
     });
-    deps.onIpAvailabilityChanged?.();
+    deps.onIpAvailabilityChanged?.({ assetIds: result.assetIds });
     res.json({ ok: true, ...result, state: deps.sanitizeState(state, req.auth) });
   });
 
@@ -488,7 +488,7 @@ export function registerOrchestrationRoutes(app, deps) {
       return draft;
     });
     if (key === 'telegramBots') deps.onTelegramChanged?.();
-    if (['ipAssets', 'ipPools'].includes(key)) deps.onIpAvailabilityChanged?.();
+    if (['ipAssets', 'ipPools'].includes(key)) deps.onIpAvailabilityChanged?.(key === 'ipPools' ? { poolIds: [created.id] } : { assetIds: [created.id] });
     if (key === 'dnsGuards') deps.onDnsGuardChanged?.(created.id);
     res.json({ ok: true, item: sanitizeResource(key, created), state: deps.sanitizeState(state, req.auth) });
   }));
@@ -527,7 +527,7 @@ export function registerOrchestrationRoutes(app, deps) {
       return draft;
     });
     if (key === 'telegramBots') deps.onTelegramChanged?.();
-    if (['ipAssets', 'ipPools'].includes(key)) deps.onIpAvailabilityChanged?.();
+    if (['ipAssets', 'ipPools'].includes(key)) deps.onIpAvailabilityChanged?.(key === 'ipPools' ? { poolIds: [updated.id] } : { assetIds: [updated.id] });
     if (key === 'dnsGuards') deps.onDnsGuardChanged?.(updated.id);
     res.json({ ok: true, item: sanitizeResource(key, updated), state: deps.sanitizeState(state, req.auth) });
   }));
@@ -1349,13 +1349,24 @@ function dnsGuardCycleStale(guard, now = Date.now()) {
   return now - Date.parse(guard.cycle.startedAt || 0) > maxAge;
 }
 
-export function requestWaitingDnsGuardChecks(deps) {
+export function requestWaitingDnsGuardChecks(deps, change = {}) {
+  const snapshot = deps.readState(['dnsGuards', 'ipPools', 'ipAssets', 'ipLeases', 'incidents']);
+  const changedAssets = new Set(change.assetIds || []);
+  const affectedPools = new Set(change.poolIds || []);
+  for (const pool of snapshot.ipPools || []) if (pool.assetIds?.some((id) => changedAssets.has(id))) affectedPools.add(pool.id);
+  const scoped = Array.isArray(change.poolIds) || Array.isArray(change.assetIds);
+  const eligible = (guard) => guard.enabled !== false && !guard.cycle && !dnsGuardRuntime.has(guard.id)
+    && (guard.status === 'waiting_ip' || dnsGuardPoolTarget(guard, guard.currentValues || []) > (guard.currentValues?.length || 0))
+    && (!scoped || guard.poolIds?.some((id) => affectedPools.has(id)))
+    && collectDnsGuardPoolCandidates(snapshot, guard, 1, new Set(guard.currentValues || [])).length > 0;
+  const waiting = new Set(snapshot.dnsGuards.filter(eligible).map((guard) => guard.id));
+  if (!waiting.size) return 0;
   const requestedIds = [];
   deps.updateState((draft) => {
     for (const guard of draft.dnsGuards) {
-      if (guard.enabled === false || guard.status !== 'waiting_ip' || guard.cycle) continue;
+      if (!waiting.has(guard.id) || guard.enabled === false || guard.cycle) continue;
       guard.nextCheckAt = '';
-      guard.message = '备用 IP 已更新，等待重新确认故障';
+      guard.message = '备用 IP 已更新，等待检查并补位';
       guard.updatedAt = nowIso();
       requestedIds.push(guard.id);
     }
@@ -1459,6 +1470,9 @@ function dnsGuardPreparationKey(guard) {
     checkRounds: guard.checkRounds,
     attemptsPerRound: guard.attemptsPerRound,
     maxParallel: guard.maxParallel,
+    maxActiveIps: guard.maxActiveIps,
+    poolFillMode: guard.poolFillMode,
+    poolTargetCount: guard.poolTargetCount,
     sources: guard.sources,
     pruneStale: guard.pruneStale
   });
@@ -1561,14 +1575,20 @@ function createDnsGuardRemoteCycle(guard, expectedProbeIds, currentValues, zone,
   };
 }
 
+function dnsGuardPoolTarget(guard, remoteValues) {
+  const capacity = guard.maxActiveIps || DNS_GUARD_MAX_VALUES;
+  return Math.min(capacity, guard.poolFillMode === 'fill'
+    ? clampNumber(guard.poolTargetCount, 1, capacity, capacity)
+    : Math.max(1, guard.repairTargetCount || 0, remoteValues.length));
+}
+
 async function startDnsGuardReplacement(guard, cycle, failedRemote, deps) {
   const healthyRemote = (cycle.remoteValues || []).filter((address) => !failedRemote.includes(address));
   const sourceResult = await resolveDnsGuardCycleSources(guard, cycle, healthyRemote, deps);
   if (!deps.readState(['dnsGuards']).dnsGuards.some((item) => item.id === guard.id && item.cycle?.id === cycle.id)) return;
-  // DDNS additions use the configured capacity. Pool consumption only repairs
-  // the existing population, including a deficit left by an earlier failure.
-  const targetCount = Math.min(guard.maxActiveIps || DNS_GUARD_MAX_VALUES,
-    Math.max(1, guard.repairTargetCount || 0, (cycle.remoteValues || []).length));
+  // DDNS additions use the configured capacity. Pool consumption follows the
+  // explicit fill target or the original population and its outstanding deficit.
+  const targetCount = dnsGuardPoolTarget(guard, cycle.remoteValues || []);
   const excluded = new Set(cycle.remoteValues || []);
   const remainingAddresses = sourceResult.values
     .filter((address) => !excluded.has(address));
@@ -1676,8 +1696,7 @@ async function advanceDnsGuardSources(guard, cycle, deps) {
   const retained = Object.values(selected.state).some((entry) => entry.pending) ? healthyRemote : protectedRemote;
   const missing = Math.max(0, cycle.targetCount - new Set([...retained, ...selected.values]).size);
   if (missing) {
-    cycle.candidateAssets = collectDnsGuardPoolCandidates(deps.readState(DNS_GUARD_RUNTIME_KEYS), guard, DNS_GUARD_MAX_VALUES)
-      .filter((item) => !results.has(item.address));
+    cycle.candidateAssets = collectDnsGuardPoolCandidates(deps.readState(DNS_GUARD_RUNTIME_KEYS), guard, DNS_GUARD_MAX_VALUES, new Set(results.keys()));
     const addresses = cycle.candidateAssets.map((item) => item.address);
     const batch = addresses.slice(0, Math.max(1, guard.maxParallel || 20));
     cycle.phase = 'replacement';
@@ -1822,7 +1841,7 @@ export function selectHealthyDnsGuardSources(sources, candidates, sourceState, r
   return { values: values.slice(0, DNS_GUARD_MAX_VALUES), state };
 }
 
-export function collectDnsGuardPoolCandidates(state, guard, limit = DNS_GUARD_MAX_VALUES) {
+export function collectDnsGuardPoolCandidates(state, guard, limit = DNS_GUARD_MAX_VALUES, excludedAddresses = new Set()) {
   const result = [];
   const seen = new Set();
   const assetsById = new Map(state.ipAssets.map((item) => [item.id, item]));
@@ -1835,9 +1854,9 @@ export function collectDnsGuardPoolCandidates(state, guard, limit = DNS_GUARD_MA
     let assets = (pool.assetIds || []).map((id) => assetsById.get(id)).filter((item) => item && item.enabled !== false && item.health !== 'unhealthy' && !unavailable.has(item.id));
     if (pool.selectionMode === 'random') assets = assets.sort(() => Math.random() - 0.5);
     for (const asset of assets) {
-      if (seen.has(asset.id) || result.length >= limit) continue;
+      if (excludedAddresses.has(asset.address) || seen.has(asset.address) || result.length >= limit) continue;
       if ((guard.recordType === 'AAAA' ? net.isIPv6(asset.address) : net.isIPv4(asset.address))) {
-        seen.add(asset.id);
+        seen.add(asset.address);
         result.push({ assetId: asset.id, poolId, address: asset.address });
       }
     }
@@ -1905,7 +1924,7 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
       observations: check.observations
     }]));
     const failedRemote = (guard.cycle.remoteValues || []).filter((address) => !resultByAddress.get(address)?.ok);
-    if (failedRemote.length || guard.sources?.length || guard.repairTargetCount > (guard.cycle.remoteValues || []).length) {
+    if (failedRemote.length || guard.sources?.length || dnsGuardPoolTarget(guard, guard.cycle.remoteValues || []) > (guard.cycle.remoteValues || []).length) {
       await startDnsGuardReplacement(guard, guard.cycle, failedRemote, deps);
       return;
     }
@@ -2071,10 +2090,12 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
     if (changed) draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', guardId, bindingId: '', accountId: item.accountId, zoneId: cycleSnapshot.zone.id || '', zoneName: cycleSnapshot.zone.name, providerZoneId: cycleSnapshot.zone.providerZoneId || '', domain: item.domain, beforeValues: remote, afterValues: desired, status: 'applied', createdAt: finishedAt, rolledBackAt: '' });
     draft.dnsChanges = draft.dnsChanges.slice(0, 3000);
     const ownership = calculateDnsGuardOwnership(item, remote, desired, healthySources, usedAssets);
+    const fillMissing = guard.poolFillMode === 'fill' && desired.length < targetCount;
+    const addedHealthy = usedAssets.length || healthySources.some((address) => !remote.includes(address));
     const status = !desired.length
       ? 'waiting_ip'
-      : (failedRemote.length
-          ? (desired.length >= targetCount && (usedAssets.length || healthySources.some((address) => !remote.includes(address))) ? 'replaced' : 'degraded')
+      : fillMissing ? 'degraded' : (failedRemote.length
+          ? (desired.length >= targetCount && addedHealthy ? 'replaced' : guard.poolFillMode === 'fill' ? 'healthy' : 'degraded')
           : 'healthy');
     Object.assign(item, {
       status, message: dnsGuardStatusMessage(status, failedRemote.length, usedAssets.length), currentValues: desired,
@@ -2087,9 +2108,11 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
     if (cycle.sourceSync && !failedRemote.length) {
       const added = desired.filter((address) => !remote.includes(address)).length;
       const pending = Object.values(sourceState).filter((entry) => entry.pending).length;
-      if (added) item.message = `来源同步新增 ${added} 个 IP，当前 ${desired.length} 个活动 IP`;
+      if (added) item.message = `已补充 ${added} 个 IP，当前 ${desired.length} 个活动 IP`;
       else if (pending) item.message = `现有 IP 正常，${pending} 个来源待重试`;
     }
+    if (fillMissing) item.message = `${desired.length}/${targetCount} 个健康 IP，待补 ${targetCount - desired.length} 个；等待备用池补充`;
+    else if (status === 'healthy' && failedRemote.length) item.message = `已移除 ${failedRemote.length} 个故障 IP，当前 ${desired.length} 个健康 IP，已达到目标 ${targetCount} 个`;
     draft.dnsGuardRuns.unshift({ id: uuidv4(), guardId, guardName: item.name, domain: item.domain, status, beforeValues: remote, afterValues: desired, failedValues: failedRemote, sourceValues: cycleSnapshot.sourceValues, consumedIps: usedAssets.map((entry) => entry.address), discardedIps: unusableAssets.map((entry) => entry.address), startedAt: cycleSnapshot.startedAt, finishedAt, message: item.message });
     draft.dnsGuardRuns = draft.dnsGuardRuns.slice(0, DNS_GUARD_HISTORY_LIMIT);
     pushAudit(draft, 'dnsGuard.check', 'dnsGuard', guardId, `${item.domain} 检查 ${remote.length} 个记录，故障 ${failedRemote.length} 个，补位 ${usedAssets.length} 个`, 'system');
@@ -2293,6 +2316,15 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     const recordType = input.recordType === 'AAAA' ? 'AAAA' : 'A';
     const probeIds = cleanIds(input.probeIds, 500);
     const poolIds = cleanIds(input.poolIds, 100);
+    const maxActiveIps = clampNumber(input.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50);
+    const poolFillMode = (input.poolFillMode ?? existing?.poolFillMode) === 'fill' ? 'fill' : 'repair';
+    const requestedTarget = input.poolTargetCount ?? existing?.poolTargetCount ?? maxActiveIps;
+    if (poolFillMode === 'fill' && (!Number.isInteger(Number(requestedTarget)) || Number(requestedTarget) < 1 || Number(requestedTarget) > maxActiveIps)) {
+      throw new Error(`补满目标数量须为 1–${maxActiveIps}，不能超过活动解析上限`);
+    }
+    const poolTargetCount = clampNumber(requestedTarget, 1, maxActiveIps, maxActiveIps);
+    const fillChanged = existing && ((existing.poolFillMode || 'repair') !== poolFillMode
+      || (poolFillMode === 'fill' && (existing.poolTargetCount ?? existing.maxActiveIps ?? 50) !== poolTargetCount));
     validateDdnsSources(input.sources || input.ddnsSources);
     const sources = normalizeDdnsSources(input.sources || input.ddnsSources);
     const targetChanged = Boolean(existing && (existing.accountId !== accountId || existing.domain !== domain || existing.recordType !== recordType));
@@ -2309,7 +2341,9 @@ function normalizeResource(key, input = {}, existing = null, deps) {
       recordType,
       recordLine: cleanText(input.recordLine, 100) || '默认',
       ttl: clampNumber(input.ttl, 1, 86400, 60),
-      maxActiveIps: clampNumber(input.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50),
+      maxActiveIps,
+      poolFillMode,
+      poolTargetCount,
       probeIds,
       poolIds,
       alertBotIds: cleanIds(input.alertBotIds ?? existing?.alertBotIds, 50),
@@ -2334,7 +2368,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
         return entry && prior?.domain === source.domain && (prior.backupDomain || '') === source.backupDomain
           ? [[source.id, entry]] : [];
       })),
-      repairTargetCount: targetChanged ? 0 : (existing?.repairTargetCount || 0),
+      repairTargetCount: targetChanged || fillChanged ? 0 : (existing?.repairTargetCount || 0),
       sourceErrors: targetChanged || sourcesChanged ? [] : (existing?.sourceErrors || []),
       providerRecordId: targetChanged ? '' : (existing?.providerRecordId || ''),
       providerRecordIds: targetChanged ? [] : (existing?.providerRecordIds || []),
@@ -2813,8 +2847,12 @@ function allocateIpsForIncident(incidentId, deps) {
 function unavailableAssetIds(state) {
   const now = Date.now();
   const stabilizing = new Set((state.incidents || []).filter((item) => item.status === 'stabilizing').map((item) => item.id));
-  return new Set((state.ipLeases || []).filter((lease) => ['locked', 'active'].includes(lease.status)
+  const unavailable = new Set((state.ipLeases || []).filter((lease) => ['locked', 'active'].includes(lease.status)
     && (stabilizing.has(lease.incidentId) || Date.parse(lease.expiresAt) > now)).map((lease) => lease.assetId));
+  for (const guard of state.dnsGuards || []) {
+    for (const candidate of guard.cycle?.candidateAssets || []) unavailable.add(candidate.assetId);
+  }
+  return unavailable;
 }
 
 async function checkReplacementIp(address, deps) {
@@ -3527,6 +3565,8 @@ function normalizeDnsGuardState(value = {}) {
     recordLine: cleanText(value.recordLine, 100) || '默认',
     ttl: clampNumber(value.ttl, 1, 86400, 60),
     maxActiveIps: clampNumber(value.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50),
+    poolFillMode: value.poolFillMode === 'fill' ? 'fill' : 'repair',
+    poolTargetCount: clampNumber(value.poolTargetCount, 1, clampNumber(value.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50), clampNumber(value.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50)),
     probeIds: cleanIds(value.probeIds, 500),
     poolIds: cleanIds(value.poolIds, 100),
     alertBotIds: cleanIds(value.alertBotIds, 50),

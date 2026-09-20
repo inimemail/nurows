@@ -12,7 +12,7 @@
 .auth-welcome .auth-brand span { display: block; margin-top: 3px; font-size: 12px; }
 .auth-welcome .auth-copy { margin-top: 40px; }
 .auth-welcome .label-chip { border: 1px solid var(--accent-border-soft); background: var(--accent-soft); color: var(--accent-text); font-size: 11px; padding: 5px 10px; }
-.auth-welcome .auth-copy h1 { margin: 18px 0 16px; font-size: clamp(30px, 3.3vw, 44px); line-height: 1.35; letter-spacing: -1.4px; }
+.auth-welcome .auth-copy h1 { margin: 16px 0 12px; font-size: clamp(26px, 2.6vw, 32px); font-weight: 500; line-height: 1.45; letter-spacing: -.5px; }
 .auth-welcome .auth-copy p { max-width: 370px; line-height: 1.9; font-size: 13px; }
 .auth-terminal-preview { margin-top: 28px; max-width: 400px; border: 1px solid var(--border-card); border-radius: 16px; background: var(--terminal-bg); box-shadow: var(--elev-shadow); overflow: hidden; }
 .auth-terminal-top { padding: 12px 15px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--border-soft); font: 10px ui-monospace, monospace; color: var(--text-soft); }
@@ -61,8 +61,7 @@
   .auth-welcome .auth-brand .brand-mark { width: 38px; height: 38px; font-size: 17px; }
   .auth-welcome .auth-copy { margin-top: 22px; }
   .auth-welcome .auth-copy .label-chip { display: none; }
-  .auth-welcome .auth-copy h1 { margin: 0 0 8px; font-size: 28px; line-height: 1.4; letter-spacing: -.8px; }
-  .auth-welcome .auth-copy h1 br { display: none; }
+  .auth-welcome .auth-copy h1 { margin: 0 0 8px; font-size: clamp(22px, 6vw, 24px); line-height: 1.45; letter-spacing: 0; }
   .auth-welcome .auth-copy p { font-size: 12px; }
   .auth-terminal-preview, .auth-welcome .auth-grid { display: none; }
   .auth-welcome .auth-form-card { padding: 24px 20px; gap: 22px; border-radius: 20px; }

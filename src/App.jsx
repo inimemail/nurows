@@ -2196,7 +2196,7 @@ export default function App() {
             </div>
             <div className="auth-copy">
               <span className="label-chip">{isSetup ? '从这里开始' : '欢迎回来'}</span>
-              <h1>{isSetup ? '开启你的运维工作台' : <>连接服务器，<br />让管理更从容。</>}</h1>
+              <h1>{isSetup ? '开启你的运维工作台' : '你的服务器工作台'}</h1>
               <p>终端、批量任务与网络管理，在一个工作台里完成。</p>
             </div>
             <div className="auth-terminal-preview" aria-hidden="true">

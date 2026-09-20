@@ -588,12 +588,12 @@ function countFor(section, state) {
 function summary(tab, state) {
   const current = state.orchestrationSummary;
   if (current) {
-    if (tab === 'probes') return `${current.onlineProbes} 个在线探针 · ${current.enabledGuards} 个 DNS 守护 · ${current.activeIncidents} 个活动事件`;
+    if (tab === 'probes') return `${current.onlineProbes} 个在线探针 · ${current.activeIncidents} 个活动事件`;
     if (tab === 'pools') return `${current.counts.ipAssets} 个可用 IP · ${current.counts.ipUsageRecords} 条使用记录`;
     if (tab === 'telegram') return `${current.enabledBots} 个运行中机器人`;
     return `${current.counts.dnsAccounts} 个账号 · ${current.counts.dnsBindings} 条解析绑定`;
   }
-  if (tab === 'probes') return `${state.probes?.filter((item) => item.status === 'online').length || 0} 个在线探针 · ${state.dnsGuards?.filter((item) => item.enabled !== false).length || 0} 个 DNS 守护 · ${state.incidents?.filter((item) => !['succeeded', 'recovered', 'rolled_back'].includes(item.status)).length || 0} 个活动事件`; if (tab === 'pools') return `${state.ipAssets?.length || 0} 个可用 IP · ${state.ipUsageRecords?.length || 0} 条使用记录`; if (tab === 'telegram') return `${state.telegramBots?.filter((item) => item.enabled && item.configured).length || 0} 个运行中机器人`; return `${state.dnsAccounts?.length || 0} 个账号 · ${state.dnsBindings?.length || 0} 条解析绑定`;
+  if (tab === 'probes') return `${state.probes?.filter((item) => item.status === 'online').length || 0} 个在线探针 · ${state.incidents?.filter((item) => !['succeeded', 'recovered', 'rolled_back'].includes(item.status)).length || 0} 个活动事件`; if (tab === 'pools') return `${state.ipAssets?.length || 0} 个可用 IP · ${state.ipUsageRecords?.length || 0} 条使用记录`; if (tab === 'telegram') return `${state.telegramBots?.filter((item) => item.enabled && item.configured).length || 0} 个运行中机器人`; return `${state.dnsAccounts?.length || 0} 个账号 · ${state.dnsBindings?.length || 0} 条解析绑定`;
 }
 function allocationLabel(item) { return item.allocationMode === 'all' ? '全部取用' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '一次取一个'; }
 function assetSubtitle(item) { return [item.name && item.name !== item.address ? item.address : '', item.region, item.carrier].filter(Boolean).join(' · '); }

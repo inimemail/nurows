@@ -3,7 +3,7 @@ import path from 'node:path';
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { HISTORY_RETENTION_DAYS, HISTORY_STATE_KEYS, pruneHistory } from './history.js';
+import { HISTORY_RETENTION_DAYS, HISTORY_KEYS, HISTORY_STATE_KEYS, pruneHistory } from './history.js';
 import { commandJobDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
 import express from 'express';
 import cors from 'cors';
@@ -366,12 +366,26 @@ app.get('/api/state', (req, res) => {
   res.json(sanitizeStateForClient(readState(), req.auth));
 });
 
+app.get('/api/history/:scope', (req, res) => {
+  const { scope } = req.params;
+  if (!HISTORY_KEYS.includes(scope)) return res.status(400).json({ error: '未知历史记录类别' });
+  const state = readState([scope]);
+  const records = scope === 'automationRuns' ? state.automationRuns || [] : sanitizeOrchestrationState(state)[scope];
+  const pageSize = 50;
+  const pages = Math.max(1, Math.ceil(records.length / pageSize));
+  const requestedPage = Number(req.query.page);
+  const page = Math.min(pages, Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1);
+  res.json({ records: records.slice((page - 1) * pageSize, page * pageSize), total: records.length, page, pages });
+});
+
 app.delete('/api/history', (req, res) => {
   if (req.body?.confirm !== 'clear-history') return res.status(400).json({ error: '请确认清空历史记录' });
+  const scope = req.body.scope === undefined ? 'all' : req.body.scope;
+  if (scope !== 'all' && !HISTORY_KEYS.includes(scope)) return res.status(400).json({ error: '未知历史记录类别' });
   const activeJobIds = new Set([...commandJobs.values()].filter((job) => job.status !== 'done').map((job) => job.id));
   let result;
   const state = updateState((draft) => {
-    result = pruneHistory(draft, { all: true, activeJobIds });
+    result = pruneHistory(draft, { all: true, scope, activeJobIds });
     return draft;
   });
   res.json({ ok: true, ...result, retentionDays: HISTORY_RETENTION_DAYS, state: sanitizeStateForClient(state, req.auth) });

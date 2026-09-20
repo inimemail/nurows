@@ -91,6 +91,50 @@ test('waiting and paused tasks survive age and manual cleanup', () => {
   assert.equal(pruneHistory(state, { all: true, now, activeJobIds: new Set(['live']) }).removed, 0);
 });
 
+test('each category can be cleared independently without changing any other history', () => {
+  for (const scope of HISTORY_KEYS) {
+    const state = fixture();
+    for (const key of HISTORY_KEYS) state[key].push({ id: `${key}-undated`, status: 'done' });
+    const original = structuredClone(state);
+    const result = pruneHistory(state, { all: true, scope, now });
+    assert.deepEqual(result.counts, { [scope]: 3 });
+    assert.equal(result.removed, 3);
+    assert.equal(result.kept, 0);
+    assert.deepEqual(state[scope], []);
+    for (const key of HISTORY_KEYS.filter((key) => key !== scope)) assert.deepEqual(state[key], original[key]);
+  }
+});
+
+test('scoped age cleanup does not stamp undated records in other categories', () => {
+  const state = { incidents: [{ id: 'undated', status: 'succeeded' }], auditLogs: [{ id: 'old', createdAt: date(8) }] };
+  pruneHistory(state, { scope: 'auditLogs', now });
+  assert.deepEqual(state.incidents, [{ id: 'undated', status: 'succeeded' }]);
+  assert.deepEqual(state.auditLogs, []);
+});
+
+test('single-category cleanup preserves completed incidents and their rollback dependencies', () => {
+  const original = { incidents: [{ id: 'completed', status: 'succeeded', finishedAt: date(20), dnsChangeIds: ['change'], automationJobId: 'job' }],
+    dnsChanges: [{ id: 'change', status: 'applied' }, { id: 'related', incidentId: 'completed' }, { id: 'unrelated' }],
+    automationRuns: [{ id: 'job', status: 'done' }, { id: 'unrelated', status: 'done' }],
+    ipUsageRecords: [{ id: 'usage', incidentId: 'completed', status: 'consumed' }, { id: 'unrelated', status: 'consumed' }] };
+  for (const scope of ['dnsChanges', 'automationRuns', 'ipUsageRecords']) {
+    const state = structuredClone(original);
+    const result = pruneHistory(state, { scope, all: true, now });
+    assert.equal(result.removed, 1);
+    assert.deepEqual(state[scope], original[scope].filter((item) => item.id !== 'unrelated'));
+    for (const key of Object.keys(original).filter((key) => key !== scope)) assert.deepEqual(state[key], original[key]);
+  }
+});
+
+test('invalid cleanup scope is rejected before any mutation', () => {
+  for (const scope of ['', null, [], {}, 'typo', '__proto__']) {
+    const state = fixture();
+    const original = structuredClone(state);
+    assert.throws(() => pruneHistory(state, { scope, all: true, now }), /未知历史记录类别/);
+    assert.deepEqual(state, original);
+  }
+});
+
 const source = fs.readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
 test('hourly cleanup skips database writes when no history changed and tolerates persistence failure', () => {
   const start = source.indexOf('function cleanupHistoryRecords(');
@@ -121,7 +165,7 @@ test('clear-history route requires explicit confirmation and returns sanitized r
   let state = fixture();
   let writes = 0;
   vm.runInNewContext(source.slice(start, end), { app: { delete(_path, callback) { handler = callback; } },
-    commandJobs: new Map(), pruneHistory, HISTORY_RETENTION_DAYS,
+    commandJobs: new Map(), pruneHistory, HISTORY_RETENTION_DAYS, HISTORY_KEYS,
     updateState(mutate) { writes++; return mutate(state); }, sanitizeStateForClient: () => ({ sanitized: true }) });
   let status = 200;
   let result;
@@ -129,10 +173,44 @@ test('clear-history route requires explicit confirmation and returns sanitized r
   handler({ body: {}, auth: { username: 'test' } }, response);
   assert.equal(status, 400);
   assert.equal(writes, 0);
+  handler({ body: { confirm: 'clear-history', scope: 'unknown' }, auth: { username: 'test' } }, response);
+  assert.equal(status, 400);
+  assert.equal(writes, 0);
+  handler({ body: { confirm: 'clear-history', scope: 'auditLogs' }, auth: { username: 'test' } }, response);
+  assert.equal(result.removed, 2);
+  assert.deepEqual(state.auditLogs, []);
+  assert.equal(state.dnsChanges.length, 2);
+  assert.equal(writes, 1);
   handler({ body: { confirm: 'clear-history' }, auth: { username: 'test' } }, response);
-  assert.equal(result.removed, 12);
+  assert.equal(result.removed, 10);
   assert.equal(result.kept, 0);
   assert.equal(result.retentionDays, 7);
   assert.equal(result.state.sanitized, true);
-  assert.equal(writes, 1);
+  assert.equal(writes, 2);
+});
+
+test('history reader loads only the selected category, paginates and clamps stale page numbers', () => {
+  const start = source.indexOf("app.get('/api/history/:scope'");
+  const end = source.indexOf("app.delete('/api/history'", start);
+  let handler;
+  let reads = 0;
+  const records = Array.from({ length: 115 }, (_, index) => ({ id: String(index) }));
+  vm.runInNewContext(source.slice(start, end), { app: { get(_path, callback) { handler = callback; } }, HISTORY_KEYS,
+    readState(keys) { reads++; assert.deepEqual(Array.from(keys), ['dnsGuardRuns']); return { dnsGuardRuns: records }; },
+    sanitizeOrchestrationState: (state) => state });
+  let status = 200;
+  let result;
+  const response = { status(code) { status = code; return this; }, json(value) { result = value; } };
+  handler({ params: { scope: 'dnsGuardRuns' }, query: { page: '2' } }, response);
+  assert.equal(result.total, 115);
+  assert.equal(result.records.length, 50);
+  assert.equal(result.records[0].id, '50');
+  handler({ params: { scope: 'dnsGuardRuns' }, query: { page: '999' } }, response);
+  assert.equal(result.page, 3);
+  assert.equal(result.records.length, 15);
+  handler({ params: { scope: 'dnsGuardRuns' }, query: { page: 'bad' } }, response);
+  assert.equal(result.page, 1);
+  handler({ params: { scope: 'dnsAccounts' }, query: {} }, response);
+  assert.equal(status, 400);
+  assert.equal(reads, 3);
 });

@@ -6,7 +6,9 @@ const ACTIVE_RUNS = new Set(['queued', 'running', 'paused', 'awaiting_input']);
 
 // This operates only on local history. Configuration, current DNS values,
 // probe evidence, asset inventory and allocation locks are never modified.
-export function pruneHistory(state, { all = false, now = Date.now(), activeJobIds = new Set() } = {}) {
+export function pruneHistory(state, { all = false, scope = 'all', now = Date.now(), activeJobIds = new Set() } = {}) {
+  if (scope !== 'all' && !HISTORY_KEYS.includes(scope)) throw new Error('未知历史记录类别');
+  const keys = scope === 'all' ? HISTORY_KEYS : [scope];
   const cutoff = now - HISTORY_RETENTION_DAYS * 86400000;
   let stamped = 0;
   const eligible = (item) => {
@@ -27,7 +29,10 @@ export function pruneHistory(state, { all = false, now = Date.now(), activeJobId
     || (change.status === 'applied' && incidentById.get(change.incidentId)?.status === 'failed')).map((change) => change.incidentId));
   const protectedIncidents = new Set(incidents.filter((item) => item.executionId || ACTIVE_INCIDENTS.has(item.status)
     || activeJobIds.has(item.automationJobId) || lockedIncidentIds.has(item.id) || recoveryIncidentIds.has(item.id)).map((item) => item.id));
-  const keptIncidents = incidents.filter((item) => protectedIncidents.has(item.id) || !eligible(item));
+  // When clearing another category, every existing incident still needs its
+  // rollback dependencies, including completed incidents.
+  const keptIncidents = keys.includes('incidents')
+    ? incidents.filter((item) => protectedIncidents.has(item.id) || !eligible(item)) : incidents;
   const keptIncidentIds = new Set(keptIncidents.map((item) => item.id));
   const referencedChanges = new Set(keptIncidents.flatMap((item) => item.dnsChangeIds || []));
   const referencedJobs = new Set(keptIncidents.map((item) => item.automationJobId).filter(Boolean));
@@ -44,7 +49,7 @@ export function pruneHistory(state, { all = false, now = Date.now(), activeJobId
   let removed = 0;
   let kept = 0;
   const counts = {};
-  for (const key of HISTORY_KEYS) {
+  for (const key of keys) {
     const before = state[key] || [];
     const after = key === 'incidents' ? keptIncidents : before.filter((item) => isProtected[key](item) || !eligible(item));
     counts[key] = before.length - after.length;

@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { parsePerServerInputLines } from '../shared/command-input.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
+import HistoryRecords, { HISTORY_LABELS } from './HistoryRecords.jsx';
 
 const EMPTY_SERVER = {
   id: '',
@@ -383,6 +384,8 @@ export default function App() {
   const [authForm, setAuthForm] = useState({ username: '', password: '', confirmPassword: '' });
   const [authError, setAuthError] = useState('');
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
+  const [historyScope, setHistoryScope] = useState('');
+  const [historyRevision, setHistoryRevision] = useState(0);
   const [confirmDialog, setConfirmDialog] = useState({ open: false, title: '', message: '', onConfirm: null });
   const [accountForm, setAccountForm] = useState({
     username: '',
@@ -1135,17 +1138,22 @@ export default function App() {
     }
   }
 
-  function requestHistoryCleanup() {
+  function requestHistoryCleanup(scope = 'all') {
+    if (busy.clearHistory || (scope !== 'all' && !Object.hasOwn(HISTORY_LABELS, scope))) return;
+    const label = scope === 'all' ? '所有历史记录' : HISTORY_LABELS[scope];
     setConfirmDialog({
       open: true,
-      title: '清空所有历史记录',
-      message: '将删除自动化执行、DNS 守护检查、故障事件、IP 使用、DNS 变更和审计历史，删除后不可恢复，相关历史回滚入口也将移除。正在执行、等待处理和故障恢复依赖的记录会保留。服务器、域名、IP 资产、规则配置及当前终端不受影响。',
+      title: `清空${label}`,
+      message: (scope === 'all' ? '将删除自动化执行、DNS 守护检查、故障事件、IP 使用、DNS 变更和审计历史。' : `将清理全部${label}，包括当前未显示的记录；其他类别不受影响。`)
+        + '删除后不可恢复。' + (['all', 'incidents'].includes(scope) ? '已删除故障事件的历史回滚入口也将移除。' : '')
+        + '正在执行、等待处理和故障恢复依赖的记录会保留。服务器、域名、IP 资产、规则配置及当前终端不受影响。',
       onConfirm: async () => {
         setActionBusy('clearHistory', true);
         try {
-          const data = await api('/api/history', { method: 'DELETE', body: JSON.stringify({ confirm: 'clear-history' }) });
+          const data = await api('/api/history', { method: 'DELETE', body: JSON.stringify({ confirm: 'clear-history', scope }) });
           setState(data.state);
-          toast(`已清理 ${data.removed} 条历史记录${data.kept ? `，保留 ${data.kept} 条任务及恢复依赖记录` : ''}`);
+          setHistoryRevision((value) => value + 1);
+          toast(`已清理 ${data.removed} 条${label}${data.kept ? `，保留 ${data.kept} 条任务及恢复依赖记录` : ''}`);
         } catch (error) { toast(error.message); }
         finally { setActionBusy('clearHistory', false); }
       }
@@ -2511,11 +2519,12 @@ export default function App() {
         </aside>
 
           <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-main' : '')}>
-          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
+          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
           {tab === 'automation' ? (
             <section className="automation-board">
               <div className="automation-page-head surface">
                 <div className="automation-title-block"><span className="automation-kicker">批量工作台</span><strong>{selectedAutomationTask?.name || '自动化任务'}</strong><span>{selectedAutomationTask ? `${selectedAutomationTask.steps?.length || 0} 个步骤 · 并发 ${selectedAutomationTask.concurrency}` : '从左侧选择一个任务开始执行'}</span></div>
+                <div className="toolbar"><button className="ghost" onClick={() => setHistoryScope('automationRuns')}>执行记录</button></div>
               </div>
 
               <div className="automation-workspace-grid">
@@ -3115,7 +3124,8 @@ export default function App() {
           <div className="field-grid single">
             <Field label="历史记录">
               <p className="confirm-copy">默认保留 7 天，启动时及每小时自动清理过期记录；达到现有条数上限时可提前清理。执行中及恢复所需记录自动保留。</p>
-              <button className="ghost danger-text" disabled={busy.clearHistory} onClick={requestHistoryCleanup}>
+              <button className="ghost" onClick={() => { setSettingsDialogOpen(false); setHistoryScope('auditLogs'); }}>审计记录</button>
+              <button className="ghost danger-text" disabled={busy.clearHistory} onClick={() => requestHistoryCleanup()}>
                 {busy.clearHistory ? '清理中...' : '一键清空所有历史记录'}
               </button>
             </Field>
@@ -3256,6 +3266,10 @@ export default function App() {
           </div>
         </Dialog>
       ) : null}
+
+      {historyScope ? <Dialog title={HISTORY_LABELS[historyScope]} wide onClose={() => setHistoryScope('')}>
+        <HistoryRecords key={historyScope} scope={historyScope} api={api} revision={historyRevision} clearing={busy.clearHistory} onClear={requestHistoryCleanup} />
+      </Dialog> : null}
 
       {confirmDialog.open ? (
         <Dialog

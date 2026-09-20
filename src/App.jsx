@@ -2204,18 +2204,9 @@ export default function App() {
               <div className="auth-terminal-lines"><div><em>~</em> ssh your-server</div><div className="auth-terminal-note">终端 · 自动化 · 探针守护</div><div><em>❯</em> <span className="auth-terminal-cursor" /></div></div>
             </div>
             <div className="auth-grid">
-              <div className="auth-kpi">
-                <strong>SSH</strong>
-                <span>浏览器终端</span>
-              </div>
-              <div className="auth-kpi">
-                <strong>任务</strong>
-                <span>批量命令执行</span>
-              </div>
-              <div className="auth-kpi">
-                <strong>网络</strong>
-                <span>代理接入</span>
-              </div>
+              <div className="auth-kpi"><strong>SSH</strong><span>浏览器终端</span></div>
+              <div className="auth-kpi"><strong>Command</strong><span>高级命令执行</span></div>
+              <div className="auth-kpi"><strong>Smart Ops</strong><span>智能运维</span></div>
             </div>
           </section>
 

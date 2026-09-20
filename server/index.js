@@ -452,6 +452,30 @@ app.put('/api/groups/:id', (req, res) => {
   res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
 });
 
+app.delete('/api/groups/:id/servers', (req, res) => {
+  const { confirm, serverIds } = req.body || {};
+  if (confirm !== 'clear-group-servers' || !Array.isArray(serverIds) || !serverIds.length ||
+      serverIds.some((id) => typeof id !== 'string' || !id.trim())) {
+    return res.status(400).json({ error: '请确认要清空的服务器' });
+  }
+  const targetIds = new Set(serverIds);
+  let deletedCount = 0;
+  const state = updateState((draft) => {
+    if (!draft.groups.some((group) => group.id === req.params.id)) {
+      throw new Error('未找到分组');
+    }
+    // Restrict deletion to the confirmed IDs that still belong to this group.
+    // Servers added or moved after confirmation must not be deleted accidentally.
+    draft.servers = draft.servers.filter((item) => {
+      if (item.groupId !== req.params.id || !targetIds.has(item.id)) return true;
+      deletedCount += 1;
+      return false;
+    });
+    return draft;
+  });
+  res.json({ ok: true, deletedCount, state: sanitizeStateForClient(state, req.auth) });
+});
+
 app.delete('/api/groups/:id', (req, res) => {
   const state = updateState((draft) => {
     if (req.params.id === 'group-default') {

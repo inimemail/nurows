@@ -505,6 +505,11 @@ svg {
   font-size: 11px;
 }
 
+.tree-group-head .icon-button:disabled {
+  opacity: .4;
+  cursor: not-allowed;
+}
+
 .tree-group-button .collapsed {
   transform: rotate(-90deg);
 }

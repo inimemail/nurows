@@ -30,6 +30,8 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
   const [install, setInstall] = useState(null);
   const [assetImport, setAssetImport] = useState({ open: false, addresses: '', region: '', carrier: '', labels: '' });
   const [incidentCleanup, setIncidentCleanup] = useState({ open: false, id: '', all: false, busy: false });
+  const [assetDeletion, setAssetDeletion] = useState(null);
+  const assetDeletingRef = useRef(false);
   const [guardView, setGuardView] = useState(null);
   const [guardRemote, setGuardRemote] = useState({ open: false, guardId: '', name: '', recordType: 'A', values: '', expectedValues: [], busy: false, saving: false, ready: false, error: '' });
   const guardRemoteRequest = useRef(0);
@@ -166,6 +168,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
   };
   const remove = async () => {
     if (editorBusy) return;
+    if (editor.type === 'asset') { setAssetDeletion({ id: editor.value.id, address: editor.value.address, busy: false }); return; }
     setEditorBusy(true);
     try {
       const data = await api(`/api/orchestration/${resourceFor(editor.type)}/${editor.value.id}`, { method: 'DELETE' });
@@ -174,6 +177,23 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       toast('已删除');
     } catch (error) { toast(error.message); }
     finally { setEditorBusy(false); }
+  };
+  const closeAssetDeletion = () => { if (!assetDeletingRef.current) setAssetDeletion(null); };
+  const confirmAssetDeletion = async () => {
+    if (!assetDeletion || assetDeletingRef.current) return;
+    assetDeletingRef.current = true;
+    setAssetDeletion((current) => ({ ...current, busy: true }));
+    try {
+      const data = await api(`/api/orchestration/ip-assets/${encodeURIComponent(assetDeletion.id)}`, { method: 'DELETE' });
+      onState(data.state);
+      setEditor((current) => current.type === 'asset' && current.value?.id === assetDeletion.id
+        ? { open: false, type: '', value: null } : current);
+      setAssetDeletion(null);
+      toast('IP 资产已删除，并已从所有关联备用池移除');
+    } catch (error) {
+      setAssetDeletion((current) => current ? { ...current, busy: false } : null);
+      toast(error.message);
+    } finally { assetDeletingRef.current = false; }
   };
   const openProbeInstall = async (id) => {
     try {
@@ -231,7 +251,7 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       </header>
       <div className="ops-tabs" role="tablist">{sections.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setSection(key)}>{label}<em>{countFor(key, state)}</em></button>)}</div>
       <div className="surface ops-content">
-        {active === 'dynamic' ? <DynamicGuardWorkspace onState={onState} api={api} toast={toast} Dialog={Dialog} onOpenHistory={onOpenHistory} /> : renderSection(active, { state, onHistoryCleanup, onOpenHistory, historyClearing, guardSyncingIds, openCreate, openEdit, duplicateRecord, checkTargetNow, checkGuardNow, syncGuardRemote, openGuardRemote, openGuardView: setGuardView, openProbeInstall, rotateProbe, executeIncident, rollbackIncident, requestIncidentDelete: (id) => setIncidentCleanup({ open: true, id, all: false, busy: false }), requestIncidentClear: () => onHistoryCleanup('incidents'), openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
+        {active === 'dynamic' ? <DynamicGuardWorkspace onState={onState} api={api} toast={toast} Dialog={Dialog} onOpenHistory={onOpenHistory} /> : renderSection(active, { state, onHistoryCleanup, onOpenHistory, historyClearing, guardSyncingIds, openCreate, openEdit, duplicateRecord, checkTargetNow, checkGuardNow, syncGuardRemote, openGuardRemote, openGuardView: setGuardView, openProbeInstall, rotateProbe, executeIncident, rollbackIncident, requestAssetDelete: (item) => setAssetDeletion({ id: item.id, address: item.address, busy: false }), requestIncidentDelete: (id) => setIncidentCleanup({ open: true, id, all: false, busy: false }), requestIncidentClear: () => onHistoryCleanup('incidents'), openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
       </div>
 
       {editor.open ? <Dialog title={`${editor.value.id ? '编辑' : '新增'}${typeLabel(editor.type)}`} className="ops-editor-dialog" wide={editor.type !== 'target' && editor.type !== 'policy' && editor.type !== 'guard'} xwide={editor.type === 'target' || editor.type === 'policy' || editor.type === 'guard'} onClose={() => !editorBusy && closeEditor()} footer={<><div>{editor.value.id ? <button className="danger-text" disabled={editorBusy} onClick={remove}>删除</button> : null}</div><div className="dialog-actions"><button className="ghost" disabled={editorBusy} onClick={closeEditor}>取消</button><button className="primary" disabled={editorBusy} onClick={save}>{editorBusy ? (editor.type === 'binding' ? '写入远端中...' : '保存中...') : editor.type === 'guard' ? '保存规则' : '保存'}</button></div></>}>{renderEditor(editor.type, editor.value, (patch) => setEditor((current) => ({ ...current, value: { ...current.value, ...patch } })), state, api, toast)}</Dialog> : null}
@@ -240,6 +260,9 @@ export default function OrchestrationWorkspace({ tab, state, api, onState, toast
       {install ? <Dialog title="探针安装 / 升级" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装 / 升级命令" value={install.installCommand} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>重复执行安装命令会下载最新代理并重启探针服务，现有长期注册令牌继续使用。</span></div></Dialog> : null}
       {assetImport.open ? <Dialog title="批量导入 IP 资产" className="ops-editor-dialog" wide onClose={() => setAssetImport((current) => ({ ...current, open: false }))} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setAssetImport((current) => ({ ...current, open: false }))}>取消</button><button className="primary" onClick={importAssets}>导入</button></div></>}><EditorGrid><Field label="IP 地址" full><textarea className="ops-batch-ip-input" rows="12" value={assetImport.addresses} onChange={(e) => setAssetImport((current) => ({ ...current, addresses: e.target.value }))} placeholder={'每行一个，也支持空格或逗号分隔\n1.1.1.1\n2001:db8::1'} /></Field><Field label="地区（选填，批量设置）"><input value={assetImport.region} onChange={(e) => setAssetImport((current) => ({ ...current, region: e.target.value }))} /></Field><Field label="运营商（选填，批量设置）"><input value={assetImport.carrier} onChange={(e) => setAssetImport((current) => ({ ...current, carrier: e.target.value }))} /></Field><Field label="标签（选填，逗号分隔）" full><input value={assetImport.labels} onChange={(e) => setAssetImport((current) => ({ ...current, labels: e.target.value }))} /></Field></EditorGrid></Dialog> : null}
       {incidentCleanup.open ? <Dialog title={incidentCleanup.all ? '清理故障事件' : '删除故障事件'} onClose={() => !incidentCleanup.busy && setIncidentCleanup({ open: false, id: '', all: false, busy: false })} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={incidentCleanup.busy} onClick={() => setIncidentCleanup({ open: false, id: '', all: false, busy: false })}>取消</button><button className="primary danger-action" disabled={incidentCleanup.busy} onClick={confirmIncidentCleanup}>{incidentCleanup.busy ? '清理中...' : '确认清理'}</button></div></>}><div className="confirm-copy">{incidentCleanup.all ? '将清理全部非执行中的故障事件，正在运行的自动化、DNS 更新和回滚事件会自动保留。' : '将删除这条故障事件；IP 使用记录、DNS 变更记录和审计记录仍会保留。'}</div></Dialog> : null}
+      {assetDeletion ? <Dialog title="删除 IP 资产" onClose={closeAssetDeletion} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={assetDeletion.busy} onClick={closeAssetDeletion}>取消</button><button className="primary danger-action" disabled={assetDeletion.busy} onClick={confirmAssetDeletion}>{assetDeletion.busy ? '删除中...' : '确认删除'}</button></div></>}>
+        <div className="confirm-copy">确定删除 IP「{assetDeletion.address}」吗？将自动从所有关联备用池移除该 IP，备用池和历史使用记录保留。正在使用或被任务占用的 IP 无法删除。</div>
+      </Dialog> : null}
     </section>
   );
 }
@@ -252,7 +275,7 @@ function renderSection(section, ctx) {
   if (section === 'policies') return <DataView title="切换策略" copy="把检查目标、备用池、自动化和 DNS 串成一条可回滚流程" action="新增策略" onAction={() => ctx.openCreate('policy')} empty="还没有切换策略">{state.failoverPolicies?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.poolIds?.length || 0} 个池 · ${item.dnsBindingIds?.length || 0} 条解析 · ${item.approvalMode === 'telegram' ? '需确认' : '自动执行'}`} status={item.enabled ? '已启用' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} onTripleClick={() => ctx.duplicateRecord('policy', item)} actions={<button className="ghost" onClick={() => ctx.openEdit('policy', item)}>编辑</button>} />)}</DataView>;
   if (section === 'incidents') return <DataView title="故障事件" copy="无备用 IP 时保持等待，补入后重新确认故障并预检候选 IP" dangerAction="清理全部" dangerDisabled={ctx.historyClearing} onDangerAction={ctx.requestIncidentClear} empty="还没有故障事件">{state.incidents?.map((item) => { const deletable = !item.executionId && !['allocating', 'automating', 'dns_updating', 'verifying', 'stabilizing', 'rolling_back'].includes(item.status); const detail = item.status === 'failed' ? item.error : item.message; return <Row key={item.id} title={item.targetName} subtitle={`${formatTime(item.startedAt)} · ${detail || item.policyName}`} status={STATUS[item.status] || item.status} tone={['succeeded', 'recovered'].includes(item.status) ? 'ok' : ['failed', 'waiting_for_ip'].includes(item.status) ? 'bad' : 'warn'} actions={<>{['pending_approval', 'failed', 'observing'].includes(item.status) ? <button className="primary" onClick={() => ctx.executeIncident(item.id)}>执行</button> : null}{item.dnsChangeIds?.length && item.status !== 'rolled_back' ? <button className="ghost" onClick={() => ctx.rollbackIncident(item.id)}>回滚</button> : null}{deletable ? <button className="ghost danger-text-button" onClick={() => ctx.requestIncidentDelete(item.id)}>删除</button> : null}</>} />; })}</DataView>;
   if (section === 'bots') return <DataView title="Telegram 机器人" copy="每个机器人可独立配置授权用户、菜单功能和关联任务" action="新增机器人" onAction={() => ctx.openCreate('bot')} empty="还没有配置 Telegram 机器人">{state.telegramBots?.map((item) => <Row key={item.id} title={item.name || '未命名机器人'} subtitle={`${item.userIds?.length || 0} 个授权用户 · ${item.automationTaskIds?.length || 0} 个自动化任务`} status={item.enabled && item.configured ? '运行中' : item.configured ? '已停用' : '未配置 Token'} tone={item.enabled && item.configured ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('bot', item)}>编辑</button>} />)}</DataView>;
-  if (section === 'assets') return <DataView title="IP 资产" copy="支持一次导入最多 5000 个 IPv4 / IPv6，自动去重" action="批量导入 IP" secondaryAction="单个新增" onAction={ctx.openAssetImport} onSecondaryAction={() => ctx.openCreate('asset')} empty="还没有 IP 资产">{state.ipAssets?.map((item) => <Row key={item.id} title={item.name || item.address} subtitle={assetSubtitle(item)} status={STATUS[item.health] || item.health} tone={item.health === 'healthy' ? 'ok' : item.health === 'unhealthy' ? 'bad' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('asset', item)}>编辑</button>} />)}</DataView>;
+  if (section === 'assets') return <DataView title="IP 资产" copy="支持批量导入；删除空闲 IP 时自动从所有关联备用池移除" action="批量导入 IP" secondaryAction="单个新增" onAction={ctx.openAssetImport} onSecondaryAction={() => ctx.openCreate('asset')} empty="还没有 IP 资产">{state.ipAssets?.map((item) => <Row key={item.id} title={item.name || item.address} subtitle={assetSubtitle(item)} status={STATUS[item.health] || item.health} tone={item.health === 'healthy' ? 'ok' : item.health === 'unhealthy' ? 'bad' : 'muted'} actions={<><button className="ghost" onClick={() => ctx.openEdit('asset', item)}>编辑</button><button className="ghost danger-text-button" onClick={() => ctx.requestAssetDelete(item)}>删除</button></>} />)}</DataView>;
   if (section === 'pools') return <DataView title="备用池" copy="IP 可加入多个备用池；成功切换后会自动消耗并删除" action="新增备用池" onAction={() => ctx.openCreate('pool')} empty="还没有备用池">{state.ipPools?.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.assetIds?.length || 0} 个 IP · ${allocationLabel(item)}`} status={item.enabled ? '可分配' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('pool', item)}>编辑</button>} />)}</DataView>;
   if (section === 'usage') return <UsageRecordsView records={state.ipUsageRecords || []} onClear={() => ctx.onHistoryCleanup('ipUsageRecords')} clearing={ctx.historyClearing} />;
   if (section === 'accounts') return <DataView title="服务商账号" copy="保存凭证后，系统按完整域名自动识别托管域和解析记录" action="新增账号" onAction={() => ctx.openCreate('account')} empty="还没有 DNS 服务商账号">{state.dnsAccounts?.map((item) => <Row key={item.id} title={item.name} subtitle={PROVIDERS[item.provider] || item.provider} status={item.configured ? (item.status === 'healthy' ? '连接正常' : '待测试') : '未配置凭证'} tone={item.status === 'healthy' ? 'ok' : 'warn'} onTripleClick={() => ctx.duplicateRecord('account', item)} actions={<><button className="ghost" onClick={async () => { try { const data = await ctx.api(`/api/dns-accounts/${item.id}/test`, { method: 'POST' }); ctx.onState(data.state); ctx.toast('连接测试成功'); } catch (error) { ctx.toast(error.message); } }}>测试</button><button className="ghost" onClick={() => ctx.openEdit('account', item)}>编辑</button></>} />)}</DataView>;

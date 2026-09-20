@@ -1661,6 +1661,34 @@ export default function App() {
     }
   }
 
+  function confirmClearGroup(group) {
+    const serverIds = state.servers.filter((item) => item.groupId === group.id).map((item) => item.id);
+    if (!serverIds.length || busy.clearGroupServers) return;
+    openConfirm({
+      title: '清空服务器',
+      message: `确定删除「${group.name}」内的全部 ${serverIds.length} 台服务器吗（包含搜索未显示的服务器）？分组将保留。仅删除面板中的服务器配置，不会删除远程机器。此操作不可撤销。`,
+      onConfirm: () => clearGroupServers(group.id, serverIds)
+    });
+  }
+
+  async function clearGroupServers(groupId, serverIds) {
+    if (!serverIds.length || busy.clearGroupServers) return;
+    try {
+      setActionBusy('clearGroupServers', true);
+      const data = await api(`/api/groups/${encodeURIComponent(groupId)}/servers`, {
+        method: 'DELETE',
+        body: JSON.stringify({ confirm: 'clear-group-servers', serverIds }),
+        onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
+      });
+      setState(data.state);
+      toast(`已删除 ${data.deletedCount} 台服务器，分组已保留`);
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      setActionBusy('clearGroupServers', false);
+    }
+  }
+
   async function removeGroup(id) {
     if (!id) {
       return;
@@ -2420,13 +2448,21 @@ export default function App() {
                       </button>
                       <div className="row-actions">
                         <button className="icon-button" onClick={() => setGroupDialog({ open: true, value: { ...group } })}><EditIcon /></button>
-                        {group.id !== 'group-default' ? (
+                        {group.id === 'group-default' ? (
+                          <button
+                            className="icon-button danger"
+                            title={busy.clearGroupServers ? '正在清空服务器…' : '清空服务器（保留分组）'}
+                            aria-label="清空服务器（保留分组）"
+                            disabled={busy.clearGroupServers || !state.servers.some((item) => item.groupId === group.id)}
+                            onClick={() => confirmClearGroup(group)}
+                          ><TrashIcon /></button>
+                        ) : (
                           <button className="icon-button danger" onClick={() => openConfirm({
                             title: '删除分组',
                             message: '确认删除当前分组吗？分组下的服务器也会一起删除。',
                             onConfirm: () => removeGroup(group.id)
                           })}><TrashIcon /></button>
-                        ) : null}
+                        )}
                       </div>
                     </div>
 

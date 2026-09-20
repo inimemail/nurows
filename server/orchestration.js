@@ -481,8 +481,12 @@ export function registerOrchestrationRoutes(app, deps) {
     if (!key) return res.status(404).json({ error: '未知资源类型' });
     if (key === 'dnsGuards') assertDnsGuardIdle(req.params.id, deps, '守护检查正在执行，请结束后再删除');
     const state = deps.updateState((draft) => {
-      ensureNotReferenced(draft, key, req.params.id);
-      draft[key] = draft[key].filter((entry) => entry.id !== req.params.id);
+      if (key === 'ipAssets') {
+        deleteUnusedIpAsset(draft, req.params.id);
+      } else {
+        ensureNotReferenced(draft, key, req.params.id);
+        draft[key] = draft[key].filter((entry) => entry.id !== req.params.id);
+      }
       if (key === 'telegramBots') {
         for (const pool of draft.ipPools) pool.alertBotIds = (pool.alertBotIds || []).filter((id) => id !== req.params.id);
       }
@@ -2433,10 +2437,34 @@ function ensureResourceReferences(state, key, item, deps) {
   }
 }
 
+function deleteUnusedIpAsset(state, id) {
+  const asset = state.ipAssets.find((item) => item.id === id);
+  if (!asset) throw new Error('IP 资产不存在，请刷新列表');
+  const activeIncidents = new Set((state.incidents || [])
+    .filter((item) => item.executionId || ['allocating', 'automating', 'dns_updating', 'verifying', 'stabilizing', 'rolling_back'].includes(item.status))
+    .map((item) => item.id));
+  const leased = (state.ipLeases || []).some((lease) => lease.assetId === id && ['locked', 'active'].includes(lease.status)
+    && (activeIncidents.has(lease.incidentId) || !Number.isFinite(Date.parse(lease.expiresAt)) || Date.parse(lease.expiresAt) > Date.now()));
+  const allocated = (state.incidents || []).some((item) => activeIncidents.has(item.id) && item.allocatedIps?.includes(asset.address));
+  const selectedByGuard = (state.dnsGuards || []).some((guard) =>
+    guard.cycle?.candidateAssets?.some((candidate) => candidate.assetId === id || candidate.address === asset.address));
+  const inDns = [...(state.dnsGuards || []), ...(state.dnsBindings || [])]
+    .some((item) => item.currentValues?.includes(asset.address));
+  if (leased || allocated || selectedByGuard || inDns) throw new Error('该 IP 正在使用或被任务占用，暂时不能删除');
+
+  state.ipAssets = state.ipAssets.filter((item) => item.id !== id);
+  for (const pool of state.ipPools) {
+    if (pool.assetIds?.includes(id)) {
+      pool.assetIds = pool.assetIds.filter((assetId) => assetId !== id);
+      pool.updatedAt = nowIso();
+    }
+  }
+  state.ipLeases = (state.ipLeases || []).filter((lease) => lease.assetId !== id);
+}
+
 function ensureNotReferenced(state, key, id) {
   const references = {
     probes: state.probeTargets.some((item) => item.probeIds?.includes(id)) || state.dnsGuards.some((item) => item.probeIds?.includes(id)),
-    ipAssets: state.ipPools.some((item) => item.assetIds?.includes(id)),
     ipPools: state.failoverPolicies.some((item) => item.poolIds?.includes(id)) || state.dnsGuards.some((item) => item.poolIds?.includes(id)),
     dnsAccounts: state.dnsZones.some((item) => item.accountId === id) || state.dnsBindings.some((item) => item.accountId === id) || state.dnsGuards.some((item) => item.accountId === id),
     dnsZones: state.dnsBindings.some((item) => item.zoneId === id),

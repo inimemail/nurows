@@ -1,0 +1,54 @@
+.dialog.settings-dialog { width: min(800px, 100%); max-height: min(820px, calc(100dvh - 48px)); }
+.settings-dialog .dialog-body { padding: 0; display: flex; flex-direction: column; overflow: hidden; }
+.settings-tabs { display: flex; gap: 6px; flex: 0 0 auto; padding: 12px 20px; border-bottom: 1px solid var(--border-soft); }
+.settings-tabs button { border: 0; border-radius: 10px; background: transparent; color: var(--text-soft); font: inherit; font-weight: 600; padding: 10px 16px; cursor: pointer; white-space: nowrap; min-height: 42px; }
+.settings-tabs button.active { color: var(--accent-text); background: var(--accent-soft); }
+.settings-tabs button:hover { background: var(--accent-soft-2); }
+.settings-tabs button:focus-visible { outline: 2px solid var(--accent-solid); outline-offset: -2px; }
+.settings-panel { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 22px; }
+.settings-section-heading { margin-bottom: 20px; }
+.settings-section-heading h3 { margin: 0; font-size: 15px; color: var(--text-strong); }
+.settings-section-heading p { margin: 6px 0 0; color: var(--text-soft); font-size: 12px; line-height: 1.65; }
+.settings-account-fields { display: flex; flex-direction: column; gap: 18px; border: 0; padding: 0; margin: 0; min-width: 0; }
+.settings-account-fields label { display: flex; flex-direction: column; gap: 8px; min-width: 0; color: var(--text-soft); font-size: 12px; }
+.settings-account-fields input { width: 100%; min-width: 0; }
+.settings-password-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; padding-top: 18px; border-top: 1px solid var(--border-soft); }
+.settings-dialog .dialog-footer { gap: 12px; }
+.settings-dialog .dialog-footer button { min-height: 42px; }
+.settings-logout { color: #ef6464; }
+.settings-retention { display: flex; align-items: center; gap: 16px; padding: 14px 16px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--accent-soft); margin-bottom: 16px; }
+.settings-retention > div { flex: 1; min-width: 0; }
+.settings-retention strong { font-size: 13px; color: var(--text-strong); }
+.settings-retention p { margin: 5px 0 0; font-size: 12px; line-height: 1.7; color: var(--text-soft); }
+.settings-retention > button { flex-shrink: 0; }
+.history-browser { min-width: 0; }
+.history-category-tabs { flex-wrap: wrap; padding: 0 0 12px; gap: 4px; }
+.history-category-tabs button { padding: 8px 11px; font-size: 12px; }
+.history-category-panel { padding-top: 16px; }
+.history-category-panel .ops-content-head { gap: 12px; align-items: flex-start; }
+.history-category-panel .ops-list { flex: none; overflow: visible; }
+.history-category-panel .ops-row { align-items: flex-start; }
+.history-category-panel .ops-row-main strong, .history-category-panel .ops-row-main span:not(.ops-dot) { white-space: normal; overflow-wrap: anywhere; text-overflow: clip; }
+.history-category-panel .confirm-copy { min-height: 0; display: block; text-align: left; margin: 16px 0; line-height: 1.7; overflow-wrap: anywhere; }
+.history-category-panel .ops-content-actions { flex-wrap: wrap; }
+.history-category-panel .ops-row details { margin-top: 10px; }
+.history-category-panel .ops-row details summary { cursor: pointer; color: var(--accent-text); }
+.dialog.history-dialog .dialog-body { padding-top: 16px; }
+@media (max-width: 760px) {
+  .dialog.settings-dialog { width: 100%; max-height: 100%; border-radius: 18px; }
+  .settings-tabs { padding: 10px 12px; }
+  .settings-dialog > .dialog-body > .settings-tabs button { flex: 1; min-height: 44px; }
+  .settings-panel { padding: 16px 14px; }
+  .settings-password-fields { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .settings-account-fields input { font-size: 16px; min-height: 46px; }
+  .settings-retention { flex-direction: column; align-items: stretch; gap: 10px; padding: 12px; }
+  .settings-retention > button { align-self: flex-start; min-height: 44px; }
+  .history-category-tabs { flex-wrap: nowrap; overflow-x: auto; overscroll-behavior-x: contain; padding: 0 0 10px; }
+  .history-category-tabs button { flex: 0 0 auto; min-height: 44px; }
+  .history-category-panel .ops-content-head { flex-direction: column; align-items: stretch; }
+  .history-category-panel .ops-content-actions > button { min-height: 44px; }
+  .settings-dialog .dialog-footer { flex-wrap: nowrap; padding: 12px 14px max(12px, env(safe-area-inset-bottom)); }
+  .settings-dialog .dialog-footer > .settings-logout { flex: 0 0 auto; padding: 10px; }
+  .settings-dialog .dialog-footer > .dialog-actions { flex: 1 1 auto; justify-content: flex-end; min-width: 0; gap: 8px; }
+  .settings-dialog .dialog-footer .dialog-actions > button { flex: 0 1 auto; min-height: 44px; padding: 10px 16px; }
+}

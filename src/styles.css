@@ -1571,6 +1571,8 @@ svg {
   background: rgba(2, 6, 23, 0.6);
   backdrop-filter: blur(10px);
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   place-items: center;
   padding: 24px;
   z-index: 25;

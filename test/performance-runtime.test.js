@@ -211,7 +211,7 @@ test('maintenance removes expired cache entries while preserving active limits a
   const sessions = new Map([['old', { expiresAt: old }], ['active', { expiresAt: future }]]);
   const authAttempts = new Map([['old', { until: old }], ['active', { until: future }]]);
   const pending = new Map([['old', { expiresAt: old }], ['active', { expiresAt: future }]]);
-  runtime(['cleanupExpiredSessions', 'cleanupRuntimeCaches'], { sessions, authAttempts, probeRegistrationAttempts: new Map(), telegramRuntime: { pending } }).cleanupRuntimeCaches();
+  runtime(['cleanupExpiredSessions', 'cleanupRuntimeCaches'], { sessions, sessionSockets: { revoke: (token) => sessions.delete(token) }, authAttempts, probeRegistrationAttempts: new Map(), telegramRuntime: { pending } }).cleanupRuntimeCaches();
   for (const map of [sessions, authAttempts, pending]) assert.deepEqual([...map.keys()], ['active']);
 });
 

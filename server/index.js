@@ -5,6 +5,7 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import { HISTORY_RETENTION_DAYS, HISTORY_KEYS, HISTORY_STATE_KEYS, pruneHistory } from './history.js';
 import { createDynamicGuardService, registerDynamicGuardRoutes, sanitizeDynamicGuard } from './dynamic-guard.js';
+import { createSessionSocketRegistry, createWebSocketUpgradeHandler } from './websocket-security.js';
 import { commandJobDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
 import express from 'express';
 import cors from 'cors';
@@ -71,6 +72,7 @@ const WEBSOCKET_PING_INTERVAL_MS = readDurationMs(process.env.WEBSOCKET_PING_INT
 const TERMINAL_REATTACH_GRACE_MS = 1000 * 60 * 60 * 12;
 const TERMINAL_HISTORY_LIMIT = 1000 * 1000;
 const sessions = new Map();
+const sessionSockets = createSessionSocketRegistry(sessions);
 const terminalSessions = new Map();
 const authAttempts = new Map();
 const probeRegistrationAttempts = new Map();
@@ -317,7 +319,7 @@ app.post('/api/auth/login', (req, res) => {
 app.post('/api/auth/logout', (req, res) => {
   const token = getCookie(req.headers.cookie || '', 'nurossh_session');
   if (token) {
-    sessions.delete(token);
+    sessionSockets.revoke(token);
   }
   clearSessionCookie(res);
   res.json({ ok: true });
@@ -356,7 +358,7 @@ app.post('/api/auth/account', (req, res) => {
     writeState(state);
   }
   writeAuth(nextAuth);
-  sessions.clear();
+  sessionSockets.revokeAll();
 
   const session = createSession(nextUsername, deriveEncryptionKey(finalPassword, nextAuth.salt));
   setSessionCookie(req, res, session.token);
@@ -958,24 +960,13 @@ app.use((error, _req, res, _next) => {
   res.status(error.statusCode || 400).json({ error: error.message || '请求失败' });
 });
 
-server.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url || '', 'http://localhost');
-  if (url.pathname !== '/ws/terminal' && url.pathname !== '/ws/command-job') {
-    socket.destroy();
-    return;
+server.on('upgrade', createWebSocketUpgradeHandler({
+  wss, getSession: getSessionFromRequest, sessionSockets,
+  originOptions: {
+    production: process.env.NODE_ENV === 'production', devPort: DEV_SERVER_PORT,
+    allowedOrigins: String(process.env.ALLOWED_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean)
   }
-
-  const session = getSessionFromRequest(req);
-  if (!session) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req);
-  });
-});
+}));
 
 wss.on('connection', (ws, req) => {
   attachWebSocketHeartbeat(ws);
@@ -1280,6 +1271,7 @@ function attachTerminalClient(runtime, ws) {
   }
 
   ws.on('message', (raw) => {
+    if (!sessionSockets.authorized(ws)) return;
     if (!runtime.shellStream || runtime.closed) {
       return;
     }
@@ -1347,7 +1339,7 @@ function closeTerminalRuntime(runtime, notifyClients) {
 function broadcastTerminalSession(runtime, payload) {
   let message;
   for (const client of runtime.clients) {
-    if (client.readyState === client.OPEN) {
+    if (client.readyState === client.OPEN && sessionSockets.authorized(client)) {
       message ??= JSON.stringify(payload);
       client.send(message);
     }
@@ -1411,6 +1403,7 @@ function attachWebSocketHeartbeat(ws) {
     alive = true;
   };
   const timer = setInterval(() => {
+    if (!sessionSockets.authorized(ws)) { clearInterval(timer); return; }
     if (ws.readyState !== ws.OPEN) {
       clearInterval(timer);
       return;
@@ -1665,7 +1658,7 @@ function cleanupExpiredSessions() {
   const now = Date.now();
   for (const [token, session] of sessions.entries()) {
     if (session.expiresAt <= now) {
-      sessions.delete(token);
+      sessionSockets.revoke(token);
     }
   }
 }
@@ -1709,7 +1702,7 @@ function getSessionFromRequest(req) {
     return null;
   }
   if (session.expiresAt <= Date.now()) {
-    sessions.delete(token);
+    sessionSockets.revoke(token);
     return null;
   }
   session.expiresAt = Date.now() + SESSION_TTL_MS;
@@ -1737,7 +1730,7 @@ function getCookie(cookieHeader, name) {
   for (const item of cookies) {
     const [key, ...rest] = item.trim().split('=');
     if (key === name) {
-      return decodeURIComponent(rest.join('='));
+      try { return decodeURIComponent(rest.join('=')); } catch { return ''; }
     }
   }
   return '';
@@ -3550,6 +3543,7 @@ function handleCommandJobConnection(ws, req) {
   }
 
   ws.on('message', (raw) => {
+    if (!sessionSockets.authorized(ws)) return;
     const activeRuntime = job.sessions.get(serverId);
     if (!activeRuntime || !resultItem) {
       return;
@@ -3610,7 +3604,7 @@ function writeCommandSessionInput(job, runtime, resultItem, data) {
 function broadcastCommandSession(runtime, payload) {
   let message;
   for (const client of runtime.clients) {
-    if (client.readyState === client.OPEN) {
+    if (client.readyState === client.OPEN && sessionSockets.authorized(client)) {
       message ??= JSON.stringify(payload);
       client.send(message);
     }

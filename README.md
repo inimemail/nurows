@@ -100,6 +100,10 @@ Docker 运行配置已经做了几项基础收敛：
 - 数据单独挂载到 `./data`
 - `/tmp` 使用 `tmpfs`
 
+终端和命令中心的 WebSocket 会核验登录会话与浏览器 Origin。退出登录立即撤销该会话的全部 WebSocket；修改账号信息会撤销所有旧会话连接，后台自动化任务继续运行。会话过期后拒绝输入和输出并关闭连接，畸形 Cookie 或握手请求不会退出面板进程。
+
+Nginx 等反向代理应保留 `Host` 并覆盖设置 `X-Forwarded-Proto`（Nginx 对应 `$http_host` 和 `$scheme`），同时正常转发 WebSocket Upgrade。需要使用不同公开域名时，可在运行环境中配置 `ALLOWED_ORIGINS=https://panel.example.com`，多个完整来源用逗号分隔；不支持通配符。不带 Origin 的 WebSocket 客户端会被拒绝。此校验不影响探针 HTTP 接口。
+
 ## 本地开发
 
 1. 安装依赖：

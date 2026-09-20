@@ -4,8 +4,9 @@ import { FitAddon } from '@xterm/addon-fit';
 import { parsePerServerInputLines } from '../shared/command-input.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
-import HistoryRecords, { HISTORY_LABELS } from './HistoryRecords.jsx';
+import { HISTORY_LABELS } from './HistoryRecords.jsx';
 import Dialog from './Dialog.jsx';
+import SettingsDialog, { HistoryBrowser } from './SettingsDialog.jsx';
 
 const EMPTY_SERVER = {
   id: '',
@@ -3069,69 +3070,15 @@ export default function App() {
       ) : null}
 
       {settingsDialogOpen ? (
-        <Dialog
-          title="设置"
+        <SettingsDialog
+          accountForm={accountForm} setAccountForm={setAccountForm} accountError={accountError}
+          saving={busy.account} onSave={saveAccount} onLogout={logout}
+          api={api} historyRevision={historyRevision} historyClearing={busy.clearHistory} onClearHistory={requestHistoryCleanup}
           onClose={() => {
             setSettingsDialogOpen(false);
             setAccountError('');
           }}
-          footer={
-            <>
-              <button className="danger-text dialog-danger" onClick={logout}>退出登录</button>
-              <div className="dialog-actions">
-                <button className="ghost" onClick={() => {
-                  setSettingsDialogOpen(false);
-                  setAccountError('');
-                }}>取消</button>
-              <button className={'primary ' + (busy.account ? 'is-loading' : '')} onClick={saveAccount} disabled={busy.account}>
-                  {busy.account ? '保存中...' : '保存'}
-                </button>
-              </div>
-            </>
-          }
-        >
-          <div className="field-grid single">
-            <Field label="用户名">
-              <input
-                value={accountForm.username}
-                onChange={(event) => setAccountForm((current) => ({ ...current, username: event.target.value }))}
-              />
-            </Field>
-            <Field label="当前密码">
-              <input
-                type="password"
-                value={accountForm.currentPassword}
-                onChange={(event) => setAccountForm((current) => ({ ...current, currentPassword: event.target.value }))}
-              />
-            </Field>
-            <Field label="新密码">
-              <input
-                type="password"
-                value={accountForm.newPassword}
-                placeholder="留空则不修改"
-                onChange={(event) => setAccountForm((current) => ({ ...current, newPassword: event.target.value }))}
-              />
-            </Field>
-            <Field label="确认新密码">
-              <input
-                type="password"
-                value={accountForm.confirmPassword}
-                placeholder="留空则不修改"
-                onChange={(event) => setAccountForm((current) => ({ ...current, confirmPassword: event.target.value }))}
-              />
-            </Field>
-          </div>
-          {accountError ? <div className="auth-error inline-error">{accountError}</div> : null}
-          <div className="field-grid single">
-            <Field label="历史记录">
-              <p className="confirm-copy">默认保留 7 天，启动时及每小时自动清理过期记录；达到现有条数上限时可提前清理。执行中及恢复所需记录自动保留。</p>
-              <button className="ghost" onClick={() => { setSettingsDialogOpen(false); setHistoryScope('auditLogs'); }}>审计记录</button>
-              <button className="ghost danger-text" disabled={busy.clearHistory} onClick={() => requestHistoryCleanup()}>
-                {busy.clearHistory ? '清理中...' : '一键清空所有历史记录'}
-              </button>
-            </Field>
-          </div>
-        </Dialog>
+        />
       ) : null}
 
       {serverPickerOpen ? (
@@ -3268,8 +3215,8 @@ export default function App() {
         </Dialog>
       ) : null}
 
-      {historyScope ? <Dialog title={HISTORY_LABELS[historyScope]} wide onClose={() => setHistoryScope('')}>
-        <HistoryRecords key={historyScope} scope={historyScope} api={api} revision={historyRevision} clearing={busy.clearHistory} onClear={requestHistoryCleanup} />
+      {historyScope ? <Dialog title="历史记录" wide className="history-dialog" onClose={() => setHistoryScope('')}>
+        <HistoryBrowser key={historyScope} initialScope={historyScope} api={api} revision={historyRevision} clearing={busy.clearHistory} onClear={requestHistoryCleanup} />
       </Dialog> : null}
 
       {confirmDialog.open ? (

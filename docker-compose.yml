@@ -10,6 +10,7 @@ services:
       HOST: ${HOST:-0.0.0.0}
       PORT: ${PORT:-38471}
       SQLITE_DB_PATH: ${SQLITE_DB_PATH:-/app/data/app.db}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
     ports:
       - "${PORT:-38471}:${PORT:-38471}"
     volumes:

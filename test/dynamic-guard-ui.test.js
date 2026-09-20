@@ -118,3 +118,16 @@ test('rapid repeated form submissions save once', async () => {
   assert.equal(calls.length, 1);
   release({ ok: true }); await first;
 });
+
+test('new editor starts compact, preserves advanced values and expands settings for invalid fields', () => {
+  const view = harness(async () => ({}));
+  view.button('新增任务').props.onClick(); view.render();
+  let details = view.nodes().find((node) => node.type === 'details');
+  assert.equal(details.props.open, false);
+  assert.equal(view.nodes().filter((node) => node.type === 'input' && node.props.type === 'number').length, 9);
+  details.props.onToggle({ currentTarget: { open: true } }); view.render();
+  assert.equal(view.nodes().find((node) => node.type === 'details').props.open, true);
+  details.props.onToggle({ currentTarget: { open: false } }); view.render();
+  view.nodes().find((node) => node.type === 'form').props.onInvalid(); view.render();
+  assert.equal(view.nodes().find((node) => node.type === 'details').props.open, true);
+});

@@ -1576,6 +1576,8 @@ svg {
   z-index: 25;
 }
 
+body:has(.dialog-backdrop) { overflow: hidden; }
+
 .dialog {
   width: min(620px, 100%);
   max-height: min(760px, calc(100vh - 48px));
@@ -1608,6 +1610,7 @@ svg {
 
 .dialog-head,
 .dialog-footer {
+  flex: 0 0 auto;
   padding: 18px 20px;
 }
 

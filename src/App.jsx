@@ -5,6 +5,7 @@ import { parsePerServerInputLines } from '../shared/command-input.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
 import HistoryRecords, { HISTORY_LABELS } from './HistoryRecords.jsx';
+import Dialog from './Dialog.jsx';
 
 const EMPTY_SERVER = {
   id: '',
@@ -4471,23 +4472,6 @@ function QuickImportGroupPicker({ groups, value, onChange }) {
           ))}
         </div>
       ) : null}
-    </div>
-  );
-}
-
-function Dialog({ title, onClose, footer, children, wide = false, xwide = false, className = '' }) {
-  return (
-    <div className="dialog-backdrop" onClick={onClose}>
-      <div className={'dialog ' + (wide ? 'wide' : '') + ' ' + (xwide ? 'xwide' : '') + ' ' + className} onClick={(event) => event.stopPropagation()}>
-        <div className="dialog-head">
-          <strong>{title}</strong>
-          <button className="icon-button" type="button" aria-label="关闭" onClick={onClose}>
-            <CloseIcon />
-          </button>
-        </div>
-        <div className="dialog-body">{children}</div>
-        <div className="dialog-footer">{footer}</div>
-      </div>
     </div>
   );
 }

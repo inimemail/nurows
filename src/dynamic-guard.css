@@ -25,7 +25,46 @@
 .dynamic-settings { margin-top: 18px; }
 .dynamic-settings summary { cursor: pointer; color: var(--text-strong); padding: 10px 0; }
 .dynamic-run-output { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; font-size: 12px; }
+.dialog.dynamic-editor { width: min(860px, 100%); max-height: min(860px, calc(100dvh - 48px)); }
+.dynamic-editor .dialog-body { padding: 20px; overscroll-behavior: contain; }
+.dynamic-editor-form { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.dynamic-intro { margin: 0; color: var(--text-soft); font-size: 13px; line-height: 1.6; }
+.dynamic-form-section { min-width: 0; padding: 16px; border: 1px solid var(--border-soft); border-radius: 14px; background: var(--card-bg); }
+.dynamic-section-title { display: flex; flex-direction: column; gap: 4px; margin-bottom: 16px; }
+.dynamic-section-title h3 { margin: 0; font-size: 14px; color: var(--text-strong); }
+.dynamic-section-title > span, .dynamic-help { color: var(--text-soft); font-size: 12px; line-height: 1.65; }
+.dynamic-help { margin: 10px 0 0; text-align: left; overflow-wrap: anywhere; }
+.dynamic-form-section .dynamic-command { margin: 0 0 10px; }
+.dynamic-command textarea { resize: vertical; min-height: 110px; max-height: 260px; line-height: 1.6; tab-size: 2; }
+.dynamic-form-section .dynamic-choice { margin: 16px 0 0; padding: 0; border: 0; }
+.dynamic-choice legend { padding: 0; margin-bottom: 10px; }
+.dynamic-choice legend > span { margin-left: 6px; font-weight: normal; color: var(--text-muted); }
+.dynamic-choice label { padding: 9px 10px; border: 1px solid var(--border-soft); border-radius: 10px; cursor: pointer; background: var(--input-bg); }
+.dynamic-choice label:has(input:checked) { border-color: var(--accent-border); background: var(--accent-soft); }
+.dynamic-choice label > span { min-width: 0; flex: 1; }
+.dynamic-choice small { flex-shrink: 0; font-size: 11px; color: var(--text-soft); }
+.dynamic-choice p { margin: 8px 0 0; }
+.dynamic-settings { margin: 0; border: 1px solid var(--border-soft); border-radius: 14px; background: var(--card-bg); }
+.dynamic-settings summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; font-size: 13px; font-weight: 600; list-style: none; }
+.dynamic-settings summary::-webkit-details-marker { display: none; }
+.dynamic-settings summary small { display: block; margin-top: 5px; font-size: 12px; font-weight: normal; line-height: 1.6; color: var(--text-soft); }
+.dynamic-settings-action { display: flex; align-items: center; gap: 6px; flex-shrink: 0; color: var(--accent-text); font-size: 12px; }
+.dynamic-settings[open] .dynamic-settings-action > span { transform: rotate(180deg); }
+.dynamic-settings-body { padding: 0 16px 16px; border-top: 1px solid var(--border-soft); }
+.dynamic-settings-body h4 { margin: 16px 0 12px; font-size: 12px; color: var(--text-strong); }
+.dynamic-notifications .dynamic-choice { margin-top: 0; }
+.dynamic-enable { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-soft); cursor: pointer; }
+.dynamic-enable small { display: block; margin-top: 3px; font-size: 12px; font-weight: normal; color: var(--text-soft); }
+.dynamic-editor-footer button { min-width: 104px; }
 @media (max-width: 760px) {
+  .dialog.dynamic-editor { width: 100%; height: 100%; max-height: 100%; border-radius: 18px; }
+  .dynamic-editor .dialog-body { padding: 14px 12px; scrollbar-gutter: auto; }
+  .dynamic-editor-form { gap: 12px; }
+  .dynamic-form-section { padding: 14px 12px; }
+  .dynamic-section-title { margin-bottom: 12px; }
+  .dynamic-settings summary { padding: 14px 12px; align-items: flex-start; }
+  .dynamic-settings-body { padding-inline: 12px; }
+  .dynamic-head .ops-content-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dynamic-head { align-items: stretch; }
   .dynamic-card { padding: 14px; }
   .dynamic-card-title { flex-wrap: wrap; }

@@ -73,7 +73,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
     finally { generation.current++; if (mounted.current) setRefresh((value) => value + 1); }
   };
   const patch = (value) => setEditor((current) => ({ ...current, ...value }));
-  const openEditor = (guard) => { setFormError(''); setSettingsOpen(!guard); setEditor(guard ? { ...guard, command: '' } : structuredClone(DEFAULTS)); };
+  const openEditor = (guard) => { setFormError(''); setSettingsOpen(false); setEditor(guard ? { ...guard, command: '' } : structuredClone(DEFAULTS)); };
   const save = async (event) => {
     event.preventDefault();
     if (saveLock.current) return;
@@ -126,7 +126,10 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
     </div>
     {editor ? <Dialog title={editor.id ? '编辑动态 IP 守护' : '新增动态 IP 守护'} wide className="dynamic-editor" onClose={() => !saving && setEditor(null)}
       footer={<div className="dynamic-editor-footer"><button className="ghost" disabled={saving} onClick={() => setEditor(null)}>取消</button><button className="primary" form="dynamic-guard-form" type="submit" disabled={saving}>{saving ? '保存中...' : '保存任务'}</button></div>}>
-      <form id="dynamic-guard-form" onSubmit={save}>
+      <form id="dynamic-guard-form" className="dynamic-editor-form" onSubmit={save} onInvalid={() => setSettingsOpen(true)}>
+        <p className="dynamic-intro">填写 DDNS 域名和 API 命令，检查失败后自动换 IP。</p>
+        <section className="dynamic-form-section" aria-labelledby="dynamic-target-title">
+        <div className="dynamic-section-title"><h3 id="dynamic-target-title">目标与探针</h3><span>任意探针一次成功，即通过检查</span></div>
         <div className="dynamic-form-grid">
           <label>任务名称<input value={editor.name} maxLength={100} onChange={(event) => patch({ name: event.target.value })} placeholder="可留空，使用域名" /></label>
           <label>目标 DDNS 域名<input required value={editor.domain} autoCapitalize="none" spellCheck={false} onChange={(event) => patch({ domain: event.target.value })} placeholder="vps.example.com" /></label>
@@ -134,17 +137,26 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
           <label>检查方式<select value={editor.checkType} onChange={(event) => patch({ checkType: event.target.value })}><option value="ping">Ping</option><option value="tcp">TCP</option></select></label>
           {editor.checkType === 'tcp' ? <label>TCP 端口<input type="number" inputMode="numeric" required min={1} max={65535} value={editor.port} onChange={(event) => patch({ port: event.target.value })} /></label> : null}
         </div>
-        <fieldset className="dynamic-choice"><legend>检查探针 · 任意一个一次成功即通过</legend><div>{data.probes.filter((probe) => probe.enabled !== false).map((probe) => <label key={probe.id}><input type="checkbox" checked={editor.probeIds.includes(probe.id)} onChange={(event) => patch({ probeIds: event.target.checked ? [...editor.probeIds, probe.id] : editor.probeIds.filter((id) => id !== probe.id) })} /><span>{probe.name}{probe.status !== 'online' || time - Date.parse(probe.lastSeenAt) >= 90000 ? '（离线）' : ''}</span></label>)}</div>{!data.probes.length ? <p>请先在探针节点中添加探针。</p> : null}</fieldset>
-        <label className="dynamic-command">换 IP API 命令<textarea required={!editor.commandConfigured} rows={6} maxLength={32768} autoCapitalize="none" spellCheck={false} value={editor.command} onChange={(event) => patch({ command: event.target.value })} placeholder={editor.commandConfigured ? '已保存加密命令；留空保持原命令' : 'curl --fail --max-time 60 ...\n支持多行，在面板所在 Linux 环境执行'} /></label>
+        <fieldset className="dynamic-choice"><legend>检查探针 <span>已选 {editor.probeIds.length} 个</span></legend><div>{data.probes.filter((probe) => probe.enabled !== false).map((probe) => <label key={probe.id}><input type="checkbox" checked={editor.probeIds.includes(probe.id)} onChange={(event) => patch({ probeIds: event.target.checked ? [...editor.probeIds, probe.id] : editor.probeIds.filter((id) => id !== probe.id) })} /><span>{probe.name}</span><small>{probe.status !== 'online' || time - Date.parse(probe.lastSeenAt) >= 90000 ? '离线' : '在线'}</small></label>)}</div>{!data.probes.some((probe) => probe.enabled !== false) ? <p>暂无可用探针，请先在探针节点中添加或启用。</p> : null}</fieldset>
+        </section>
+        <section className="dynamic-form-section" aria-labelledby="dynamic-api-title">
+        <div className="dynamic-section-title"><h3 id="dynamic-api-title">换 IP 命令</h3><span>在面板执行 API 请求，无需 SSH 登录目标</span></div>
+        <label className="dynamic-command"><span className="dynamic-field-caption">API 命令</span><textarea required={!editor.commandConfigured} rows={4} maxLength={32768} autoCapitalize="none" spellCheck={false} value={editor.command} onChange={(event) => patch({ command: event.target.value })} placeholder={editor.commandConfigured ? '已保存加密命令；留空保持原命令' : 'curl --fail --max-time 60 ...\n支持多行 API 命令'} /></label>
         {editor.commandConfigured ? <button type="button" className="ghost" disabled={saving} onClick={async () => {
           const id = editor.id;
           try { const result = await api(`/api/dynamic-guards/${id}/command`, { signal: AbortSignal.timeout(15000) }); setEditor((current) => current?.id === id ? { ...current, command: result.command } : current); }
           catch (err) { setFormError(err.message); }
         }}>读取已保存命令</button> : null}
-        <p className="confirm-copy">正常时不执行命令。全部探针全部轮次失败后才自动换 IP；等待新 IP 超时会重新提交。请让 API 命令的退出码反映请求结果，例如 curl 使用 --fail。更改目标域名会结束旧目标的等待流程。</p>
-        <details className="dynamic-settings" open={settingsOpen} onToggle={(event) => setSettingsOpen(event.currentTarget.open)}><summary>检查与重试设置</summary><div className="dynamic-form-grid">{numbers.map(([key, label, min, max]) => <label key={key}>{label}<input type="number" inputMode="numeric" required min={min} max={max} value={editor[key]} onChange={(event) => patch({ [key]: event.target.value })} /></label>)}</div></details>
-        <fieldset className="dynamic-choice"><legend>结果通知（可选）</legend><div>{data.bots.filter((bot) => bot.enabled !== false && bot.configured).map((bot) => <label key={bot.id}><input type="checkbox" checked={editor.botIds.includes(bot.id)} onChange={(event) => patch({ botIds: event.target.checked ? [...editor.botIds, bot.id] : editor.botIds.filter((id) => id !== bot.id) })} /><span>{bot.name}</span></label>)}</div><p>正常检查不通知；完成、等待超时重试、命令异常或达到上限时通知，同一流程的同类异常不重复刷屏。</p></fieldset>
-        <label className="dynamic-enable"><input type="checkbox" checked={editor.enabled} onChange={(event) => patch({ enabled: event.target.checked })} />启用任务</label>
+        <p className="dynamic-help">全部探针、全部轮次失败才执行。建议 curl 使用 --fail，让退出码反映请求结果。{editor.id ? ' 更改域名会结束旧目标的等待流程。' : ''}</p>
+        </section>
+        <details className="dynamic-settings" open={settingsOpen} onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
+          <summary><span>检查与重试设置<small>每 {editor.interval} 秒检查 · {editor.checkRounds} 轮 × {editor.attemptsPerRound} 次 · {Number(editor.waitTimeout) === 0 ? '持续等待新 IP' : `等待 ${editor.waitTimeout} 秒后重试`}</small></span><span className="dynamic-settings-action">{settingsOpen ? '收起' : '调整'}<span aria-hidden="true">⌄</span></span></summary>
+          <div className="dynamic-settings-body">{[['探针检查', numbers.slice(0, 4)], ['换 IP 与重试', numbers.slice(4)]].map(([title, fields]) => <section key={title}><h4>{title}</h4><div className="dynamic-form-grid">{fields.map(([key, label, min, max]) => <label key={key}>{label}<input type="number" inputMode="numeric" required min={min} max={max} value={editor[key]} onChange={(event) => patch({ [key]: event.target.value })} /></label>)}</div></section>)}<p className="dynamic-help">失败轮次连续执行；等待新 IP 超时后会再次提交，受冷却时间与每日额度限制。</p></div>
+        </details>
+        <section className="dynamic-form-section dynamic-notifications">
+        <fieldset className="dynamic-choice"><legend>结果通知 <span>可选</span></legend><div>{data.bots.filter((bot) => bot.enabled !== false && bot.configured).map((bot) => <label key={bot.id}><input type="checkbox" checked={editor.botIds.includes(bot.id)} onChange={(event) => patch({ botIds: event.target.checked ? [...editor.botIds, bot.id] : editor.botIds.filter((id) => id !== bot.id) })} /><span>{bot.name}</span></label>)}</div><p>{data.bots.some((bot) => bot.enabled !== false && bot.configured) ? '正常检查不通知；完成、超时重试、异常或达到上限时通知，同类异常去重。' : '暂无可用通知机器人，可稍后在 Telegram 中配置。'}</p></fieldset>
+        <label className="dynamic-enable"><input type="checkbox" checked={editor.enabled} onChange={(event) => patch({ enabled: event.target.checked })} /><span>启用任务<small>保存后开始检查，停用后不再自动重试</small></span></label>
+        </section>
         {formError ? <p className="auth-error" role="alert">{formError}</p> : null}
       </form>
     </Dialog> : null}

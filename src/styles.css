@@ -980,7 +980,7 @@ svg {
 .ops-source-addresses em.warn { color: #b47722; }
 .ops-editor-section { grid-column: 1 / -1; display: flex; align-items: center; min-height: 34px; margin-top: 4px; padding: 5px 0 8px; border-bottom: 1px solid var(--border-soft); }
 .ops-editor-section:first-child { margin-top: -4px; }
-.guard-notification-hint { grid-column: 1 / -1; min-width: 0; color: var(--text-soft); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.guard-notification-hint { grid-column: 1 / -1; min-width: 0; margin-top: -4px; color: var(--text-soft); font-size: 12px; line-height: 1.6; text-align: left; overflow-wrap: anywhere; }
 .tg-feature-picker { grid-column: 1 / -1; min-width: 0; }
 .tg-feature-picker .ops-multi-options { max-height: 320px; }
 .ops-editor-section strong { color: var(--text-strong); font-size: 12px; font-weight: 650; }

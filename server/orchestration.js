@@ -1353,12 +1353,16 @@ export function requestWaitingDnsGuardChecks(deps, change = {}) {
   const snapshot = deps.readState(['dnsGuards', 'ipPools', 'ipAssets', 'ipLeases', 'incidents']);
   const changedAssets = new Set(change.assetIds || []);
   const affectedPools = new Set(change.poolIds || []);
-  for (const pool of snapshot.ipPools || []) if (pool.assetIds?.some((id) => changedAssets.has(id))) affectedPools.add(pool.id);
+  if (changedAssets.size) {
+    for (const pool of snapshot.ipPools || []) if (pool.assetIds?.some((id) => changedAssets.has(id))) affectedPools.add(pool.id);
+  }
   const scoped = Array.isArray(change.poolIds) || Array.isArray(change.assetIds);
+  let candidateIndex;
   const eligible = (guard) => guard.enabled !== false && !guard.cycle && !dnsGuardRuntime.has(guard.id)
     && (guard.status === 'waiting_ip' || dnsGuardPoolTarget(guard, guard.currentValues || []) > (guard.currentValues?.length || 0))
     && (!scoped || guard.poolIds?.some((id) => affectedPools.has(id)))
-    && collectDnsGuardPoolCandidates(snapshot, guard, 1, new Set(guard.currentValues || [])).length > 0;
+    && collectDnsGuardPoolCandidates(snapshot, guard, 1, new Set(guard.currentValues || []),
+      candidateIndex ||= createDnsGuardCandidateIndex(snapshot)).length > 0;
   const waiting = new Set(snapshot.dnsGuards.filter(eligible).map((guard) => guard.id));
   if (!waiting.size) return 0;
   const requestedIds = [];
@@ -1473,6 +1477,7 @@ function dnsGuardPreparationKey(guard) {
     maxActiveIps: guard.maxActiveIps,
     poolFillMode: guard.poolFillMode,
     poolTargetCount: guard.poolTargetCount,
+    poolSelectionMode: guard.poolSelectionMode,
     sources: guard.sources,
     pruneStale: guard.pruneStale
   });
@@ -1841,24 +1846,77 @@ export function selectHealthyDnsGuardSources(sources, candidates, sourceState, r
   return { values: values.slice(0, DNS_GUARD_MAX_VALUES), state };
 }
 
-export function collectDnsGuardPoolCandidates(state, guard, limit = DNS_GUARD_MAX_VALUES, excludedAddresses = new Set()) {
+function dnsGuardPoolOrder(guard) {
+  const ids = [...new Set(guard.poolIds || [])];
+  const start = guard.poolSelectionMode === 'balanced' ? ids.indexOf(guard.poolBalanceNextId) : 0;
+  return start > 0 ? [...ids.slice(start), ...ids.slice(0, start)] : ids;
+}
+
+function takeBalancedPoolCandidates(iterators, limit) {
   const result = [];
+  // Exhausted pools drop out; each remaining pool contributes one per turn.
+  let active = iterators;
+  while (active.length && result.length < limit) {
+    const remaining = [];
+    for (const iterator of active) {
+      const next = iterator.next();
+      if (next.done) continue;
+      result.push(next.value);
+      if (result.length >= limit) return result;
+      remaining.push(iterator);
+    }
+    active = remaining;
+  }
+  return result;
+}
+
+function createDnsGuardCandidateIndex(state) {
+  const assetsById = new Map();
+  const poolsById = new Map();
+  for (const asset of state.ipAssets) assetsById.set(asset.id, asset);
+  for (const pool of state.ipPools) poolsById.set(pool.id, pool);
+  return { assetsById, poolsById, unavailable: unavailableAssetIds(state) };
+}
+
+function* randomPoolAssetIds(ids) {
+  // Lazy Fisher–Yates: draw only as many IDs as needed without copying or
+  // sorting the entire pool, and never mutate its configured order.
+  const swaps = new Map();
+  for (let remaining = ids.length; remaining > 0; remaining--) {
+    const index = Math.floor(Math.random() * remaining);
+    const selected = swaps.get(index) ?? index;
+    swaps.set(index, swaps.get(remaining - 1) ?? remaining - 1);
+    swaps.delete(remaining - 1);
+    yield ids[selected];
+  }
+}
+
+export function collectDnsGuardPoolCandidates(state, guard, limit = DNS_GUARD_MAX_VALUES, excludedAddresses = new Set(), candidateIndex = null) {
+  if (limit <= 0) return [];
+  const poolIds = dnsGuardPoolOrder(guard);
+  if (!poolIds.length) return [];
   const seen = new Set();
-  const assetsById = new Map(state.ipAssets.map((item) => [item.id, item]));
-  const poolsById = new Map(state.ipPools.map((item) => [item.id, item]));
-  const unavailable = unavailableAssetIds(state);
-  for (const poolId of guard.poolIds || []) {
-    if (result.length >= limit) break;
+  const { assetsById, poolsById, unavailable } = candidateIndex || createDnsGuardCandidateIndex(state);
+  function* candidates(poolId) {
     const pool = poolsById.get(poolId);
-    if (!pool || pool.enabled === false) continue;
-    let assets = (pool.assetIds || []).map((id) => assetsById.get(id)).filter((item) => item && item.enabled !== false && item.health !== 'unhealthy' && !unavailable.has(item.id));
-    if (pool.selectionMode === 'random') assets = assets.sort(() => Math.random() - 0.5);
-    for (const asset of assets) {
-      if (excludedAddresses.has(asset.address) || seen.has(asset.address) || result.length >= limit) continue;
+    if (!pool || pool.enabled === false) return;
+    const ids = pool.selectionMode === 'random' ? randomPoolAssetIds(pool.assetIds || []) : (pool.assetIds || []);
+    for (const id of ids) {
+      const asset = assetsById.get(id);
+      if (!asset || asset.enabled === false || asset.health === 'unhealthy' || unavailable.has(id)
+        || excludedAddresses.has(asset.address) || seen.has(asset.address)) continue;
       if ((guard.recordType === 'AAAA' ? net.isIPv6(asset.address) : net.isIPv4(asset.address))) {
         seen.add(asset.address);
-        result.push({ assetId: asset.id, poolId, address: asset.address });
+        yield { assetId: asset.id, poolId, address: asset.address };
       }
+    }
+  }
+  if (guard.poolSelectionMode === 'balanced') return takeBalancedPoolCandidates(poolIds.map(candidates), limit);
+  const result = [];
+  for (const poolId of poolIds) {
+    for (const candidate of candidates(poolId)) {
+      result.push(candidate);
+      if (result.length >= limit) return result;
     }
   }
   return result;
@@ -1990,7 +2048,18 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
   for (const address of healthySources) if (!desired.includes(address) && desired.length < capacity) desired.push(address);
   const usedAssets = [];
   const unusableAssets = [];
-  for (const item of cycle.candidateAssets || []) {
+  let candidates = cycle.candidateAssets || [];
+  if (guard.poolSelectionMode === 'balanced') {
+    // Balance successful candidates again so failures in one pool do not skew
+    // selection when other healthy candidates from that pool are already ready.
+    const groups = new Map(dnsGuardPoolOrder(guard).map((id) => [id, []]));
+    for (const candidate of candidates) {
+      if (!desired.includes(candidate.address) && resultByAddress.get(candidate.address)?.ok) groups.get(candidate.poolId)?.push(candidate);
+    }
+    const healthy = takeBalancedPoolCandidates([...groups.values()].map((items) => items.values()), DNS_GUARD_MAX_VALUES);
+    candidates = [...healthy, ...candidates.filter((candidate) => !resultByAddress.get(candidate.address)?.ok)];
+  }
+  for (const item of candidates) {
     if (desired.includes(item.address)) continue;
     const result = resultByAddress.get(item.address);
     if (result?.ok && desired.length < targetCount) { desired.push(item.address); usedAssets.push(item); }
@@ -2071,9 +2140,15 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
     const discardedIds = new Set(unusableAssets.map((entry) => entry.assetId));
     const consumedIds = new Set(usedAssets.map((entry) => entry.assetId));
     const removedIds = new Set([...discardedIds, ...consumedIds]);
-    const removedAssets = draft.ipAssets.filter((asset) => removedIds.has(asset.id));
-    draft.ipAssets = draft.ipAssets.filter((asset) => !removedIds.has(asset.id));
-    for (const pool of draft.ipPools) pool.assetIds = (pool.assetIds || []).filter((assetId) => !removedIds.has(assetId));
+    const removedAssets = [];
+    if (removedIds.size) {
+      draft.ipAssets = draft.ipAssets.filter((asset) => {
+        if (!removedIds.has(asset.id)) return true;
+        removedAssets.push(asset);
+        return false;
+      });
+      for (const pool of draft.ipPools) pool.assetIds = (pool.assetIds || []).filter((assetId) => !removedIds.has(assetId));
+    }
     for (const asset of removedAssets) {
       const candidate = [...unusableAssets, ...usedAssets].find((entry) => entry.assetId === asset.id);
       const discarded = discardedIds.has(asset.id);
@@ -2086,10 +2161,15 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
         startedAt: cycleSnapshot.startedAt, finishedAt, error: discarded ? 'DNS 守护候选 IP 不可用' : ''
       });
     }
-    draft.ipUsageRecords = draft.ipUsageRecords.slice(0, 5000);
+    if (removedAssets.length) draft.ipUsageRecords = draft.ipUsageRecords.slice(0, 5000);
     if (changed) draft.dnsChanges.unshift({ id: uuidv4(), incidentId: '', guardId, bindingId: '', accountId: item.accountId, zoneId: cycleSnapshot.zone.id || '', zoneName: cycleSnapshot.zone.name, providerZoneId: cycleSnapshot.zone.providerZoneId || '', domain: item.domain, beforeValues: remote, afterValues: desired, status: 'applied', createdAt: finishedAt, rolledBackAt: '' });
     draft.dnsChanges = draft.dnsChanges.slice(0, 3000);
     const ownership = calculateDnsGuardOwnership(item, remote, desired, healthySources, usedAssets);
+    if (item.poolSelectionMode === 'balanced' && usedAssets.length) {
+      const poolIds = item.poolIds || [];
+      const lastIndex = poolIds.indexOf(usedAssets.at(-1).poolId);
+      item.poolBalanceNextId = poolIds[(lastIndex + 1) % poolIds.length] || '';
+    }
     const fillMissing = guard.poolFillMode === 'fill' && desired.length < targetCount;
     const addedHealthy = usedAssets.length || healthySources.some((address) => !remote.includes(address));
     const status = !desired.length
@@ -2318,6 +2398,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     const poolIds = cleanIds(input.poolIds, 100);
     const maxActiveIps = clampNumber(input.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50);
     const poolFillMode = (input.poolFillMode ?? existing?.poolFillMode) === 'fill' ? 'fill' : 'repair';
+    const poolSelectionMode = (input.poolSelectionMode ?? existing?.poolSelectionMode) === 'balanced' ? 'balanced' : 'ordered';
     const requestedTarget = input.poolTargetCount ?? existing?.poolTargetCount ?? maxActiveIps;
     if (poolFillMode === 'fill' && (!Number.isInteger(Number(requestedTarget)) || Number(requestedTarget) < 1 || Number(requestedTarget) > maxActiveIps)) {
       throw new Error(`补满目标数量须为 1–${maxActiveIps}，不能超过活动解析上限`);
@@ -2344,6 +2425,9 @@ function normalizeResource(key, input = {}, existing = null, deps) {
       maxActiveIps,
       poolFillMode,
       poolTargetCount,
+      poolSelectionMode,
+      poolBalanceNextId: !targetChanged && poolSelectionMode === 'balanced' && existing?.poolSelectionMode === 'balanced'
+        && poolIds.includes(existing?.poolBalanceNextId) ? existing.poolBalanceNextId : '',
       probeIds,
       poolIds,
       alertBotIds: cleanIds(input.alertBotIds ?? existing?.alertBotIds, 50),
@@ -3566,6 +3650,8 @@ function normalizeDnsGuardState(value = {}) {
     ttl: clampNumber(value.ttl, 1, 86400, 60),
     maxActiveIps: clampNumber(value.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50),
     poolFillMode: value.poolFillMode === 'fill' ? 'fill' : 'repair',
+    poolSelectionMode: value.poolSelectionMode === 'balanced' ? 'balanced' : 'ordered',
+    poolBalanceNextId: value.poolSelectionMode === 'balanced' ? cleanId(value.poolBalanceNextId) : '',
     poolTargetCount: clampNumber(value.poolTargetCount, 1, clampNumber(value.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50), clampNumber(value.maxActiveIps, 1, DNS_GUARD_MAX_VALUES, 50)),
     probeIds: cleanIds(value.probeIds, 500),
     poolIds: cleanIds(value.poolIds, 100),

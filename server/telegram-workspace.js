@@ -141,6 +141,7 @@ export function createTelegramWorkspace(deps) {
     if (section === 'guards') {
       lines.push(`活动 IP：${item.currentValues?.length || 0} / ${item.maxActiveIps || 50}`, `来源：${item.sources?.length || 0} 个`, `最近检查：${date(item.lastCheckAt)}`);
       lines.push(`备用池补位：${item.poolFillMode === 'fill' ? `补满 ${item.poolTargetCount || item.maxActiveIps || 50} 个健康 IP` : '故障补位'}`);
+      lines.push(`备用池取用：${item.poolSelectionMode === 'balanced' ? '均衡取用' : '按顺序取用'}`);
       rows.push([...(canWrite(ctx) ? [action('检查并修复', 'action', 'check')] : []), action('管理 IP', 'ips')]);
       rows.push([action('来源状态', 'sources'), action('检查记录', 'history')]);
     } else if (section === 'dynamic') {

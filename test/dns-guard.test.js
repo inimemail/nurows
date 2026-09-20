@@ -111,6 +111,172 @@ function addFillStock(deps, count, start = 1, poolId = 'fill-pool') {
   }
 }
 
+test('balanced pool candidates rotate across pools while legacy selection keeps pool priority', () => {
+  const deps = sourceGuardFixture([], { poolIds: ['a', 'b', 'c'] });
+  for (const [pool, start] of [['a', 1], ['b', 40], ['c', 80]]) addFillStock(deps, 10, start, pool);
+  const state = deps.getState(), guard = state.dnsGuards[0];
+  assert.deepEqual(collectDnsGuardPoolCandidates(state, guard, 4).map((item) => item.poolId), ['a', 'a', 'a', 'a']);
+  guard.poolSelectionMode = 'balanced';
+  assert.deepEqual(collectDnsGuardPoolCandidates(state, guard, 7).map((item) => item.poolId), ['a', 'b', 'c', 'a', 'b', 'c', 'a']);
+  guard.poolBalanceNextId = 'b';
+  assert.deepEqual(collectDnsGuardPoolCandidates(state, guard, 4).map((item) => item.poolId), ['b', 'c', 'a', 'b']);
+  assert.equal(guard.poolBalanceNextId, 'b', 'collecting candidates must not move the persisted cursor');
+});
+
+test('random pool draws stay bounded, unique and leave the saved pool order intact', (t) => {
+  const deps = sourceGuardFixture([], { poolIds: ['a', 'b'], poolSelectionMode: 'balanced' });
+  addFillStock(deps, 100, 1, 'a'); addFillStock(deps, 100, 101, 'b');
+  const state = deps.getState();
+  for (const pool of state.ipPools) pool.selectionMode = 'random';
+  const before = state.ipPools.map((pool) => [...pool.assetIds]);
+  let calls = 0;
+  t.mock.method(Math, 'random', () => { calls++; return 0.5; });
+  const one = collectDnsGuardPoolCandidates(state, state.dnsGuards[0], 1);
+  assert.equal(calls, 1, 'drawing one candidate must not randomize the whole inventory');
+  assert.equal(one[0].assetId, 'fill-51');
+  calls = 0;
+  const all = collectDnsGuardPoolCandidates(state, state.dnsGuards[0], 200);
+  assert.equal(all.length, 200);
+  assert.equal(new Set(all.map((item) => item.assetId)).size, 200);
+  assert.equal(calls, 200);
+  assert.deepEqual(state.ipPools.map((pool) => pool.assetIds), before);
+});
+
+test('one inventory wakeup shares its index across multiple deficient guards', () => {
+  const deps = sourceGuardFixture([], { sources: [], poolIds: ['a'], poolSelectionMode: 'balanced', poolFillMode: 'fill', poolTargetCount: 2 });
+  addFillStock(deps, 10, 1, 'a');
+  const state = deps.getState();
+  state.dnsGuards[0].recordType = 'AAAA';
+  for (let i = 1; i < 24; i++) state.dnsGuards.push({ ...structuredClone(state.dnsGuards[0]), id: `idle-${i}` });
+  let idReads = 0;
+  for (const asset of state.ipAssets) {
+    const id = asset.id;
+    Object.defineProperty(asset, 'id', { get() { idReads++; return id; } });
+  }
+  assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['a'] }), 0, 'IPv4 stock cannot wake IPv6 guards');
+  assert.equal(idReads, state.ipAssets.length, 'inventory indexing runs once for this snapshot, not once per guard');
+});
+
+test('healthy guard cycles leave unused inventory arrays and pool membership untouched', async () => {
+  const deps = sourceGuardFixture(['198.51.100.1'], { sources: [], poolIds: ['a'], poolSelectionMode: 'balanced' });
+  addFillStock(deps, 100, 1, 'a');
+  const state = deps.getState(), assets = state.ipAssets, members = state.ipPools[0].assetIds, usage = state.ipUsageRecords;
+  await nextSourceCycle(deps);
+  assert.equal(state.dnsGuards[0].status, 'healthy');
+  assert.equal(state.ipAssets, assets);
+  assert.equal(state.ipPools[0].assetIds, members);
+  assert.equal(state.ipUsageRecords, usage);
+});
+
+test('balanced fill consumes ten IPs as four three three without changing existing healthy records', async () => {
+  const deps = sourceGuardFixture(['198.51.100.1'], {
+    sources: [], poolIds: ['a', 'b', 'c'], poolFillMode: 'fill', poolTargetCount: 11, poolSelectionMode: 'balanced'
+  });
+  for (const [pool, start] of [['a', 1], ['b', 40], ['c', 80]]) addFillStock(deps, 10, start, pool);
+  await nextSourceCycle(deps);
+  assert.equal(deps.getRemote().length, 11);
+  assert.ok(deps.getRemote().includes('198.51.100.1'));
+  assert.deepEqual(['a', 'b', 'c'].map((id) => deps.getState().ipUsageRecords.filter((item) => item.poolId === id).length), [4, 3, 3]);
+  assert.equal(deps.getState().dnsGuards[0].poolBalanceNextId, 'b');
+});
+
+test('balanced consumption redistributes healthy results after uneven candidate failures', async () => {
+  const deps = sourceGuardFixture([], {
+    sources: [], poolIds: ['a', 'b'], poolFillMode: 'fill', poolTargetCount: 10, poolSelectionMode: 'balanced'
+  });
+  addFillStock(deps, 10, 1, 'a'); addFillStock(deps, 10, 40, 'b');
+  await nextSourceCycle(deps, (address) => Number(address.split('.').at(-1)) > 5);
+  const records = deps.getState().ipUsageRecords;
+  assert.deepEqual(['a', 'b'].map((id) => records.filter((item) => item.poolId === id && item.status === 'consumed').length), [5, 5]);
+  assert.equal(records.filter((item) => item.status === 'discarded').length, 5);
+  assert.equal(deps.getRemote().length, 10);
+});
+
+test('balanced fill lets other pools cover depleted or unhealthy pools', async () => {
+  const deps = sourceGuardFixture([], {
+    sources: [], poolIds: ['a', 'b', 'c'], poolFillMode: 'fill', poolTargetCount: 5, poolSelectionMode: 'balanced', maxParallel: 3
+  });
+  addFillStock(deps, 2, 1, 'a'); addFillStock(deps, 5, 40, 'b'); addFillStock(deps, 0, 80, 'c');
+  await nextSourceCycle(deps, (address) => address !== '203.0.113.1');
+  assert.deepEqual(['a', 'b', 'c'].map((id) => deps.getState().ipUsageRecords.filter((item) => item.poolId === id && item.status === 'consumed').length), [1, 4, 0]);
+  assert.equal(deps.getRemote().length, 5);
+});
+
+test('single IP balanced repairs rotate across runs and survive restart', async () => {
+  let deps = sourceGuardFixture([], { sources: [], poolIds: ['a', 'b', 'c'], poolSelectionMode: 'balanced', maxParallel: 1 });
+  for (const [pool, start] of [['a', 1], ['b', 40], ['c', 80]]) addFillStock(deps, 2, start, pool);
+  for (const poolId of ['a', 'b', 'c', 'a']) {
+    const previous = new Set(deps.getRemote());
+    await nextSourceCycle(deps, (address) => !previous.has(address));
+    assert.equal(deps.getRemote().length, 1);
+    assert.equal(deps.getState().ipUsageRecords[0].poolId, poolId);
+    deps = remoteDeps(normalizeOrchestrationState(deps.getState()), deps.getRemote());
+  }
+});
+
+test('balanced candidates skip unavailable and duplicate IPs and preserve IPv6 pool order', () => {
+  const deps = sourceGuardFixture([], { recordType: 'AAAA', poolIds: ['a', 'off', 'b'], poolSelectionMode: 'balanced' });
+  const state = deps.getState();
+  state.ipAssets = [
+    { id: 'active', address: '2001:db8::1' }, { id: 'shared', address: '2001:db8::2' },
+    { id: 'leased', address: '2001:db8::3' }, { id: 'reserved', address: '2001:db8::4' },
+    { id: 'bad', address: '2001:db8::5', health: 'unhealthy' }, { id: 'disabled', address: '2001:db8::6', enabled: false },
+    { id: 'ipv4', address: '192.0.2.1' }, { id: 'only-b', address: '2001:db8::7' }, { id: 'only-off', address: '2001:db8::8' }
+  ];
+  state.ipPools = [{ id: 'a', assetIds: state.ipAssets.slice(0, 7).map((item) => item.id) },
+    { id: 'off', enabled: false, assetIds: ['only-off'] }, { id: 'b', assetIds: ['shared', 'only-b'] }];
+  state.ipLeases = [{ assetId: 'leased', status: 'locked', expiresAt: '2099-01-01' }];
+  state.dnsGuards.push({ id: 'busy', cycle: { candidateAssets: [{ assetId: 'reserved' }] } });
+  const result = collectDnsGuardPoolCandidates(state, state.dnsGuards[0], 50, new Set(['2001:db8::1']));
+  assert.deepEqual(result.map((item) => item.address), ['2001:db8::2', '2001:db8::7']);
+});
+
+test('balanced checks finish when enough candidates pass without waiting for a slow pool or probe', async () => {
+  const deps = sourceGuardFixture([], { sources: [], poolIds: ['a', 'b'], poolSelectionMode: 'balanced', poolFillMode: 'fill', poolTargetCount: 2 });
+  addFillStock(deps, 2, 1, 'a'); addFillStock(deps, 2, 40, 'b');
+  await runDueDnsGuards(deps);
+  const guard = deps.getState().dnsGuards[0];
+  assert.equal(guard.cycle.checks.length, 4);
+  for (const check of guard.cycle.checks.filter((item) => ['203.0.113.40', '203.0.113.41'].includes(item.address))) {
+    check.observations['probe-1'] = { ok: true, attempts: 1 };
+  }
+  await processReadyDnsGuards(deps);
+  assert.deepEqual(deps.getRemote(), ['203.0.113.40', '203.0.113.41']);
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+  assert.equal(deps.getState().ipAssets.length, 2, 'unsettled candidates must remain in inventory');
+});
+
+test('balanced cursor advances only after a successful provider commit, including timeout retries', async () => {
+  const deps = sourceGuardFixture([], { sources: [], poolIds: ['a', 'b'], poolSelectionMode: 'balanced', poolBalanceNextId: 'b' });
+  addFillStock(deps, 2, 1, 'a'); addFillStock(deps, 2, 40, 'b');
+  await runDueDnsGuards(deps);
+  for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  const read = deps.readDnsRecord;
+  deps.readDnsRecord = async () => { throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }); };
+  await processReadyDnsGuards(deps);
+  assert.equal(deps.getState().dnsGuards[0].poolBalanceNextId, 'b');
+  assert.equal(deps.getState().ipAssets.length, 4);
+  assert.deepEqual(deps.getRemote(), []);
+  deps.readDnsRecord = read;
+  await processReadyDnsGuards(deps);
+  assert.deepEqual(deps.getRemote(), ['203.0.113.40']);
+  assert.equal(deps.getState().dnsGuards[0].poolBalanceNextId, 'a');
+  assert.equal(deps.getState().ipAssets.length, 3);
+  await processReadyDnsGuards(deps);
+  assert.equal(deps.getState().dnsGuards[0].poolBalanceNextId, 'a');
+});
+
+test('changing pool selection during preparation rejects the old preparation', async () => {
+  const deps = sourceGuardFixture(['198.51.100.1'], { sources: [], poolSelectionMode: 'ordered' });
+  const read = deps.readDnsRecord, gate = Promise.withResolvers();
+  deps.readDnsRecord = async (...args) => { await gate.promise; return read(...args); };
+  const running = runDueDnsGuards(deps);
+  await Promise.resolve();
+  deps.getState().dnsGuards[0].poolSelectionMode = 'balanced';
+  gate.resolve(); await running;
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+});
+
 test('fill mode tops up healthy records to fifty independently of the pool incident allocation mode', async () => {
   const deps = sourceGuardFixture(['198.51.100.1'], { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 50 });
   addFillStock(deps, 60);
@@ -248,6 +414,8 @@ test('fill configuration defaults safely, validates the target and clears obsole
   const legacy = normalizeOrchestrationState({ dnsGuards: [{ maxActiveIps: 20 }] }).dnsGuards[0];
   assert.equal(legacy.poolFillMode, 'repair');
   assert.equal(legacy.poolTargetCount, 20);
+  assert.equal(legacy.poolSelectionMode, 'ordered');
+  assert.equal(legacy.poolBalanceNextId, '');
   const deps = sourceGuardFixture(undefined, { sources: [], maxActiveIps: 20 });
   deps.sanitizeState = (state) => state;
   const routes = new Map();
@@ -266,6 +434,14 @@ test('fill configuration defaults safely, validates the target and clears obsole
   assert.equal((await save({ poolFillMode: 'repair' })).repairTargetCount, 0);
   deps.getState().dnsGuards[0].repairTargetCount = 5;
   assert.equal((await save({ name: 'renamed' })).repairTargetCount, 5, 'ordinary edits retain actual repair deficits');
+  addFillStock(deps, 2, 1, 'a'); addFillStock(deps, 2, 40, 'b');
+  const balanced = await save({ poolIds: ['a', 'b'], poolSelectionMode: 'balanced', poolBalanceNextId: 'forged' });
+  assert.equal(balanced.poolSelectionMode, 'balanced');
+  assert.equal(balanced.poolBalanceNextId, '', 'the client cannot choose the runtime cursor');
+  deps.getState().dnsGuards[0].poolBalanceNextId = 'b';
+  assert.equal((await save({ name: 'rename again', poolSelectionMode: undefined, poolBalanceNextId: 'a' })).poolBalanceNextId, 'b');
+  assert.equal((await save({ poolIds: ['a'] })).poolBalanceNextId, '', 'removing the next pool resets its cursor');
+  assert.equal((await save({ poolSelectionMode: 'ordered' })).poolBalanceNextId, '');
 });
 
 test('shared pool candidates are reserved across concurrent guards and released after completion', async () => {

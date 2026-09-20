@@ -16,7 +16,7 @@ const STATUS = { online: '在线', offline: '离线', pending: '待接入', revo
 const EMPTY = {
   probe: { name: '', region: '', carrier: '', maxConcurrency: 100, enabled: true, alertBotIds: [] },
   target: { name: '', address: '', allowPrivate: false, checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, probeIds: [], policyId: '', enabled: true },
-  guard: { name: '', accountId: '', domain: '', recordType: 'A', recordLine: '默认', ttl: 60, maxActiveIps: 50, poolFillMode: 'repair', poolTargetCount: 50, probeIds: [], poolIds: [], alertBotIds: [], checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, maxParallel: 20, pruneStale: true, sources: [], enabled: true },
+  guard: { name: '', accountId: '', domain: '', recordType: 'A', recordLine: '默认', ttl: 60, maxActiveIps: 50, poolFillMode: 'repair', poolTargetCount: 50, poolSelectionMode: 'ordered', probeIds: [], poolIds: [], alertBotIds: [], checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, maxParallel: 20, pruneStale: true, sources: [], enabled: true },
   asset: { name: '', address: '', region: '', carrier: '', labels: '', health: 'unknown', enabled: true, note: '' },
   pool: { name: '', assetIds: [], newAssetAddresses: '', allocationMode: 'one', allocationCount: 1, selectionMode: 'ordered', enabled: true, alertEnabled: false, alertThresholds: [5, 3, 1, 0], alertBotIds: [], note: '' },
   account: { name: '', provider: 'huawei', enabled: true, credentials: {} },
@@ -430,10 +430,18 @@ function GuardEditor({ value, patch, state, api }) {
     <Toggle checked={value.pruneStale} onChange={(pruneStale) => patch({ pruneStale })}>移除来源已不再提供的旧 IP</Toggle>
 
     <EditorSection title="备用池补位" />
-    <Field label="补位方式"><select value={value.poolFillMode || 'repair'} onChange={(e) => patch({ poolFillMode: e.target.value, poolTargetCount: Math.min(Number(value.poolTargetCount) || Number(value.maxActiveIps) || 50, Number(value.maxActiveIps) || 50) })}><option value="repair">故障补位</option><option value="fill">补满指定数量</option></select></Field>
-    {value.poolFillMode === 'fill' ? <Field label="目标 IP 数量"><input type="number" min="1" max={value.maxActiveIps || 50} step="1" value={value.poolTargetCount ?? value.maxActiveIps ?? 50} onChange={(e) => patch({ poolTargetCount: e.target.value })} /></Field> : null}
-    <div className="guard-notification-hint">{value.poolFillMode === 'fill' ? '按健康 IP 数量补足目标；库存不足先补一部分，后续有库存继续补。调低目标不会删除健康 IP。' : '删除不健康 IP 后补回缺口；库存不足时保留缺口，后续继续补。'}</div>
-    <Multi label="备用池（按选择顺序兜底）" items={(state.ipPools || []).filter((item) => item.enabled !== false)} value={value.poolIds || []} onChange={(poolIds) => patch({ poolIds })} secondary={(item) => `${item.assetIds?.length || 0} 个 IP`} searchable selectable />
+    <div className="ops-editor-grid guard-pool-settings">
+      <div className="guard-pool-setting">
+        <Field label="补位方式"><select value={value.poolFillMode || 'repair'} onChange={(e) => patch({ poolFillMode: e.target.value, poolTargetCount: Math.min(Number(value.poolTargetCount) || Number(value.maxActiveIps) || 50, Number(value.maxActiveIps) || 50) })}><option value="repair">故障补位</option><option value="fill">补满指定数量</option></select></Field>
+        {value.poolFillMode === 'fill' ? <Field label="目标 IP 数量"><input type="number" min="1" max={value.maxActiveIps || 50} step="1" value={value.poolTargetCount ?? value.maxActiveIps ?? 50} onChange={(e) => patch({ poolTargetCount: e.target.value })} /></Field> : null}
+        <div className="guard-notification-hint">{value.poolFillMode === 'fill' ? '按健康 IP 数量补足目标；库存不足先补一部分，后续有库存继续补。调低目标不会删除健康 IP。' : '删除不健康 IP 后补回缺口；库存不足时保留缺口，后续继续补。'}</div>
+      </div>
+      <div className="guard-pool-setting">
+        <Field label="备用池取用方式"><select value={value.poolSelectionMode || 'ordered'} onChange={(e) => patch({ poolSelectionMode: e.target.value })}><option value="ordered">按顺序取用</option><option value="balanced">均衡取用</option></select></Field>
+        <div className="guard-notification-hint">{value.poolSelectionMode === 'balanced' ? '各池尽量平均补入，单个补位也轮流取用；库存不足或检查失败由其他池补足，不调整已有健康 IP。' : '按选择顺序优先取用，当前池不足或检查失败时由后面的池补足。'}</div>
+      </div>
+    </div>
+    <Multi label={value.poolSelectionMode === 'balanced' ? '备用池（均衡取用）' : '备用池（按选择顺序兜底）'} items={(state.ipPools || []).filter((item) => item.enabled !== false)} value={value.poolIds || []} onChange={(poolIds) => patch({ poolIds })} secondary={(item) => `${item.assetIds?.length || 0} 个 IP`} searchable selectable />
     <EditorSection title="TG 通知" />
     <Multi label="通知机器人（不选则不通知）" items={state.telegramBots || []} value={value.alertBotIds || []} onChange={(alertBotIds) => patch({ alertBotIds })} secondary={(item) => item.enabled === false ? '已停用' : !item.configured ? '未配置 Token' : !item.userIds?.length ? '未配置接收 ID' : '发送到机器人配置的接收 ID'} emptyLabel="请先在 Telegram 中添加机器人" />
     <div className="guard-notification-hint">删除不健康 IP 时通知，并显示剩余数量；正常检查不通知。</div>

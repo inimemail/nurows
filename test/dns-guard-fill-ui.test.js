@@ -41,6 +41,23 @@ test('guard form defaults to repair, conditionally exposes a bounded fill target
   assert.equal(field(render(), '目标 IP 数量'), undefined);
 });
 
+test('guard pool selection is independent of fill mode and survives save and copy', () => {
+  let value = normalizeDraft('guard', { poolIds: ['a', 'b'], poolFillMode: 'repair' });
+  const state = { probes: [], ipPools: [], dnsAccounts: [], telegramBots: [] };
+  const render = () => GuardEditor({ value, state, patch: (next) => { value = { ...value, ...next }; } });
+  assert.equal(field(render(), '备用池取用方式').props.children.props.value, 'ordered');
+  assert.ok(field(render(), '备用池（按选择顺序兜底）'));
+  field(render(), '备用池取用方式').props.children.props.onChange({ target: { value: 'balanced' } });
+  assert.ok(field(render(), '备用池（均衡取用）'));
+  assert.equal(value.poolFillMode, 'repair');
+  const saved = serializeDraft('guard', value);
+  assert.equal(saved.poolSelectionMode, 'balanced');
+  assert.equal(normalizeDraft('guard', saved).poolSelectionMode, 'balanced');
+  assert.deepEqual(saved.poolIds, ['a', 'b']);
+  field(render(), '补位方式').props.children.props.onChange({ target: { value: 'fill' } });
+  assert.equal(value.poolSelectionMode, 'balanced');
+});
+
 test('pool editor separates DNS guard and incident allocation without changing stored incident choices', () => {
   for (const allocationMode of ['one', 'count', 'all']) {
     const value = normalizeDraft('pool', { allocationMode, allocationCount: 7, assetIds: ['asset'], selectionMode: 'random' });

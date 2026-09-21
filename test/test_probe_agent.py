@@ -13,6 +13,73 @@ SPEC.loader.exec_module(PROBE)
 
 
 class ProbeCheckWindowTests(unittest.TestCase):
+    def test_pool_ping_command_errors_are_not_network_failure_evidence(self):
+        with mock.patch.object(PROBE.subprocess, "run", return_value=mock.Mock(returncode=2)):
+            with self.assertRaisesRegex(RuntimeError, "ping command error"):
+                PROBE.check_address({"poolCheckId": "pool", "checkType": "ping"}, "8.8.8.8", 1)
+            with self.assertRaisesRegex(RuntimeError, "ping failed"):
+                PROBE.check_address({"checkType": "ping"}, "8.8.8.8", 1)
+
+    def test_pool_cancellation_stops_attempts_without_reporting_failure(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        target = {"id": "pool-ip", "poolCheckId": "pool", "address": "8.8.8.8", "_cancel_event": cancelled}
+        with mock.patch.object(PROBE, "check_attempt") as attempt, mock.patch.object(PROBE, "request") as report:
+            result = PROBE.check_target(target)
+            self.assertEqual(result, {"targetId": "pool-ip", "cancelled": True})
+            PROBE.run_due_checks({"maxConcurrency": 50}, [target], {}, 100)
+            attempt.assert_not_called()
+            report.assert_not_called()
+
+    def test_pool_cancellation_between_attempts_does_not_finish_failure_rounds(self):
+        cancelled = threading.Event()
+        target = {**self.target, "poolCheckId": "pool", "_cancel_event": cancelled}
+        def fail_once(*_args):
+            cancelled.set()
+            return False, "ping failed", ""
+        with mock.patch.object(PROBE, "validate_target_address", return_value={"8.8.8.8"}), \
+                mock.patch.object(PROBE, "check_attempt", side_effect=fail_once) as attempt:
+            self.assertTrue(PROBE.check_target(target)["cancelled"])
+            self.assertEqual(attempt.call_count, 1)
+
+    def test_pool_checks_are_isolated_and_removed_config_cancels_old_work(self):
+        targets = [{"id": "guard", "guardId": "g"}, {"id": "ordinary"}, {"id": "pool", "poolCheckId": "p"}]
+        cancellations = {}
+        PROBE.update_pool_cancellations(targets, cancellations)
+        event = cancellations["pool"]
+        guard, ordinary, pool = PROBE.split_due_checks(targets, cancellations)
+        self.assertEqual([target["id"] for target in guard], ["guard"])
+        self.assertEqual([target["id"] for target in ordinary], ["ordinary"])
+        self.assertEqual([target["id"] for target in pool], ["pool"])
+        self.assertIs(pool[0]["_cancel_event"], event)
+        PROBE.update_pool_cancellations(targets, cancellations)
+        self.assertIs(cancellations["pool"], event)
+        PROBE.update_pool_cancellations(targets[:2], cancellations)
+        self.assertTrue(event.is_set())
+        self.assertEqual(cancellations, {})
+
+    def test_slow_pool_batch_does_not_block_monitoring_workers(self):
+        release_pool = threading.Event()
+        completed = {"guard": threading.Event(), "ordinary": threading.Event()}
+        def check(target):
+            if target.get("poolCheckId"):
+                release_pool.wait(2)
+            else:
+                completed[target["id"]].set()
+            return {"targetId": target["id"], "ok": True}
+        with mock.patch.object(PROBE, "check_target", side_effect=check), mock.patch.object(PROBE, "request"):
+            pool = PROBE.start_check_batch({"maxConcurrency": 50}, [{"id": "pool", "poolCheckId": "p"}], {}, 100)
+            workers = [PROBE.start_check_batch({"maxConcurrency": 1}, [target], {}, 100)
+                       for target in [{"id": "guard", "guardId": "g"}, {"id": "ordinary"}]]
+            try:
+                self.assertTrue(all(event.wait(1) for event in completed.values()))
+                self.assertTrue(pool.is_alive())
+            finally:
+                release_pool.set()
+                pool.join(2)
+                for worker in workers:
+                    worker.join(2)
+
     def test_old_guard_ids_do_not_accumulate_or_reset_live_schedules(self):
         schedules = {f"old-{index}": index for index in range(10000)}
         schedules.update({"running": float("inf"), "regular": 12345})

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import * as probeCapabilities from '../shared/probe-capabilities.js';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
@@ -23,6 +24,7 @@ function harness(api, assets, search = '', extra = {}) {
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
     if (path.endsWith('polling.js')) return { startPolling() {} };
     if (path.endsWith('telegram-permissions.js')) return telegramPermissions;
+    if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return workspaceSearch;
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     throw Error(path);
@@ -40,6 +42,69 @@ function harness(api, assets, search = '', extra = {}) {
 }
 
 const poolFixture = () => ({ ipPools: [{ id: 'p1', name: '备用池一', assetIds: ['a'], enabled: true }] });
+
+const healthFixture = () => ({ ...poolFixture(), probes: [{ id: 'probe', name: '在线探针', status: 'online', agentVersion: '1.4.9', lastSeenAt: new Date().toISOString() }] });
+
+test('pool health check confirms selected probes and snapshot, defaults to 50 parallel IPs and prevents duplicate starts', async () => {
+  const calls = [];
+  let finish;
+  const view = harness((path, options) => { calls.push({ path, options }); return new Promise(resolve => { finish = resolve; }); }, undefined, '', healthFixture());
+  view.buttons('备用池1')[0].props.onClick(); view.render();
+  view.buttons('检测并删除不通 IP')[0].props.onClick(); view.render();
+  assert.equal(view.buttons('确认检测并删除')[0].props.disabled, false);
+  view.buttons('取消')[0].props.onClick(); view.render();
+  assert.equal(calls.length, 0);
+  view.buttons('检测并删除不通 IP')[0].props.onClick(); view.render();
+  const fields = view.nodes().find(node => node.type?.name === 'PoolHealthFields');
+  assert.equal(fields.props.value.maxParallel, 50);
+  assert.deepEqual(Array.from(fields.props.value.probeIds), ['probe']);
+  view.state.ipPools[0].assetIds.push('added-later');
+  const confirm = view.buttons('确认检测并删除')[0].props.onClick;
+  const pending = confirm(); await confirm(); view.render();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, '/api/ip-pools/p1/health-check');
+  const body = JSON.parse(calls[0].options.body);
+  assert.equal(body.confirm, 'check-and-delete-unreachable');
+  assert.deepEqual(body.assetIds, ['a']);
+  assert.equal(body.maxParallel, 50);
+  assert.equal(view.buttons('启动中...')[0].props.disabled, true);
+  finish({ state: { ...healthFixture(), ipAssets: [] } }); await pending; view.render();
+  assert.equal(view.buttons('确认检测并删除').length, 0);
+});
+
+test('pool health setup validates online probes and numbers, and keeps errors editable for retry', async () => {
+  const view = harness(async () => { throw Error('所选探针已离线'); }, undefined, '', healthFixture());
+  view.buttons('备用池1')[0].props.onClick(); view.render();
+  view.buttons('检测并删除不通 IP')[0].props.onClick(); view.render();
+  const fields = () => view.nodes().find(node => node.type?.name === 'PoolHealthFields');
+  fields().props.patch({ maxParallel: '101' }); view.render();
+  assert.equal(view.buttons('确认检测并删除')[0].props.disabled, true);
+  fields().props.patch({ maxParallel: '50', probeIds: [] }); view.render();
+  assert.equal(view.buttons('确认检测并删除')[0].props.disabled, true);
+  fields().props.patch({ probeIds: ['probe'] }); view.render();
+  await view.buttons('确认检测并删除')[0].props.onClick(); view.render();
+  assert.equal(fields().props.value.error, '所选探针已离线');
+  assert.equal(view.buttons('确认检测并删除')[0].props.disabled, false);
+  view.state.probes[0].status = 'offline'; view.render();
+  assert.equal(view.buttons('确认检测并删除')[0].props.disabled, true);
+});
+
+test('running pool health checks replace the start button with an idempotent stop action', async () => {
+  const fixture = healthFixture();
+  fixture.ipPools[0].healthCheck = { id: 'job', status: 'running' };
+  const calls = [];
+  let finish;
+  const view = harness((path, options) => { calls.push({ path, options }); return new Promise(resolve => { finish = resolve; }); }, undefined, '', fixture);
+  view.buttons('备用池1')[0].props.onClick(); view.render();
+  assert.equal(view.buttons('检测并删除不通 IP').length, 0);
+  const stop = view.buttons('停止检测')[0].props.onClick;
+  const pending = stop(); await stop(); view.render();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, '/api/ip-pools/p1/health-check/stop');
+  assert.deepEqual(JSON.parse(calls[0].options.body), { jobId: 'job' });
+  assert.equal(view.buttons('停止中...')[0].props.disabled, true);
+  finish({ state: fixture }); await pending;
+});
 
 test('pool cleanup confirms saved membership, cancels without requests and prevents duplicate submission', async () => {
   const calls = [];

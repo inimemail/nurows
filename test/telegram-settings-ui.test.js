@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import * as probeCapabilities from '../shared/probe-capabilities.js';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
@@ -15,6 +16,7 @@ function harness() {
     if (path === 'react') return { useState: (value) => [typeof value === 'function' ? value() : value, () => {}], useRef: (current) => ({ current }), useEffect() {}, useMemo: (fn) => fn() };
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
     if (path.endsWith('telegram-permissions.js')) return permissions;
+    if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return workspaceSearch;
     if (path.endsWith('polling.js')) return {};
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };

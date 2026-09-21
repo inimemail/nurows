@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { startPolling } from '../shared/polling.js';
 import { TELEGRAM_FEATURES, telegramScopes } from '../shared/telegram-permissions.js';
 import { WORKSPACE_SEARCH, filterWorkspaceRecords } from '../shared/workspace-search.js';
+import { supportsPoolHealthCheck, POOL_HEALTH_PROBE_VERSION } from '../shared/probe-capabilities.js';
 import DynamicGuardWorkspace from './DynamicGuardWorkspace.jsx';
 
 const PROVIDERS = {
@@ -39,6 +40,10 @@ export default function OrchestrationWorkspace({ tab, state, search = '', onSear
   const assetDeletingRef = useRef(false);
   const [poolCleanup, setPoolCleanup] = useState(null);
   const poolCleaningRef = useRef(false);
+  const [poolHealth, setPoolHealth] = useState(null);
+  const poolHealthBusy = useRef(false);
+  const [poolStopping, setPoolStopping] = useState([]);
+  const poolStoppingRef = useRef(new Set());
   const [guardView, setGuardView] = useState(null);
   const [guardRemote, setGuardRemote] = useState({ open: false, guardId: '', name: '', recordType: 'A', values: '', expectedValues: [], busy: false, saving: false, ready: false, error: '' });
   const guardRemoteRequest = useRef(0);
@@ -57,6 +62,7 @@ export default function OrchestrationWorkspace({ tab, state, search = '', onSear
   const visibleRecords = useMemo(() => ['dynamic', 'usage'].includes(active) ? [] : filterWorkspaceRecords(active, active === 'assets' ? newestAssets : state[WORKSPACE_SEARCH[active]?.key] || [], search, state, PROVIDERS), [active, state, search, newestAssets]);
   const guardCheckActive = tab === 'probes' && Boolean(state.orchestrationSummary
     ? state.orchestrationSummary.checkingGuards : state.dnsGuards?.some((guard) => Boolean(guard.cycle)));
+  const poolCheckActive = tab === 'pools' && state.ipPools?.some(pool => pool.healthCheck?.status === 'running');
 
   useEffect(() => {
     if (historyClearing || active === 'dynamic') return;
@@ -64,9 +70,9 @@ export default function OrchestrationWorkspace({ tab, state, search = '', onSear
     const stop = startPolling(async (signal) => {
       const data = await api(`/api/orchestration/status/${active}`, { signal });
       if (!cancelled) onState((current) => ({ ...current, ...data }));
-    }, guardCheckActive ? 5000 : 10000);
+    }, guardCheckActive || poolCheckActive ? 5000 : 10000);
     return () => { cancelled = true; stop(); };
-  }, [api, onState, active, guardCheckActive, historyRevision, historyClearing]);
+  }, [api, onState, active, guardCheckActive, poolCheckActive, historyRevision, historyClearing]);
 
   const openCreate = (type) => { setEditorBusy(false); setEditor({ open: true, type, value: structuredClone(EMPTY[type]) }); };
   const openEdit = (type, value) => { setEditorBusy(false); setEditor({ open: true, type, value: normalizeDraft(type, value) }); };
@@ -243,6 +249,48 @@ export default function OrchestrationWorkspace({ tab, state, search = '', onSear
       toast(error.message);
     } finally { poolCleaningRef.current = false; }
   };
+  const requestPoolHealth = (pool) => {
+    if (poolHealthBusy.current || editorBusy) return;
+    const saved = state.ipPools?.find(item => item.id === pool.id);
+    if (!saved) { toast('请先保存备用池'); return; }
+    if (saved.healthCheck?.status === 'running') { toast('本池正在检测'); return; }
+    const previous = saved.healthCheck || {};
+    const available = onlinePoolProbes(state.probes);
+    const probeIds = previous.probeIds?.filter(id => available.some(probe => probe.id === id)) || [];
+    setPoolHealth({ id: saved.id, name: saved.name, assetIds: [...new Set(saved.assetIds || [])],
+      probeIds: probeIds.length ? probeIds : available.slice(0, 20).map(probe => probe.id),
+      checkType: previous.checkType || 'ping', port: previous.port || 443, timeout: previous.timeout || 5,
+      checkRounds: previous.checkRounds || 3, attemptsPerRound: previous.attemptsPerRound || 3,
+      maxParallel: previous.maxParallel || 50, busy: false, error: '' });
+  };
+  const closePoolHealth = () => { if (!poolHealthBusy.current) setPoolHealth(null); };
+  const confirmPoolHealth = async () => {
+    if (!poolHealth || poolHealthBusy.current) return;
+    poolHealthBusy.current = true;
+    setPoolHealth(current => ({ ...current, busy: true, error: '' }));
+    try {
+      const data = await api(`/api/ip-pools/${encodeURIComponent(poolHealth.id)}/health-check`, {
+        method: 'POST', body: JSON.stringify({ ...poolHealth, confirm: 'check-and-delete-unreachable' })
+      });
+      onState(data.state);
+      setPoolHealth(null);
+      toast('已开始后台检测，仅删除确认不通的空闲 IP');
+    } catch (error) { setPoolHealth(current => current ? { ...current, busy: false, error: error.message } : null); }
+    finally { poolHealthBusy.current = false; }
+  };
+  const stopPoolHealth = async (pool) => {
+    if (poolStoppingRef.current.has(pool.id)) return;
+    poolStoppingRef.current.add(pool.id);
+    setPoolStopping([...poolStoppingRef.current]);
+    try {
+      const data = await api(`/api/ip-pools/${encodeURIComponent(pool.id)}/health-check/stop`, {
+        method: 'POST', body: JSON.stringify({ jobId: pool.healthCheck.id })
+      });
+      onState(data.state);
+      toast('已停止检测，未确认的 IP 已保留');
+    } catch (error) { toast(error.message); }
+    finally { poolStoppingRef.current.delete(pool.id); setPoolStopping([...poolStoppingRef.current]); }
+  };
   const openProbeInstall = async (id) => {
     try {
       const data = await api(`/api/probes/${id}/install-command`);
@@ -299,7 +347,7 @@ export default function OrchestrationWorkspace({ tab, state, search = '', onSear
       </header>
       <div className="ops-tabs" role="tablist">{sections.map(([key, label]) => <button key={key} className={active === key ? 'active' : ''} onClick={() => setSection(key)}>{label}<em>{countFor(key, state)}</em></button>)}</div>
       <div className="surface ops-content">
-        {active === 'dynamic' ? <DynamicGuardWorkspace search={search} onState={onState} api={api} toast={toast} Dialog={Dialog} onOpenHistory={onOpenHistory} /> : renderSection(active, { state, search, onSearchChange, visibleRecords, onHistoryCleanup, onOpenHistory, historyClearing, guardSyncingIds, openCreate, openEdit, duplicateRecord, checkTargetNow, checkGuardNow, syncGuardRemote, openGuardRemote, openGuardView: setGuardView, openProbeInstall, rotateProbe, executeIncident, rollbackIncident, requestPoolCleanup, requestAssetDelete: (item) => setAssetDeletion({ id: item.id, address: item.address, busy: false }), requestIncidentDelete: (id) => setIncidentCleanup({ open: true, id, all: false, busy: false }), requestIncidentClear: () => onHistoryCleanup('incidents'), openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
+        {active === 'dynamic' ? <DynamicGuardWorkspace search={search} onState={onState} api={api} toast={toast} Dialog={Dialog} onOpenHistory={onOpenHistory} /> : renderSection(active, { state, search, onSearchChange, visibleRecords, onHistoryCleanup, onOpenHistory, historyClearing, guardSyncingIds, openCreate, openEdit, duplicateRecord, checkTargetNow, checkGuardNow, syncGuardRemote, openGuardRemote, openGuardView: setGuardView, openProbeInstall, rotateProbe, executeIncident, rollbackIncident, requestPoolCleanup, requestPoolHealth, stopPoolHealth, poolStopping, requestAssetDelete: (item) => setAssetDeletion({ id: item.id, address: item.address, busy: false }), requestIncidentDelete: (id) => setIncidentCleanup({ open: true, id, all: false, busy: false }), requestIncidentClear: () => onHistoryCleanup('incidents'), openAssetImport: () => setAssetImport((current) => ({ ...current, open: true })), api, onState, toast })}
       </div>
 
       {editor.open ? <Dialog title={`${editor.value.id ? '编辑' : '新增'}${typeLabel(editor.type)}`} className="ops-editor-dialog" wide={editor.type !== 'target' && editor.type !== 'policy' && editor.type !== 'guard'} xwide={editor.type === 'target' || editor.type === 'policy' || editor.type === 'guard'} onClose={() => !editorBusy && closeEditor()} footer={<><div>{editor.value.id ? <button className="danger-text" disabled={editorBusy} onClick={remove}>删除</button> : null}</div><div className="dialog-actions"><button className="ghost" disabled={editorBusy} onClick={closeEditor}>取消</button><button className="primary" disabled={editorBusy} onClick={save}>{editorBusy ? (editor.type === 'binding' ? '写入远端中...' : '保存中...') : editor.type === 'guard' ? '保存规则' : '保存'}</button></div></>}>{renderEditor(editor.type, editor.value, (patch) => setEditor((current) => ({ ...current, value: { ...current.value, ...patch } })), state, api, toast, requestPoolCleanup)}</Dialog> : null}
@@ -313,6 +361,9 @@ export default function OrchestrationWorkspace({ tab, state, search = '', onSear
       </Dialog> : null}
       {poolCleanup ? <Dialog title="删除本池空闲 IP" onClose={closePoolCleanup} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={poolCleanup.busy} onClick={closePoolCleanup}>取消</button><button className="primary danger-action" disabled={poolCleanup.busy || !poolCleanup.assetIds.length} onClick={confirmPoolCleanup}>{poolCleanup.busy ? '删除中...' : '确认删除空闲 IP'}</button></div></>}>
         <div className="confirm-copy"><p>备用池「{poolCleanup.name}」：检查已保存的 {poolCleanup.assetIds.length} 个 IP，删除其中未占用的资产。</p><p>这是永久删除 IP 资产，并会同步从所有关联备用池移除，不只是取消选择。备用池、历史记录和远程 DNS 记录保留。</p><p>正在使用、被任务占用或等待 DNS 写入确认的 IP 自动跳过。未保存的勾选不参与本次删除；确认期间新加入本池的 IP 不会被删除。</p></div>
+      </Dialog> : null}
+      {poolHealth ? <Dialog title="检测并删除不通 IP" className="ops-editor-dialog ops-pool-health-dialog" wide onClose={closePoolHealth} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={poolHealth.busy} onClick={closePoolHealth}>取消</button><button className="primary danger-action" disabled={poolHealth.busy || !validPoolHealthSettings(poolHealth, state.probes)} onClick={confirmPoolHealth}>{poolHealth.busy ? '启动中...' : '确认检测并删除'}</button></div></>}>
+        <PoolHealthFields value={poolHealth} patch={patch => setPoolHealth(current => ({ ...current, ...patch }))} probes={state.probes} />
       </Dialog> : null}
     </section>
   );
@@ -333,7 +384,7 @@ function renderSection(section, ctx) {
   if (section === 'incidents') return <DataView search={search} title="故障事件" copy="无备用 IP 时保持等待，补入后重新确认故障并预检候选 IP" dangerAction="清理全部" dangerDisabled={ctx.historyClearing} onDangerAction={ctx.requestIncidentClear} empty="还没有故障事件">{visibleRecords.map((item) => { const deletable = !item.executionId && !['allocating', 'automating', 'dns_updating', 'verifying', 'stabilizing', 'rolling_back'].includes(item.status); const detail = item.status === 'failed' ? item.error : item.message; return <Row key={item.id} title={item.targetName} subtitle={`${formatTime(item.startedAt)} · ${detail || item.policyName}`} status={STATUS[item.status] || item.status} tone={['succeeded', 'recovered'].includes(item.status) ? 'ok' : ['failed', 'waiting_for_ip'].includes(item.status) ? 'bad' : 'warn'} actions={<>{['pending_approval', 'failed', 'observing'].includes(item.status) ? <button className="primary" onClick={() => ctx.executeIncident(item.id)}>执行</button> : null}{item.dnsChangeIds?.length && item.status !== 'rolled_back' ? <button className="ghost" onClick={() => ctx.rollbackIncident(item.id)}>回滚</button> : null}{deletable ? <button className="ghost danger-text-button" onClick={() => ctx.requestIncidentDelete(item.id)}>删除</button> : null}</>} />; })}</DataView>;
   if (section === 'bots') return <DataView search={search} title="Telegram 机器人" copy="每个机器人可独立配置授权用户、菜单功能和关联任务" action="新增机器人" onAction={() => ctx.openCreate('bot')} empty="还没有配置 Telegram 机器人">{visibleRecords.map((item) => <Row key={item.id} title={item.name || '未命名机器人'} subtitle={`${item.userIds?.length || 0} 个授权用户 · ${item.automationTaskIds?.length || 0} 个自动化任务`} status={item.enabled && item.configured ? '运行中' : item.configured ? '已停用' : '未配置 Token'} tone={item.enabled && item.configured ? 'ok' : 'muted'} actions={<button className="ghost" onClick={() => ctx.openEdit('bot', item)}>编辑</button>} />)}</DataView>;
   if (section === 'assets') return <DataView search={search} title="IP 资产" copy="支持批量导入；删除空闲 IP 时自动从所有关联备用池移除" action="批量导入 IP" secondaryAction="单个新增" onAction={ctx.openAssetImport} onSecondaryAction={() => ctx.openCreate('asset')} empty="还没有 IP 资产">{visibleRecords.map((item) => <Row key={item.id} title={item.name || item.address} subtitle={assetSubtitle(item)} status={STATUS[item.health] || item.health} tone={item.health === 'healthy' ? 'ok' : item.health === 'unhealthy' ? 'bad' : 'muted'} actions={<><button className="ghost" onClick={() => ctx.openEdit('asset', item)}>编辑</button><button className="ghost danger-text-button" onClick={() => ctx.requestAssetDelete(item)}>删除</button></>} />)}</DataView>;
-  if (section === 'pools') return <DataView search={search} title="备用池" copy="IP 可加入多个备用池；成功切换后会自动消耗并删除" action="新增备用池" onAction={() => ctx.openCreate('pool')} empty="还没有备用池">{visibleRecords.map((item) => <Row key={item.id} title={item.name} subtitle={`${item.assetIds?.length || 0} 个 IP · ${allocationLabel(item)}`} status={item.enabled ? '可分配' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} actions={<><button className="ghost" onClick={() => ctx.openEdit('pool', item)}>编辑</button><button className="ghost danger-text-button" disabled={!item.assetIds?.length} onClick={() => ctx.requestPoolCleanup(item)}>删除本池空闲 IP</button></>} />)}</DataView>;
+  if (section === 'pools') return <DataView search={search} title="备用池" copy="IP 可加入多个备用池；成功切换后会自动消耗并删除" action="新增备用池" onAction={() => ctx.openCreate('pool')} empty="还没有备用池">{visibleRecords.map((item) => <Row key={item.id} className="ops-pool-row" title={item.name} subtitle={`${item.assetIds?.length || 0} 个 IP · ${allocationLabel(item)}`} status={item.enabled ? '可分配' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} details={item.healthCheck ? <PoolHealthProgress job={item.healthCheck} /> : null} actions={<><button className="ghost" onClick={() => ctx.openEdit('pool', item)}>编辑</button>{item.healthCheck?.status === 'running' ? <button className="ghost" disabled={ctx.poolStopping.includes(item.id)} onClick={() => ctx.stopPoolHealth(item)}>{ctx.poolStopping.includes(item.id) ? '停止中...' : '停止检测'}</button> : <button className="ghost" disabled={!item.assetIds?.length} onClick={() => ctx.requestPoolHealth(item)}>检测并删除不通 IP</button>}<button className="ghost danger-text-button" disabled={!item.assetIds?.length} onClick={() => ctx.requestPoolCleanup(item)}>删除本池空闲 IP</button></>} />)}</DataView>;
   if (section === 'usage') return <UsageRecordsView records={state.ipUsageRecords || []} query={search} onQueryChange={ctx.onSearchChange} onClear={() => ctx.onHistoryCleanup('ipUsageRecords')} clearing={ctx.historyClearing} />;
   if (section === 'accounts') return <DataView search={search} title="服务商账号" copy="保存凭证后，系统按完整域名自动识别托管域和解析记录" action="新增账号" onAction={() => ctx.openCreate('account')} empty="还没有 DNS 服务商账号">{visibleRecords.map((item) => <Row key={item.id} title={item.name} subtitle={PROVIDERS[item.provider] || item.provider} status={item.configured ? (item.status === 'healthy' ? '连接正常' : '待测试') : '未配置凭证'} tone={item.status === 'healthy' ? 'ok' : 'warn'} onTripleClick={() => ctx.duplicateRecord('account', item)} actions={<><button className="ghost" onClick={async () => { try { const data = await ctx.api(`/api/dns-accounts/${item.id}/test`, { method: 'POST' }); ctx.onState(data.state); ctx.toast('连接测试成功'); } catch (error) { ctx.toast(error.message); } }}>测试</button><button className="ghost" onClick={() => ctx.openEdit('account', item)}>编辑</button></>} />)}</DataView>;
   if (section === 'bindings') return <DataView search={search} title="解析绑定" copy="按完整域名管理 A、AAAA、CNAME、TXT、NS、CAA 记录和多值地址" action="新增解析绑定" onAction={() => ctx.openCreate('binding')} empty="还没有解析绑定">{visibleRecords.map((item) => { const values = item.currentValues?.length ? item.currentValues : ['A', 'AAAA'].includes(item.recordType) ? (item.managedValues?.length ? item.managedValues : item.backupIps || []) : item.recordValues || []; return <Row key={item.id} title={item.name} subtitle={`${item.recordType} · ${item.domain} · ${values.length} 个记录值${values.length ? ` · ${values.join(', ')}` : ''}`} status={item.enabled ? '已启用' : '已停用'} tone={item.enabled ? 'ok' : 'muted'} onTripleClick={() => ctx.duplicateRecord('binding', item)} actions={<><button className="ghost" onClick={async () => { try { const data = await ctx.api(`/api/dns-bindings/${item.id}/sync`, { method: 'POST' }); ctx.onState(data.state); ctx.toast(`已读取远端 ${data.values?.length || 0} 个记录值`); } catch (error) { ctx.toast(error.message); } }}>读取远端</button><button className="ghost" onClick={() => ctx.openEdit('binding', item)}>编辑</button></>} />; })}</DataView>;
@@ -387,8 +438,48 @@ function UsageRecordsView({ records, onClear, clearing, query = '', onQueryChang
   </div><div className="ops-list">{filtered.length ? filtered.map((item) => { const domains = (item.bindings || []).map((binding) => binding.domain).filter(Boolean).join(', '); const preflight = item.preflight?.attempts ? `Ping ${item.preflight.attempts} 次${item.preflight.ok ? '通过' : '失败'}` : ''; const details = [item.poolName || '未知备用池', item.targetName, preflight, domains, item.automationTaskName ? `任务：${item.automationTaskName}` : '', item.message, item.error, formatTime(item.finishedAt || item.startedAt)].filter(Boolean).join(' · '); const tone = ['consumed', 'returned'].includes(item.status) ? 'ok' : ['failed', 'discarded'].includes(item.status) ? 'bad' : 'warn'; return <Row key={item.id} title={item.address} subtitle={details} status={STATUS[item.status] || item.status} tone={tone} />; }) : <div className="ops-empty"><strong>{(records.length || query.trim()) ? '没有匹配的使用记录' : '还没有 IP 使用记录'}</strong><span>故障切换取用备用 IP 后会自动生成记录。</span></div>}</div></>;
 }
 
-function Row({ title, subtitle, status, tone = 'muted', actions, onTripleClick }) {
-  return <article className="ops-row" onClick={(event) => { if (onTripleClick && event.detail === 3 && !event.target.closest('button')) onTripleClick(); }}><div className="ops-row-main"><span className={`ops-dot ${tone}`} /><div><strong>{title}</strong>{subtitle ? <span>{subtitle}</span> : null}</div></div><div className="ops-row-side"><em className={`ops-status ${tone}`}>{status}</em>{actions ? <div className="ops-row-actions">{actions}</div> : null}</div></article>;
+function Row({ title, subtitle, status, tone = 'muted', actions, onTripleClick, details, className = '' }) {
+  return <article className={`ops-row ${className}`} onClick={(event) => { if (onTripleClick && event.detail === 3 && !event.target.closest('button')) onTripleClick(); }}><div className="ops-row-main"><span className={`ops-dot ${tone}`} /><div><strong>{title}</strong>{subtitle ? <span>{subtitle}</span> : null}</div></div><div className="ops-row-side"><em className={`ops-status ${tone}`}>{status}</em>{actions ? <div className="ops-row-actions">{actions}</div> : null}</div>{details}</article>;
+}
+
+function onlinePoolProbes(probes = []) {
+  return probes.filter(probe => probe.enabled !== false && probe.status === 'online' && probe.lastSeenAt && Date.now() - Date.parse(probe.lastSeenAt) <= 90000 && supportsPoolHealthCheck(probe.agentVersion));
+}
+
+function validPoolHealthSettings(value, probes) {
+  const online = new Set(onlinePoolProbes(probes).map(probe => probe.id));
+  return value.assetIds.length > 0 && value.probeIds.length > 0 && value.probeIds.length <= 20 && value.probeIds.every(id => online.has(id))
+    && [['timeout', 1, 30], ['checkRounds', 1, 10], ['attemptsPerRound', 1, 10], ['maxParallel', 1, 100], ['port', 1, 65535]]
+      .every(([key, min, max]) => Number.isInteger(Number(value[key])) && Number(value[key]) >= min && Number(value[key]) <= max);
+}
+
+function PoolHealthFields({ value, patch, probes }) {
+  return <div className="ops-pool-check-form">
+    <div className="ops-pool-check-scope"><strong>{value.name}</strong><span>{value.assetIds.length} 个已保存 IP</span></div>
+    <fieldset disabled={value.busy}><EditorGrid>
+      <Field label="检测方式"><select value={value.checkType} onChange={e => patch({ checkType: e.target.value })}><option value="ping">Ping</option><option value="tcp">TCP</option></select></Field>
+      {value.checkType === 'tcp' ? <Field label="TCP 端口"><input type="number" min="1" max="65535" value={value.port} onChange={e => patch({ port: e.target.value })} /></Field> : null}
+      <Field label="并发 IP 数量"><input type="number" min="1" max="100" value={value.maxParallel} onChange={e => patch({ maxParallel: e.target.value })} /></Field>
+      <Field label="每轮超时（秒）"><input type="number" min="1" max="30" value={value.timeout} onChange={e => patch({ timeout: e.target.value })} /></Field>
+      <Field label="检查轮数"><input type="number" min="1" max="10" value={value.checkRounds} onChange={e => patch({ checkRounds: e.target.value })} /></Field>
+      <Field label="每轮次数"><input type="number" min="1" max="10" value={value.attemptsPerRound} onChange={e => patch({ attemptsPerRound: e.target.value })} /></Field>
+      <Multi label="检测探针" items={onlinePoolProbes(probes)} value={value.probeIds} onChange={probeIds => patch({ probeIds })} secondary={probe => [probe.region, probe.carrier].filter(Boolean).join(' · ')} emptyLabel={`暂无可用探针，需在线且版本不低于 ${POOL_HEALTH_PROBE_VERSION}`} />
+      {probes?.some(probe => probe.enabled !== false && !supportsPoolHealthCheck(probe.agentVersion)) ? <div className="guard-notification-hint">部分探针版本过旧，请在探针管理中获取升级命令，升级至 {POOL_HEALTH_PROBE_VERSION} 后可选。</div> : null}
+    </EditorGrid></fieldset>
+    <p className="ops-pool-check-warning">任一探针成功即保留；全部所选探针完成失败轮次后，永久删除该空闲资产，并从所有关联池移除。探针异常、占用中的 IP 和未保存的勾选不删除，远程 DNS 不变。{value.checkType === 'ping' ? '禁 Ping 的 IP 请改用 TCP 检测。' : '请确认所选端口应当开放；端口不通也会判为失败。'}</p>
+    {value.error ? <div className="guard-error" role="alert">{value.error}</div> : null}
+  </div>;
+}
+
+function PoolHealthProgress({ job }) {
+  const active = job.status === 'running';
+  const label = ({ running: job.checkingCount ? '检测中' : '等待检测', completed: '检测完成', stopped: '已停止', interrupted: '检测中断' })[job.status] || job.status;
+  return <div className="ops-pool-check-progress">
+    <div><strong>{label}</strong><span>{job.completedCount} / {job.total}</span><time>{formatTime(job.finishedAt || job.startedAt)}</time></div>
+    {active ? <progress value={job.completedCount} max={Math.max(1, job.total)} aria-label="备用池检测进度" /> : null}
+    <div className="ops-pool-check-counts"><span>正常 <b>{job.healthyCount}</b></span><span>删除 <b>{job.deletedCount}</b></span><span>跳过 <b>{job.skippedCount}</b></span><span>不确定 <b>{job.uncertainCount}</b></span><span>池内剩余 <b>{job.remainingCount}</b></span>{job.total > job.completedCount ? <span>未完成 <b>{job.total - job.completedCount}</b></span> : null}</div>
+    {job.status === 'interrupted' ? <span className="ops-pool-check-message">{job.message}</span> : null}
+  </div>;
 }
 
 function CommandBlock({ label, value, toast }) {
@@ -673,7 +764,7 @@ function summary(tab, state) {
 function allocationLabel(item) { return `DNS 守护跟随规则 · 故障切换${item.allocationMode === 'all' ? '取全部' : item.allocationMode === 'count' ? `取 ${item.allocationCount} 个` : '取一个'}`; }
 function assetSubtitle(item) { return [item.name && item.name !== item.address ? item.address : '', item.region, item.carrier].filter(Boolean).join(' · '); }
 function targetSubtitle(item) { const rounds = Number(item.checkRounds) || 3; const perRound = Number(item.attemptsPerRound) || 3; const expectedAttempts = rounds * perRound; const observations = Object.values(item.observations || {}).sort((a, b) => Date.parse(b.checkedAt || 0) - Date.parse(a.checkedAt || 0)); const latest = observations[0]; const result = !latest ? '尚未检查' : latest.ok ? `第 ${latest.successfulRound || 1} 轮第 ${latest.successfulAttempt || 1} 次成功` : latest.attempts === expectedAttempts ? `${expectedAttempts} 次全部失败` : '等待探针升级'; return `${item.checkType === 'ping' ? 'PING' : `TCP:${item.port}`} · ${item.address || '未填写地址'} · ${item.probeIds?.length || 0} 个探针 · ${rounds}轮×${perRound}次 · ${result} · ${formatTime(item.lastCheckAt)}`; }
-function probeVersionCurrent(version) { const [major = 0, minor = 0, patch = 0] = String(version || '').split('.').map(Number); return major > 1 || (major === 1 && (minor > 4 || (minor === 4 && patch >= 8))); }
+function probeVersionCurrent(version) { return supportsPoolHealthCheck(version); }
 function probeVersionLabel(version) { return version ? `${version}${probeVersionCurrent(version) ? '' : '（需升级）'}` : '未接入'; }
 function updateModeLabel(mode) { return ({ append: '追加 IP', managed_replace: '覆盖托管值', replace: '完全替换' })[mode] || mode; }
 function formatTime(value) { if (!value) return '-'; return new Date(value).toLocaleString('zh-CN', { hour12: false }); }

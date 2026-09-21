@@ -14,14 +14,14 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
 
 CONFIG_PATH = os.environ.get("NUROSSH_PROBE_CONFIG", "/etc/nurossh-probe/config.json")
-VERSION = "1.4.8"
+VERSION = "1.4.10"
 DEFAULT_CHECK_ROUNDS = 3
 DEFAULT_ATTEMPTS_PER_ROUND = 3
 MAX_CHECK_ROUNDS = 10
 MAX_ATTEMPTS_PER_ROUND = 10
 ROUND_DELAY_SECONDS = 1
 POLL_INTERVAL_SECONDS = 1
-REPORT_BATCH_WINDOW_SECONDS = 0.04
+REPORT_BATCH_WINDOW_SECONDS = 0.1
 MAX_REPORT_RESULTS = 2000
 
 
@@ -79,6 +79,8 @@ def check_address(target, address, timeout):
             check=False
         )
         if completed.returncode != 0:
+            if target.get("poolCheckId") and completed.returncode != 1:
+                raise RuntimeError(f"ping command error (exit {completed.returncode})")
             raise RuntimeError("ping failed")
         return
     with socket.create_connection((address, int(target.get("port", 443))), timeout=timeout):
@@ -104,6 +106,8 @@ def check_attempt(target, addresses, timeout):
 
 def check_target(target):
     started = time.monotonic()
+    cancel_event = target.get("_cancel_event")
+    cancelled = {"targetId": target["id"], "cancelled": True}
     try:
         timeout = max(1.0, float(target.get("timeout", 5)))
     except (TypeError, ValueError):
@@ -122,6 +126,8 @@ def check_target(target):
     resolved_addresses = set()
     last_error = "check failed"
     for round_index in range(1, check_rounds + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            return cancelled
         addresses = None
         try:
             addresses = validate_target_address(target["address"], bool(target.get("allowPrivate")))
@@ -130,6 +136,8 @@ def check_target(target):
             last_error = str(error) or error.__class__.__name__
         round_deadline = time.monotonic() + timeout
         for attempt_index in range(1, attempts_per_round + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                return cancelled
             attempts_run += 1
             try:
                 if addresses is None:
@@ -158,7 +166,11 @@ def check_target(target):
                 last_error = str(error) or error.__class__.__name__
         rounds_completed = round_index
         if round_index < check_rounds:
-            time.sleep(ROUND_DELAY_SECONDS)
+            if cancel_event is not None:
+                if cancel_event.wait(ROUND_DELAY_SECONDS):
+                    return cancelled
+            else:
+                time.sleep(ROUND_DELAY_SECONDS)
     return {
         "targetId": target["id"], "ok": False,
         "latencyMs": round((time.monotonic() - started) * 1000, 2),
@@ -172,73 +184,173 @@ def check_target(target):
     }
 
 
-def run_due_checks(config, due, schedules, now):
-    workers = min(max(1, int(config.get("maxConcurrency", 100))), len(due))
-    # Guard checks are already ordered first by the server. Keep that priority
-    # when a probe has a small worker pool and a stale client sends old order.
-    due = sorted(due, key=lambda target: 0 if target.get("guardId") else 1)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(check_target, target): target for target in due}
-        pending = set(futures)
-        while pending:
-            completed, pending = concurrent.futures.wait(
-                pending, return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            # Healthy IPs in the same parallel wave usually finish together.
-            # Briefly collect them into one state write without waiting for a
-            # slow or failing IP that still has rounds left to run.
-            if pending and len(completed) < MAX_REPORT_RESULTS:
-                nearby, pending = concurrent.futures.wait(
-                    pending,
-                    timeout=REPORT_BATCH_WINDOW_SECONDS,
-                    return_when=concurrent.futures.ALL_COMPLETED,
-                )
-                completed.update(nearby)
-            completed_list = list(completed)
-            for offset in range(0, len(completed_list), MAX_REPORT_RESULTS):
-                batch = completed_list[offset:offset + MAX_REPORT_RESULTS]
-                results = [future.result() for future in batch]
-                request(config, "POST", "/probe/report", {"version": VERSION, "results": results})
-                for future in batch:
-                    target = futures.pop(future)
-                    schedules[target["id"]] = now + max(5, int(target.get("interval", 30)))
+class CheckScheduler:
+    """One bounded worker pool; report delivery never blocks slot replenishment."""
 
+    def __init__(self, config):
+        self.config = dict(config)
+        self.condition = threading.Condition(threading.RLock())
+        self.entries = {}
+        self.running = {}
+        self.pending = {}
+        self.lane_cursor = 0
+        self.closed = False
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1000)
+        self.worker = threading.Thread(target=self._loop, name="probe-scheduler", daemon=True)
+        self.reporters = [threading.Thread(target=self._report_loop, args=(pool,),
+                          name="pool-reporter" if pool else "monitor-reporter", daemon=True)
+                          for pool in (False, True)]
+        self.worker.start()
+        for reporter in self.reporters:
+            reporter.start()
 
-def start_check_batch(config, due, schedules, now):
-    if not due:
-        return None
-    for target in due:
-        schedules[target["id"]] = float("inf")
+    @staticmethod
+    def _lane(target):
+        return 2 if target.get("poolCheckId") else 0 if target.get("guardId") or target.get("dynamicGuardId") else 1
 
-    def worker():
+    def update(self, config, targets):
+        with self.condition:
+            self.config = dict(config)
+            incoming = {target["id"]: target for target in targets}
+            for target_id, entry in list(self.entries.items()):
+                if incoming.get(target_id) != entry["target"]:
+                    entry["cancel"].set()
+                    self.pending.pop(id(entry), None)
+                    del self.entries[target_id]
+            for target_id, target in incoming.items():
+                if target_id not in self.entries:
+                    self.entries[target_id] = {"target": dict(target), "lane": self._lane(target),
+                                               "cancel": threading.Event(), "due": 0, "started": 0}
+            self.condition.notify_all()
+
+    def _current(self, entry):
+        return self.entries.get(entry["target"]["id"]) is entry
+
+    def _notify(self, _future):
+        with self.condition:
+            self.condition.notify_all()
+
+    def _collect(self):
+        for future, entry in list(self.running.items()):
+            if not future.done():
+                continue
+            del self.running[future]
+            if not self._current(entry):
+                continue
+            try:
+                result = future.result()
+            except Exception as error:
+                # Missing evidence cannot be accepted as a failed network check.
+                result = {"targetId": entry["target"]["id"], "ok": False,
+                          "error": str(error)[:200], "attempts": 0}
+            if result.get("cancelled"):
+                entry["due"] = time.monotonic() + 5
+                continue
+            self.pending[id(entry)] = (entry, result)
+        self.condition.notify_all()
+
+    def _dispatch(self):
         try:
-            run_due_checks(config, due, schedules, now)
-        except Exception as error:
-            print(f"probe check batch failed: {error}", file=sys.stderr, flush=True)
-        finally:
-            for target in due:
-                if schedules.get(target["id"]) == float("inf"):
-                    schedules[target["id"]] = 0
+            budget = min(1000, max(1, int(self.config.get("maxConcurrency", 100))))
+        except (ValueError, TypeError):
+            budget = 100
+        capacity = min(budget - len(self.running),
+                       MAX_REPORT_RESULTS - len(self.running) - len(self.pending))
+        if capacity <= 0:
+            return
+        now = time.monotonic()
+        lanes = [[], [], []]
+        for entry in self.entries.values():
+            if entry["due"] <= now:
+                lanes[entry["lane"]].append(entry)
+        for lane in lanes:
+            lane.sort(key=lambda entry: entry["due"], reverse=True)
+        counts = [sum(entry["lane"] == lane for entry in self.running.values()) for lane in range(3)]
+        # Pool scans cannot occupy the monitor reserve, including when a guard
+        # arrives later. With the default budget of 100, scans retain 50 slots.
+        limits = [budget, budget, min(100, max(1, budget // 2))]
+        for _ in range(capacity):
+            selected = None
+            for offset in range(3):
+                lane = (self.lane_cursor + offset) % 3
+                if lanes[lane] and counts[lane] < limits[lane]:
+                    selected = lane
+                    break
+            if selected is None:
+                break
+            self.lane_cursor = (selected + 1) % 3
+            entry = lanes[selected].pop()
+            entry["due"] = float("inf")
+            entry["started"] = now
+            future = self.executor.submit(check_target, {**entry["target"], "_cancel_event": entry["cancel"]})
+            self.running[future] = entry
+            counts[selected] += 1
+            future.add_done_callback(self._notify)
 
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    return thread
+    def _loop(self):
+        with self.condition:
+            while not self.closed:
+                self._collect()
+                self._dispatch()
+                self.condition.wait(timeout=0.1)
+
+    def _report_loop(self, pool):
+        endpoint = "/probe/pool-report" if pool else "/probe/report"
+        next_send = 0
+        while True:
+            with self.condition:
+                while not self.closed:
+                    batch = [(key, entry, result) for key, (entry, result) in self.pending.items()
+                             if (entry["lane"] == 2) == pool]
+                    if batch and time.monotonic() >= next_send:
+                        # Coalesce nearby completions without waiting for slow IPs.
+                        self.condition.wait_for(lambda: self.closed, timeout=REPORT_BATCH_WINDOW_SECONDS)
+                        batch = [(key, entry, result) for key, (entry, result) in self.pending.items()
+                                 if (entry["lane"] == 2) == pool][:MAX_REPORT_RESULTS]
+                        break
+                    self.condition.wait(timeout=max(0.01, min(1, next_send - time.monotonic())) if batch else None)
+                if self.closed:
+                    return
+                config = dict(self.config)
+            if not batch:
+                continue
+            try:
+                request(config, "POST", endpoint, {"version": VERSION, "results": [row[2] for row in batch]})
+            except Exception as error:
+                # Retain exact evidence until acknowledged; backpressure bounds
+                # both memory and work when the panel is temporarily unavailable.
+                print(f"probe report failed: {error}", file=sys.stderr, flush=True)
+                next_send = time.monotonic() + 1
+                continue
+            with self.condition:
+                for key, entry, result in batch:
+                    pending = self.pending.get(key)
+                    if pending is None or pending[0] is not entry or pending[1] is not result:
+                        continue
+                    del self.pending[key]
+                    if self._current(entry):
+                        # Pool/guard IDs are one-shot; config removal or a new
+                        # marker rearms them. Never recheck acknowledged evidence.
+                        one_shot = entry["lane"] in (0, 2)
+                        entry["due"] = float("inf") if one_shot else entry["started"] + max(5, int(entry["target"].get("interval", 30)))
+                self.condition.notify_all()
+            next_send = 0
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            for entry in [*self.entries.values(), *self.running.values()]:
+                entry["cancel"].set()
+            self.condition.notify_all()
+        self.worker.join()
+        self.executor.shutdown(wait=True)
+        for reporter in self.reporters:
+            reporter.join()
 
 
 def update_config_cache(payload, targets, version):
     next_targets = targets if payload.get("unchanged") else payload.get("targets", [])
     return next_targets, str(payload.get("version", version))
-
-
-def prune_check_cache(targets, schedules, markers):
-    # Guard check IDs change every cycle. Retaining every old ID leaks memory
-    # over weeks of uptime. Worker threads may finish an old ID later; it is
-    # safely pruned on the next poll without changing any current schedule.
-    active_ids = {target["id"] for target in targets}
-    for cache in (schedules, markers):
-        for target_id in list(cache):
-            if target_id not in active_ids:
-                cache.pop(target_id, None)
 
 
 def main():
@@ -249,14 +361,18 @@ def main():
         raise RuntimeError("probe server must use https")
     if not config.get("secret"):
         register(config)
-    schedules = {}
-    check_now_markers = {}
+    scheduler = CheckScheduler(config)
+    try:
+        poll(config, scheduler)
+    finally:
+        scheduler.close()
+
+
+def poll(config, scheduler):
     last_heartbeat_at = 0.0
     heartbeat_interval = 20
     config_version = ""
     targets = []
-    guard_worker = None
-    ordinary_worker = None
     while True:
         try:
             now = time.time()
@@ -266,25 +382,12 @@ def main():
             config_path = "/probe/config" + (f"?version={quote(config_version, safe='')}" if config_version else "")
             payload = request(config, "GET", config_path)
             targets, config_version = update_config_cache(payload, targets, config_version)
-            prune_check_cache(targets, schedules, check_now_markers)
             try:
                 heartbeat_interval = max(10, int(payload.get("heartbeatInterval", heartbeat_interval)))
             except (TypeError, ValueError):
                 heartbeat_interval = 20
             runtime_config = {**config, "maxConcurrency": payload.get("maxConcurrency", config.get("maxConcurrency", 100))}
-            now = time.time()
-            for target in targets:
-                marker = str(target.get("checkNowAt", ""))
-                if marker and check_now_markers.get(target["id"]) != marker:
-                    check_now_markers[target["id"]] = marker
-                    schedules[target["id"]] = 0
-            due = [target for target in targets if now >= schedules.get(target["id"], 0)]
-            guard_due = [target for target in due if target.get("guardId")]
-            ordinary_due = [target for target in due if not target.get("guardId")]
-            if guard_due and (guard_worker is None or not guard_worker.is_alive()):
-                guard_worker = start_check_batch(runtime_config, guard_due, schedules, now)
-            if ordinary_due and (ordinary_worker is None or not ordinary_worker.is_alive()):
-                ordinary_worker = start_check_batch(runtime_config, ordinary_due, schedules, now)
+            scheduler.update(runtime_config, targets)
         except HTTPError as error:
             if error.code == 401 and config.get("token") and config.get("secret"):
                 config.pop("secret", None)

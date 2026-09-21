@@ -10,6 +10,7 @@ import { telegramScopeAllowed } from '../shared/telegram-permissions.js';
 import { createDynamicGuardService, registerDynamicGuardRoutes, sanitizeDynamicGuard } from './dynamic-guard.js';
 import { createRenewalService, registerRenewalRoutes, normalizeRenewalState, renewalSnapshot } from './renewals.js';
 import { createNotesService, registerNotesRoutes } from './notes.js';
+import { poolHealthSummary, poolHealthProbeState, poolHealthSchedule, clonePoolHealthPools } from './pool-health-check.js';
 import { parseStoredRecord } from './storage-validation.js';
 import { loadStorageKey } from './storage-key.js';
 import { createSessionSocketRegistry, createWebSocketUpgradeHandler, createWebSocketTickets } from './websocket-security.js';
@@ -35,6 +36,7 @@ import {
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
   scanOfflineProbes,
+  processPoolHealthChecks,
   clearFinishedIncidents,
   requestWaitingDnsGuardChecks,
   requestWaitingDnsGuardProbeChecks,
@@ -130,6 +132,8 @@ const SHELL_PROMPT_PATTERNS = [
 const orchestrationDeps = {
   readState,
   readProbeState,
+  readPoolHealthSchedule,
+  updatePoolHealthState,
   readDnsGuardStatusState,
   readOrchestrationStatusState,
   updateState,
@@ -1180,6 +1184,11 @@ server.listen(PORT, HOST, () => {
   renewalService.tick();
   setInterval(() => renewalService.tick(), 60000).unref();
   checkProbePresence();
+  processPoolHealthChecks(orchestrationDeps, true);
+  setInterval(() => {
+    try { processPoolHealthChecks(orchestrationDeps); }
+    catch (error) { console.error('Pool health check:', error.message); }
+  }, 5000).unref();
   setInterval(() => telegramWorkspace.cleanup(), 60000).unref();
   resumePendingIncidents();
   dynamicGuardService.tick();
@@ -2056,6 +2065,7 @@ function readProbeState() {
   if (!cachedState) cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
   return structuredClone({
     probes: cachedState.probes || [],
+    ipPools: poolHealthProbeState(cachedState.ipPools),
     dynamicGuards: (cachedState.dynamicGuards || []).filter((guard) => guard.enabled !== false && guard.cycle).map((guard) => ({
       id: guard.id, enabled: guard.enabled, checkType: guard.checkType, port: guard.port,
       timeout: guard.timeout, checkRounds: guard.checkRounds, attemptsPerRound: guard.attemptsPerRound, cycle: guard.cycle
@@ -2116,10 +2126,16 @@ function readDnsGuardStatusState() {
   });
 }
 
+function readPoolHealthSchedule() {
+  ensureStorage();
+  return { schedule: poolHealthSchedule(cachedState.ipPools), probes: (cachedState.probes || []).map(({ id, status, enabled, lastSeenAt, agentVersion }) => ({ id, status, enabled, lastSeenAt, agentVersion })) };
+}
+
 function readOrchestrationStatusState(keys) {
   ensureStorage();
   if (!cachedState) cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
   const selected = Object.fromEntries(keys.map((key) => [key, cachedState[key]]));
+  if (selected.ipPools) selected.ipPools = selected.ipPools.map(pool => ({ ...pool, healthCheck: poolHealthSummary(pool.healthCheck) }));
   if (selected.dnsGuards) selected.dnsGuards = selected.dnsGuards.map((guard) => ({
     ...guard, cycle: guard.cycle ? { id: guard.cycle.id, phase: guard.cycle.phase, startedAt: guard.cycle.startedAt } : null
   }));
@@ -2159,6 +2175,28 @@ function updateState(mutator) {
   const saved = readState();
   notifyPoolThresholdDrops(previousPoolInventory, saved);
   return saved;
+}
+
+function updatePoolHealthState(mutator) {
+  ensureStorage();
+  const before = cachedState;
+  const draft = { ...before, ipPools: clonePoolHealthPools(before.ipPools),
+    probes: structuredClone(before.probes || []), auditLogs: [...(before.auditLogs || [])] };
+  const next = mutator(draft);
+  const durable = next.ipAssets !== before.ipAssets || next.ipLeases !== before.ipLeases
+    || next.auditLogs.length !== (before.auditLogs || []).length || next.auditLogs[0] !== before.auditLogs?.[0];
+  if (durable) {
+    const inventory = next.ipAssets !== before.ipAssets ? snapshotPoolInventory(before) : new Map();
+    // Publish only after persistence succeeds. Asset removal and its summary
+    // remain one durable transaction; a failed write leaves the live cache intact.
+    writeState(next);
+    notifyPoolThresholdDrops(inventory, cachedState);
+  } else {
+    // Successful/incomplete checks and fresh heartbeats are ephemeral progress.
+    // Restarts interrupt scans; no deletion relies on unpersisted evidence.
+    cachedState = next;
+  }
+  return { probes: cachedState.probes, ipPools: cachedState.ipPools };
 }
 
 function sanitizeStateForClient(state, auth = null) {

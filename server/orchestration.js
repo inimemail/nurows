@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { telegramScopes } from '../shared/telegram-permissions.js';
+import { supportsPoolHealthCheck } from '../shared/probe-capabilities.js';
 import { execFile as execFileCallback } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -8,6 +9,8 @@ import net from 'node:net';
 import { promisify } from 'node:util';
 import { v4 as uuidv4 } from 'uuid';
 import { sanitizeDynamicGuard, dynamicProbeTargets, acceptDynamicReports } from './dynamic-guard.js';
+import { poolHealthSummary, poolHealthTargets, createPoolHealthCheck, finishPoolHealthCheck,
+  acceptPoolHealthReports, advancePoolHealthChecks, poolHealthSchedule, poolHealthTickNeeded } from './pool-health-check.js';
 
 const execFile = promisify(execFileCallback);
 
@@ -166,6 +169,7 @@ export function sanitizeOrchestrationState(state = {}) {
   const domain = normalizeOrchestrationState(state);
   return {
     ...domain,
+    ipPools: domain.ipPools.map((pool) => ({ ...pool, healthCheck: poolHealthSummary(pool.healthCheck) })),
     dynamicGuards: domain.dynamicGuards.map((guard) => sanitizeDynamicGuard(guard)),
     dynamicGuardRuns: domain.dynamicGuardRuns.slice(0, 30).map(({ output, ...run }) => run),
     probes: domain.probes.map(({ tokenHash, tokenEnc, agentSecretHash, ...item }) => ({
@@ -283,7 +287,8 @@ export function registerProbePublicRoutes(app, deps) {
     });
     // DNS guard cycles are latency-sensitive: start them before ordinary
     // targets so a busy probe cannot make a two-IP guard wait behind a queue.
-    const checks = [...guardChecks, ...dynamicProbeTargets(auth.state.dynamicGuards, auth.probe.id), ...targets];
+    const checks = [...guardChecks, ...dynamicProbeTargets(auth.state.dynamicGuards, auth.probe.id),
+      ...targets, ...(supportsPoolHealthCheck(auth.probe.agentVersion) ? poolHealthTargets(auth.state.ipPools, auth.probe.id) : [])];
     const version = configVersion(checks);
     const unchanged = cleanText(req.query?.version, 100) === version;
     res.json({
@@ -341,6 +346,7 @@ export function registerProbePublicRoutes(app, deps) {
         probe.agentVersion = cleanText(req.body.version, 40) || probe.agentVersion;
       }
       acceptedDynamicReport = acceptDynamicReports(draft, auth.probe.id, reports);
+      acceptPoolHealthReports(draft, auth.probe.id, reports, poolHealthHooks(draft));
       const targetById = new Map((draft.probeTargets || []).map((item) => [item.id, item]));
       const guardCheckById = new Map();
       const touchedGuards = new Set();
@@ -431,6 +437,25 @@ export function registerProbePublicRoutes(app, deps) {
     if (acceptedTargetReport) deps.onProbeReport?.(state);
     res.json({ ok: true, accepted: reports.length, incidents: createdIncidentIds });
   });
+
+  app.post('/probe/pool-report', (req, res) => {
+    const auth = authenticateProbe(req, deps.readState(['probes']));
+    if (!auth) return res.status(401).json({ error: '探针凭证无效' });
+    const reports = Array.isArray(req.body.results) ? req.body.results.slice(0, 2000) : [];
+    let presenceEvents = [];
+    (deps.updatePoolHealthState || deps.updateState)((draft) => {
+      const probe = draft.probes.find(item => item.id === auth.probe.id);
+      if (probe) {
+        presenceEvents = markProbeOnline(draft, probe);
+        probe.agentVersion = cleanText(req.body.version, 40) || probe.agentVersion;
+      }
+      acceptPoolHealthReports(draft, auth.probe.id, reports, poolHealthHooks(draft));
+      return draft;
+    });
+    deps.notifyProbePresence?.(presenceEvents);
+    if (presenceEvents.length) deps.onProbeAvailable?.(auth.probe.id);
+    res.json({ ok: true });
+  });
 }
 
 export function registerOrchestrationRoutes(app, deps) {
@@ -439,7 +464,7 @@ export function registerOrchestrationRoutes(app, deps) {
       nodes: ['probes', 'telegramBots'], targets: ['probes', 'probeTargets', 'failoverPolicies'],
       guards: ['probes', 'dnsGuards', 'dnsGuardRuns', 'dnsAccounts', 'ipPools', 'telegramBots'],
       policies: ['failoverPolicies', 'ipPools', 'dnsBindings', 'telegramBots', 'automationTasks'], incidents: ['incidents', 'probeTargets'],
-      assets: ['ipAssets', 'ipPools', 'telegramBots'], pools: ['ipPools', 'ipAssets', 'telegramBots'],
+      assets: ['ipAssets', 'ipPools', 'telegramBots'], pools: ['ipPools', 'ipAssets', 'telegramBots', 'probes'],
       usage: ['ipUsageRecords'], accounts: ['dnsAccounts'], bindings: ['dnsBindings', 'dnsAccounts'],
       changes: ['dnsChanges'], bots: ['telegramBots', 'automationTasks']
     };
@@ -504,6 +529,31 @@ export function registerOrchestrationRoutes(app, deps) {
       return draft;
     });
     res.json({ ok: true, ...result, state: deps.sanitizeState(state, req.auth) });
+  }));
+
+  app.post('/api/ip-pools/:id/health-check', asyncRoute(async (req, res) => {
+    const state = deps.updateState((draft) => {
+      const pool = draft.ipPools.find((item) => item.id === req.params.id);
+      if (!pool) throw new Error('备用池不存在，请刷新列表');
+      createPoolHealthCheck(pool, req.body || {}, draft, req.auth.username);
+      pushAudit(draft, 'ipPools.health_check_started', 'ipPools', pool.id,
+        `开始检测 ${pool.healthCheck.total} 个 IP，仅删除确认不通的空闲资产`, req.auth.username);
+      advancePoolHealthChecks(draft, poolHealthHooks(draft));
+      return draft;
+    });
+    res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
+  }));
+
+  app.post('/api/ip-pools/:id/health-check/stop', asyncRoute(async (req, res) => {
+    const state = deps.updateState((draft) => {
+      const pool = draft.ipPools.find((item) => item.id === req.params.id);
+      if (!pool) throw new Error('备用池不存在，请刷新列表');
+      if (!req.body?.jobId || pool.healthCheck?.id !== req.body.jobId) throw new Error('检测任务已变化，请刷新后重试');
+      finishPoolHealthCheck(pool, 'stopped', '已停止，未确认的 IP 已保留', poolHealthHooks(draft));
+      advancePoolHealthChecks(draft, poolHealthHooks(draft));
+      return draft;
+    });
+    res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
   }));
 
   app.post('/api/dns-sources/resolve', asyncRoute(async (req, res) => {
@@ -2942,6 +2992,26 @@ function protectedIpAssets(state) {
   return { ids, addresses };
 }
 
+const poolHealthHooks = (state) => ({
+  protected: protectedIpAssets,
+  remove: removeIpAssets,
+  allowed: (address) => !isForbiddenProbeIp(address, false),
+  audit: (pool, job) => pushAudit(state, 'ipPools.health_check_finished', 'ipPools', pool.id,
+    `${job.message}：正常 ${job.healthyCount}，删除 ${job.deletedCount}，跳过 ${job.skippedCount}，不确定 ${job.uncertainCount}，剩余 ${job.remainingCount}`, job.actor)
+});
+
+export function processPoolHealthChecks(deps, restart = false, now = Date.now()) {
+  const snapshot = deps.readPoolHealthSchedule?.() || deps.readState(['ipPools', 'probes']);
+  const schedule = snapshot.schedule || poolHealthSchedule(snapshot.ipPools);
+  if (!schedule.length || (!restart && !poolHealthTickNeeded(schedule, snapshot.probes || [], now))) return;
+  (deps.updatePoolHealthState || deps.updateState)((draft) => {
+    if (restart) {
+      for (const pool of draft.ipPools || []) finishPoolHealthCheck(pool, 'interrupted', '服务已重启，未确认的 IP 已保留，请重新检测', poolHealthHooks(draft), now);
+    } else advancePoolHealthChecks(draft, poolHealthHooks(draft), now);
+    return draft;
+  });
+}
+
 function removeIpAssets(state, ids) {
   if (!ids.size) return;
   state.ipAssets = state.ipAssets.filter((item) => !ids.has(item.id));
@@ -4259,6 +4329,7 @@ function pushAudit(state, action, resourceType, resourceId, summary, actor) {
 }
 
 function sanitizeResource(key, item) {
+  if (key === 'ipPools') return { ...item, healthCheck: poolHealthSummary(item.healthCheck) };
   if (key === 'dnsAccounts') { const { credentialsEnc, ...safe } = item; return { ...safe, configured: Boolean(credentialsEnc) }; }
   if (key === 'telegramBots') { const { tokenEnc, tokenHash, ...safe } = item; return { ...safe, configured: Boolean(tokenEnc) }; }
   if (key === 'probes') { const { tokenHash, tokenEnc, agentSecretHash, ...safe } = item; return safe; }

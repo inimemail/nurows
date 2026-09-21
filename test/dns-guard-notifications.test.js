@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import * as probeCapabilities from '../shared/probe-capabilities.js';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
@@ -84,6 +85,7 @@ test('guard editor exposes default-empty bot selection and serializes changes wi
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
     if (path.endsWith('polling.js')) return {};
     if (path.endsWith('telegram-permissions.js')) return telegramPermissions;
+    if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return workspaceSearch;
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     throw Error(path);

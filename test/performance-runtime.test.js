@@ -5,6 +5,7 @@ import test from 'node:test';
 import { commandJobDelta, mergeCommandDelta } from '../shared/command-output.js';
 import { startPolling } from '../shared/polling.js';
 import { sanitizeDynamicGuard } from '../server/dynamic-guard.js';
+import { poolHealthProbeState, poolHealthSummary, poolHealthSchedule } from '../server/pool-health-check.js';
 import { collectDnsGuardPoolCandidates, orchestrationDefaults, registerOrchestrationRoutes } from '../server/orchestration.js';
 
 // Load individual runtime functions without opening storage or starting services.
@@ -16,7 +17,7 @@ function runtime(names, globals = {}) {
     const end = source.indexOf('\nfunction ', start + 1);
     return source.slice(start, end === -1 ? undefined : end);
   });
-  const context = vm.createContext({ structuredClone, ...globals });
+  const context = vm.createContext({ structuredClone, poolHealthProbeState, poolHealthSummary, poolHealthSchedule, ...globals });
   vm.runInContext(functions.join('\n'), context);
   return context;
 }
@@ -138,6 +139,20 @@ test('view snapshots retain live sidebar counts and latest runs without copying 
   assert.equal(snapshot.orchestrationSummary.checkingGuards, 1);
   assert.equal(snapshot.orchestrationSummary.onlineProbes, 1);
   assert.equal(snapshot.orchestrationSummary.activeIncidents, 1);
+});
+
+test('pool health polling and probe configuration project progress before cloning large queues', () => {
+  const job = { id: 'job', status: 'running', probeIds: ['probe'], maxParallel: 50, cursor: 0,
+    checks: [{ id: 'check', assetId: 'a', address: '8.8.8.8', observations: {}, deadline: Date.now() + 60000 }],
+    queue: Array.from({ length: 5000 }, (_, i) => ({ assetId: `a${i}`, address: '8.8.8.8' })) };
+  const state = { ...orchestrationDefaults(), ipPools: [{ id: 'pool', assetIds: ['a'], healthCheck: job }] };
+  const ctx = runtime(['readProbeState', 'readOrchestrationStatusState', 'readPoolHealthSchedule'], { ensureStorage() {}, cachedState: state,
+    structuredClone(value) { assert.equal(JSON.stringify(value).includes('a4999'), false); return structuredClone(value); } });
+  assert.equal(ctx.readProbeState().ipPools[0].healthCheck.checks.length, 1);
+  assert.equal(ctx.readOrchestrationStatusState(['ipPools']).ipPools[0].healthCheck.checkingCount, 1);
+  const schedule = ctx.readPoolHealthSchedule().schedule;
+  assert.equal(schedule[0].pending, true);
+  assert.equal(schedule[0].count, 1);
 });
 
 test('section polling only returns requested resources and strips all credentials', () => {

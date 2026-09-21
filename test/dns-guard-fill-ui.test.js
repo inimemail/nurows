@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import * as probeCapabilities from '../shared/probe-capabilities.js';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
@@ -14,6 +15,7 @@ vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone,
   if (path === 'react') return { useState: (value) => [typeof value === 'function' ? value() : value, () => {}] };
   if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
   if (path.endsWith('telegram-permissions.js')) return permissions;
+  if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
   if (path.endsWith('workspace-search.js')) return search;
   return {};
 } });

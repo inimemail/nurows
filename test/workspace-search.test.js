@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import * as probeCapabilities from '../shared/probe-capabilities.js';
 import test from 'node:test';
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -105,6 +106,7 @@ function harness() {
   vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone, require(path) {
     if (path === 'react') return { useState, useMemo: (fn) => fn(), useRef: (current) => useState({ current })[0], useEffect: (fn) => effects.push(fn) };
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
+    if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return search;
     if (path.endsWith('telegram-permissions.js')) return permissions;
     if (path.endsWith('polling.js')) return { startPolling: () => () => {} };

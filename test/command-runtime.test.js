@@ -5,6 +5,8 @@ import crypto from 'node:crypto';
 import test from 'node:test';
 import { hasExactPerServerInputs } from '../shared/command-input.js';
 import { commandJobDelta, mergeCommandDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
+import { parseStoredRecord } from '../server/storage-validation.js';
+import { loadStorageKey } from '../server/storage-key.js';
 
 // Exercise the actual runtime functions without starting the HTTP server,
 // connecting SSH, reading credentials, or launching background DNS tasks.
@@ -32,13 +34,15 @@ test('repeated authenticated input requests do not reload storage or migrate eve
   let schemaChecks = 0;
   let decryptions = 0;
   const session = { username: 'test', encryptionKey: key.toString('hex') };
+  const storedAuth = { configured: true, username: 'test', salt: 'a'.repeat(32), hash: 'b'.repeat(128) };
   const ctx = harness(['ensureStorage', 'migrateLegacyStorage', 'readAuth', 'getAppSecretKey', 'decryptSecret', 'authGuard', 'readState', 'migrateLegacySecrets'], {
     fs: { existsSync: () => true }, path: { dirname: (value) => value },
     DATA_DIR: 'unused', SQLITE_FILE: 'unused', SQLITE_KV_TABLE: 'kv',
     STORAGE_KEYS: { state: 'state', auth: 'auth', secret: 'secret' }, defaultState: {},
     normalizeStateRecord: (value) => value, normalizeAuthRecord: (value) => value, getDefaultAuthRecord: () => ({}),
-    getSqliteDb: () => ({ pragma() {}, exec() { schemaChecks += 1; } }),
-    dbGetRaw: () => key.toString('hex'),
+    getSqliteDb: () => ({ pragma() {}, exec() { schemaChecks += 1; }, transaction: (fn) => fn }),
+    dbGetRaw: (id) => id === 'secret' ? key.toString('hex') : JSON.stringify(id === 'auth' ? storedAuth : state),
+    parseStoredRecord, loadStorageKey, process: { env: {} },
     dbGetJson: (id) => { if (id === 'state') { stateLoads += 1; return structuredClone(state); } return { configured: true }; },
     structuredClone, Buffer,
     crypto: { ...crypto, createDecipheriv(...args) { decryptions += 1; return crypto.createDecipheriv(...args); } },

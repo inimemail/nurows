@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from 'react';
+﻿import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { parsePerServerInputLines } from '../shared/command-input.js';
@@ -7,10 +7,11 @@ import { workspaceSearchPlaceholder } from '../shared/workspace-search.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
 import RenewalWorkspace from './RenewalWorkspace.jsx';
-import { CalendarClock } from 'lucide-react';
+import { BookOpen, CalendarClock } from 'lucide-react';
 import { HISTORY_LABELS } from './HistoryRecords.jsx';
 import Dialog from './Dialog.jsx';
 import SettingsDialog, { HistoryBrowser } from './SettingsDialog.jsx';
+const NotesWorkspace = lazy(() => import('./NotesWorkspace.jsx'));
 
 const EMPTY_SERVER = {
   id: '',
@@ -83,7 +84,8 @@ const TABS = [
   { key: 'pools', label: '备用 IP 池', icon: PoolIcon },
   { key: 'dns', label: '解析管理', icon: DnsIcon },
   { key: 'renewals', label: '续费管理', icon: CalendarClock },
-  { key: 'telegram', label: 'Telegram', icon: TelegramIcon }
+  { key: 'telegram', label: 'Telegram', icon: TelegramIcon },
+  { key: 'notes', label: '笔记', icon: BookOpen }
 ];
 
 const TERMINAL_SESSIONS_STORAGE_KEY = 'nurossh-terminal-sessions';
@@ -340,7 +342,7 @@ function readStoredActiveTerminalId() {
 
 function normalizeWorkspacePayload(workspace = {}) {
   return {
-    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram'].includes(workspace.tab) ? workspace.tab : 'servers',
+    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(workspace.tab) ? workspace.tab : 'servers',
     search: typeof workspace.search === 'string' ? workspace.search : '',
     selectedServerId: typeof workspace.selectedServerId === 'string' ? workspace.selectedServerId : '',
     selectedCommandId: typeof workspace.selectedCommandId === 'string' ? workspace.selectedCommandId : '',
@@ -409,6 +411,7 @@ export default function App() {
 
   const [state, setState] = useState({ groups: [], servers: [], commands: [], proxies: [], automationTasks: [], telegram: {}, probes: [], probeTargets: [], failoverPolicies: [], incidents: [], ipAssets: [], ipPools: [], ipLeases: [], ipUsageRecords: [], dnsAccounts: [], dnsZones: [], dnsBindings: [], dnsChanges: [], auditLogs: [], telegramBots: [] });
   const [tab, setTab] = useState('servers');
+  const notesBeforeLeave = useRef(null);
   const [search, setSearch] = useState('');
   const [workspaceSearchScope, setWorkspaceSearchScope] = useState(null);
   const [busy, setBusy] = useState({});
@@ -1054,6 +1057,7 @@ export default function App() {
       const telegramSection = new URLSearchParams(window.location.search).get('tgSection');
       const telegramTab = { guards: 'probes', dynamic: 'probes', probes: 'probes', targets: 'probes', policies: 'probes', incidents: 'probes', assets: 'pools', pools: 'pools', usage: 'pools', dns: 'dns', automation: 'automation' }[telegramSection];
       if (telegramTab) setTab(telegramTab);
+      if (/^#note=[a-f0-9-]{36}$/.test(window.location.hash)) setTab('notes');
       setStateLoaded(true);
     } catch (error) {
       setStateLoaded(true);
@@ -1110,6 +1114,7 @@ export default function App() {
   }
 
   async function logout() {
+    if (notesBeforeLeave.current && !await notesBeforeLeave.current()) return;
     try {
       await api('/api/auth/logout', {
         method: 'POST',
@@ -1122,6 +1127,7 @@ export default function App() {
     setTerminalFullscreenOpen(false);
     setStateLoaded(false);
     setSettingsDialogOpen(false);
+    for (const key of Object.keys(sessionStorage)) if (key.startsWith('nurossh-note-draft:')) sessionStorage.removeItem(key);
   }
 
   async function saveAccount() {
@@ -2368,7 +2374,7 @@ export default function App() {
           {TABS.map((item) => {
             const Icon = item.icon;
             return (
-              <button key={item.key} className={'top-tab ' + (tab === item.key ? 'active' : '')} onClick={() => setTab(item.key)}>
+              <button key={item.key} className={'top-tab ' + (tab === item.key ? 'active' : '')} onClick={async () => { if (tab === 'notes' && item.key !== 'notes' && notesBeforeLeave.current && !await notesBeforeLeave.current()) return; setTab(item.key); }}>
                 <Icon />
                 <span>{item.label}</span>
               </button>
@@ -2397,7 +2403,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram'].includes(tab) ? ' orchestration-layout' : '')}>
+      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-layout' : '')}>
         {!workspaceFullscreenActive ? (
           <button
             className={'mobile-drawer-scrim ' + (assetDrawerOpen ? 'open' : '')}
@@ -2406,7 +2412,7 @@ export default function App() {
             onClick={() => setAssetDrawerOpen(false)}
           />
         ) : null}
-        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram'].includes(tab) ? ' orchestration-aside' : '')}>
+        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-aside' : '')}>
           <div className="side-head">
             <div>
               <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'dns' ? '解析管理' : '代理列表'}</strong>
@@ -2606,9 +2612,10 @@ export default function App() {
           ) : null}
         </aside>
 
-          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram'].includes(tab) ? ' orchestration-main' : '')}>
+          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-main' : '')}>
           {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} search={search} onSearchChange={setSearch} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
           {tab === 'renewals' ? <RenewalWorkspace state={state} search={search} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
+          {tab === 'notes' ? <Suspense fallback={<div className="surface workspace-panel">正在加载笔记...</div>}><NotesWorkspace api={api} toast={toast} search={search} onSearchScopeChange={setWorkspaceSearchScope} onBeforeLeave={handler => { notesBeforeLeave.current = handler; }} /></Suspense> : null}
           {tab === 'automation' ? (
             <section className="automation-board">
               <div className="automation-page-head surface">

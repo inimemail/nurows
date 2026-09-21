@@ -260,17 +260,30 @@ EOF
 ensure_runtime_env_file() {
   local workdir="$1"
   local env_file="${workdir}/.env"
-  local port host
+  local port host tmp_env
 
   port="$(read_env_value "${env_file}" PORT "38471")"
   host="$(read_env_value "${env_file}" HOST "0.0.0.0")"
-  write_runtime_env "${env_file}" "${port}" "${host}"
+  if [[ ! -f "${env_file}" ]]; then
+    write_runtime_env "${env_file}" "${port}" "${host}"
+    return
+  fi
+  tmp_env="$(mktemp "${env_file}.XXXXXX")"
+  cp -p "${env_file}" "${tmp_env}"
+  printf '\n' >> "${tmp_env}"
+  grep -q '^PORT=' "${tmp_env}" || printf 'PORT=%s\n' "${port}" >> "${tmp_env}"
+  grep -q '^HOST=' "${tmp_env}" || printf 'HOST=%s\n' "${host}" >> "${tmp_env}"
+  grep -q '^NODE_ENV=' "${tmp_env}" || printf 'NODE_ENV=production\n' >> "${tmp_env}"
+  grep -q '^SQLITE_DB_PATH=' "${tmp_env}" || printf 'SQLITE_DB_PATH=/app/data/app.db\n' >> "${tmp_env}"
+  chmod --reference="${env_file}" "${tmp_env}" 2>/dev/null || true
+  mv -f "${tmp_env}" "${env_file}"
 }
 
 ensure_data_permissions() {
   local install_path="$1"
   mkdir -p "${install_path}/data" "${install_path}/backups"
-  chown -R 10001:10001 "${install_path}/data" "${install_path}/backups" 2>/dev/null || true
+  find "${install_path}/data" \( ! -user 10001 -o ! -group 10001 \) -exec chown 10001:10001 {} +
+  chmod 700 "${install_path}/data" "${install_path}/backups"
 }
 
 get_local_ip() {
@@ -320,7 +333,11 @@ deploy_service() {
   mkdir -p "${install_path}/app"
   sync_app_bundle "${bundle_dir}" "${install_path}/app"
   write_compose_file "${install_path}"
-  write_runtime_env "${install_path}/.env" "${port}" "0.0.0.0"
+  if [[ -f "${install_path}/.env" ]]; then
+    ensure_runtime_env_file "${install_path}"
+  else
+    write_runtime_env "${install_path}/.env" "${port}" "0.0.0.0"
+  fi
   ensure_data_permissions "${install_path}"
   copy_manage_script "${install_path}" "${bundle_dir}"
 
@@ -334,6 +351,17 @@ deploy_service() {
   print_access_info "${install_path}/.env"
 }
 
+wait_service_ready() {
+  local attempt
+  for attempt in $(seq 1 20); do
+    if compose_cmd exec -T nurossh node -e 'const http=require("node:http");const host=["0.0.0.0","::",""].includes(process.env.HOST||"")?"127.0.0.1":process.env.HOST;const req=http.get({host,port:process.env.PORT||38471,path:"/api/auth/status",timeout:1500},res=>{let body="";res.on("data",chunk=>body+=chunk);res.on("end",()=>{try{process.exit(res.statusCode===200&&typeof JSON.parse(body).configured==="boolean"?0:1)}catch{process.exit(1)}})});req.on("timeout",()=>req.destroy());req.on("error",()=>process.exit(1));' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 upgrade_service() {
   require_docker
   require_compose
@@ -344,16 +372,20 @@ upgrade_service() {
   [[ -n "${workdir}" ]] || die "未检测到已部署实例。"
 
   bundle_dir="$(get_upgrade_bundle_dir "${workdir}")"
+  info "升级前先创建数据快照，确保新版本异常时可以恢复。"
+  backup_service "${bundle_dir}"
   sync_app_bundle "${bundle_dir}" "${workdir}/app"
-  write_compose_file "${workdir}"
+  [[ -f "${workdir}/docker-compose.yml" ]] || write_compose_file "${workdir}"
   ensure_runtime_env_file "${workdir}"
   ensure_data_permissions "${workdir}"
   copy_manage_script "${workdir}" "${bundle_dir}"
 
-  (
+  if ! (
     cd "${workdir}" || exit 1
-    compose_cmd up -d --build
-  )
+    compose_cmd up -d --build && wait_service_ready
+  ); then
+    die "新版服务未通过就绪检查。升级前备份保存在 ${workdir}/backups，原数据目录未清空，请查看日志或恢复该备份。"
+  fi
 
   print_access_info "${workdir}/.env"
 }
@@ -427,76 +459,122 @@ logs_service() {
   )
 }
 
-backup_service() {
-  require_cmd tar
+management_helper() {
+  local name="$1" bundle="${2:-}"
+  if [[ -n "${bundle}" && -f "${bundle}/server/${name}" ]]; then
+    echo "${bundle}/server/${name}"
+  elif [[ -f "${SCRIPT_DIR}/server/${name}" ]]; then
+    echo "${SCRIPT_DIR}/server/${name}"
+  elif [[ -f "${SCRIPT_DIR}/app/server/${name}" ]]; then
+    echo "${SCRIPT_DIR}/app/server/${name}"
+  else
+    local fetched
+    fetched="$(get_install_bundle_dir)"
+    [[ -f "${fetched}/server/${name}" ]] || die "缺少管理组件 ${name}，请使用新版完整源码中的 install.sh。"
+    echo "${fetched}/server/${name}"
+  fi
+}
 
-  local workdir backup_dir backup_file timestamp
+backup_service() (
+  set -euo pipefail
+  umask 077
+  require_docker
+  require_compose
+  require_cmd python3
+  require_cmd flock
+  local workdir helper archive_helper stage snapshot timestamp db_path backup_file
   workdir="$(get_workdir)"
   [[ -n "${workdir}" ]] || die "未检测到已部署实例。"
-
-  backup_dir="${workdir}/backups"
-  mkdir -p "${backup_dir}"
-  timestamp="$(date +"%Y%m%d_%H%M%S")"
-  backup_file="${backup_dir}/${APP_NAME}_backup_${timestamp}.tar.gz"
-
+  helper="$(management_helper storage-backup.js "${1:-}")"
+  archive_helper="$(management_helper backup-archive.py "${1:-}")"
+  mkdir -p "${workdir}/backups"
+  exec 9>"${workdir}/backups/.backup.lock"
+  flock -n 9 || die "已有备份正在执行，请稍后重试。"
+  stage="$(mktemp -d "${workdir}/backups/.stage-XXXXXX")"
+  snapshot=".backup-${stage##*/}"
+  trap "$(printf 'rm -rf -- %q %q' "${stage}" "${workdir}/data/${snapshot}")" EXIT
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  backup_file="${workdir}/backups/${APP_NAME}_backup_${timestamp}_${stage##*-}.tar.gz"
+  db_path="$(read_env_value "${workdir}/.env" SQLITE_DB_PATH "/app/data/app.db")"
+  db_path="${db_path%\"}"; db_path="${db_path#\"}"
+  db_path="${db_path%\'}"; db_path="${db_path#\'}"
+  [[ "${db_path}" == /app/data/* && "${db_path}" != *"/../"* ]] || die "数据库必须位于 /app/data 持久化目录，已停止备份以避免遗漏自定义数据库。"
   (
-    cd "${workdir}" || exit 1
-    tar -czf "${backup_file}" docker-compose.yml .env app data manage.sh
+    cd "${workdir}"
+    if [[ -n "$(compose_cmd ps -q --status running nurossh)" ]]; then
+      compose_cmd exec -T nurossh node --input-type=module - /app/data "/app/data/${snapshot}" "${db_path}" < "${helper}"
+    else
+      compose_cmd run --rm --no-deps -T nurossh node --input-type=module - /app/data "/app/data/${snapshot}" "${db_path}" < "${helper}"
+    fi
   )
-
-  info "备份已创建：${backup_file}"
-}
+  mv "${workdir}/data/${snapshot}" "${stage}/data"
+  cp -p "${workdir}/.env" "${workdir}/docker-compose.yml" "${workdir}/manage.sh" "${stage}/"
+  mkdir "${stage}/app"
+  tar --exclude='./node_modules' --exclude='./.git' --exclude='./data' --exclude='./backups' --exclude='./.env' --exclude='./dist' --exclude='__pycache__' -cf - -C "${workdir}/app" . | tar -xf - -C "${stage}/app"
+  python3 "${archive_helper}" manifest "${stage}"
+  # Fast compression reduces CPU spent on large attachments. Publish only a complete archive.
+  tar -cf - -C "${stage}" . | gzip -1 > "${backup_file}.partial"
+  mv "${backup_file}.partial" "${backup_file}"
+  info "一致性备份已创建：${backup_file}"
+)
 
 do_backup() {
   backup_service
 }
 
-restore_service() {
+restore_service() (
+  set -euo pipefail
+  umask 077
   require_docker
   require_compose
-  require_cmd tar
-
-  local backup_path target_dir input_path input_backup
-
-  read -r -p "备份压缩包路径: " input_backup
-  backup_path="${input_backup}"
+  require_cmd python3
+  local backup_path target_dir input_path archive_root previous_dir helper confirm_restore
+  read -r -p "备份压缩包路径: " backup_path
   [[ -f "${backup_path}" ]] || die "未找到备份文件。"
-
+  backup_path="$(readlink -f "${backup_path}")"
+  helper="$(management_helper backup-archive.py)"
+  archive_root="$(mktemp -d)"
+  trap "$(printf 'rm -rf -- %q' "${archive_root}")" EXIT
+  info "正在校验备份和数据库，校验结束前不会停止现有服务。"
+  python3 "${helper}" extract "${backup_path}" "${archive_root}"
   read -r -p "恢复目标路径 [默认: ${DEFAULT_INSTALL_PATH}]: " input_path
   target_dir="${input_path:-$DEFAULT_INSTALL_PATH}"
-
-  if [[ -d "${target_dir}" && -f "${target_dir}/docker-compose.yml" ]]; then
-    warn "目标路径已有部署，恢复会覆盖现有内容：${target_dir}"
-    local confirm_restore
-    read -r -p "是否继续恢复？(y/N): " confirm_restore
-    if [[ ! "${confirm_restore}" =~ ^[Yy]$ ]]; then
-      info "已取消恢复。"
-      return
-    fi
-
-    (
-      cd "${target_dir}" || exit 1
-      compose_cmd down || true
-    )
+  [[ "${target_dir}" == /* && "${target_dir}" != "/" && "${target_dir}" != "/root" && "${target_dir}" != "/home" && "${target_dir}" != "/opt" && ! -L "${target_dir}" ]] || die "请指定独立的绝对部署路径。"
+  target_dir="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${target_dir}")"
+  [[ "${target_dir}" != "/" && "${target_dir}" != "/root" && "${target_dir}" != "/home" && "${target_dir}" != "/opt" && "${target_dir}" != "/etc" && "${target_dir}" != "/usr" && "${target_dir}" != "/var" ]] || die "恢复目标不能是系统目录。"
+  if [[ -e "${target_dir}" ]]; then
+    [[ -f "${target_dir}/docker-compose.yml" ]] || die "目标目录已有非部署数据，请使用其他目录。"
+    read -r -p "恢复将替换当前部署，并保留完整旧目录。是否继续？(y/N): " confirm_restore
+    [[ "${confirm_restore}" =~ ^[Yy]$ ]] || { info "已取消恢复。"; return; }
   fi
-
-  mkdir -p "${target_dir}"
-  tar -xzf "${backup_path}" -C "${target_dir}"
-  write_compose_file "${target_dir}"
-  ensure_runtime_env_file "${target_dir}"
-  ensure_data_permissions "${target_dir}"
-  copy_manage_script "${target_dir}" "${target_dir}/app"
-
+  # Stage on the destination filesystem; directory rename cannot mix old WAL files.
+  local prepared
+  mkdir -p "$(dirname "${target_dir}")"
+  prepared="$(mktemp -d "${target_dir}.restore-XXXXXX")"
+  cp -a "${archive_root}/." "${prepared}/"
+  ensure_runtime_env_file "${prepared}"
+  ensure_data_permissions "${prepared}"
+  if [[ -e "${target_dir}" ]]; then
+    (cd "${target_dir}" && compose_cmd stop)
+    previous_dir="${target_dir}.before-restore-$(date +%Y%m%d_%H%M%S)"
+    [[ ! -e "${previous_dir}" ]] || die "回退目录已存在，请稍后重试。"
+    mv "${target_dir}" "${previous_dir}"
+    info "原部署已保留：${previous_dir}"
+  fi
+  mv "${prepared}" "${target_dir}"
+  if ! (cd "${target_dir}" && compose_cmd up -d --build --force-recreate && wait_service_ready); then
+    warn "恢复版本启动失败，新目录已保留。"
+    if [[ -n "${previous_dir:-}" ]]; then
+      (cd "${target_dir}" && compose_cmd down) || true
+      mv "${target_dir}" "${target_dir}.failed-$(date +%Y%m%d_%H%M%S)"
+      mv "${previous_dir}" "${target_dir}"
+      (cd "${target_dir}" && compose_cmd up -d --force-recreate) || true
+    fi
+    die "恢复失败，请检查日志；原数据未被覆盖。"
+  fi
   echo "${target_dir}" > "${STATE_FILE}"
-
-  (
-    cd "${target_dir}" || exit 1
-    compose_cmd up -d --build
-  )
-
   print_access_info "${target_dir}/.env"
-}
-
+)
 restore_backup() {
   restore_service
 }
@@ -621,6 +699,11 @@ install_ftp() {
   bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
 }
 
+install_s3() {
+  require_cmd curl
+  bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/bs3/main/install.sh)
+}
+
 main_menu() {
   if command -v clear >/dev/null 2>&1; then
     clear
@@ -642,12 +725,13 @@ main_menu() {
   echo " 6) 恢复备份"
   echo " 7) 定时备份"
   echo " 8) 完全卸载"
-  echo " 9) FTP/SFTP 备份工具"
+  echo " 9) 📁 FTP/SFTP 备份工具"
+  echo "10) 📂 S3 备份工具"
   echo " 0) 退出"
   echo "=================================================="
 
   local choice
-  read -r -p "请选择操作 [0-9]: " choice
+  read -r -p "请选择操作 [0-10]: " choice
   case "${choice}" in
     1) deploy_service ;;
     2) upgrade_service ;;
@@ -658,6 +742,7 @@ main_menu() {
     7) setup_auto_backup ;;
     8) uninstall_service ;;
     9) install_ftp ;;
+    10) install_s3 ;;
     0) info "再见"; exit 0 ;;
     *) warn "无效选项。" ;;
   esac
@@ -689,5 +774,7 @@ dispatch_command() {
   esac
 }
 
-require_root
-dispatch_command "${1:-}"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  require_root
+  dispatch_command "${1:-}"
+fi

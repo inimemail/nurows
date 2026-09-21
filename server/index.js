@@ -9,6 +9,9 @@ import { createTelegramActions } from './telegram-actions.js';
 import { telegramScopeAllowed } from '../shared/telegram-permissions.js';
 import { createDynamicGuardService, registerDynamicGuardRoutes, sanitizeDynamicGuard } from './dynamic-guard.js';
 import { createRenewalService, registerRenewalRoutes, normalizeRenewalState, renewalSnapshot } from './renewals.js';
+import { createNotesService, registerNotesRoutes } from './notes.js';
+import { parseStoredRecord } from './storage-validation.js';
+import { loadStorageKey } from './storage-key.js';
 import { createSessionSocketRegistry, createWebSocketUpgradeHandler, createWebSocketTickets } from './websocket-security.js';
 import { commandJobDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
 import express from 'express';
@@ -248,6 +251,7 @@ function loadRuntimeEnv() {
 
 ensureStorage();
 cleanupExpiredSessions();
+const notesService = createNotesService({ dataDir: DATA_DIR });
 
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
@@ -446,6 +450,7 @@ app.delete('/api/history', (req, res) => {
 registerOrchestrationRoutes(app, orchestrationDeps);
 registerDynamicGuardRoutes(app, { ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus }, dynamicGuardService);
 registerRenewalRoutes(app, renewalDeps, renewalService);
+registerNotesRoutes(app, notesService, { dataDir: DATA_DIR });
 
 app.post('/api/workspace', (req, res) => {
   const workspaceInput = normalizeWorkspaceInput(req.body);
@@ -1523,34 +1528,46 @@ function getSqliteDb() {
 }
 
 function migrateLegacyStorage() {
-  if (dbGetRaw(STORAGE_KEYS.state) === null) {
-    const legacyState = fs.existsSync(LEGACY_STATE_FILE)
-      ? safelyParseJson(fs.readFileSync(LEGACY_STATE_FILE, 'utf8'), defaultState)
-      : defaultState;
-    dbSetJson(STORAGE_KEYS.state, normalizeStateRecord(legacyState));
-  }
+  return getSqliteDb().transaction(() => {
+    const existingState = dbGetRaw(STORAGE_KEYS.state);
+    const existingAuth = dbGetRaw(STORAGE_KEYS.auth);
+    if (existingState !== null) parseStoredRecord(existingState, 'state');
+    if (existingAuth !== null) parseStoredRecord(existingAuth, 'auth');
+    if (existingState !== null && existingAuth === null && !fs.existsSync(LEGACY_AUTH_FILE)) {
+      throw new Error('现有数据库缺少认证记录，禁止重新初始化账户，请恢复备份。');
+    }
+    if (dbGetRaw(STORAGE_KEYS.state) === null) {
+      const legacyState = fs.existsSync(LEGACY_STATE_FILE)
+        ? parseStoredRecord(fs.readFileSync(LEGACY_STATE_FILE, 'utf8'), 'state')
+        : defaultState;
+      dbSetJson(STORAGE_KEYS.state, normalizeStateRecord(legacyState));
+    }
 
-  if (dbGetRaw(STORAGE_KEYS.auth) === null) {
-    const legacyAuth = fs.existsSync(LEGACY_AUTH_FILE)
-      ? safelyParseJson(fs.readFileSync(LEGACY_AUTH_FILE, 'utf8'), getDefaultAuthRecord())
-      : getDefaultAuthRecord();
-    dbSetJson(STORAGE_KEYS.auth, normalizeAuthRecord(legacyAuth));
-  }
+    if (dbGetRaw(STORAGE_KEYS.auth) === null) {
+      const legacyAuth = fs.existsSync(LEGACY_AUTH_FILE)
+        ? parseStoredRecord(fs.readFileSync(LEGACY_AUTH_FILE, 'utf8'), 'auth')
+        : getDefaultAuthRecord();
+      dbSetJson(STORAGE_KEYS.auth, normalizeAuthRecord(legacyAuth));
+    }
 
-  if (dbGetRaw(STORAGE_KEYS.secret) === null) {
-    const legacySecret =
-      fs.existsSync(LEGACY_SECRET_FILE)
-        ? String(fs.readFileSync(LEGACY_SECRET_FILE, 'utf8') || '').trim()
-        : '';
-    dbSetRaw(STORAGE_KEYS.secret, legacySecret || crypto.randomBytes(32).toString('hex'));
-  }
+    if (dbGetRaw(STORAGE_KEYS.secret) === null) {
+      if (existingAuth !== null && parseStoredRecord(existingAuth, 'auth').configured && !fs.existsSync(LEGACY_SECRET_FILE)) {
+        throw new Error('现有数据库缺少应用密钥，请恢复原密钥，禁止生成替代密钥。');
+      }
+      const legacySecret =
+        fs.existsSync(LEGACY_SECRET_FILE)
+          ? String(fs.readFileSync(LEGACY_SECRET_FILE, 'utf8') || '').trim()
+          : '';
+      dbSetRaw(STORAGE_KEYS.secret, legacySecret || crypto.randomBytes(32).toString('hex'));
+    }
 
-  cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
-  cachedAuth = dbGetJson(STORAGE_KEYS.auth, getDefaultAuthRecord(), normalizeAuthRecord);
-  cachedSecretHex = dbGetRaw(STORAGE_KEYS.secret) || crypto.randomBytes(32).toString('hex');
-  if (!dbGetRaw(STORAGE_KEYS.secret)) {
-    dbSetRaw(STORAGE_KEYS.secret, cachedSecretHex);
-  }
+    cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
+    cachedAuth = dbGetJson(STORAGE_KEYS.auth, getDefaultAuthRecord(), normalizeAuthRecord);
+    const storedKey = dbGetRaw(STORAGE_KEYS.secret);
+    const loadedKey = loadStorageKey(storedKey, process.env.MASTER_KEY_FILE || '');
+    if (loadedKey.stored !== storedKey) dbSetRaw(STORAGE_KEYS.secret, loadedKey.stored);
+    cachedSecretHex = loadedKey.key;
+  })();
 }
 
 function dbGetRaw(key) {
@@ -1576,19 +1593,11 @@ function dbGetJson(key, fallback, normalizer = (value) => value) {
   if (raw === null) {
     return normalizer(structuredClone(fallback));
   }
-  return normalizer(safelyParseJson(raw, fallback));
+  return normalizer(parseStoredRecord(raw, key));
 }
 
 function dbSetJson(key, value) {
   dbSetRaw(key, JSON.stringify(value));
-}
-
-function safelyParseJson(raw, fallback) {
-  try {
-    return JSON.parse(raw);
-  } catch (_error) {
-    return structuredClone(fallback);
-  }
 }
 
 function getDefaultAuthRecord() {
@@ -1621,8 +1630,9 @@ function readAuth() {
 
 function writeAuth(auth) {
   ensureStorage();
-  cachedAuth = normalizeAuthRecord(auth);
-  dbSetJson(STORAGE_KEYS.auth, cachedAuth);
+  const next = normalizeAuthRecord(auth);
+  dbSetJson(STORAGE_KEYS.auth, next);
+  cachedAuth = next;
 }
 
 function deriveEncryptionKey(password, salt) {
@@ -1632,8 +1642,7 @@ function deriveEncryptionKey(password, salt) {
 function getAppSecretKey() {
   ensureStorage();
   if (!cachedSecretHex) {
-    cachedSecretHex = dbGetRaw(STORAGE_KEYS.secret) || crypto.randomBytes(32).toString('hex');
-    dbSetRaw(STORAGE_KEYS.secret, cachedSecretHex);
+    cachedSecretHex = loadStorageKey(dbGetRaw(STORAGE_KEYS.secret), process.env.MASTER_KEY_FILE || '').key;
   }
   return Buffer.from(cachedSecretHex, 'hex');
 }
@@ -2212,7 +2221,7 @@ function getWorkspaceForUser(state, auth = null) {
     };
   }
   return {
-    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram'].includes(source.tab) ? source.tab : 'servers',
+    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(source.tab) ? source.tab : 'servers',
     search: typeof source.search === 'string' ? source.search : '',
     selectedServerId: typeof source.selectedServerId === 'string' ? source.selectedServerId : '',
     selectedCommandId: typeof source.selectedCommandId === 'string' ? source.selectedCommandId : '',
@@ -2273,7 +2282,7 @@ function getWorkspaceForUser(state, auth = null) {
 
 function normalizeWorkspaceInput(input = {}) {
   return {
-    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram'].includes(input.tab) ? input.tab : 'servers',
+    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(input.tab) ? input.tab : 'servers',
     search: typeof input.search === 'string' ? input.search : '',
     selectedServerId: typeof input.selectedServerId === 'string' ? input.selectedServerId : '',
     selectedCommandId: typeof input.selectedCommandId === 'string' ? input.selectedCommandId : '',

@@ -17,7 +17,7 @@ const labels = { online: '在线', offline: '离线', pending: '待接入', revo
   waiting_new_ip: '等待新 IP', waiting: '等待中', executing: '执行中', observing: '观察中', disabled: '已停用', command_error: '命令异常', resolve_error: '解析异常', cooldown: '冷却中', daily_limit: '达到每日上限',
   succeeded: '已完成', recovered: '已恢复', replaced: '已补位', degraded: '容量不足', error: '异常', failed: '失败',
   pending_approval: '待确认', allocating: '分配中', automating: '执行自动化', dns_updating: '写入 DNS', verifying: '验证中',
-  stabilizing: '等待生效', rolling_back: '回滚中', rolled_back: '已回滚', consumed: '已使用', discarded: '已丢弃',
+  stabilizing: '等待生效', rolling_back: '回滚中', rolled_back: '已回滚', consumed: '已使用', discarded: '已丢弃', returned: '已退回原池',
   done: '已结束', running: '执行中', cancelled: '已取消', processing: '处理中',
   resolving: '正在解析', probe_failed: '检查失败，待重试', capacity: '达到 IP 上限', ready: '检查通过，待写入', synced: '已同步' };
 const finished = new Set(['succeeded', 'recovered', 'rolled_back', 'cancelled', 'done']);
@@ -142,6 +142,7 @@ export function createTelegramWorkspace(deps) {
       lines.push(`活动 IP：${item.currentValues?.length || 0} / ${item.maxActiveIps || 50}`, `来源：${item.sources?.length || 0} 个`, `最近检查：${date(item.lastCheckAt)}`);
       lines.push(`备用池补位：${item.poolFillMode === 'fill' ? `补满 ${item.poolTargetCount || item.maxActiveIps || 50} 个健康 IP` : '故障补位'}`);
       lines.push(`备用池取用：${item.poolSelectionMode === 'balanced' ? '均衡取用' : '按顺序取用'}`);
+      if (item.poolSelectionMode === 'balanced') lines.push(`自动调整已有 IP：${item.poolRebalanceEnabled ? `每 ${item.poolRebalanceIntervalMinutes || 30} 分钟评估` : '关闭'}`);
       rows.push([...(canWrite(ctx) ? [action('检查并修复', 'action', 'check')] : []), action('管理 IP', 'ips')]);
       rows.push([action('来源状态', 'sources'), action('检查记录', 'history')]);
     } else if (section === 'dynamic') {

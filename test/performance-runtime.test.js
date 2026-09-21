@@ -120,6 +120,8 @@ test('probe config snapshots keep evidence but omit provider and source payloads
   assert.equal(compact.zone, undefined);
   compact.checks[0].observations.probe.ok = false;
   assert.equal(cycle.checks[0].observations.probe.ok, true);
+  cycle.finalResults = { '192.0.2.1': { ok: true } };
+  assert.equal(ctx.readProbeState().dnsGuards.length, 0, 'settled checks waiting for provider confirmation never reach probes');
 });
 
 test('view snapshots retain live sidebar counts and latest runs without copying unrelated history', () => {

@@ -42,13 +42,16 @@ test('guard form defaults to repair, conditionally exposes a bounded fill target
 });
 
 test('guard pool selection is independent of fill mode and survives save and copy', () => {
-  let value = normalizeDraft('guard', { poolIds: ['a', 'b'], poolFillMode: 'repair' });
+  let value = normalizeDraft('guard', { poolIds: ['a', 'b'], poolFillMode: 'repair', currentValues: ['192.0.2.1'], poolOrigins: { '192.0.2.1': 'a', '192.0.2.2': 'b' } });
   const state = { probes: [], ipPools: [], dnsAccounts: [], telegramBots: [] };
   const render = () => GuardEditor({ value, state, patch: (next) => { value = { ...value, ...next }; } });
   assert.equal(field(render(), '备用池取用方式').props.children.props.value, 'ordered');
   assert.ok(field(render(), '备用池（按选择顺序兜底）'));
   field(render(), '备用池取用方式').props.children.props.onChange({ target: { value: 'balanced' } });
   assert.ok(field(render(), '备用池（均衡取用）'));
+  const poolPicker = field(render(), '备用池（均衡取用）');
+  assert.equal(poolPicker.props.secondary({ id: 'a', assetIds: ['1', '2'] }), '库存 2 个 · 当前域名 1 个');
+  assert.equal(poolPicker.props.secondary({ id: 'b', assetIds: [] }), '库存 0 个 · 当前域名 0 个');
   assert.equal(value.poolFillMode, 'repair');
   const saved = serializeDraft('guard', value);
   assert.equal(saved.poolSelectionMode, 'balanced');
@@ -71,4 +74,39 @@ test('pool editor separates DNS guard and incident allocation without changing s
     assert.equal(saved.selectionMode, 'random');
     assert.deepEqual(saved.assetIds, ['asset']);
   }
+});
+
+test('balanced selection enables automatic rebalance by default and preserves explicit opt-out on save and copy', () => {
+  let value = normalizeDraft('guard', {});
+  const state = { probes: [], ipPools: [], dnsAccounts: [], telegramBots: [] };
+  const render = () => GuardEditor({ value, state, patch: (next) => { value = { ...value, ...next }; } });
+  const toggle = () => nodes(render()).find((node) => node.props?.children === '自动调整已有 IP');
+  assert.equal(value.poolRebalanceEnabled, false);
+  assert.equal(value.poolRebalanceIntervalMinutes, 30);
+  assert.equal(field(render(), '自动调整间隔（分钟）'), undefined);
+  assert.equal(toggle(), undefined);
+  field(render(), '备用池取用方式').props.children.props.onChange({ target: { value: 'balanced' } });
+  assert.equal(toggle().props.checked, true);
+  const interval = field(render(), '自动调整间隔（分钟）').props.children;
+  assert.equal(interval.props.value, 30);
+  assert.equal(interval.props.min, '1');
+  assert.equal(interval.props.max, '1440');
+  assert.equal(interval.props.required, true);
+  interval.props.onChange({ target: { value: '45' } });
+  assert.match(text(render()), /确认远程替换后/);
+  const saved = serializeDraft('guard', value);
+  assert.equal(saved.poolRebalanceEnabled, true);
+  assert.equal(saved.poolRebalanceIntervalMinutes, '45');
+  assert.equal(normalizeDraft('guard', saved).poolRebalanceEnabled, true);
+  assert.equal(normalizeDraft('guard', saved).poolRebalanceIntervalMinutes, '45');
+  toggle().props.onChange(false);
+  const optedOut = serializeDraft('guard', value);
+  assert.equal(normalizeDraft('guard', optedOut).poolRebalanceEnabled, false);
+  assert.equal(field(render(), '自动调整间隔（分钟）'), undefined);
+  field(render(), '备用池取用方式').props.children.props.onChange({ target: { value: 'ordered' } });
+  assert.equal(value.poolRebalanceEnabled, false);
+  assert.equal(toggle(), undefined);
+  assert.equal(field(render(), '自动调整间隔（分钟）'), undefined);
+  field(render(), '备用池取用方式').props.children.props.onChange({ target: { value: 'balanced' } });
+  assert.equal(toggle().props.checked, true);
 });

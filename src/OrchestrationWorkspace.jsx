@@ -11,12 +11,12 @@ const PROVIDERS = {
   dnsla: 'DNSLA', era: '时代互联 / Eranet', tndns: 'Tnethk', gcore: 'Gcore', edgeone: '腾讯 EdgeOne',
   ns1: 'IBM NS1 Connect', rainyun: '雨云', dynv6: 'Dynv6', vercel: 'Vercel DNS', spaceship: 'Spaceship'
 };
-const STATUS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', unknown: '未检测', queued: '等待执行', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待备用 IP', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', stabilizing: '等待 DNS 生效', processing: '处理中', discarded: '检测不可用，已丢弃', consumed: '成功消耗', succeeded: '已完成', failed: '失败保留', rolled_back: '已回滚' };
+const STATUS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', unknown: '未检测', queued: '等待执行', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待备用 IP', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', stabilizing: '等待 DNS 生效', processing: '处理中', discarded: '检测不可用，已丢弃', consumed: '成功消耗', returned: '已退回原池', succeeded: '已完成', failed: '失败保留', rolled_back: '已回滚' };
 
 const EMPTY = {
   probe: { name: '', region: '', carrier: '', maxConcurrency: 100, enabled: true, alertBotIds: [] },
   target: { name: '', address: '', allowPrivate: false, checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, probeIds: [], policyId: '', enabled: true },
-  guard: { name: '', accountId: '', domain: '', recordType: 'A', recordLine: '默认', ttl: 60, maxActiveIps: 50, poolFillMode: 'repair', poolTargetCount: 50, poolSelectionMode: 'ordered', probeIds: [], poolIds: [], alertBotIds: [], checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, maxParallel: 20, pruneStale: true, sources: [], enabled: true },
+  guard: { name: '', accountId: '', domain: '', recordType: 'A', recordLine: '默认', ttl: 60, maxActiveIps: 50, poolFillMode: 'repair', poolTargetCount: 50, poolSelectionMode: 'ordered', poolRebalanceEnabled: false, poolRebalanceIntervalMinutes: 30, probeIds: [], poolIds: [], alertBotIds: [], checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, maxParallel: 20, pruneStale: true, sources: [], enabled: true },
   asset: { name: '', address: '', region: '', carrier: '', labels: '', health: 'unknown', enabled: true, note: '' },
   pool: { name: '', assetIds: [], newAssetAddresses: '', allocationMode: 'one', allocationCount: 1, selectionMode: 'ordered', enabled: true, alertEnabled: false, alertThresholds: [5, 3, 1, 0], alertBotIds: [], note: '' },
   account: { name: '', provider: 'huawei', enabled: true, credentials: {} },
@@ -181,7 +181,7 @@ export default function OrchestrationWorkspace({ tab, state, search = '', onSear
       const data = await api(`/api/orchestration/${resource}${value.id ? `/${value.id}` : ''}`, { method: value.id ? 'PUT' : 'POST', body: JSON.stringify(value) });
       onState(data.state);
       closeEditor();
-      toast(editor.type === 'binding' ? '已保存并写入远端' : editor.type === 'guard' ? '守护规则已保存，等待检查并修复' : '已保存');
+      toast(editor.type === 'pool' && data.ignoredAssetCount ? `已保存，已跳过 ${data.ignoredAssetCount} 个已消耗或删除的旧 IP 关联` : editor.type === 'binding' ? '已保存并写入远端' : editor.type === 'guard' ? '守护规则已保存，等待检查并修复' : '已保存');
     } catch (error) { toast(error.message); }
     finally { setEditorBusy(false); }
   };
@@ -340,13 +340,13 @@ function UsageRecordsView({ records, onClear, clearing, query = '', onQueryChang
     <div><strong>IP 使用记录</strong><span>默认保留 7 天，执行中及恢复依赖记录会保留</span></div>
     <div className="ops-usage-filters">
       <input aria-label="搜索 IP 使用记录" value={query} onChange={(event) => onQueryChange?.(event.target.value)} placeholder="搜索 IP、池、目标或域名" />
-      <select aria-label="使用记录状态" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">全部状态</option><option value="processing">处理中</option><option value="discarded">检测不可用</option><option value="consumed">成功消耗</option><option value="failed">失败保留</option><option value="rolled_back">已回滚</option></select>
+      <select aria-label="使用记录状态" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">全部状态</option><option value="processing">处理中</option><option value="discarded">检测不可用</option><option value="consumed">成功消耗</option><option value="returned">已退回原池</option><option value="failed">失败保留</option><option value="rolled_back">已回滚</option></select>
       <button className="ghost danger-text-button ops-usage-clear" disabled={clearing} onClick={onClear}>
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6" /></svg>
         {clearing ? '清理中...' : '清理全部'}
       </button>
     </div>
-  </div><div className="ops-list">{filtered.length ? filtered.map((item) => { const domains = (item.bindings || []).map((binding) => binding.domain).filter(Boolean).join(', '); const preflight = item.preflight?.attempts ? `Ping ${item.preflight.attempts} 次${item.preflight.ok ? '通过' : '失败'}` : ''; const details = [item.poolName || '未知备用池', item.targetName, preflight, domains, item.automationTaskName ? `任务：${item.automationTaskName}` : '', item.error, formatTime(item.finishedAt || item.startedAt)].filter(Boolean).join(' · '); const tone = item.status === 'consumed' ? 'ok' : ['failed', 'discarded'].includes(item.status) ? 'bad' : 'warn'; return <Row key={item.id} title={item.address} subtitle={details} status={STATUS[item.status] || item.status} tone={tone} />; }) : <div className="ops-empty"><strong>{(records.length || query.trim()) ? '没有匹配的使用记录' : '还没有 IP 使用记录'}</strong><span>故障切换取用备用 IP 后会自动生成记录。</span></div>}</div></>;
+  </div><div className="ops-list">{filtered.length ? filtered.map((item) => { const domains = (item.bindings || []).map((binding) => binding.domain).filter(Boolean).join(', '); const preflight = item.preflight?.attempts ? `Ping ${item.preflight.attempts} 次${item.preflight.ok ? '通过' : '失败'}` : ''; const details = [item.poolName || '未知备用池', item.targetName, preflight, domains, item.automationTaskName ? `任务：${item.automationTaskName}` : '', item.message, item.error, formatTime(item.finishedAt || item.startedAt)].filter(Boolean).join(' · '); const tone = ['consumed', 'returned'].includes(item.status) ? 'ok' : ['failed', 'discarded'].includes(item.status) ? 'bad' : 'warn'; return <Row key={item.id} title={item.address} subtitle={details} status={STATUS[item.status] || item.status} tone={tone} />; }) : <div className="ops-empty"><strong>{(records.length || query.trim()) ? '没有匹配的使用记录' : '还没有 IP 使用记录'}</strong><span>故障切换取用备用 IP 后会自动生成记录。</span></div>}</div></>;
 }
 
 function Row({ title, subtitle, status, tone = 'muted', actions, onTripleClick }) {
@@ -379,6 +379,11 @@ function renderEditor(type, value, patch, state, api, toast) {
 
 function GuardEditor({ value, patch, state, api }) {
   const sources = Array.isArray(value.sources) ? value.sources : [];
+  const poolCounts = new Map();
+  for (const address of new Set(value.currentValues || [])) {
+    const poolId = value.poolOrigins?.[address];
+    if (poolId) poolCounts.set(poolId, (poolCounts.get(poolId) || 0) + 1);
+  }
   const [sourceChecks, setSourceChecks] = useState({});
   const updateSource = (index, next) => {
     const key = sources[index]?.id || index;
@@ -437,11 +442,16 @@ function GuardEditor({ value, patch, state, api }) {
         <div className="guard-notification-hint">{value.poolFillMode === 'fill' ? '按健康 IP 数量补足目标；库存不足先补一部分，后续有库存继续补。调低目标不会删除健康 IP。' : '删除不健康 IP 后补回缺口；库存不足时保留缺口，后续继续补。'}</div>
       </div>
       <div className="guard-pool-setting">
-        <Field label="备用池取用方式"><select value={value.poolSelectionMode || 'ordered'} onChange={(e) => patch({ poolSelectionMode: e.target.value })}><option value="ordered">按顺序取用</option><option value="balanced">均衡取用</option></select></Field>
-        <div className="guard-notification-hint">{value.poolSelectionMode === 'balanced' ? '各池尽量平均补入，单个补位也轮流取用；库存不足或检查失败由其他池补足，不调整已有健康 IP。' : '按选择顺序优先取用，当前池不足或检查失败时由后面的池补足。'}</div>
+        <Field label="备用池取用方式"><select value={value.poolSelectionMode || 'ordered'} onChange={(e) => patch({ poolSelectionMode: e.target.value, poolRebalanceEnabled: e.target.value === 'balanced' })}><option value="ordered">按顺序取用</option><option value="balanced">均衡取用</option></select></Field>
+        {value.poolSelectionMode === 'balanced' ? <Toggle checked={Boolean(value.poolRebalanceEnabled)} onChange={(poolRebalanceEnabled) => patch({ poolRebalanceEnabled })}>自动调整已有 IP</Toggle> : null}
+        {value.poolSelectionMode === 'balanced' && value.poolRebalanceEnabled ? <Field label="自动调整间隔（分钟）"><input type="number" inputMode="numeric" min="1" max="1440" step="1" required value={value.poolRebalanceIntervalMinutes ?? 30} onChange={(e) => patch({ poolRebalanceIntervalMinutes: e.target.value })} /></Field> : null}
+        <div className="guard-notification-hint">{value.poolSelectionMode === 'balanced' ? value.poolRebalanceEnabled
+          ? '开启或更换关联池后，保存即安排评估；故障补位优先。新 IP 检查通过并确认远程替换后，健康旧 IP 退回原池。'
+          : '按域名当前的来源池占比补位，优先补数量少的池；库存不足或检查失败由其他池补足，不删除已有健康 IP。'
+          : '按选择顺序优先取用，当前池不足或检查失败时由后面的池补足。'}</div>
       </div>
     </div>
-    <Multi label={value.poolSelectionMode === 'balanced' ? '备用池（均衡取用）' : '备用池（按选择顺序兜底）'} items={(state.ipPools || []).filter((item) => item.enabled !== false)} value={value.poolIds || []} onChange={(poolIds) => patch({ poolIds })} secondary={(item) => `${item.assetIds?.length || 0} 个 IP`} searchable selectable />
+    <Multi label={value.poolSelectionMode === 'balanced' ? '备用池（均衡取用）' : '备用池（按选择顺序兜底）'} items={(state.ipPools || []).filter((item) => item.enabled !== false)} value={value.poolIds || []} onChange={(poolIds) => patch({ poolIds })} secondary={(item) => `库存 ${item.assetIds?.length || 0} 个 · 当前域名 ${poolCounts.get(item.id) || 0} 个`} searchable selectable />
     <EditorSection title="TG 通知" />
     <Multi label="通知机器人（不选则不通知）" items={state.telegramBots || []} value={value.alertBotIds || []} onChange={(alertBotIds) => patch({ alertBotIds })} secondary={(item) => item.enabled === false ? '已停用' : !item.configured ? '未配置 Token' : !item.userIds?.length ? '未配置接收 ID' : '发送到机器人配置的接收 ID'} emptyLabel="请先在 Telegram 中添加机器人" />
     <div className="guard-notification-hint">删除不健康 IP 时通知，并显示剩余数量；正常检查不通知。</div>

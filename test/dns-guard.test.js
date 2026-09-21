@@ -111,6 +111,452 @@ function addFillStock(deps, count, start = 1, poolId = 'fill-pool') {
   }
 }
 
+function autoBalanceFixture(total = 50, poolIds = ['a', 'b']) {
+  const remote = Array.from({ length: total }, (_, index) => `198.51.100.${index + 1}`);
+  const deps = sourceGuardFixture(remote, { sources: [], currentValues: remote, ownedValues: remote,
+    poolOrigins: Object.fromEntries(remote.map((address) => [address, 'a'])), poolIds,
+    poolSelectionMode: 'balanced', poolRebalanceEnabled: true, poolFillMode: 'fill', poolTargetCount: total });
+  addFillStock(deps, 0, 1, 'a');
+  return deps;
+}
+
+function guardConfigSaver(deps) {
+  deps.sanitizeState = (state) => state;
+  const routes = new Map();
+  registerOrchestrationRoutes(Object.fromEntries(['get', 'post', 'put', 'delete'].map((method) => [method, (path, fn) => routes.set(`${method} ${path}`, fn)])), deps);
+  return async (extra) => {
+    let result;
+    await routes.get('put /api/orchestration/:resource/:id')({ params: { resource: 'dns-guards', id: 'guard-1' }, auth: { username: 'test' }, body: { ...deps.getState().dnsGuards[0], ...extra } },
+      { json(value) { result = value; } }, (error) => { throw error; });
+    return result.item;
+  };
+}
+
+test('automatic rebalancing swaps a full domain to 25/25 and returns old healthy IPs only after verification', async () => {
+  const deps = autoBalanceFixture();
+  addFillStock(deps, 30, 1, 'b');
+  const write = deps.writeDnsRecord;
+  let writes = 0;
+  deps.writeDnsRecord = async (...args) => {
+    writes++;
+    assert.equal(deps.getState().ipPools.find((pool) => pool.id === 'a').assetIds.length, 0, 'old IPs must not be available before remote confirmation');
+    return write(...args);
+  };
+  await nextSourceCycle(deps);
+  const state = deps.getState(), guard = state.dnsGuards[0];
+  assert.equal(deps.getRemote().length, 50);
+  assert.deepEqual(['a', 'b'].map((id) => Object.values(guard.poolOrigins).filter((poolId) => poolId === id).length), [25, 25]);
+  const returnedIds = state.ipPools.find((pool) => pool.id === 'a').assetIds;
+  assert.equal(returnedIds.length, 25);
+  assert.ok(state.ipAssets.filter((asset) => returnedIds.includes(asset.id)).every((asset) => !deps.getRemote().includes(asset.address)));
+  assert.equal(state.ipUsageRecords.filter((entry) => entry.status === 'returned').length, 25);
+  assert.equal(state.dnsGuardRuns[0].returnedIps.length, 25);
+  assert.equal(writes, 1);
+  const deadline = guard.poolRebalanceNextAt;
+  assert.equal(Date.parse(deadline) - Date.parse(guard.poolRebalanceLastAt), 30 * 60000);
+  await nextSourceCycle(deps);
+  assert.equal(writes, 1, 'balanced domains do not churn on later checks');
+  assert.equal(guard.poolRebalanceNextAt, deadline, 'ordinary health checks must not slide the rebalance deadline');
+});
+
+test('automatic rebalance supports three and four pools with stable indivisible remainders', async () => {
+  for (const poolIds of [['a', 'b', 'c'], ['a', 'b', 'c', 'd']]) {
+    const deps = autoBalanceFixture(50, poolIds);
+    for (const [index, poolId] of poolIds.slice(1).entries()) addFillStock(deps, 25, index * 40 + 1, poolId);
+    await nextSourceCycle(deps);
+    const counts = poolIds.map((id) => Object.values(deps.getState().dnsGuards[0].poolOrigins).filter((poolId) => poolId === id).length);
+    assert.equal(counts.reduce((a, b) => a + b), 50);
+    assert.ok(Math.max(...counts) - Math.min(...counts) <= 1);
+    const before = [...deps.getRemote()], inventory = deps.getState().ipAssets.length;
+    deps.getState().dnsGuards[0].poolRebalanceNextAt = '2000-01-01';
+    await nextSourceCycle(deps);
+    assert.deepEqual(deps.getRemote(), before);
+    assert.equal(deps.getState().ipAssets.length, inventory);
+  }
+});
+
+test('automatic rebalance keeps healthy old records on empty or failed pools and resumes after replenishment', async () => {
+  const deps = autoBalanceFixture(10);
+  addFillStock(deps, 0, 1, 'b');
+  const before = [...deps.getRemote()];
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.getRemote(), before);
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+  addFillStock(deps, 2, 1, 'b');
+  assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['b'] }), 0, 'stock changes cannot bypass the rebalance interval');
+  deps.getState().dnsGuards[0].poolRebalanceNextAt = '2000-01-01';
+  assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['b'] }), 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  await finishGuardChecks(deps, (address) => address !== '203.0.113.1');
+  assert.equal(deps.getRemote().length, 10);
+  assert.equal(deps.getState().dnsGuardRuns[0].returnedIps.length, 1);
+  assert.equal(deps.getState().ipPools.find((pool) => pool.id === 'a').assetIds.length, 1);
+  addFillStock(deps, 4, 3, 'b');
+  deps.getState().dnsGuards[0].poolRebalanceNextAt = '2000-01-01';
+  await nextSourceCycle(deps);
+  assert.equal(Object.values(deps.getState().dnsGuards[0].poolOrigins).filter((id) => id === 'b').length, 5);
+});
+
+test('automatic rebalance leaves unknown and DDNS-owned IPs alone and respects explicit opt-out', async () => {
+  for (const mode of ['off', 'unknown', 'source']) {
+    const deps = autoBalanceFixture(4);
+    addFillStock(deps, 4, 1, 'b');
+    const guard = deps.getState().dnsGuards[0];
+    if (mode === 'off') guard.poolRebalanceEnabled = false;
+    if (mode === 'unknown') guard.poolOrigins = {};
+    if (mode === 'source') guard.sourceOwnedValues = [...guard.currentValues];
+    const before = [...deps.getRemote()];
+    await nextSourceCycle(deps);
+    assert.deepEqual(deps.getRemote(), before);
+    assert.equal(deps.getState().ipUsageRecords.length, 0);
+  }
+});
+
+test('uncertain rebalance writes survive restart and offline probes without duplicate consumption or returns', async () => {
+  let deps = autoBalanceFixture(4);
+  addFillStock(deps, 2, 1, 'b');
+  await runDueDnsGuards(deps);
+  for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+  for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  const write = deps.writeDnsRecord;
+  deps.writeDnsRecord = async (...args) => { await write(...args); throw Object.assign(new Error('timeout'), { name: 'TimeoutError' }); };
+  await processReadyDnsGuards(deps);
+  assert.equal(deps.getState().dnsGuards[0].cycle.rebalanceCommit.writeAttempted, true);
+  assert.equal(deps.getState().ipPools.find((pool) => pool.id === 'a').assetIds.length, 0);
+  assert.equal(deps.getState().ipAssets.length, 2);
+  await assert.rejects(writeDnsGuardRemoteValues('guard-1', { values: [] }, deps), /正在确认自动均衡/);
+  await assert.rejects(syncDnsGuardRemote('guard-1', deps), /正在确认自动均衡/);
+  deps = remoteDeps(normalizeOrchestrationState(deps.getState()), deps.getRemote());
+  deps.getState().probes.forEach((probe) => { probe.status = 'offline'; probe.lastSeenAt = '2000-01-01'; });
+  deps.getState().dnsGuards[0].cycle.startedAt = '2000-01-01';
+  await runDueDnsGuards(deps);
+  assert.ok(deps.getState().dnsGuards[0].cycle.rebalanceCommit);
+  assert.equal(await processReadyDnsGuards(deps), 0, 'confirmation retries respect their delay');
+  deps.getState().dnsGuards[0].cycle.rebalanceRetryAt = '';
+  deps.writeDnsRecord = async () => { assert.fail('already applied write must only be verified, not resubmitted'); };
+  const read = deps.readDnsRecord;
+  deps.readDnsRecord = async (...args) => {
+    assert.equal(args[3].providerRecordId, '');
+    assert.deepEqual(args[3].providerRecordIds, []);
+    return read(...args);
+  };
+  await runDueDnsGuards(deps);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+  assert.equal(deps.getState().ipPools.find((pool) => pool.id === 'a').assetIds.length, 2);
+  assert.equal(deps.getState().ipUsageRecords.filter((entry) => entry.status === 'consumed').length, 2);
+  await processReadyDnsGuards(deps);
+  assert.equal(deps.getState().ipUsageRecords.filter((entry) => entry.status === 'returned').length, 2);
+});
+
+test('rebalance waits for the required recipient pools, not many successes from only one pool', async () => {
+  const deps = autoBalanceFixture(6, ['a', 'b', 'c']);
+  addFillStock(deps, 5, 1, 'b'); addFillStock(deps, 5, 40, 'c');
+  await runDueDnsGuards(deps);
+  for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+  const guard = deps.getState().dnsGuards[0];
+  for (const check of guard.cycle.checks.filter((check) => Number(check.address.split('.').at(-1)) < 40)) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  assert.equal(dnsGuardCycleReady(guard), false, 'five B successes cannot fill the two C slots');
+  for (const check of guard.cycle.checks.filter((check) => Number(check.address.split('.').at(-1)) >= 40).slice(0, 2)) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  assert.equal(dnsGuardCycleReady(guard), true);
+  await processReadyDnsGuards(deps);
+  assert.deepEqual(['a', 'b', 'c'].map((id) => Object.values(deps.getState().dnsGuards[0].poolOrigins).filter((poolId) => poolId === id).length), [2, 2, 2]);
+});
+
+test('automatic rebalance cancels without consuming stock when remote or pool settings change before writing', async () => {
+  for (const change of ['remote', 'disabled', 'removed', 'asset']) {
+    const deps = autoBalanceFixture(4);
+    addFillStock(deps, 2, 1, 'b');
+    await runDueDnsGuards(deps);
+    for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+    await processReadyDnsGuards(deps);
+    const state = deps.getState(), before = [...deps.getRemote()];
+    if (change === 'remote') await deps.writeDnsRecord(null, null, null, null, ['192.0.2.99']);
+    if (change === 'disabled') state.ipPools.find((pool) => pool.id === 'b').enabled = false;
+    if (change === 'removed') state.ipPools.find((pool) => pool.id === 'b').assetIds = [];
+    if (change === 'asset') state.ipAssets[0].enabled = false;
+    deps.writeDnsRecord = async () => assert.fail('changed plans must not write');
+    await finishGuardChecks(deps);
+    assert.equal(state.dnsGuards[0].status, 'queued');
+    assert.equal(state.ipUsageRecords.length, 0);
+    assert.equal(state.ipPools.find((pool) => pool.id === 'a').assetIds.length, 0);
+    assert.equal(state.ipAssets.length, 2);
+    assert.deepEqual(deps.getRemote(), change === 'remote' ? ['192.0.2.99'] : before);
+  }
+});
+
+test('automatic rebalance does not remove healthy old IPs when every replacement fails', async () => {
+  const deps = autoBalanceFixture(4);
+  addFillStock(deps, 2, 1, 'b');
+  const before = [...deps.getRemote()];
+  deps.writeDnsRecord = async () => assert.fail('failed replacements must not replace healthy IPs');
+  await nextSourceCycle(deps, (address) => address.startsWith('198.51.100.'));
+  assert.deepEqual(deps.getRemote(), before);
+  assert.equal(deps.getState().ipUsageRecords.filter((entry) => entry.status === 'returned').length, 0);
+  assert.equal(deps.getState().ipPools.find((pool) => pool.id === 'a').assetIds.length, 0);
+});
+
+test('legacy recorded pool origins can be rebalanced without assigning unknown old IPs', async () => {
+  const deps = autoBalanceFixture(5);
+  const state = deps.getState();
+  delete state.dnsGuards[0].poolOrigins;
+  state.ipUsageRecords = state.dnsGuards[0].currentValues.slice(0, 4).map((address, i) => ({
+    id: `old-${i}`, guardId: 'guard-1', address, poolId: 'a', status: 'consumed'
+  }));
+  addFillStock(deps, 5, 1, 'b');
+  const restored = remoteDeps(normalizeOrchestrationState(state), deps.getRemote());
+  await nextSourceCycle(restored);
+  assert.deepEqual(['a', 'b'].map((id) => Object.values(restored.getState().dnsGuards[0].poolOrigins).filter((poolId) => poolId === id).length), [2, 2]);
+  assert.ok(restored.getRemote().includes('198.51.100.5'));
+  assert.equal(restored.getState().dnsGuards[0].poolOrigins['198.51.100.5'], undefined);
+});
+
+test('uncertain rebalance mismatch holds inventory and reimported addresses until remote confirmation', async () => {
+  const deps = autoBalanceFixture(4);
+  addFillStock(deps, 2, 1, 'b');
+  const write = deps.writeDnsRecord;
+  deps.writeDnsRecord = async (...args) => {
+    await write(...args.slice(0, 4), args[4].slice(0, 1));
+    return ['record-1'];
+  };
+  await runDueDnsGuards(deps);
+  for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+  for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+  const state = deps.getState(), guard = state.dnsGuards[0], commit = guard.cycle.rebalanceCommit;
+  assert.equal(commit.writeAttempted, true);
+  assert.equal(state.ipUsageRecords.length, 0);
+  state.ipAssets.push({ id: 'reimport', address: commit.returnedAssets[0].address, enabled: true });
+  state.ipPools.find((pool) => pool.id === 'b').assetIds.push('reimport');
+  assert.deepEqual(collectDnsGuardPoolCandidates(state, { poolIds: ['b'], recordType: 'A' }), []);
+  assert.equal(await processReadyDnsGuards(deps), 0);
+  guard.cycle.rebalanceRetryAt = '';
+  deps.writeDnsRecord = async () => assert.fail('unexpected remote changes must not be overwritten');
+  await processReadyDnsGuards(deps);
+  assert.match(guard.lastError, /前后均不一致/);
+  assert.equal(state.ipUsageRecords.length, 0);
+  await write(null, null, null, null, commit.desired);
+  guard.cycle.rebalanceRetryAt = '';
+  await processReadyDnsGuards(deps);
+  assert.equal(guard.cycle, null);
+  assert.equal(state.ipAssets.filter((asset) => asset.address === commit.returnedAssets[0].address).length, 1);
+  assert.equal(state.ipPools.find((pool) => pool.id === 'a').assetIds.length, 2);
+});
+
+test('pending remote rebalance confirmations do not occupy probe preparation slots', async () => {
+  const deps = autoBalanceFixture(4);
+  addFillStock(deps, 2, 1, 'b');
+  await runDueDnsGuards(deps);
+  for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+  for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  deps.writeDnsRecord = async () => { throw new Error('timeout'); };
+  await processReadyDnsGuards(deps);
+  const state = deps.getState(), guard = state.dnsGuards[0];
+  guard.cycle.rebalanceRetryAt = '2099-01-01';
+  for (let i = 1; i < 10; i++) state.dnsGuards.push({ ...structuredClone(guard), id: `pending-${i}` });
+  state.dnsGuards.push({ ...structuredClone(guard), id: 'fresh', cycle: null, nextCheckAt: '', poolRebalanceEnabled: false });
+  assert.equal(await runDueDnsGuards(deps), 1);
+  assert.ok(state.dnsGuards.find((item) => item.id === 'fresh').cycle?.checks.length);
+  assert.ok(guard.cycle.rebalanceCommit.writeAttempted);
+});
+
+test('rebalance cadence survives restart and cooldown checks do not evaluate pools or write DNS', async () => {
+  const original = autoBalanceFixture(4);
+  addFillStock(original, 0, 1, 'b');
+  await nextSourceCycle(original);
+  const deps = remoteDeps(normalizeOrchestrationState(original.getState()), original.getRemote());
+  const state = deps.getState(), guard = state.dnsGuards[0], deadline = guard.poolRebalanceNextAt;
+  addFillStock(deps, 4, 1, 'b');
+  const readState = deps.readState;
+  deps.readState = (keys) => {
+    assert.ok(keys && !['ipAssets', 'ipPools', 'ipLeases', 'incidents', 'ipUsageRecords'].some((key) => keys.includes(key)),
+      'routine full healthy checks must not load inventory, leases or histories');
+    return readState(keys);
+  };
+  deps.writeDnsRecord = async () => assert.fail('a full domain must wait for its rebalance deadline');
+  await nextSourceCycle(deps);
+  assert.equal(guard.poolRebalanceNextAt, deadline);
+  deps.readState = readState;
+  assert.deepEqual(deps.getRemote(), original.getRemote());
+});
+
+test('inventory notifications do not load assets or rewrite idle guards during rebalance cooldown', async () => {
+  const deps = autoBalanceFixture(4);
+  addFillStock(deps, 0, 1, 'b');
+  await nextSourceCycle(deps);
+  addFillStock(deps, 4, 1, 'b');
+  const readState = deps.readState;
+  deps.readState = (keys) => {
+    assert.deepEqual(keys, ['dnsGuards'], 'cooldown notifications skip even the pool membership lists');
+    return readState(keys);
+  };
+  deps.updateState = () => assert.fail('idle notifications must not rewrite state');
+  for (let i = 0; i < 25; i++) assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['b'] }), 0);
+});
+
+test('balanced repairs run during rebalance cooldown without returning healthy survivors', async () => {
+  const deps = autoBalanceFixture(6);
+  addFillStock(deps, 8, 1, 'b');
+  await nextSourceCycle(deps);
+  const guard = deps.getState().dnsGuards[0], deadline = guard.poolRebalanceNextAt;
+  const before = [...deps.getRemote()];
+  const failed = before.find((address) => guard.poolOrigins[address] === 'b');
+  await nextSourceCycle(deps, (address) => address !== failed);
+  assert.equal(deps.getRemote().length, 6);
+  assert.ok(before.filter((address) => address !== failed).every((address) => deps.getRemote().includes(address)));
+  assert.deepEqual(['a', 'b'].map((id) => Object.values(guard.poolOrigins).filter((poolId) => poolId === id).length), [3, 3]);
+  assert.deepEqual(deps.getState().dnsGuardRuns[0].returnedIps, []);
+  assert.equal(guard.poolRebalanceNextAt, deadline);
+});
+
+test('a due rebalance gives priority to failed-IP repair and only redistributes on a later evaluation', async () => {
+  const deps = autoBalanceFixture(6);
+  addFillStock(deps, 8, 1, 'b');
+  const before = [...deps.getRemote()];
+  await nextSourceCycle(deps, (address) => address !== before[0]);
+  const state = deps.getState(), guard = state.dnsGuards[0];
+  assert.equal(deps.getRemote().length, 6);
+  assert.deepEqual(['a', 'b'].map((id) => Object.values(guard.poolOrigins).filter((poolId) => poolId === id).length), [5, 1]);
+  assert.deepEqual(state.dnsGuardRuns[0].returnedIps, []);
+  assert.equal(state.ipPools.find((pool) => pool.id === 'a').assetIds.length, 0);
+  await nextSourceCycle(deps);
+  assert.equal(state.ipPools.find((pool) => pool.id === 'a').assetIds.length, 0);
+  guard.poolRebalanceNextAt = '2000-01-01';
+  await nextSourceCycle(deps);
+  assert.deepEqual(['a', 'b'].map((id) => Object.values(guard.poolOrigins).filter((poolId) => poolId === id).length), [3, 3]);
+  assert.equal(state.dnsGuardRuns[0].returnedIps.length, 2);
+});
+
+test('due rebalance uses the existing scheduler even with a longer health interval and coalesces repeated ticks', async () => {
+  const deps = autoBalanceFixture(6);
+  addFillStock(deps, 8, 1, 'b');
+  const guard = deps.getState().dnsGuards[0];
+  Object.assign(guard, { status: 'healthy', interval: 86400, nextCheckAt: '2099-01-01', poolRebalanceNextAt: '2000-01-01', poolRebalanceIntervalMinutes: 45 });
+  assert.equal(await runDueDnsGuards(deps), 1);
+  const cycleId = guard.cycle.id;
+  assert.equal(await runDueDnsGuards(deps), 0);
+  assert.equal(guard.cycle.id, cycleId);
+  await finishGuardChecks(deps);
+  assert.equal(Date.parse(guard.poolRebalanceNextAt) - Date.parse(guard.poolRebalanceLastAt), 45 * 60000);
+  assert.equal(await runDueDnsGuards(deps), 0);
+});
+
+test('rebalance cadence validates minutes and enables immediately without resetting on unrelated edits', async () => {
+  const deps = autoBalanceFixture(4);
+  addFillStock(deps, 4, 1, 'b');
+  addFillStock(deps, 4, 10, 'c');
+  const guard = deps.getState().dnsGuards[0];
+  guard.poolRebalanceEnabled = false;
+  guard.nextCheckAt = '2099-01-01';
+  const changed = [];
+  deps.onDnsGuardChanged = (id) => changed.push(id);
+  const save = guardConfigSaver(deps);
+  for (const poolRebalanceIntervalMinutes of [0, 1441, 1.5, '', 'abc', Infinity]) {
+    await assert.rejects(save({ poolRebalanceIntervalMinutes }), /自动调整间隔/);
+  }
+  await save({ poolRebalanceEnabled: true, poolRebalanceIntervalMinutes: '30', poolRebalanceNextAt: '2099-01-01' });
+  assert.deepEqual(changed, ['guard-1']);
+  assert.equal(guard.nextCheckAt, '');
+  assert.equal(guard.poolRebalanceNextAt, '');
+  await nextSourceCycle(deps);
+  const last = guard.poolRebalanceLastAt, next = guard.poolRebalanceNextAt;
+  await save({ name: 'renamed', poolIds: ['b', 'a'], poolRebalanceLastAt: '2000-01-01', poolRebalanceNextAt: '2099-01-01' });
+  assert.equal(guard.poolRebalanceLastAt, last);
+  assert.equal(guard.poolRebalanceNextAt, next);
+  await save({ poolRebalanceIntervalMinutes: 60 });
+  assert.equal(Date.parse(guard.poolRebalanceNextAt) - Date.parse(last), 60 * 60000);
+  await save({ poolRebalanceIntervalMinutes: 5 });
+  assert.equal(Date.parse(guard.poolRebalanceNextAt) - Date.parse(last), 5 * 60000);
+  await save({ poolIds: ['a', 'b', 'c'] });
+  assert.equal(guard.poolRebalanceLastAt, '');
+  assert.equal(guard.poolRebalanceNextAt, '');
+  await nextSourceCycle(deps);
+  assert.ok(Object.values(guard.poolOrigins).includes('c'));
+  await save({ poolRebalanceEnabled: false });
+  assert.equal(guard.poolRebalanceNextAt, '');
+  await save({ poolRebalanceEnabled: true });
+  assert.equal(guard.poolRebalanceNextAt, '');
+});
+
+test('editing rebalance interval or disabling during preflight cancels the old plan safely', async () => {
+  for (const patch of [{ poolRebalanceIntervalMinutes: 45 }, { poolRebalanceEnabled: false }]) {
+    const deps = autoBalanceFixture(4);
+    addFillStock(deps, 4, 1, 'b');
+    await runDueDnsGuards(deps);
+    const guard = deps.getState().dnsGuards[0];
+    for (const check of guard.cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+    await processReadyDnsGuards(deps);
+    assert.ok(guard.cycle.rebalancePlan);
+    const before = [...deps.getRemote()];
+    await guardConfigSaver(deps)(patch);
+    assert.equal(guard.cycle, null);
+    await processReadyDnsGuards(deps);
+    assert.deepEqual(deps.getRemote(), before);
+    assert.equal(deps.getState().ipUsageRecords.length, 0);
+  }
+});
+
+test('changing rebalance interval during preparation cannot publish the obsolete cycle', async () => {
+  const deps = autoBalanceFixture(4);
+  addFillStock(deps, 2, 1, 'b');
+  const read = deps.readDnsRecord, gate = Promise.withResolvers();
+  deps.readDnsRecord = async (...args) => { await gate.promise; return read(...args); };
+  const running = runDueDnsGuards(deps);
+  await Promise.resolve();
+  await guardConfigSaver(deps)({ poolRebalanceIntervalMinutes: 45 });
+  gate.resolve();
+  await running;
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+});
+
+test('balanced legacy guards migrate once, preserve running commits and honor later opt-outs after restart', async () => {
+  const state = guardState();
+  state.dnsGuards = [
+    { id: 'missing', poolSelectionMode: 'balanced' },
+    { id: 'off', poolSelectionMode: 'balanced', poolRebalanceEnabled: false, poolRebalanceNextAt: '2099-01-01' },
+    { id: 'on', poolSelectionMode: 'balanced', poolRebalanceEnabled: true, poolRebalanceIntervalMinutes: 45, poolRebalanceNextAt: '2099-01-01' },
+    { id: 'ordered', poolSelectionMode: 'ordered' },
+    { id: 'paused', enabled: false, poolSelectionMode: 'balanced' },
+    { id: 'pending', poolSelectionMode: 'balanced', poolRebalanceEnabled: true, cycle: { id: 'pending-cycle', rebalanceCommit: { writeAttempted: true, desired: ['192.0.2.1'] } } }
+  ];
+  const migrated = normalizeOrchestrationState(state);
+  assert.deepEqual(migrated.dnsGuards.map((guard) => guard.poolRebalanceEnabled), [true, true, true, false, true, true]);
+  assert.ok(migrated.dnsGuards.every((guard) => guard.poolRebalanceDefaultVersion === 1));
+  assert.equal(migrated.dnsGuards[0].poolRebalanceIntervalMinutes, 30);
+  assert.equal(migrated.dnsGuards[1].poolRebalanceNextAt, '');
+  assert.equal(migrated.dnsGuards[2].poolRebalanceIntervalMinutes, 45);
+  assert.equal(migrated.dnsGuards[2].poolRebalanceNextAt, '2099-01-01');
+  assert.equal(migrated.dnsGuards[4].enabled, false);
+  assert.deepEqual(migrated.dnsGuards[5].cycle, state.dnsGuards[5].cycle);
+  migrated.dnsGuards[1].poolRebalanceEnabled = false;
+  assert.equal(normalizeOrchestrationState(migrated).dnsGuards[1].poolRebalanceEnabled, false);
+
+  const deps = autoBalanceFixture(4);
+  addFillStock(deps, 4, 1, 'b');
+  const save = guardConfigSaver(deps);
+  await save({ poolRebalanceEnabled: false });
+  assert.equal(normalizeOrchestrationState(deps.getState()).dnsGuards[0].poolRebalanceEnabled, false);
+  await save({ poolSelectionMode: 'ordered' });
+  const balanced = await save({ poolSelectionMode: 'balanced', poolRebalanceEnabled: undefined });
+  assert.equal(balanced.poolRebalanceEnabled, true, 'API mode changes use the same default as the form');
+  assert.equal(balanced.poolRebalanceIntervalMinutes, 30);
+});
+
+test('migrating many balanced tasks keeps the ten-cycle limit and does not duplicate preparations', async () => {
+  const fixture = autoBalanceFixture(2);
+  const state = fixture.getState();
+  state.dnsGuards = Array.from({ length: 35 }, (_, i) => ({ ...structuredClone(state.dnsGuards[0]), id: `migrated-${i}`, poolRebalanceEnabled: false }));
+  const deps = remoteDeps(normalizeOrchestrationState(state), fixture.getRemote());
+  assert.equal(await runDueDnsGuards(deps), 10);
+  assert.equal(await runDueDnsGuards(deps), 0);
+  assert.equal(deps.getState().dnsGuards.filter((guard) => guard.cycle).length, 10);
+  assert.ok(deps.getState().dnsGuards.filter((guard) => guard.cycle).every((guard) => guard.cycle.rebalanceDue));
+});
+
 test('balanced pool candidates rotate across pools while legacy selection keeps pool priority', () => {
   const deps = sourceGuardFixture([], { poolIds: ['a', 'b', 'c'] });
   for (const [pool, start] of [['a', 1], ['b', 40], ['c', 80]]) addFillStock(deps, 10, start, pool);
@@ -166,6 +612,160 @@ test('healthy guard cycles leave unused inventory arrays and pool membership unt
   assert.equal(state.ipAssets, assets);
   assert.equal(state.ipPools[0].assetIds, members);
   assert.equal(state.ipUsageRecords, usage);
+});
+
+test('balanced fill targets total pool ownership, reaching 25 per pool instead of splitting only new IPs', async () => {
+  const remote = Array.from({ length: 40 }, (_, i) => `198.51.100.${i + 1}`);
+  const poolOrigins = Object.fromEntries(remote.map((address, index) => [address, index < 25 ? 'a' : 'b']));
+  const deps = sourceGuardFixture(remote, { sources: [], currentValues: remote, poolOrigins,
+    poolIds: ['a', 'b'], poolSelectionMode: 'balanced', poolFillMode: 'fill', poolTargetCount: 50 });
+  addFillStock(deps, 20, 1, 'a'); addFillStock(deps, 20, 40, 'b');
+  await nextSourceCycle(deps);
+  const origins = Object.values(deps.getState().dnsGuards[0].poolOrigins);
+  assert.deepEqual(['a', 'b'].map((id) => origins.filter((poolId) => id === poolId).length), [25, 25]);
+  assert.ok(remote.every((address) => deps.getRemote().includes(address)));
+  assert.ok(deps.getState().ipUsageRecords.every((record) => record.poolId === 'b'));
+});
+
+test('three pool total ownership reaches 17 17 16 and persists after history cleanup and restart', async () => {
+  const remote = Array.from({ length: 17 }, (_, i) => `198.51.100.${i + 1}`);
+  const deps = sourceGuardFixture(remote, { sources: [], currentValues: remote, poolOrigins: Object.fromEntries(remote.map((address) => [address, 'a'])),
+    poolIds: ['a', 'b', 'c'], poolSelectionMode: 'balanced', poolFillMode: 'fill', poolTargetCount: 50 });
+  addFillStock(deps, 20, 1, 'a'); addFillStock(deps, 20, 40, 'b'); addFillStock(deps, 20, 80, 'c');
+  await nextSourceCycle(deps);
+  const origins = Object.values(deps.getState().dnsGuards[0].poolOrigins);
+  assert.deepEqual(['a', 'b', 'c'].map((id) => origins.filter((poolId) => id === poolId).length), [17, 17, 16]);
+  deps.getState().ipUsageRecords = [];
+  const restarted = remoteDeps(normalizeOrchestrationState(deps.getState()), deps.getRemote());
+  assert.deepEqual(restarted.getState().dnsGuards[0].poolOrigins, deps.getState().dnsGuards[0].poolOrigins);
+  await nextSourceCycle(restarted, (address) => address !== '198.51.100.1');
+  const repaired = Object.values(restarted.getState().dnsGuards[0].poolOrigins);
+  assert.equal(restarted.getRemote().length, 50);
+  assert.equal(Math.max(...['a', 'b', 'c'].map((id) => repaired.filter((poolId) => id === poolId).length)), 17);
+  assert.equal(restarted.getState().dnsGuards[0].poolOrigins['198.51.100.1'], undefined);
+});
+
+test('overrepresented healthy IPs are kept, and all available capacity goes to the smaller pool', async () => {
+  const remote = Array.from({ length: 40 }, (_, i) => `198.51.100.${i + 1}`);
+  const deps = sourceGuardFixture(remote, { sources: [], currentValues: remote, poolOrigins: Object.fromEntries(remote.map((address) => [address, 'a'])),
+    poolIds: ['a', 'b'], poolSelectionMode: 'balanced', poolFillMode: 'fill', poolTargetCount: 50 });
+  addFillStock(deps, 10, 1, 'a'); addFillStock(deps, 10, 40, 'b');
+  await nextSourceCycle(deps);
+  assert.ok(remote.every((address) => deps.getRemote().includes(address)));
+  assert.equal(Object.values(deps.getState().dnsGuards[0].poolOrigins).filter((id) => id === 'b').length, 10);
+  const remaining = deps.getState().ipAssets.length;
+  await nextSourceCycle(deps);
+  assert.equal(deps.getState().ipAssets.length, remaining, 'full healthy domain must not rotate records just for balance');
+});
+
+test('legacy current pool ownership recovers from successful history only and is not recreated after deletion', async () => {
+  const state = guardState();
+  state.dnsGuards[0].currentValues = ['198.51.100.1', '198.51.100.2', '198.51.100.3'];
+  state.ipUsageRecords = [
+    { guardId: 'guard-1', address: '198.51.100.1', poolId: 'b', status: 'consumed' },
+    { guardId: 'guard-1', address: '198.51.100.1', poolId: 'a', status: 'consumed' },
+    { guardId: 'guard-1', address: '198.51.100.2', poolId: 'a', status: 'discarded' },
+    { guardId: 'other', address: '198.51.100.3', poolId: 'c', status: 'consumed' },
+    { guardId: 'guard-1', address: '198.51.100.4', poolId: 'c', status: 'consumed' }
+  ];
+  const migrated = normalizeOrchestrationState(state);
+  assert.deepEqual(migrated.dnsGuards[0].poolOrigins, { '198.51.100.1': 'b' });
+  const deps = remoteDeps(migrated, state.dnsGuards[0].currentValues);
+  await writeDnsGuardRemoteValues('guard-1', { values: ['198.51.100.2'], expectedValues: state.dnsGuards[0].currentValues }, deps);
+  assert.deepEqual(deps.getState().dnsGuards[0].poolOrigins, {});
+  assert.deepEqual(normalizeOrchestrationState(deps.getState()).dnsGuards[0].poolOrigins, {});
+});
+
+test('remote reads prune removed ownership but do not assign unknown external IPs to pools', async () => {
+  const deps = sourceGuardFixture(['198.51.100.2', '198.51.100.3'], {
+    sources: [], currentValues: ['198.51.100.1', '198.51.100.2'],
+    poolOrigins: { '198.51.100.1': 'a', '198.51.100.2': 'b' }
+  });
+  await syncDnsGuardRemote('guard-1', deps);
+  assert.deepEqual(deps.getState().dnsGuards[0].poolOrigins, { '198.51.100.2': 'b' });
+});
+
+test('balanced healthy survivor counts exclude failed IPs before replacement preflight', async () => {
+  const remote = ['198.51.100.1', '198.51.100.2', '198.51.100.3', '198.51.100.4'];
+  const deps = sourceGuardFixture(remote, { sources: [], currentValues: remote,
+    poolOrigins: { '198.51.100.1': 'a', '198.51.100.2': 'a', '198.51.100.3': 'b', '198.51.100.4': 'b' },
+    poolIds: ['a', 'b'], poolSelectionMode: 'balanced', poolBalanceNextId: 'a', maxParallel: 1 });
+  addFillStock(deps, 2, 1, 'a'); addFillStock(deps, 2, 40, 'b');
+  await nextSourceCycle(deps, (address) => address !== '198.51.100.3');
+  assert.equal(deps.getState().ipUsageRecords[0].poolId, 'b', 'failed pool IP no longer contributes to the existing count');
+  assert.deepEqual(Object.values(deps.getState().dnsGuards[0].poolOrigins).sort(), ['a', 'a', 'b', 'b']);
+});
+
+test('four-pool balancing skips empty disabled and missing pools without waiting for their stock', async () => {
+  const deps = sourceGuardFixture([], { sources: [], poolIds: ['empty', 'disabled', 'missing', 'available'],
+    poolSelectionMode: 'balanced', poolFillMode: 'fill', poolTargetCount: 5 });
+  addFillStock(deps, 0, 1, 'empty');
+  addFillStock(deps, 5, 10, 'disabled');
+  addFillStock(deps, 5, 40, 'available');
+  deps.getState().ipPools.find((pool) => pool.id === 'disabled').enabled = false;
+  await nextSourceCycle(deps);
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+  assert.equal(deps.getRemote().length, 5);
+  assert.ok(Object.values(deps.getState().dnsGuards[0].poolOrigins).every((id) => id === 'available'));
+  assert.equal(deps.getState().ipPools.find((pool) => pool.id === 'disabled').assetIds.length, 5);
+});
+
+test('all-empty pools settle immediately and refill only the real deficit when stock is added', async () => {
+  for (const remote of [[], ['198.51.100.1']]) {
+    const deps = sourceGuardFixture(remote, { sources: [], currentValues: remote, poolIds: ['a', 'b', 'c', 'd'],
+      poolSelectionMode: 'balanced', poolFillMode: 'fill', poolTargetCount: 5 });
+    for (const id of ['a', 'b', 'c', 'd']) addFillStock(deps, 0, 1, id);
+    await nextSourceCycle(deps);
+    const guard = deps.getState().dnsGuards[0];
+    assert.equal(guard.cycle, null);
+    assert.equal(guard.status, remote.length ? 'degraded' : 'waiting_ip');
+    assert.deepEqual(deps.getRemote(), remote);
+    assert.ok(Date.parse(guard.nextCheckAt) > Date.now(), 'empty inventory retries on the interval, not a busy loop');
+    assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['a'] }), 0);
+    addFillStock(deps, 2, 1, 'a');
+    assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['a'] }), 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    await finishGuardChecks(deps);
+    assert.equal(deps.getRemote().length, remote.length + 2);
+    assert.equal(deps.getState().dnsGuards[0].cycle, null);
+    assert.equal(deps.getState().dnsGuards[0].repairTargetCount, 5);
+    addFillStock(deps, 5, 40, 'b');
+    assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['b'] }), 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    await finishGuardChecks(deps);
+    assert.equal(deps.getRemote().length, 5);
+    assert.equal(deps.getState().dnsGuards[0].repairTargetCount, 0);
+    assert.equal(deps.getState().ipAssets.length, remote.length + 2);
+  }
+});
+
+test('a smaller pool whose candidates all fail falls back to healthy stock in a larger pool', async () => {
+  const deps = sourceGuardFixture(['198.51.100.1'], { sources: [], currentValues: ['198.51.100.1'],
+    poolOrigins: { '198.51.100.1': 'b' }, poolIds: ['a', 'b', 'empty'],
+    poolSelectionMode: 'balanced', poolFillMode: 'fill', poolTargetCount: 4, maxParallel: 2 });
+  addFillStock(deps, 4, 1, 'a'); addFillStock(deps, 4, 40, 'b'); addFillStock(deps, 0, 80, 'empty');
+  await nextSourceCycle(deps, (address) => !['203.0.113.1', '203.0.113.2', '203.0.113.3', '203.0.113.4'].includes(address));
+  assert.equal(deps.getRemote().length, 4);
+  assert.ok(Object.values(deps.getState().dnsGuards[0].poolOrigins).every((poolId) => poolId === 'b'));
+  assert.equal(deps.getState().ipUsageRecords.filter((item) => item.status === 'consumed').length, 3);
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+});
+
+test('a replenished pool catches up on future deficits without replacing healthy IPs just for balance', async () => {
+  const deps = sourceGuardFixture([], { sources: [], poolIds: ['a', 'b', 'c', 'd'],
+    poolSelectionMode: 'balanced', poolFillMode: 'fill', poolTargetCount: 8 });
+  addFillStock(deps, 0, 1, 'a');
+  for (const [id, start] of [['b', 40], ['c', 80], ['d', 120]]) addFillStock(deps, 5, start, id);
+  await nextSourceCycle(deps);
+  const before = [...deps.getRemote()];
+  addFillStock(deps, 5, 1, 'a');
+  assert.equal(requestWaitingDnsGuardChecks(deps, { poolIds: ['a'] }), 0, 'no extra rebalance check for a full healthy domain');
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.getRemote(), before);
+  const failed = new Set(['b', 'c'].map((id) => Object.entries(deps.getState().dnsGuards[0].poolOrigins).find(([, poolId]) => poolId === id)[0]));
+  await nextSourceCycle(deps, (address) => !failed.has(address));
+  const origins = Object.values(deps.getState().dnsGuards[0].poolOrigins);
+  assert.deepEqual(['a', 'b', 'c', 'd'].map((id) => origins.filter((poolId) => poolId === id).length), [2, 2, 2, 2]);
 });
 
 test('balanced fill consumes ten IPs as four three three without changing existing healthy records', async () => {
@@ -415,6 +1015,9 @@ test('fill configuration defaults safely, validates the target and clears obsole
   assert.equal(legacy.poolFillMode, 'repair');
   assert.equal(legacy.poolTargetCount, 20);
   assert.equal(legacy.poolSelectionMode, 'ordered');
+  assert.equal(legacy.poolRebalanceEnabled, false);
+  assert.equal(legacy.poolRebalanceIntervalMinutes, 30);
+  assert.equal(legacy.poolRebalanceNextAt, '');
   assert.equal(legacy.poolBalanceNextId, '');
   const deps = sourceGuardFixture(undefined, { sources: [], maxActiveIps: 20 });
   deps.sanitizeState = (state) => state;
@@ -437,11 +1040,19 @@ test('fill configuration defaults safely, validates the target and clears obsole
   addFillStock(deps, 2, 1, 'a'); addFillStock(deps, 2, 40, 'b');
   const balanced = await save({ poolIds: ['a', 'b'], poolSelectionMode: 'balanced', poolBalanceNextId: 'forged' });
   assert.equal(balanced.poolSelectionMode, 'balanced');
+  assert.equal(balanced.poolRebalanceEnabled, false);
+  assert.equal((await save({ poolRebalanceEnabled: true })).poolRebalanceEnabled, true);
+  assert.equal((await save({ name: 'rebalance preserved', poolRebalanceEnabled: undefined })).poolRebalanceEnabled, true);
   assert.equal(balanced.poolBalanceNextId, '', 'the client cannot choose the runtime cursor');
   deps.getState().dnsGuards[0].poolBalanceNextId = 'b';
   assert.equal((await save({ name: 'rename again', poolSelectionMode: undefined, poolBalanceNextId: 'a' })).poolBalanceNextId, 'b');
   assert.equal((await save({ poolIds: ['a'] })).poolBalanceNextId, '', 'removing the next pool resets its cursor');
   assert.equal((await save({ poolSelectionMode: 'ordered' })).poolBalanceNextId, '');
+  assert.equal(deps.getState().dnsGuards[0].poolRebalanceEnabled, false);
+  deps.getState().dnsGuards[0].currentValues = ['198.51.100.1'];
+  deps.getState().dnsGuards[0].poolOrigins = { '198.51.100.1': 'a' };
+  assert.deepEqual((await save({ poolOrigins: { '198.51.100.1': 'forged' } })).poolOrigins, { '198.51.100.1': 'a' });
+  assert.deepEqual((await save({ domain: 'changed.example.com' })).poolOrigins, {});
 });
 
 test('shared pool candidates are reserved across concurrent guards and released after completion', async () => {
@@ -1790,6 +2401,11 @@ test('sends DNS guard checks before ordinary probe targets', () => {
   assert.equal(response.version, version);
   assert.equal(response.unchanged, true);
   assert.equal(response.targets, undefined);
+
+  state.dnsGuards[0].cycle.finalResults = { '198.51.100.10': { ok: true } };
+  routes.get('GET /probe/config')({ headers: { 'x-probe-id': 'probe-1', authorization: `Bearer ${secret}` }, query: {} },
+    { json: (value) => { response = value; } });
+  assert.deepEqual(response.targets.map((target) => target.id), ['target-1'], 'DNS confirmations do not keep unused probe checks alive');
 });
 
 test('routes probe report follow-up work only to the matching subsystem', () => {
@@ -1835,6 +2451,15 @@ test('routes probe report follow-up work only to the matching subsystem', () => 
 
   report({ headers, body: { version: '1.4.5', results: [{ targetId: 'target-1', ...result }] } }, response);
   assert.deepEqual([guardFollowUps, targetFollowUps], [1, 1]);
+
+  const guard = state.dnsGuards[0];
+  guard.cycle.finalResults = { '198.51.100.10': { ok: true } };
+  guard.message = '正在确认自动均衡写入结果，旧 IP 尚未退池';
+  const before = structuredClone(guard.cycle.checks);
+  report({ headers, body: { results: [{ targetId: 'guard-check-1', ...result, ok: false }] } }, response);
+  assert.deepEqual([guardFollowUps, targetFollowUps], [1, 1], 'late reports must not restart settled provider work');
+  assert.deepEqual(guard.cycle.checks, before);
+  assert.equal(guard.message, '正在确认自动均衡写入结果，旧 IP 尚未退池');
 });
 
 test('skips redundant probe heartbeat state writes', () => {

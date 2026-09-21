@@ -6,7 +6,7 @@ export const HISTORY_LABELS = {
 };
 
 const STATUS = { running: '执行中', queued: '等待执行', paused: '已暂停', awaiting_input: '等待输入', done: '已完成',
-  healthy: '正常', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_ip: '等待备用 IP', processing: '处理中', succeeded: '已完成', cancelled: '已结束' };
+  healthy: '正常', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_ip: '等待备用 IP', processing: '处理中', succeeded: '已完成', cancelled: '已结束', returned: '已退回原池' };
 
 // Load only while this record dialog is open, with bounded pages and no
 // background polling. Do not overwrite the guard workspace's latest-run cache.

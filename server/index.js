@@ -2038,7 +2038,7 @@ function readProbeState() {
       interval: target.interval,
       checkNowAt: target.checkNowAt
     })),
-    dnsGuards: (cachedState.dnsGuards || []).map((guard) => ({
+    dnsGuards: (cachedState.dnsGuards || []).filter((guard) => guard.enabled !== false && guard.cycle && !guard.cycle.finalResults).map((guard) => ({
       id: guard.id,
       enabled: guard.enabled,
       status: guard.status,

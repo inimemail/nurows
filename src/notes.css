@@ -14,6 +14,33 @@
   padding: 0;
   background: var(--page-bg);
 }
+/* Note dialogs are portaled to body, outside the fullscreen stacking context. */
+.dialog-backdrop:has(> .note-dialog) {
+  z-index: 60;
+}
+body:has(.notes-fullscreen, .note-dialog) .toast-stack {
+  z-index: 70;
+}
+.notes-fullscreen > .notes-layout {
+  flex: 1 1 0;
+  min-height: 0;
+}
+.notes-fullscreen .notes-editor {
+  min-height: 0;
+}
+.notes-fullscreen .note-writing-layout {
+  display: flex;
+  min-height: 0;
+}
+.notes-fullscreen .note-writing-scroll {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.notes-fullscreen .notes-empty {
+  min-height: 0;
+  overflow: auto;
+}
 .notes-layout.notes-sidebar-hidden {
   grid-template-columns: minmax(0, 1fr);
 }
@@ -364,6 +391,10 @@
   padding: 7px;
   cursor: pointer;
   white-space: nowrap;
+}
+.note-delete-title {
+  overflow-wrap: anywhere;
+  font-weight: 600;
 }
 .note-row-order > div {
   position: absolute;
@@ -1074,6 +1105,26 @@
   }
 }
 @media (max-width: 760px) {
+  body:has(.notes-workspace) .toast-stack {
+    transform: none;
+  }
+  .notes-workspace.notes-fullscreen {
+    inset: 0;
+    height: 100dvh;
+    gap: 6px;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  .notes-fullscreen > .notes-header {
+    padding: 10px 12px;
+    gap: 8px;
+    border-radius: 0;
+  }
+  .notes-fullscreen > .notes-layout {
+    border-radius: 0;
+  }
+  .notes-sidebar-hidden > .notes-sidebar {
+    display: flex;
+  }
   .notes-workspace {
     height: auto;
     min-height: calc(100dvh - 220px);

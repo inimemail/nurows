@@ -962,6 +962,8 @@ svg {
 .ops-multi-head > span { color: var(--text-muted); font-size: 10px; }
 .ops-multi-tools { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 7px; }
 .ops-multi-tools .ghost { min-height: 38px; padding: 8px 11px; }
+.ops-pool-cleanup { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
+.ops-pool-cleanup button { min-height: 44px; max-width: 100%; white-space: normal; }
 .ops-multi-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; max-height: 220px; overflow: auto; padding: 8px; border: 1px solid var(--border-card); border-radius: 10px; background: color-mix(in srgb, var(--card-bg) 65%, transparent); }
 .ops-multi label { display: flex; align-items: flex-start; gap: 7px; min-width: 0; padding: 7px; border-radius: 8px; color: var(--text-main); font-size: 11px; cursor: pointer; }
 .ops-multi label:hover { background: var(--card-hover); }

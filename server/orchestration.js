@@ -477,6 +477,35 @@ export function registerOrchestrationRoutes(app, deps) {
     res.json({ ok: true, ...result, state: deps.sanitizeState(state, req.auth) });
   });
 
+  app.post('/api/ip-pools/:id/delete-unused', asyncRoute(async (req, res) => {
+    if (req.body?.confirm !== 'delete-unused-pool-assets' || !Array.isArray(req.body.assetIds)
+      || req.body.assetIds.some((id) => typeof id !== 'string' || !id || id.length > 200)) {
+      return res.status(400).json({ error: '请确认删除范围后重试' });
+    }
+    const requested = new Set(req.body.assetIds);
+    let result;
+    const state = deps.updateState((draft) => {
+      const pool = draft.ipPools.find((item) => item.id === req.params.id);
+      if (!pool) throw new Error('备用池不存在，请刷新列表');
+      const members = new Set(pool.assetIds || []);
+      const { ids, addresses } = protectedIpAssets(draft);
+      const deleted = new Set();
+      let occupiedCount = 0;
+      for (const asset of draft.ipAssets) {
+        if (!requested.has(asset.id) || !members.has(asset.id)) continue;
+        if (ids.has(asset.id) || addresses.has(asset.address)) occupiedCount++;
+        else deleted.add(asset.id);
+      }
+      removeIpAssets(draft, deleted);
+      result = { deletedCount: deleted.size, skippedCount: requested.size - deleted.size, occupiedCount,
+        changedCount: requested.size - deleted.size - occupiedCount, remainingCount: (pool.assetIds || []).length };
+      pushAudit(draft, 'ipPools.delete_unused', 'ipPools', pool.id,
+        `删除空闲 IP ${result.deletedCount} 个，跳过 ${result.skippedCount} 个，池内剩余 ${result.remainingCount} 个`, req.auth.username);
+      return draft;
+    });
+    res.json({ ok: true, ...result, state: deps.sanitizeState(state, req.auth) });
+  }));
+
   app.post('/api/dns-sources/resolve', asyncRoute(async (req, res) => {
     const domain = normalizeDomain(req.body.domain);
     const recordType = req.body.recordType === 'AAAA' ? 'AAAA' : 'A';
@@ -2882,29 +2911,56 @@ function ensureResourceReferences(state, key, item, deps) {
   }
 }
 
-function deleteUnusedIpAsset(state, id) {
-  const asset = state.ipAssets.find((item) => item.id === id);
-  if (!asset) throw new Error('IP 资产不存在，请刷新列表');
+function protectedIpAssets(state) {
+  const ids = new Set(), addresses = new Set(), now = Date.now();
   const activeIncidents = new Set((state.incidents || [])
     .filter((item) => item.executionId || ['allocating', 'automating', 'dns_updating', 'verifying', 'stabilizing', 'rolling_back'].includes(item.status))
     .map((item) => item.id));
-  const leased = (state.ipLeases || []).some((lease) => lease.assetId === id && ['locked', 'active'].includes(lease.status)
-    && (activeIncidents.has(lease.incidentId) || !Number.isFinite(Date.parse(lease.expiresAt)) || Date.parse(lease.expiresAt) > Date.now()));
-  const allocated = (state.incidents || []).some((item) => activeIncidents.has(item.id) && item.allocatedIps?.includes(asset.address));
-  const selectedByGuard = (state.dnsGuards || []).some((guard) =>
-    guard.cycle?.candidateAssets?.some((candidate) => candidate.assetId === id || candidate.address === asset.address));
-  const inDns = [...(state.dnsGuards || []), ...(state.dnsBindings || [])]
-    .some((item) => item.currentValues?.includes(asset.address));
-  if (leased || allocated || selectedByGuard || inDns) throw new Error('该 IP 正在使用或被任务占用，暂时不能删除');
+  for (const lease of state.ipLeases || []) {
+    const expiry = Date.parse(lease.expiresAt);
+    if (['locked', 'active'].includes(lease.status)
+      && (activeIncidents.has(lease.incidentId) || !Number.isFinite(expiry) || expiry > now)) ids.add(lease.assetId);
+  }
+  for (const item of state.incidents || []) {
+    if (activeIncidents.has(item.id)) for (const address of item.allocatedIps || []) addresses.add(address);
+  }
+  for (const guard of state.dnsGuards || []) {
+    const cycle = guard.cycle;
+    for (const candidate of cycle?.candidateAssets || []) {
+      ids.add(candidate.assetId);
+      addresses.add(candidate.address);
+    }
+    for (const address of [...(guard.currentValues || []), ...(cycle?.remoteValues || []), ...(cycle?.rebalanceCommit?.desired || [])]) addresses.add(address);
+    for (const candidate of [...(cycle?.rebalanceCommit?.usedAssets || []), ...(cycle?.rebalanceCommit?.returnedAssets || [])]) {
+      ids.add(candidate.assetId);
+      addresses.add(candidate.address);
+    }
+  }
+  for (const binding of state.dnsBindings || []) {
+    for (const address of [...(binding.currentValues || []), ...(binding.managedValues || []), ...(binding.backupIps || [])]) addresses.add(address);
+  }
+  return { ids, addresses };
+}
 
-  state.ipAssets = state.ipAssets.filter((item) => item.id !== id);
+function removeIpAssets(state, ids) {
+  if (!ids.size) return;
+  state.ipAssets = state.ipAssets.filter((item) => !ids.has(item.id));
   for (const pool of state.ipPools) {
-    if (pool.assetIds?.includes(id)) {
-      pool.assetIds = pool.assetIds.filter((assetId) => assetId !== id);
+    const remaining = (pool.assetIds || []).filter((id) => !ids.has(id));
+    if (remaining.length !== (pool.assetIds || []).length) {
+      pool.assetIds = remaining;
       pool.updatedAt = nowIso();
     }
   }
-  state.ipLeases = (state.ipLeases || []).filter((lease) => lease.assetId !== id);
+  state.ipLeases = (state.ipLeases || []).filter((lease) => !ids.has(lease.assetId));
+}
+
+function deleteUnusedIpAsset(state, id) {
+  const asset = state.ipAssets.find((item) => item.id === id);
+  if (!asset) throw new Error('IP 资产不存在，请刷新列表');
+  const { ids, addresses } = protectedIpAssets(state);
+  if (ids.has(id) || addresses.has(asset.address)) throw new Error('该 IP 正在使用或被任务占用，暂时不能删除');
+  removeIpAssets(state, new Set([id]));
 }
 
 function ensureNotReferenced(state, key, id) {

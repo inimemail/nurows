@@ -27,6 +27,21 @@ test("notes are row-based, paginated and exclude body from listings", (t) => {
   assert.equal(second.documents.length, 5);
   assert.ok(first.documents.every((d) => !Object.hasOwn(d, "body")));
 });
+test("directory metadata supports safe trash without loading the body and rejects stale deletions", (t) => {
+  const { store, book } = fixture(t);
+  const active = store.create({ title: "正在编辑", body: "<p>保留正文</p>" }).document;
+  const target = store.create({ title: "待删除" }).document;
+  const row = store.list({ notebookId: book }).documents.find(d => d.id === target.id);
+  assert.equal(row.body, undefined);
+  const newer = store.save({ ...target, title: "已被其他页面修改" }).document;
+  assert.throws(() => store.trash(row), error => error.statusCode === 409);
+  const fresh = store.list({ notebookId: book }).documents.find(d => d.id === newer.id);
+  store.trash(fresh);
+  assert.equal(store.get(active).document.body, active.body);
+  assert.equal(store.list({ view: "trash" }).documents[0].id, target.id);
+  assert.equal(store.restore(target).document.title, newer.title);
+});
+
 test("Chinese body search supports two-character fallback and indexed substrings", (t) => {
   const { store, book } = fixture(t);
   let d = store.create({

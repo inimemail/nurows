@@ -691,7 +691,9 @@ export default function NotesWorkspace({
               {search ? "搜索结果" : parents.at(-1)?.title || "文档目录"}
             </span>
             <small>{listing.total} 篇</small>
-            {view === "all" && !search ? (
+            {view === "all" &&
+            !search &&
+            listing.documents.some((item) => item.hasChildren) ? (
               <button
                 className="icon-button"
                 title="收起所有子文档"
@@ -726,6 +728,7 @@ export default function NotesWorkspace({
                 onOpen={open}
                 onCreate={(item) => create("blank", { parentId: item.id })}
                 onPlace={place}
+                onDelete={(item) => setDialog({ type: "delete", item })}
                 collapseKey={collapseKey}
               />
             ) : (
@@ -821,6 +824,32 @@ export default function NotesWorkspace({
                         </button>
                       </details>
                     </>
+                  ) : null}
+                  {view !== "trash" ? (
+                    <details className="note-row-order">
+                      <summary aria-label={`${item.title} 的目录操作`}>
+                        <MoreHorizontal />
+                      </summary>
+                      <div>
+                        <button
+                          className="danger-text-button"
+                          disabled={busy}
+                          onClick={(event) => {
+                            event.currentTarget.closest("details").open = false;
+                            setDialog({
+                              type: "delete",
+                              item:
+                                manager.get()?.id === item.id
+                                  ? manager.get()
+                                  : item,
+                            });
+                          }}
+                        >
+                          <Trash2 />
+                          移入回收站
+                        </button>
+                      </div>
+                    </details>
                   ) : null}
                 </div>
               ))
@@ -1054,7 +1083,9 @@ export default function NotesWorkspace({
                     </button>
                     <button
                       className="danger-text-button"
-                      onClick={() => setDialog({ type: "delete" })}
+                      onClick={() =>
+                        setDialog({ type: "delete", item: manager.get() })
+                      }
                     >
                       <Trash2 />
                       移入回收站
@@ -1293,6 +1324,7 @@ export default function NotesWorkspace({
           ) : null}
           {dialog.type === "delete" ? (
             <>
+              <p className="note-delete-title">{dialog.item.title}</p>
               <p>
                 文档将保留在回收站 30 天，期间可以恢复。历史版本和附件一并保留。
               </p>
@@ -1305,13 +1337,14 @@ export default function NotesWorkspace({
                   disabled={busy}
                   onClick={() =>
                     act(async () => {
-                      await manager.flush();
-                      const value = manager.get();
+                      const isCurrent = manager.get()?.id === dialog.item.id;
+                      if (isCurrent) await manager.flush();
+                      const value = isCurrent ? manager.get() : dialog.item;
                       await api(`/api/notes/documents/${value.id}`, {
                         method: "DELETE",
                         body: JSON.stringify({ revision: value.revision }),
                       });
-                      manager.open(null);
+                      if (isCurrent) manager.open(null);
                       setDialog(null);
                       refresh();
                     })

@@ -7,6 +7,7 @@ import {
   MoreHorizontal,
   Plus,
   Star,
+  Trash2,
 } from "lucide-react";
 
 // Children are fetched only for expanded branches, 50 at a time, with no polling.
@@ -20,6 +21,7 @@ export default function NoteTree({
   onOpen,
   onCreate,
   onPlace,
+  onDelete,
   collapseKey = 0,
   depth = 0,
 }) {
@@ -40,6 +42,7 @@ export default function NoteTree({
             onOpen,
             onCreate,
             onPlace,
+            onDelete,
             collapseKey,
             depth,
           }}
@@ -61,6 +64,7 @@ function NoteTreeItem(props) {
     onOpen,
     onCreate,
     onPlace,
+    onDelete,
     collapseKey,
     depth,
   } = props;
@@ -189,6 +193,14 @@ function NoteTreeItem(props) {
             >
               <ArrowDown />
               下移
+            </button>
+            <button
+              className="danger-text-button"
+              disabled={busy}
+              onClick={() => onDelete(selected ? { ...item, ...active } : item)}
+            >
+              <Trash2 />
+              移入回收站
             </button>
           </div>
         </details>

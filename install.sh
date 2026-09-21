@@ -47,6 +47,96 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "缺少依赖：$1"
 }
 
+ensure_host_dependencies() {
+  local scope="${1:-basic}" command_name
+  local need_python=0 need_flock=0 need_curl=0 need_tar=0 need_gzip=0 need_crontab=0
+  if [[ "${scope}" == basic || "${scope}" == backup || "${scope}" == cron ]]; then
+    command -v curl >/dev/null 2>&1 || need_curl=1
+    command -v tar >/dev/null 2>&1 || need_tar=1
+    command -v gzip >/dev/null 2>&1 || need_gzip=1
+  fi
+  if [[ "${scope}" == backup || "${scope}" == cron ]]; then
+    command -v python3 >/dev/null 2>&1 && python3 -c 'import sqlite3' >/dev/null 2>&1 || need_python=1
+    command -v flock >/dev/null 2>&1 || need_flock=1
+  fi
+  if [[ "${scope}" == cron ]]; then
+    command -v crontab >/dev/null 2>&1 || need_crontab=1
+  fi
+  if (( !need_python && !need_flock && !need_curl && !need_tar && !need_gzip && !need_crontab )); then
+    return 0
+  fi
+
+  local manager="" packages=()
+  if command -v apt-get >/dev/null 2>&1; then
+    manager=apt
+    (( need_python )) && packages+=(python3)
+    (( need_flock )) && packages+=(util-linux)
+    (( need_curl )) && packages+=(curl)
+    (( need_tar )) && packages+=(tar)
+    (( need_gzip )) && packages+=(gzip)
+    (( need_crontab )) && packages+=(cron)
+  elif command -v dnf >/dev/null 2>&1; then
+    manager=dnf
+    (( need_python )) && packages+=(python3)
+    (( need_flock )) && packages+=(util-linux)
+    (( need_curl )) && packages+=(curl)
+    (( need_tar )) && packages+=(tar)
+    (( need_gzip )) && packages+=(gzip)
+    (( need_crontab )) && packages+=(cronie)
+  elif command -v yum >/dev/null 2>&1; then
+    manager=yum
+    (( need_python )) && packages+=(python3)
+    (( need_flock )) && packages+=(util-linux)
+    (( need_curl )) && packages+=(curl)
+    (( need_tar )) && packages+=(tar)
+    (( need_gzip )) && packages+=(gzip)
+    (( need_crontab )) && packages+=(cronie)
+  elif command -v apk >/dev/null 2>&1; then
+    manager=apk
+    (( need_python )) && packages+=(python3)
+    (( need_flock )) && packages+=(util-linux)
+    (( need_curl )) && packages+=(curl)
+    (( need_tar )) && packages+=(tar)
+    (( need_gzip )) && packages+=(gzip)
+    (( need_crontab )) && packages+=(dcron)
+  elif command -v zypper >/dev/null 2>&1; then
+    manager=zypper
+    (( need_python )) && packages+=(python3)
+    (( need_flock )) && packages+=(util-linux)
+    (( need_curl )) && packages+=(curl)
+    (( need_tar )) && packages+=(tar)
+    (( need_gzip )) && packages+=(gzip)
+    (( need_crontab )) && packages+=(cron)
+  else
+    die "缺少系统依赖，且未找到 apt/dnf/yum/apk/zypper，无法自动安装。"
+  fi
+
+  info "检测到缺少系统依赖，准备自动安装：${packages[*]}"
+  case "${manager}" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends "${packages[@]}"
+      ;;
+    dnf) dnf install -y "${packages[@]}" ;;
+    yum) yum install -y "${packages[@]}" ;;
+    apk) apk add --no-cache "${packages[@]}" ;;
+    zypper) zypper --non-interactive install --no-recommends "${packages[@]}" ;;
+  esac
+
+  (( need_python )) && { command -v python3 >/dev/null 2>&1 && python3 -c 'import sqlite3' >/dev/null 2>&1; } || true
+  for command_name in curl tar gzip; do
+    if [[ "${scope}" == basic || "${scope}" == backup || "${scope}" == cron ]] && ! command -v "${command_name}" >/dev/null 2>&1; then
+      die "自动安装后仍缺少依赖：${command_name}"
+    fi
+  done
+  if [[ "${scope}" == backup || "${scope}" == cron ]]; then
+    command -v flock >/dev/null 2>&1 || die "自动安装后仍缺少依赖：flock"
+    command -v python3 >/dev/null 2>&1 && python3 -c 'import sqlite3' >/dev/null 2>&1 || die "自动安装后 Python 缺少 sqlite3 模块"
+  fi
+  [[ "${scope}" != cron || -x "$(command -v crontab 2>/dev/null || true)" ]] || die "自动安装后仍缺少依赖：crontab"
+}
+
 require_docker() {
   require_cmd docker
   docker info >/dev/null 2>&1 || die "Docker 未启动，或当前环境无法访问 Docker。"
@@ -85,8 +175,7 @@ read_env_value() {
 }
 
 download_bundle() {
-  require_cmd curl
-  require_cmd tar
+  ensure_host_dependencies basic
 
   TEMP_BUNDLE_ROOT="$(mktemp -d)"
   local archive_path="${TEMP_BUNDLE_ROOT}/${APP_NAME}.tar.gz"
@@ -308,7 +397,7 @@ print_access_info() {
 deploy_service() {
   require_docker
   require_compose
-  require_cmd tar
+  ensure_host_dependencies basic
 
   local bundle_dir install_path input_path input_port port
 
@@ -365,7 +454,7 @@ wait_service_ready() {
 upgrade_service() {
   require_docker
   require_compose
-  require_cmd tar
+  ensure_host_dependencies backup
 
   local workdir bundle_dir
   workdir="$(get_workdir)"
@@ -480,8 +569,7 @@ backup_service() (
   umask 077
   require_docker
   require_compose
-  require_cmd python3
-  require_cmd flock
+  ensure_host_dependencies backup
   local workdir helper archive_helper stage snapshot timestamp db_path backup_file
   workdir="$(get_workdir)"
   [[ -n "${workdir}" ]] || die "未检测到已部署实例。"
@@ -530,7 +618,7 @@ restore_service() (
   umask 077
   require_docker
   require_compose
-  require_cmd python3
+  ensure_host_dependencies backup
   local backup_path target_dir input_path archive_root previous_dir helper confirm_restore
   read -r -p "备份压缩包路径: " backup_path
   [[ -f "${backup_path}" ]] || die "未找到备份文件。"
@@ -583,7 +671,7 @@ restore_backup() {
 }
 
 setup_auto_backup() {
-  require_cmd crontab
+  ensure_host_dependencies cron
 
   local workdir
   workdir="$(get_workdir)"

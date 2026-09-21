@@ -26,9 +26,14 @@ import {
   ArrowUp,
   ArrowDown,
   Paperclip,
+  Maximize2,
+  Minimize2,
+  ChevronsDownUp,
 } from "lucide-react";
 import { createNoteAutosave } from "../shared/note-autosave.js";
 import NoteEditor from "./NoteEditor.jsx";
+import NoteTree from "./NoteTree.jsx";
+import NoteOutline from "./NoteOutline.jsx";
 import { copyNoteText } from "./note-clipboard.js";
 import Dialog from "./Dialog.jsx";
 import "./notes.css";
@@ -112,6 +117,34 @@ export default function NotesWorkspace({
     [version, setVersion] = useState(null),
     [attachments, setAttachments] = useState([]);
   const [tagText, setTagText] = useState("");
+  const [fullscreen, setFullscreen] = useState(false);
+  const [sidebarHidden, setSidebarHidden] = useState(false);
+  const [collapseKey, setCollapseKey] = useState(0);
+  const workspace = useRef(null);
+  useEffect(() => {
+    if (!fullscreen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [fullscreen]);
+  useEffect(() => {
+    const keydown = (event) => {
+      if (
+        event.key !== "Escape" ||
+        event.defaultPrevented ||
+        document.querySelector('.dialog[aria-modal="true"]')
+      )
+        return;
+      if (drawer) setDrawer(false);
+      else if (outlineOpen && matchMedia("(max-width: 760px)").matches)
+        setOutlineOpen(false);
+      else setFullscreen(false);
+    };
+    window.addEventListener("keydown", keydown);
+    return () => window.removeEventListener("keydown", keydown);
+  }, [drawer, outlineOpen]);
   const mounted = useRef(true),
     editor = useRef(null),
     importInput = useRef(null),
@@ -540,7 +573,11 @@ export default function NotesWorkspace({
   }
   const currentBook = books.find((b) => b.id === book);
   return (
-    <section className="notes-workspace" aria-label="笔记工作台">
+    <section
+      ref={workspace}
+      className={`notes-workspace ${fullscreen ? "notes-fullscreen" : ""}`}
+      aria-label="笔记工作台"
+    >
       <header className="notes-header">
         <div className="notes-heading">
           <span className="notes-mark">
@@ -587,7 +624,9 @@ export default function NotesWorkspace({
           </button>
         </div>
       ) : null}
-      <div className="notes-layout">
+      <div
+        className={`notes-layout ${sidebarHidden ? "notes-sidebar-hidden" : ""}`}
+      >
         <aside className={"notes-sidebar " + (drawer ? "open" : "")}>
           <div className="notes-sidebar-head">
             <strong>我的知识库</strong>
@@ -652,6 +691,16 @@ export default function NotesWorkspace({
               {search ? "搜索结果" : parents.at(-1)?.title || "文档目录"}
             </span>
             <small>{listing.total} 篇</small>
+            {view === "all" && !search ? (
+              <button
+                className="icon-button"
+                title="收起所有子文档"
+                aria-label="收起所有子文档"
+                onClick={() => setCollapseKey((n) => n + 1)}
+              >
+                <ChevronsDownUp />
+              </button>
+            ) : null}
           </div>
           {parents.length ? (
             <button
@@ -663,8 +712,22 @@ export default function NotesWorkspace({
             </button>
           ) : null}
           <div className="notes-doc-list">
-            {loading ? (
+            {loading && !listing.documents.length ? (
               <p className="notes-list-empty">正在读取…</p>
+            ) : view === "all" && !search ? (
+              <NoteTree
+                key={`${book}:${parents.at(-1)?.id || "root"}:${page}`}
+                items={listing.documents}
+                api={api}
+                book={book}
+                revision={revision}
+                active={doc}
+                busy={busy || loading}
+                onOpen={open}
+                onCreate={(item) => create("blank", { parentId: item.id })}
+                onPlace={place}
+                collapseKey={collapseKey}
+              />
             ) : (
               listing.documents.map((item) => (
                 <div
@@ -827,10 +890,19 @@ export default function NotesWorkspace({
         <main className="notes-editor">
           <div className="notes-editor-meta">
             <button
-              className="note-mobile icon-button"
+              className="icon-button"
               title="文档目录"
               aria-label="文档目录"
-              onClick={() => setDrawer(true)}
+              aria-expanded={
+                matchMedia("(max-width: 760px)").matches
+                  ? drawer
+                  : !sidebarHidden
+              }
+              onClick={() =>
+                matchMedia("(max-width: 760px)").matches
+                  ? setDrawer((value) => !value)
+                  : setSidebarHidden((value) => !value)
+              }
             >
               <PanelLeft />
             </button>
@@ -991,6 +1063,15 @@ export default function NotesWorkspace({
                 </details>
               </>
             ) : null}
+            <button
+              className="icon-button note-fullscreen-toggle"
+              title={fullscreen ? "退出全屏（Esc）" : "全屏笔记"}
+              aria-label={fullscreen ? "退出笔记全屏" : "全屏笔记"}
+              aria-pressed={fullscreen}
+              onClick={() => setFullscreen((value) => !value)}
+            >
+              {fullscreen ? <Minimize2 /> : <Maximize2 />}
+            </button>
           </div>
           {saveState.error ? (
             <div className="note-error" role="alert">
@@ -1051,38 +1132,34 @@ export default function NotesWorkspace({
                 </div>
               </div>
               {outlineOpen ? (
-                <aside className="note-outline">
-                  <div>
-                    <strong>文档大纲</strong>
-                    <button
-                      className="icon-button"
-                      aria-label="关闭大纲"
-                      onClick={() => setOutlineOpen(false)}
-                    >
-                      <X />
-                    </button>
-                  </div>
-                  {outline.length ? (
-                    outline.map((h, i) => (
-                      <button
-                        key={i}
-                        style={{ paddingLeft: 12 + (h.level - 1) * 12 }}
-                        onClick={() =>
-                          editor.current
-                            ?.chain()
-                            .focus()
-                            .setTextSelection(h.pos + 1)
-                            .scrollIntoView()
-                            .run()
-                        }
-                      >
-                        {h.text || "未命名标题"}
-                      </button>
-                    ))
-                  ) : (
-                    <p>添加标题后自动生成大纲</p>
-                  )}
-                </aside>
+                <NoteOutline
+                  key={`${doc.id}:${editorEpoch}`}
+                  headings={outline}
+                  onClose={() => setOutlineOpen(false)}
+                  onNavigate={(h) => {
+                    const instance = editor.current;
+                    if (!instance) return;
+                    const resolved = instance.state.doc.resolve(h.pos + 1);
+                    const chain = instance.chain().focus();
+                    for (let depth = 1; depth <= resolved.depth; depth++) {
+                      const node = resolved.node(depth);
+                      if (node.type.name === "details" && !node.attrs.open)
+                        chain.command(({ tr }) => {
+                          tr.setNodeMarkup(resolved.before(depth), undefined, {
+                            ...node.attrs,
+                            open: true,
+                          });
+                          return true;
+                        });
+                    }
+                    chain
+                      .setTextSelection(h.pos + 1)
+                      .scrollIntoView()
+                      .run();
+                    if (matchMedia("(max-width: 760px)").matches)
+                      setOutlineOpen(false);
+                  }}
+                />
               ) : null}
             </div>
           ) : (
@@ -1258,7 +1335,7 @@ export default function NotesWorkspace({
                   disabled={busy}
                   onClick={() => setDialog({ ...dialog, confirm: true })}
                 >
-                  {dialog.confirm ? "已确认，请点下方永久删除" : "永久删除…"}
+                  {dialog.confirm ? "已确认，请点永久删除" : "永久删除…"}
                 </button>
                 {dialog.confirm ? (
                   <button

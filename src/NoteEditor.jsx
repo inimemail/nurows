@@ -8,8 +8,8 @@ import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
 import CodeBlockLowlight from "@tiptap/extension-code-block-lowlight";
 import { common, createLowlight } from "lowlight";
-import { Node, mergeAttributes } from "@tiptap/core";
 import { copyNoteText } from "./note-clipboard.js";
+import { NoteDetails, NoteSummary } from "./note-details.js";
 import {
   Bold,
   Italic,
@@ -29,25 +29,6 @@ import {
 } from "lucide-react";
 
 const lowlight = createLowlight(common);
-const Details = Node.create({
-  name: "details",
-  group: "block",
-  content: "summary block+",
-  defining: true,
-  parseHTML: () => [{ tag: "details" }],
-  renderHTML: ({ HTMLAttributes }) => [
-    "details",
-    mergeAttributes(HTMLAttributes, { open: "" }),
-    0,
-  ],
-});
-const Summary = Node.create({
-  name: "summary",
-  content: "inline*",
-  defining: true,
-  parseHTML: () => [{ tag: "summary" }],
-  renderHTML: () => ["summary", 0],
-});
 const SafeImage = Image.extend({
   addAttributes() {
     return {
@@ -147,8 +128,8 @@ export default function NoteEditor({
       TaskList,
       TaskItem.configure({ nested: true }),
       CodeBlockLowlight.configure({ lowlight }),
-      Details,
-      Summary,
+      NoteDetails,
+      NoteSummary,
     ],
     content: doc.body,
     editable: !disabled,
@@ -240,8 +221,9 @@ export default function NoteEditor({
           aria-label="段落格式"
           disabled={disabled}
           value={
-            [1, 2, 3].find((level) => editor.isActive("heading", { level })) ||
-            0
+            [1, 2, 3, 4, 5, 6].find((level) =>
+              editor.isActive("heading", { level }),
+            ) || 0
           }
           onChange={(e) =>
             Number(e.target.value)
@@ -257,6 +239,9 @@ export default function NoteEditor({
           <option value="1">标题 1</option>
           <option value="2">标题 2</option>
           <option value="3">标题 3</option>
+          <option value="4">标题 4</option>
+          <option value="5">标题 5</option>
+          <option value="6">标题 6</option>
         </select>
         {actions.map(([label, Icon, action, active]) => (
           <button

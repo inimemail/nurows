@@ -209,14 +209,14 @@ test('management script creates a restorable archive and rolls back a failed res
   const db=new Database(path.join(deployment,'data/custom.db'));db.exec('CREATE TABLE app_kv(key TEXT PRIMARY KEY,value TEXT)');db.prepare('INSERT INTO app_kv VALUES(?,?)').run('auth','{"configured":false}');db.prepare('INSERT INTO app_kv VALUES(?,?)').run('state','{"servers":[{"name":"old-server"}]}');db.close();
   await fs.writeFile(path.join(deployment,'.env'),'PORT=12345\nSQLITE_DB_PATH=/app/data/custom.db\nCUSTOM=preserve\n');await fs.writeFile(path.join(deployment,'docker-compose.yml'),'services: {}');await fs.writeFile(path.join(deployment,'manage.sh'),'#!/bin/bash\n');await fs.writeFile(path.join(deployment,'app/package.json'),'{}');await fs.writeFile(path.join(deployment,'app/server/index.js'),'// fixture');
   const backupScript=`source "$1/install.sh"
-    require_docker(){ :; }; require_compose(){ :; }; require_cmd(){ command -v "$1" >/dev/null || [[ "$1" == flock ]]; }; flock(){ :; }
+    ensure_host_dependencies(){ :; }; require_docker(){ :; }; require_compose(){ :; }; require_cmd(){ command -v "$1" >/dev/null || [[ "$1" == flock ]]; }; flock(){ :; }
     get_workdir(){ printf '%s' "$fixture"; }
     compose_cmd(){ if [[ "$1" == ps ]]; then printf 'fixture'; else local dest; dest="$(basename "$8")"; (cd "$repo" && node --input-type=module - "$fixture/data" "$fixture/data/$dest" "$fixture/data/custom.db"); fi; }
     repo="$1"; fixture="$2"; backup_service "$repo"`;
   execFileSync('bash',['-c',backupScript,'test',root,deployment],{cwd:root,stdio:'pipe'});
   const archive=path.join(deployment,'backups',(await fs.readdir(path.join(deployment,'backups'))).find(n=>n.endsWith('.tar.gz')));assert.ok(archive);
   await fs.mkdir(path.join(target,'data'),{recursive:true});await fs.writeFile(path.join(target,'docker-compose.yml'),'services: {}');await fs.writeFile(path.join(target,'data/do-not-lose'),'current-data');await fs.writeFile(path.join(target,'data/custom.db-wal'),'stale-wal');
-  const restoreScript=`source "$1/install.sh"; require_docker(){ :; }; require_compose(){ :; }; ensure_data_permissions(){ :; }; compose_cmd(){ [[ "$1" != up || "$FAIL_RESTORE" != 1 ]]; }; wait_service_ready(){ :; }; print_access_info(){ :; }; STATE_FILE="$2/state"; restore_service`;
+  const restoreScript=`source "$1/install.sh"; ensure_host_dependencies(){ :; }; require_docker(){ :; }; require_compose(){ :; }; ensure_data_permissions(){ :; }; compose_cmd(){ [[ "$1" != up || "$FAIL_RESTORE" != 1 ]]; }; wait_service_ready(){ :; }; print_access_info(){ :; }; STATE_FILE="$2/state"; restore_service`;
   assert.throws(()=>execFileSync('bash',['-c',restoreScript,'test',root,tmp],{cwd:root,input:`${archive}\n${target}\ny\n`,env:{...process.env,FAIL_RESTORE:'1'},stdio:['pipe','pipe','pipe']}),/恢复失败/);
   assert.equal(await fs.readFile(path.join(target,'data/do-not-lose'),'utf8'),'current-data');
   execFileSync('bash',['-c',restoreScript,'test',root,tmp],{cwd:root,input:`${archive}\n${target}\ny\n`,env:{...process.env,FAIL_RESTORE:'0'},stdio:['pipe','pipe','pipe']});

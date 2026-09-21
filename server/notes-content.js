@@ -23,6 +23,8 @@ export function noteBody(value) {
       "h2",
       "h3",
       "h4",
+      "h5",
+      "h6",
       "blockquote",
       "pre",
       "code",
@@ -46,6 +48,7 @@ export function noteBody(value) {
       "summary",
     ],
     allowedAttributes: {
+      details: ["open"],
       a: ["href", "title", "target", "rel"],
       img: ["src", "alt", "title"],
       code: ["class"],
@@ -84,7 +87,7 @@ export function noteBody(value) {
 }
 export function bodyText(body) {
   return sanitizeHtml(
-    body.replace(/<\/(p|h[1-4]|li|tr|pre|blockquote)>/g, " </$1>"),
+    body.replace(/<\/(p|h[1-6]|li|tr|pre|blockquote)>/g, " </$1>"),
     { allowedTags: [], allowedAttributes: {} },
   )
     .replace(/&nbsp;/g, " ")

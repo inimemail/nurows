@@ -14,8 +14,15 @@ export const WORKSPACE_SEARCH = {
   bots: { key: 'telegramBots', placeholder: '搜索机器人名称、授权用户或群 ID', fields: ['name', 'userIds'] }
 };
 
-export function workspaceSearchPlaceholder(tab, section) {
+const COMPACT_SEARCH_LABELS = {
+  nodes: '搜索探针', targets: '搜索检查目标', guards: '搜索 DNS 守护', dynamic: '搜索动态守护',
+  policies: '搜索切换策略', incidents: '搜索故障事件', assets: '搜索 IP 资产', pools: '搜索备用池',
+  usage: '搜索使用记录', accounts: '搜索 DNS 账号', bindings: '搜索解析记录', changes: '搜索变更记录', bots: '搜索机器人'
+};
+
+export function workspaceSearchPlaceholder(tab, section, compact = false) {
   const defaults = { probes: 'nodes', pools: 'assets', dns: 'accounts', telegram: 'bots' };
+  if (compact && COMPACT_SEARCH_LABELS[section || defaults[tab]]) return COMPACT_SEARCH_LABELS[section || defaults[tab]];
   return WORKSPACE_SEARCH[section || defaults[tab]]?.placeholder || ({
     servers: '搜索服务器名称、IP', commands: '搜索命令名称', automation: '搜索自动化任务', proxies: '搜索代理名称、地址'
   })[tab] || '搜索当前列表';

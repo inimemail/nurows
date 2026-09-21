@@ -63,6 +63,34 @@ test('top-level defaults and every sub-menu have matching search hints', () => {
   for (const [section] of cases) assert.equal(search.workspaceSearchPlaceholder('probes', section), search.WORKSPACE_SEARCH[section].placeholder);
 });
 
+test('management search uses compact menu-specific labels without losing its complete search scope', () => {
+  const labels = new Set();
+  for (const [section] of cases) {
+    const compact = search.workspaceSearchPlaceholder('probes', section, true);
+    const full = search.workspaceSearchPlaceholder('probes', section);
+    assert.ok(compact.startsWith('搜索'));
+    assert.ok(compact.length <= 9, `${section}: label too long for the compact search input`);
+    assert.ok(full.length > compact.length);
+    labels.add(compact);
+  }
+  assert.equal(labels.size, cases.length);
+  for (const [tab, section] of [['probes', 'nodes'], ['pools', 'assets'], ['dns', 'accounts'], ['telegram', 'bots']]) {
+    assert.equal(search.workspaceSearchPlaceholder(tab, undefined, true), search.workspaceSearchPlaceholder(tab, section, true));
+  }
+  for (const tab of ['servers', 'commands', 'automation', 'proxies']) {
+    assert.equal(search.workspaceSearchPlaceholder(tab, undefined, true), search.workspaceSearchPlaceholder(tab));
+  }
+  const app = fs.readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
+  assert.match(app, /placeholder=\{compactSearchPlaceholder\} aria-label=\{searchPlaceholder\} title=\{searchPlaceholder\}/);
+});
+
+test('phone management search remains visible on a full-width row', () => {
+  const mobile = fs.readFileSync(new URL('../src/mobile.css', import.meta.url), 'utf8');
+  assert.match(mobile, /\.console-shell:has\(\.orchestration-layout\) \.top-actions \.search-shell\s*\{[^}]*flex: 1 1 100%/);
+  assert.doesNotMatch(mobile, /\.search-shell\s*\{[^}]*display:\s*none/);
+  assert.doesNotMatch(mobile, /\.console-shell:has\(\.orchestration-layout\) \.console-topbar\s*\{[^}]*grid-template-areas:\s*'brand' 'tabs'/);
+});
+
 const source = fs.readFileSync(new URL('../src/OrchestrationWorkspace.jsx', import.meta.url), 'utf8');
 const compiled = transformSync(`${source}\nexport { renderSection, DataView, UsageRecordsView };`, { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
 function harness() {

@@ -67,10 +67,8 @@
   .top-actions .search-shell { width: auto; flex: 1 1 130px; }
   .top-actions > .ghost:not(.theme-toggle):not(.user-pill) { min-height: 46px; padding: 10px 12px; }
   .top-actions .search-shell input { min-height: 46px; }
-  .console-shell:has(.orchestration-layout) .console-topbar { grid-template-areas: 'brand' 'tabs'; }
-  .console-shell:has(.orchestration-layout) .top-actions { display: contents; }
-  .console-shell:has(.orchestration-layout) .top-actions .mobile-only,
-  .console-shell:has(.orchestration-layout) .top-actions .search-shell { display: none; }
+  .console-shell:has(.orchestration-layout) .top-actions .mobile-only { display: none; }
+  .console-shell:has(.orchestration-layout) .top-actions .search-shell { width: 100%; flex: 1 1 100%; min-width: 0; }
   .top-tabs {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));

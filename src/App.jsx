@@ -932,6 +932,7 @@ export default function App() {
   const canRunCommand = !isCommandRunning && selectedServerIds.length > 0 && String(commandText || '').trim().length > 0;
   const workspaceFullscreenActive = Boolean(terminalFullscreenOpen && tab === 'servers' && activeTerminal);
   const searchPlaceholder = workspaceSearchPlaceholder(tab, workspaceSearchScope?.tab === tab ? workspaceSearchScope.section : undefined);
+  const compactSearchPlaceholder = workspaceSearchPlaceholder(tab, workspaceSearchScope?.tab === tab ? workspaceSearchScope.section : undefined, true);
 
   useEffect(() => {
     if (!activeTerminal) {
@@ -2365,7 +2366,7 @@ export default function App() {
         <div className="top-actions">
           <div className="search-shell">
             <SearchIcon />
-            <input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={searchPlaceholder} aria-label={searchPlaceholder} />
+            <input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={compactSearchPlaceholder} aria-label={searchPlaceholder} title={searchPlaceholder} />
           </div>
           <button
             className="ghost theme-toggle"

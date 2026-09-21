@@ -516,6 +516,9 @@ backup_service() (
   tar -cf - -C "${stage}" . | gzip -1 > "${backup_file}.partial"
   mv "${backup_file}.partial" "${backup_file}"
   info "一致性备份已创建：${backup_file}"
+  if ! python3 "${archive_helper}" prune "${workdir}/backups" "${backup_file##*/}"; then
+    warn "新备份已保存，但旧备份清理失败，请检查 backups 目录权限。"
+  fi
 )
 
 do_backup() {

@@ -157,6 +157,27 @@ test("restore rejects traversal and symlink archive members before writing outsi
     /链接或特殊文件/,
   );
 });
+test("backup rotation keeps three completed archives and never removes unrelated files", async (t) => {
+  const tmp = await dir(t);
+  const names = Array.from({ length: 5 }, (_, i) => `nurossh_backup_2026092${i}_120000${i % 2 ? '_Ab1234' : ''}.tar.gz`);
+  for (const [i, name] of names.entries()) {
+    await fs.writeFile(path.join(tmp, name), 'completed archive fixture');
+    await fs.utimes(path.join(tmp, name), 100 + i, 100 + i);
+  }
+  const untouched = ['manual.tar.gz', `${names[4]}.partial`, '.backup.lock'];
+  for (const name of untouched) await fs.writeFile(path.join(tmp, name), 'keep');
+  await fs.mkdir(path.join(tmp, 'nurossh_backup_20000101_000000.tar.gz'));
+  await fs.symlink(path.join(tmp, 'manual.tar.gz'), path.join(tmp, 'nurossh_backup_20000102_000000.tar.gz'));
+  const missing = 'nurossh_backup_20260925_120000_missing.tar.gz';
+  assert.throws(() => execFileSync('python3', ['server/backup-archive.py', 'prune', tmp, missing], { cwd: root, stdio: 'pipe' }));
+  for (const name of names) await fs.access(path.join(tmp, name));
+  // A clock rollback must not delete the snapshot just created.
+  await run('python3', ['server/backup-archive.py', 'prune', tmp, names[0]]);
+  for (const name of [names[0], names[3], names[4], ...untouched]) await fs.access(path.join(tmp, name));
+  for (const name of [names[1], names[2]]) await assert.rejects(fs.access(path.join(tmp, name)));
+  assert.equal((await fs.lstat(path.join(tmp, 'nurossh_backup_20000102_000000.tar.gz'))).isSymbolicLink(), true);
+});
+
 test("upgrade environment completion preserves custom settings, quoted values and missing final newline", async (t) => {
   const tmp = await dir(t);
   await fs.writeFile(

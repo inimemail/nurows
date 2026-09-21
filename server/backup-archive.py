@@ -15,6 +15,25 @@ def digest(file):
             h.update(chunk)
     return h.hexdigest()
 
+def prune_backups(root, newest):
+    # Only script-generated, completed archives in this deployment's backup folder.
+    pattern = re.compile(r'nurossh_backup_\d{8}_\d{6}(?:_[A-Za-z0-9]+)?\.tar\.gz')
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError('备份目录无效')
+    if not pattern.fullmatch(newest):
+        raise ValueError('新备份名称无效')
+    current = root / newest
+    if current.is_symlink() or not current.is_file() or current.stat().st_size == 0:
+        raise ValueError('新备份尚未成功生成，禁止清理旧备份')
+    archives = [p for p in root.iterdir() if pattern.fullmatch(p.name) and not p.is_symlink() and p.is_file()]
+    # Always retain this run's archive, including when the system clock moves back.
+    older = sorted((p for p in archives if p != current), key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+    removed = 0
+    for file in older[2:]:
+        file.unlink()
+        removed += 1
+    print(f'备份保留最近 3 份，本次清理 {removed} 份旧备份。')
+
 def validate(root):
     for required in ['.env', 'docker-compose.yml', 'app/package.json', 'app/server/index.js']:
         if not (root / required).is_file():
@@ -109,5 +128,7 @@ if __name__ == '__main__':
         extract(args[0], Path(args[1]))
     elif action == 'validate':
         validate(Path(args[0]))
+    elif action == 'prune':
+        prune_backups(Path(args[0]), args[1])
     else:
         raise ValueError('未知操作')

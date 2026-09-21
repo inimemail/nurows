@@ -7,10 +7,10 @@ import * as telegramPermissions from '../shared/telegram-permissions.js';
 import * as workspaceSearch from '../shared/workspace-search.js';
 
 const compiled = transformSync(fs.readFileSync(new URL('../src/OrchestrationWorkspace.jsx', import.meta.url), 'utf8'), { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
-function harness(api) {
+function harness(api, assets, search = '') {
   const values = [], messages = [], updates = [];
   let cursor = 0, tree;
-  const state = { ipAssets: [{ id: 'a', name: '测试 IP', address: '192.0.2.1', labels: [], health: 'unknown' }], ipPools: [], ipUsageRecords: [] };
+  const state = { ipAssets: assets || [{ id: 'a', name: '测试 IP', address: '192.0.2.1', labels: [], health: 'unknown' }], ipPools: [], ipUsageRecords: [] };
   const jsx = (type, props) => ({ type, props });
   const module = { exports: {} };
   const useState = (initial) => {
@@ -27,7 +27,7 @@ function harness(api) {
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     throw Error(path);
   } });
-  function render() { cursor = 0; tree = module.exports.default({ tab: 'pools', state, api, onState: (next) => updates.push(next), toast: (message) => messages.push(message), Dialog: 'dialog' }); }
+  function render() { cursor = 0; tree = module.exports.default({ tab: 'pools', state, search, api, onState: (next) => updates.push(next), toast: (message) => messages.push(message), Dialog: 'dialog' }); }
   function nodes(value = tree) {
     if (Array.isArray(value)) return value.flatMap(nodes);
     if (!value || typeof value !== 'object') return [];
@@ -62,6 +62,25 @@ test('asset row supports direct deletion; cancel makes no request and repeated c
   await pending; view.render();
   assert.equal(view.buttons('确认删除').length, 0);
   assert.equal(view.updates.length, 1);
+});
+
+test('IP assets show newest first after single and batch additions without changing allocation order', () => {
+  const assets = [
+    { id: 'legacy', address: '192.0.2.1' },
+    { id: 'old', address: '192.0.2.2', createdAt: '2026-09-20T00:00:00Z', updatedAt: '2026-10-01T00:00:00Z' },
+    { id: 'new', address: '192.0.2.3', createdAt: '2026-09-21T00:00:00Z' },
+    { id: 'batch1', address: '192.0.2.4', createdAt: '2026-09-22T00:00:00Z' },
+    { id: 'batch2', address: '192.0.2.5', createdAt: '2026-09-22T00:00:00Z' },
+    { id: 'invalid', address: '192.0.2.6', createdAt: 'invalid' }
+  ];
+  const original = structuredClone(assets);
+  const view = harness(() => assert.fail('sorting must not request the server'), assets);
+  const titles = () => view.nodes().filter((node) => node.props?.title && node.props?.actions).map((node) => node.props.title);
+  assert.deepEqual(titles(), ['192.0.2.5', '192.0.2.4', '192.0.2.3', '192.0.2.2', '192.0.2.6', '192.0.2.1']);
+  view.render(); assert.equal(titles()[0], '192.0.2.5');
+  assert.deepEqual(assets, original);
+  const filtered = harness(() => {}, assets, '192.0.2.3');
+  assert.deepEqual(filtered.nodes().filter((node) => node.props?.title && node.props?.actions).map((node) => node.props.title), ['192.0.2.3']);
 });
 
 test('editor deletion also confirms; server rejection preserves asset and allows cancel', async () => {

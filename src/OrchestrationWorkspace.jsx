@@ -51,7 +51,8 @@ export default function OrchestrationWorkspace({ tab, state, search = '', onSear
         : [['accounts', '服务商账号'], ['bindings', '解析绑定'], ['changes', '变更记录']];
   const active = sections.some(([key]) => key === section) ? section : sections[0][0];
   useEffect(() => { onSearchScopeChange?.({ tab, section: active }); }, [tab, active, onSearchScopeChange]);
-  const visibleRecords = useMemo(() => ['dynamic', 'usage'].includes(active) ? [] : filterWorkspaceRecords(active, state[WORKSPACE_SEARCH[active]?.key] || [], search, state, PROVIDERS), [active, state, search]);
+  const newestAssets = useMemo(() => active === 'assets' ? sortAssetsNewestFirst(state.ipAssets || []) : [], [active, state.ipAssets]);
+  const visibleRecords = useMemo(() => ['dynamic', 'usage'].includes(active) ? [] : filterWorkspaceRecords(active, active === 'assets' ? newestAssets : state[WORKSPACE_SEARCH[active]?.key] || [], search, state, PROVIDERS), [active, state, search, newestAssets]);
   const guardCheckActive = tab === 'probes' && Boolean(state.orchestrationSummary
     ? state.orchestrationSummary.checkingGuards : state.dnsGuards?.some((guard) => Boolean(guard.cycle)));
 
@@ -284,6 +285,12 @@ export default function OrchestrationWorkspace({ tab, state, search = '', onSear
       </Dialog> : null}
     </section>
   );
+}
+
+function sortAssetsNewestFirst(records) {
+  // Sort only the view; pool allocation still uses the original storage order.
+  return records.map((item, index) => ({ item, index, time: Date.parse(item.createdAt || '') || 0 }))
+    .sort((a, b) => b.time - a.time || b.index - a.index).map(({ item }) => item);
 }
 
 function renderSection(section, ctx) {

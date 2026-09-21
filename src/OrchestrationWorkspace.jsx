@@ -443,13 +443,17 @@ function GuardEditor({ value, patch, state, api }) {
       </div>
       <div className="guard-pool-setting">
         <Field label="备用池取用方式"><select value={value.poolSelectionMode || 'ordered'} onChange={(e) => patch({ poolSelectionMode: e.target.value, poolRebalanceEnabled: e.target.value === 'balanced' })}><option value="ordered">按顺序取用</option><option value="balanced">均衡取用</option></select></Field>
-        {value.poolSelectionMode === 'balanced' ? <Toggle checked={Boolean(value.poolRebalanceEnabled)} onChange={(poolRebalanceEnabled) => patch({ poolRebalanceEnabled })}>自动调整已有 IP</Toggle> : null}
-        {value.poolSelectionMode === 'balanced' && value.poolRebalanceEnabled ? <Field label="自动调整间隔（分钟）"><input type="number" inputMode="numeric" min="1" max="1440" step="1" required value={value.poolRebalanceIntervalMinutes ?? 30} onChange={(e) => patch({ poolRebalanceIntervalMinutes: e.target.value })} /></Field> : null}
-        <div className="guard-notification-hint">{value.poolSelectionMode === 'balanced' ? value.poolRebalanceEnabled
-          ? '开启或更换关联池后，保存即安排评估；故障补位优先。新 IP 检查通过并确认远程替换后，健康旧 IP 退回原池。'
-          : '按域名当前的来源池占比补位，优先补数量少的池；库存不足或检查失败由其他池补足，不删除已有健康 IP。'
+        <div className="guard-notification-hint">{value.poolSelectionMode === 'balanced'
+          ? '按当前来源池占比补位，优先补数量少的池；库存不足或检查失败由其他池补足。'
           : '按选择顺序优先取用，当前池不足或检查失败时由后面的池补足。'}</div>
       </div>
+      {value.poolSelectionMode === 'balanced' ? <div className="guard-rebalance-settings">
+        <Toggle className="guard-rebalance-toggle" switchControl checked={Boolean(value.poolRebalanceEnabled)} onChange={(poolRebalanceEnabled) => patch({ poolRebalanceEnabled })}>自动调整已有 IP</Toggle>
+        {value.poolRebalanceEnabled ? <Field label="自动调整间隔（分钟）"><input type="number" inputMode="numeric" min="1" max="1440" step="1" required value={value.poolRebalanceIntervalMinutes ?? 30} onChange={(e) => patch({ poolRebalanceIntervalMinutes: e.target.value })} /></Field> : null}
+        <div className="guard-notification-hint">{value.poolRebalanceEnabled
+          ? '保存后安排评估，故障补位优先；新 IP 通过检查并确认远程替换后，健康旧 IP 退回原池。'
+          : '仅均衡补充缺口，不调整已有健康 IP。'}</div>
+      </div> : null}
     </div>
     <Multi label={value.poolSelectionMode === 'balanced' ? '备用池（均衡取用）' : '备用池（按选择顺序兜底）'} items={(state.ipPools || []).filter((item) => item.enabled !== false)} value={value.poolIds || []} onChange={(poolIds) => patch({ poolIds })} secondary={(item) => `库存 ${item.assetIds?.length || 0} 个 · 当前域名 ${poolCounts.get(item.id) || 0} 个`} searchable selectable />
     <EditorSection title="TG 通知" />
@@ -598,7 +602,7 @@ function BindingEditor({ value, patch, state }) {
 
 function EditorGrid({ children, className = '' }) { return <div className={`ops-editor-grid ${className}`.trim()}>{children}</div>; }
 function Field({ label, children, full }) { return <label className={full ? 'ops-field full' : 'ops-field'}><span>{label}</span>{children}</label>; }
-function Toggle({ checked, onChange, children }) { return <label className="ops-toggle"><input type="checkbox" checked={Boolean(checked)} onChange={(e) => onChange(e.target.checked)} /><span>{children}</span></label>; }
+function Toggle({ checked, onChange, children, className = '', switchControl = false }) { return <label className={`ops-toggle ${className}`}><input type="checkbox" role={switchControl ? 'switch' : undefined} checked={Boolean(checked)} onChange={(e) => onChange(e.target.checked)} /><span>{children}</span></label>; }
 function Multi({ label, items = [], value = [], onChange, secondary, searchable = false, selectable = false, emptyLabel = '没有匹配项' }) {
   const [query, setQuery] = useState('');
   const normalized = query.trim().toLowerCase();

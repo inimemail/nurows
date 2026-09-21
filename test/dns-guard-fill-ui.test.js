@@ -110,3 +110,19 @@ test('balanced selection enables automatic rebalance by default and preserves ex
   field(render(), '备用池取用方式').props.children.props.onChange({ target: { value: 'balanced' } });
   assert.equal(toggle().props.checked, true);
 });
+
+test('automatic rebalance has a separate full-width setting row and an accessible switch', () => {
+  const value = normalizeDraft('guard', { poolSelectionMode: 'balanced', poolRebalanceEnabled: true });
+  const tree = GuardEditor({ value, state: { probes: [], ipPools: [], dnsAccounts: [], telegramBots: [] }, patch() {} });
+  const row = nodes(tree).find((node) => node.props?.className === 'guard-rebalance-settings');
+  assert.ok(row);
+  assert.ok(field(row, '自动调整间隔（分钟）'));
+  const toggle = nodes(row).find((node) => node.props?.switchControl);
+  assert.equal(toggle.props.className, 'guard-rebalance-toggle');
+  const rendered = toggle.type(toggle.props);
+  assert.equal(nodes(rendered).find((node) => node.type === 'input').props.role, 'switch');
+  const css = fs.readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+  assert.match(css, /\.guard-rebalance-settings \{ grid-column: 1 \/ -1/);
+  assert.match(css, /\.ops-guard-editor \.guard-pool-settings \{ grid-template-columns: minmax\(0, 1fr\)/);
+  assert.match(css, /\.guard-rebalance-settings \.guard-rebalance-toggle > input:focus-visible/);
+});

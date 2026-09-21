@@ -8,6 +8,7 @@ import { createTelegramWorkspace } from './telegram-workspace.js';
 import { createTelegramActions } from './telegram-actions.js';
 import { telegramScopeAllowed } from '../shared/telegram-permissions.js';
 import { createDynamicGuardService, registerDynamicGuardRoutes, sanitizeDynamicGuard } from './dynamic-guard.js';
+import { createRenewalService, registerRenewalRoutes, normalizeRenewalState, renewalSnapshot } from './renewals.js';
 import { createSessionSocketRegistry, createWebSocketUpgradeHandler, createWebSocketTickets } from './websocket-security.js';
 import { commandJobDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
 import express from 'express';
@@ -153,6 +154,18 @@ const dynamicGuardService = createDynamicGuardService({
 });
 
 const telegramActions = createTelegramActions({ ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus }, dynamicGuardService);
+const renewalDeps = {
+  read: () => readState(['renewals', 'renewalSettings', 'renewalRevision']),
+  update: updateRenewalState,
+  bots: () => readState(['telegramBots']).telegramBots,
+  send: async (bot, chatId, text) => {
+    let token;
+    try { token = decryptSecret(bot.tokenEnc); } catch { throw Object.assign(new Error('机器人凭证不可用'), { definite: true }); }
+    await telegramCall(token, 'sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true }, { signal: AbortSignal.timeout(10000) });
+  },
+  logError: (error) => console.error('Renewal reminders:', error.message)
+};
+const renewalService = createRenewalService(renewalDeps);
 const telegramWorkspace = createTelegramWorkspace({
   readState, readGuardHistoryPage, invoke: telegramActions, call: telegramCall, authorized: telegramAuthorized,
   clearFinishedIncidents: (ids, actor) => clearFinishedIncidents(orchestrationDeps, ids, actor),
@@ -432,6 +445,7 @@ app.delete('/api/history', (req, res) => {
 
 registerOrchestrationRoutes(app, orchestrationDeps);
 registerDynamicGuardRoutes(app, { ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus }, dynamicGuardService);
+registerRenewalRoutes(app, renewalDeps, renewalService);
 
 app.post('/api/workspace', (req, res) => {
   const workspaceInput = normalizeWorkspaceInput(req.body);
@@ -1158,6 +1172,8 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, HOST, () => {
   cleanupHistoryRecords();
   restartTelegramPolling();
+  renewalService.tick();
+  setInterval(() => renewalService.tick(), 60000).unref();
   checkProbePresence();
   setInterval(() => telegramWorkspace.cleanup(), 60000).unref();
   resumePendingIncidents();
@@ -1887,6 +1903,7 @@ function normalizeStateRecord(parsed) {
     automationRuns: Array.isArray(parsed?.automationRuns) ? parsed.automationRuns.slice(0, 30) : [],
     telegram: legacyTelegram,
     ...orchestration,
+    ...normalizeRenewalState(parsed),
     workspaces: parsed?.workspaces && typeof parsed.workspaces === 'object' ? parsed.workspaces : {}
   };
 }
@@ -1953,6 +1970,16 @@ function readState(keys = null) {
     cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
   }
   return structuredClone(keys ? Object.fromEntries(keys.map((key) => [key, cachedState[key]])) : cachedState);
+}
+
+function updateRenewalState(mutator) {
+  ensureStorage();
+  const selected = structuredClone({ renewals: cachedState.renewals || [], renewalSettings: cachedState.renewalSettings, renewalRevision: cachedState.renewalRevision || 0 });
+  mutator(selected);
+  selected.renewalRevision += 1;
+  const next = { ...cachedState, ...selected };
+  dbSetJson(STORAGE_KEYS.state, next);
+  cachedState = next;
 }
 
 function readDynamicGuard(id) {
@@ -2134,6 +2161,7 @@ function sanitizeStateForClient(state, auth = null) {
     automationTasks: state.automationTasks.map(sanitizeAutomationTaskForClient),
     automationRuns: state.automationRuns || [],
     ...sanitizeOrchestrationState(state),
+    ...renewalSnapshot(state),
     workspace: getWorkspaceForUser(state, auth)
   };
 }
@@ -2184,7 +2212,7 @@ function getWorkspaceForUser(state, auth = null) {
     };
   }
   return {
-    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns'].includes(source.tab) ? source.tab : 'servers',
+    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram'].includes(source.tab) ? source.tab : 'servers',
     search: typeof source.search === 'string' ? source.search : '',
     selectedServerId: typeof source.selectedServerId === 'string' ? source.selectedServerId : '',
     selectedCommandId: typeof source.selectedCommandId === 'string' ? source.selectedCommandId : '',
@@ -2245,7 +2273,7 @@ function getWorkspaceForUser(state, auth = null) {
 
 function normalizeWorkspaceInput(input = {}) {
   return {
-    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns'].includes(input.tab) ? input.tab : 'servers',
+    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram'].includes(input.tab) ? input.tab : 'servers',
     search: typeof input.search === 'string' ? input.search : '',
     selectedServerId: typeof input.selectedServerId === 'string' ? input.selectedServerId : '',
     selectedCommandId: typeof input.selectedCommandId === 'string' ? input.selectedCommandId : '',
@@ -2668,7 +2696,7 @@ async function telegramCall(token, method, body = {}, { signal } = {}) {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: signal || AbortSignal.timeout(15000)
   });
   const payload = await response.json();
-  if (!payload.ok) throw new Error(payload.description || 'Telegram API error');
+  if (!payload.ok) throw Object.assign(new Error(payload.description || 'Telegram API error'), { definite: true, retryAfter: payload.parameters?.retry_after });
   return payload.result;
 }
 

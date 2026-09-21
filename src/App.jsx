@@ -6,6 +6,8 @@ import { openAuthenticatedWebSocket } from '../shared/websocket-client.js';
 import { workspaceSearchPlaceholder } from '../shared/workspace-search.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
+import RenewalWorkspace from './RenewalWorkspace.jsx';
+import { CalendarClock } from 'lucide-react';
 import { HISTORY_LABELS } from './HistoryRecords.jsx';
 import Dialog from './Dialog.jsx';
 import SettingsDialog, { HistoryBrowser } from './SettingsDialog.jsx';
@@ -80,6 +82,7 @@ const TABS = [
   { key: 'probes', label: '探针管理', icon: ProbeIcon },
   { key: 'pools', label: '备用 IP 池', icon: PoolIcon },
   { key: 'dns', label: '解析管理', icon: DnsIcon },
+  { key: 'renewals', label: '续费管理', icon: CalendarClock },
   { key: 'telegram', label: 'Telegram', icon: TelegramIcon }
 ];
 
@@ -337,7 +340,7 @@ function readStoredActiveTerminalId() {
 
 function normalizeWorkspacePayload(workspace = {}) {
   return {
-    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns'].includes(workspace.tab) ? workspace.tab : 'servers',
+    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram'].includes(workspace.tab) ? workspace.tab : 'servers',
     search: typeof workspace.search === 'string' ? workspace.search : '',
     selectedServerId: typeof workspace.selectedServerId === 'string' ? workspace.selectedServerId : '',
     selectedCommandId: typeof workspace.selectedCommandId === 'string' ? workspace.selectedCommandId : '',
@@ -477,6 +480,16 @@ export default function App() {
   });
   const [toasts, setToasts] = useState([]);
   const [stateLoaded, setStateLoaded] = useState(false);
+  const topTabsRef = useRef(null);
+
+  useEffect(() => {
+    if (window.matchMedia('(max-width: 760px)').matches) return;
+    const tabs = topTabsRef.current, active = tabs?.querySelector('.active');
+    if (!tabs || !active) return;
+    const container = tabs.getBoundingClientRect(), button = active.getBoundingClientRect();
+    if (button.right > container.right) tabs.scrollLeft += button.right - container.right;
+    else if (button.left < container.left) tabs.scrollLeft -= container.left - button.left;
+  }, [tab, stateLoaded]);
 
   useEffect(() => {
     bootstrap();
@@ -2351,7 +2364,7 @@ export default function App() {
           </div>
         </div>
 
-        <nav className="top-tabs">
+        <nav className="top-tabs" ref={topTabsRef}>
           {TABS.map((item) => {
             const Icon = item.icon;
             return (
@@ -2384,7 +2397,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-layout' : '')}>
+      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram'].includes(tab) ? ' orchestration-layout' : '')}>
         {!workspaceFullscreenActive ? (
           <button
             className={'mobile-drawer-scrim ' + (assetDrawerOpen ? 'open' : '')}
@@ -2393,7 +2406,7 @@ export default function App() {
             onClick={() => setAssetDrawerOpen(false)}
           />
         ) : null}
-        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-aside' : '')}>
+        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram'].includes(tab) ? ' orchestration-aside' : '')}>
           <div className="side-head">
             <div>
               <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'dns' ? '解析管理' : '代理列表'}</strong>
@@ -2593,8 +2606,9 @@ export default function App() {
           ) : null}
         </aside>
 
-          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'telegram'].includes(tab) ? ' orchestration-main' : '')}>
+          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram'].includes(tab) ? ' orchestration-main' : '')}>
           {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} search={search} onSearchChange={setSearch} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
+          {tab === 'renewals' ? <RenewalWorkspace state={state} search={search} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
           {tab === 'automation' ? (
             <section className="automation-board">
               <div className="automation-page-head surface">

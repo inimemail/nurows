@@ -988,6 +988,25 @@ svg {
 .guard-pool-settings { grid-column: 1 / -1; align-items: start; }
 .guard-pool-setting { min-width: 0; display: flex; flex-direction: column; gap: 12px; }
 .guard-pool-setting .guard-notification-hint { margin-top: 0; }
+.guard-rebalance-settings { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) 210px; align-items: center; gap: 12px 24px; padding-top: 16px; border-top: 1px solid var(--border-soft); }
+.guard-rebalance-settings .guard-rebalance-toggle { grid-column: auto; display: flex; justify-content: space-between; width: 100%; max-width: 340px; min-height: 44px; gap: 16px; cursor: pointer; }
+.guard-rebalance-toggle > span { font-size: 13px; font-weight: 600; color: var(--text-strong); overflow-wrap: anywhere; }
+.guard-rebalance-settings .guard-rebalance-toggle > input { order: 1; appearance: none; position: relative; width: 40px; min-width: 40px; height: 24px; min-height: 24px; flex: 0 0 40px; margin: 0; padding: 0; border: 1px solid var(--border-card); border-radius: 12px; background: var(--text-muted); cursor: pointer; transition: background-color .15s; }
+.guard-rebalance-settings .guard-rebalance-toggle > input::before { content: ''; position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .15s; }
+.guard-rebalance-settings .guard-rebalance-toggle > input:checked { background: var(--accent-solid); border-color: var(--accent-solid); }
+.guard-rebalance-settings .guard-rebalance-toggle > input:checked::before { transform: translateX(16px); }
+.guard-rebalance-settings .guard-rebalance-toggle > input:focus-visible { outline: 2px solid var(--accent-solid); outline-offset: 4px; }
+.guard-rebalance-settings > .guard-notification-hint { margin: 0; }
+@media (max-width: 760px) {
+  .ops-guard-editor .guard-pool-settings { grid-template-columns: minmax(0, 1fr); gap: 18px; }
+  .guard-rebalance-settings { grid-template-columns: minmax(0, 1fr); gap: 12px; padding-top: 14px; }
+  .guard-rebalance-settings .guard-rebalance-toggle { max-width: none; }
+  .guard-rebalance-settings > .ops-field { display: grid; grid-template-columns: minmax(0, 1fr) 108px; align-items: center; gap: 12px; }
+  .guard-rebalance-settings > .ops-field input { width: 100%; min-width: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .guard-rebalance-settings .guard-rebalance-toggle > input, .guard-rebalance-settings .guard-rebalance-toggle > input::before { transition: none; }
+}
 .ops-pool-follow { display: flex; align-items: center; min-height: 40px; padding: 9px 12px; border: 1px solid var(--border-soft); border-radius: 10px; color: var(--text-soft); background: var(--card-bg); line-height: 1.5; overflow-wrap: anywhere; }
 .tg-feature-picker { grid-column: 1 / -1; min-width: 0; }
 .tg-feature-picker .ops-multi-options { max-height: 320px; }

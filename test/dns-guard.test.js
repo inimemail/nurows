@@ -17,6 +17,7 @@ import {
   requestWaitingDnsGuardChecks,
   resolveManagedDnsZone,
   resolveDnsGuardSources,
+  clearDnsGuardSourceCache,
   roundRobinDnsGuardSourceValues,
   runDueDnsGuards,
   selectHealthyDnsGuardSources,
@@ -1261,6 +1262,67 @@ test('source resolution is bounded and keeps the configured source order', async
   assert.equal(peak, 4);
   assert.equal(active, 0);
   assert.deepEqual(result.values, Array.from({ length: 12 }, (_, i) => `203.0.113.${i + 1}`));
+});
+
+test('concurrent guards share one source DNS lookup but keep independent source state', async () => {
+  clearDnsGuardSourceCache();
+  let lookups = 0;
+  const resolve = async () => {
+    lookups += 1;
+    await new Promise(setImmediate);
+    return ['203.0.113.77'];
+  };
+  const guard = (id, domain) => ({ id, recordType: 'A', sources: [{ id: `source-${id}`, domain }] });
+  const [first, second] = await Promise.all([
+    resolveDnsGuardSources(guard('a', 'Shared.Example.com.'), [], resolve),
+    resolveDnsGuardSources(guard('b', 'shared.example.com'), [], resolve)
+  ]);
+  assert.equal(lookups, 1);
+  assert.deepEqual(first.values, ['203.0.113.77']);
+  assert.deepEqual(second.values, ['203.0.113.77']);
+  assert.notEqual(first.state['source-a'], second.state['source-b']);
+  first.state['source-a'].primary.push('198.51.100.9');
+  assert.deepEqual(second.state['source-b'].primary, ['203.0.113.77']);
+});
+
+test('DNS failures are not cached and A and AAAA source answers stay separate', async () => {
+  clearDnsGuardSourceCache();
+  let lookups = 0;
+  const resolve = async (_domain, family) => {
+    lookups += 1;
+    if (lookups === 1) throw new Error('temporary resolver failure');
+    return family === 6 ? ['2001:db8::77'] : ['203.0.113.77'];
+  };
+  const source = [{ id: 'shared', domain: 'shared.example.com' }];
+  const failed = await resolveDnsGuardSources({ recordType: 'A', sources: source }, [], resolve);
+  const a = await resolveDnsGuardSources({ recordType: 'A', sources: source }, [], resolve);
+  const aaaa = await resolveDnsGuardSources({ recordType: 'AAAA', sources: source }, [], resolve);
+  assert.equal(failed.state.shared.status, 'resolve_error');
+  assert.deepEqual(a.values, ['203.0.113.77']);
+  assert.deepEqual(aaaa.values, ['2001:db8::77']);
+  assert.equal(lookups, 3);
+});
+
+test('an invalidated slow DNS response cannot overwrite the newer shared answer', async () => {
+  clearDnsGuardSourceCache();
+  let releaseOld;
+  let lookups = 0;
+  const resolve = async () => {
+    lookups += 1;
+    if (lookups === 1) await new Promise((resolve) => { releaseOld = resolve; });
+    return [lookups === 1 ? '203.0.113.10' : '203.0.113.20'];
+  };
+  const guard = { recordType: 'A', sources: [{ id: 'shared', domain: 'race.example.com' }] };
+  const oldRequest = resolveDnsGuardSources(guard, [], resolve);
+  await new Promise(setImmediate);
+  clearDnsGuardSourceCache();
+  const newRequest = resolveDnsGuardSources(guard, [], resolve);
+  assert.deepEqual((await newRequest).values, ['203.0.113.20']);
+  releaseOld();
+  assert.deepEqual((await oldRequest).values, ['203.0.113.20']);
+  const cached = await resolveDnsGuardSources(guard, [], resolve);
+  assert.deepEqual(cached.values, ['203.0.113.20']);
+  assert.equal(lookups, 2);
 });
 
 test('source DNS timeout cancels its resolver and produces an explicit retry state', async (t) => {

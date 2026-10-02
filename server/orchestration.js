@@ -2457,6 +2457,7 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
   }
   const finishedAt = nowIso();
   let committed = false;
+  let notificationEvent;
   state = deps.updateState((draft) => {
     const item = draft.dnsGuards.find((entry) => entry.id === guardId && entry.cycle?.id === cycleId);
     if (!item) return draft;
@@ -2562,14 +2563,19 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
     if (cycle.rebalancePlan) item.message = returnedAssets.length
       ? `自动均衡已调整 ${returnedAssets.length} 个 IP，健康旧 IP 已退回原池，当前 ${desired.length} 个活动 IP`
       : `当前 ${desired.length} 个活动 IP，等待不足占比的备用池提供可用 IP 后调整均衡`;
-    draft.dnsGuardRuns.unshift({ id: uuidv4(), guardId, guardName: item.name, domain: item.domain, status, beforeValues: remote, afterValues: desired, failedValues: failedRemote, sourceValues: cycleSnapshot.sourceValues, consumedIps: usedAssets.map((entry) => entry.address), discardedIps: unusableAssets.map((entry) => entry.address), returnedIps: returnedAssets.map((entry) => entry.address), startedAt: cycleSnapshot.startedAt, finishedAt, message: item.message });
+    const runId = uuidv4();
+    draft.dnsGuardRuns.unshift({ id: runId, guardId, guardName: item.name, domain: item.domain, status, beforeValues: remote, afterValues: desired, failedValues: failedRemote, sourceValues: cycleSnapshot.sourceValues, consumedIps: usedAssets.map((entry) => entry.address), discardedIps: unusableAssets.map((entry) => entry.address), returnedIps: returnedAssets.map((entry) => entry.address), startedAt: cycleSnapshot.startedAt, finishedAt, message: item.message });
+    notificationEvent = { id: runId, guardId, name: item.name, domain: item.domain, recordType: item.recordType,
+      removed: failedRemote.filter((address) => !desired.includes(address)), remaining: desired.length,
+      maxActiveIps: item.maxActiveIps || DNS_GUARD_MAX_VALUES, message: item.message, finishedAt,
+      botIds: [...(item.alertBotIds || [])] };
     draft.dnsGuardRuns = draft.dnsGuardRuns.slice(0, DNS_GUARD_HISTORY_LIMIT);
     pushAudit(draft, 'dnsGuard.check', 'dnsGuard', guardId, `${item.domain} 检查 ${remote.length} 个记录，故障 ${failedRemote.length} 个，补位 ${usedAssets.length} 个`, 'system');
     return draft;
   });
   // Routine checks stay silent. Notify only after unhealthy remote IPs were
   // successfully removed from the provider record.
-  if (committed && changed && failedRemote.some((address) => !desired.includes(address))) deps.notifyDnsGuard?.(guardId);
+  if (committed && changed && notificationEvent?.removed?.length) deps.notifyDnsGuard?.(guardId, notificationEvent);
 }
 
 export function calculateDnsGuardOwnership(guard, remoteValues, desiredValues, healthySourceValues, usedAssets = []) {

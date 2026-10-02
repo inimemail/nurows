@@ -42,37 +42,74 @@ test('guard notification choices default empty, remain independent and can be sa
   assert.deepEqual(h.state().dynamicGuards[0], { id: 'dynamic', botIds: ['bot-a'], revision: 7, cycle: { id: 'running' } });
 });
 
-test('DNS notifications only go to selected active bots, retain remaining count, and skip healthy runs', () => {
+test('DNS notifications collect, update shared failures, and respect current selections', async () => {
   const source = fs.readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
-  const start = source.indexOf('function notifyDnsGuardViaTelegram(');
+  const start = source.indexOf('function dnsGuardNotificationText(');
   const end = source.indexOf('\nfunction snapshotPoolInventory(', start);
-  const calls = [], reads = [];
+  const calls = [], reads = [], timers = [];
   const state = { dnsGuards: [{ id: 'guard', name: '守护', domain: 'test.example.com', currentValues: ['192.0.2.2'], recordType: 'A' }],
-    dnsGuardRuns: [{ guardId: 'guard', failedValues: ['192.0.2.1'] }],
+    dnsGuardRuns: [{ id: 'run-1', guardId: 'guard', failedValues: ['192.0.2.1'] }],
     telegramBots: [
       { id: 'chosen', enabled: true, tokenEnc: 'chosen', userIds: ['chat', 'chat'] },
       { id: 'other', enabled: true, tokenEnc: 'other', userIds: ['other-chat'] },
       { id: 'disabled', enabled: false, tokenEnc: 'disabled', userIds: ['disabled-chat'] }
     ] };
-  const ctx = vm.createContext({ AbortSignal, readState(keys) { reads.push(keys); return state; },
+  const setTimeoutFake = (fn, delay) => { const timer = { fn, delay, unref() {} }; timers.push(timer); return timer; };
+  const clearTimeoutFake = (timer) => { const index = timers.indexOf(timer); if (index >= 0) timers.splice(index, 1); };
+  const runDue = async (maxDelay) => {
+    const due = timers.filter((timer) => timer.delay <= maxDelay);
+    for (const timer of due) { clearTimeoutFake(timer); await timer.fn(); }
+    await Promise.resolve();
+  };
+  const ctx = vm.createContext({ AbortSignal, setTimeout: setTimeoutFake, clearTimeout: clearTimeoutFake,
+    DNS_GUARD_NOTIFICATION_COLLECT_MS: 0, DNS_GUARD_NOTIFICATION_MERGE_MS: 60000,
+    DNS_GUARD_NOTIFICATION_EDIT_DEBOUNCE_MS: 0,
+    telegramRuntime: { dnsNotificationRecipients: new Map() },
+    readState(keys) { reads.push(keys); return state; },
     decryptSecret: (value) => value, telegramMenuAllowed: () => false,
-    telegramCall(token, method, body, options) { calls.push({ token, method, body, options }); return Promise.resolve(); }
+    telegramCall(token, method, body, options) { calls.push({ token, method, body, options }); return Promise.resolve({ message_id: 12 }); }
   });
   vm.runInContext(source.slice(start, end), ctx);
   ctx.notifyDnsGuardViaTelegram('guard');
   assert.equal(calls.length, 0);
-  assert.equal(reads.length, 1);
   state.dnsGuards[0].alertBotIds = ['chosen', 'chosen', 'disabled', 'missing'];
   ctx.notifyDnsGuardViaTelegram('guard');
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 0);
+  await runDue(0);
+  assert.equal(calls.filter((call) => call.method === 'sendMessage').length, 1);
   assert.equal(calls[0].token, 'chosen');
   assert.equal(calls[0].body.chat_id, 'chat');
-  assert.match(calls[0].body.text, /当前活动 IP：1 个/);
+  assert.match(calls[0].body.text, /当前 1 个/);
   assert.equal(calls[0].body.reply_markup, undefined);
   assert.ok(calls[0].options.signal);
-  state.dnsGuardRuns[0].failedValues = [];
-  ctx.notifyDnsGuardViaTelegram('guard');
-  assert.equal(calls.length, 1);
+
+  state.dnsGuards[0].currentValues = ['192.0.2.3'];
+  ctx.notifyDnsGuardViaTelegram('guard', { id: 'run-2', guardId: 'guard', name: '守护', domain: 'other.example.com', recordType: 'A',
+    removed: ['192.0.2.1'], remaining: 1, botIds: ['chosen'] });
+  await runDue(0);
+  assert.equal(calls.filter((call) => call.method === 'sendMessage').length, 1);
+  assert.equal(calls.filter((call) => call.method === 'editMessageText').length, 1);
+  assert.match(calls.find((call) => call.method === 'editMessageText').body.text, /已处理 2 个域名/);
+
+  ctx.notifyDnsGuardViaTelegram('guard', { id: 'run-2b', guardId: 'guard', name: '守护', domain: 'other.example.com', recordType: 'A',
+    removed: ['192.0.2.1'], remaining: 0, botIds: ['chosen'] });
+  await runDue(0);
+  assert.equal(calls.filter((call) => call.method === 'sendMessage').length, 2, 'newly empty domains get a separate escalation');
+  assert.equal(calls.filter((call) => call.method === 'editMessageText').length, 2);
+
+  state.dnsGuards[0].alertBotIds = ['chosen'];
+  ctx.notifyDnsGuardViaTelegram('guard', { id: 'run-3', guardId: 'guard', name: '守护', domain: 'third.example.com', recordType: 'A',
+    removed: ['192.0.2.9'], remaining: 0, botIds: ['chosen'] });
+  await runDue(0);
+  assert.equal(calls.filter((call) => call.method === 'sendMessage').length, 3, 'different failed IPs stay in separate messages');
+
+  state.dnsGuards[0].alertBotIds = [];
+  ctx.notifyDnsGuardViaTelegram('guard', { id: 'run-4', guardId: 'guard', name: '守护', domain: 'fourth.example.com', recordType: 'A',
+    removed: ['192.0.2.9'], remaining: 0, botIds: ['chosen'] });
+  await runDue(0);
+  // The disabled selection must not edit an already sent batch.
+  assert.equal(calls.filter((call) => call.method === 'editMessageText').length, 2);
+  assert.ok(reads.length >= 3);
 });
 
 test('guard editor exposes default-empty bot selection and serializes changes without affecting probes or pools', () => {

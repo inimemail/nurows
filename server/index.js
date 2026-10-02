@@ -100,8 +100,12 @@ const telegramRuntime = {
   token: '',
   pending: new Map(),
   progressTimers: new Map(),
+  dnsNotificationRecipients: new Map(),
   generation: 0
 };
+const DNS_GUARD_NOTIFICATION_COLLECT_MS = 3000;
+const DNS_GUARD_NOTIFICATION_MERGE_MS = 60000;
+const DNS_GUARD_NOTIFICATION_EDIT_DEBOUNCE_MS = 1000;
 let sqliteDb = null;
 let cachedAuth = null;
 let cachedState = null;
@@ -2622,23 +2626,193 @@ async function notifyDynamicGuardViaTelegram(guard, message) {
   }));
 }
 
-function notifyDnsGuardViaTelegram(guardId) {
-  const guard = readState(['dnsGuards']).dnsGuards?.find((item) => item.id === guardId);
-  if (!guard?.alertBotIds?.length) return;
-  const selectedBotIds = new Set(guard.alertBotIds);
-  const state = readState(['dnsGuardRuns', 'telegramBots']);
-  const latestRun = state.dnsGuardRuns?.find((item) => item.guardId === guardId);
-  const removed = latestRun?.failedValues || [];
-  if (!removed.length) return;
-  const remaining = guard.currentValues?.length || 0;
-  const text = `DNS 守护：${guard.name}\n域名：${guard.domain} · ${guard.recordType}\n已删除不健康 IP（${removed.length} 个）：${removed.join(', ')}\n当前活动 IP：${remaining} 个（上限 ${guard.maxActiveIps || 50} 个）\n${guard.message || ''}`;
-  for (const settings of (state.telegramBots || []).filter((bot) => selectedBotIds.has(bot.id) && bot.enabled !== false && bot.tokenEnc)) {
-    let token = '';
-    try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
-    for (const chatId of [...new Set(settings.userIds || [])]) {
-      telegramCall(token, 'sendMessage', { chat_id: chatId, text, ...(telegramMenuAllowed(settings, 'guards') ? { reply_markup: { inline_keyboard: [[{ text: '立即检查', callback_data: `guard_check:${guard.id}` }], [{ text: 'DNS 守护', callback_data: 'menu:guards' }]] } } : {}) }, { signal: AbortSignal.timeout(10000) }).catch(() => {});
+function dnsGuardNotificationText(batch) {
+  const eventsByDomain = new Map();
+  for (const event of batch.events.values()) {
+    const key = `${String(event.domain || '').toLowerCase()}|${event.recordType}`;
+    const previous = eventsByDomain.get(key);
+    eventsByDomain.set(key, previous ? { ...event, removed: [...new Set([...previous.removed, ...event.removed])] } : event);
+  }
+  const events = [...eventsByDomain.values()];
+  const uniqueIps = [...batch.removed].slice(0, 40);
+  const totalRemoved = events.reduce((sum, event) => sum + event.removed.length, 0);
+  const lines = events.slice(0, 30).map((event) => {
+    const label = event.name ? `${event.name} · ${event.domain}` : event.domain;
+    return `✅ ${label} · 删除 ${event.removed.length} 个 · 当前 ${event.remaining} 个`;
+  });
+  const omitted = events.length - lines.length;
+  return [
+    `DNS 守护：已处理 ${events.length} 个域名`,
+    `故障 IP：${uniqueIps.length} 个唯一 IP · 共移除 ${totalRemoved} 条记录`,
+    `IP：${uniqueIps.join(', ')}${batch.removed.size > uniqueIps.length ? ' …' : ''}`,
+    ...lines,
+    omitted > 0 ? `其余 ${omitted} 个域名请在 DNS 守护记录中查看` : '',
+    events.some((event) => event.remaining === 0) ? '⚠️ 有域名当前没有活动 IP，正在等待备用 IP' : ''
+  ].filter(Boolean).join('\n').slice(0, 3900);
+}
+
+function dnsGuardNotificationMarkup(settings, batch) {
+  if (!telegramMenuAllowed(settings, 'guards')) return undefined;
+  const events = [...batch.events.values()];
+  const guardIds = new Set(events.map((event) => event.guardId));
+  const rows = [];
+  if (guardIds.size === 1) rows.push([{ text: '立即检查', callback_data: `guard_check:${events[0].guardId}` }]);
+  rows.push([{ text: 'DNS 守护', callback_data: 'menu:guards' }]);
+  return { inline_keyboard: rows };
+}
+
+function dnsGuardNotificationHasOverlap(batch, event) {
+  return event.removed.some((address) => batch.removed.has(address));
+}
+
+function dnsGuardNotificationScheduleEdit(key, batch) {
+  if (batch.editTimer) return;
+  batch.editTimer = setTimeout(() => {
+    batch.editTimer = null;
+    dnsGuardNotificationEdit(key, batch).catch(() => {});
+  }, DNS_GUARD_NOTIFICATION_EDIT_DEBOUNCE_MS);
+  batch.editTimer.unref?.();
+}
+
+async function dnsGuardNotificationEdit(key, batch) {
+  if (!batch.messageId || batch.sending) { batch.dirty = true; return; }
+  batch.zeroNotified ||= new Set();
+  const state = readState(['dnsGuards', 'telegramBots']);
+  const guardById = new Map((state.dnsGuards || []).map((guard) => [guard.id, guard]));
+  for (const [eventId, event] of batch.events) {
+    const guard = guardById.get(event.guardId);
+    if (!guard || !guard.alertBotIds?.includes(batch.botId)) batch.events.delete(eventId);
+  }
+  batch.removed = new Set([...batch.events.values()].flatMap((event) => event.removed));
+  if (!batch.events.size || !batch.removed.size) { dropDnsGuardNotificationBatch(key, batch); return; }
+  const newlyEmpty = [...new Map([...batch.events.values()]
+    .filter((event) => event.remaining === 0 && !batch.zeroNotified.has(event.guardId))
+    .map((event) => [event.guardId, event])).values()];
+  const settings = state.telegramBots?.find((bot) => bot.id === batch.botId && bot.enabled !== false && bot.tokenEnc);
+  if (!settings || !telegramRuntime.dnsNotificationRecipients.has(key)) { dropDnsGuardNotificationBatch(key, batch); return; }
+  let token;
+  try { token = decryptSecret(settings.tokenEnc); } catch { return; }
+  batch.dirty = false;
+  batch.sending = true;
+  try {
+    await telegramCall(token, 'editMessageText', {
+      chat_id: batch.chatId, message_id: batch.messageId, text: dnsGuardNotificationText(batch),
+      ...(dnsGuardNotificationMarkup(settings, batch) ? { reply_markup: dnsGuardNotificationMarkup(settings, batch) } : {})
+    }, { signal: AbortSignal.timeout(10000) });
+    if (newlyEmpty.length) {
+      await telegramCall(token, 'sendMessage', {
+        chat_id: batch.chatId,
+        text: `🚨 DNS 守护：${newlyEmpty.map((event) => `${event.name || event.domain} 当前没有活动 IP`).join('；')}\n正在等待备用 IP。`,
+        ...(dnsGuardNotificationMarkup(settings, batch) ? { reply_markup: dnsGuardNotificationMarkup(settings, batch) } : {})
+      }, { signal: AbortSignal.timeout(10000) });
+      for (const event of newlyEmpty) batch.zeroNotified.add(event.guardId);
+    }
+  } finally {
+    batch.sending = false;
+    if (batch.dirty) { batch.dirty = false; dnsGuardNotificationScheduleEdit(key, batch); }
+  }
+}
+
+function dnsGuardNotificationScheduleCleanup(key, batch) {
+  setTimeout(() => {
+    const batches = telegramRuntime.dnsNotificationRecipients.get(key);
+    if (!batches) return;
+    const index = batches.indexOf(batch);
+    if (index >= 0 && Date.now() - batch.sentAt >= DNS_GUARD_NOTIFICATION_MERGE_MS) batches.splice(index, 1);
+    if (!batches.length) telegramRuntime.dnsNotificationRecipients.delete(key);
+  }, DNS_GUARD_NOTIFICATION_MERGE_MS + 1000).unref?.();
+}
+
+function dropDnsGuardNotificationBatch(key, batch) {
+  if (batch.collectTimer) clearTimeout(batch.collectTimer);
+  if (batch.editTimer) clearTimeout(batch.editTimer);
+  const batches = telegramRuntime.dnsNotificationRecipients.get(key);
+  if (!batches) return;
+  const index = batches.indexOf(batch);
+  if (index >= 0) batches.splice(index, 1);
+  if (!batches.length) telegramRuntime.dnsNotificationRecipients.delete(key);
+}
+
+async function dnsGuardNotificationFlush(key, batch) {
+  const state = readState(['dnsGuards', 'telegramBots']);
+  const guardById = new Map((state.dnsGuards || []).map((guard) => [guard.id, guard]));
+  for (const [eventId, event] of batch.events) {
+    const guard = guardById.get(event.guardId);
+    if (!guard || !guard.alertBotIds?.includes(batch.botId)) batch.events.delete(eventId);
+  }
+  batch.removed = new Set([...batch.events.values()].flatMap((event) => event.removed));
+  if (!batch.events.size || !batch.removed.size) { dropDnsGuardNotificationBatch(key, batch); return; }
+  const settings = state.telegramBots?.find((bot) => bot.id === batch.botId && bot.enabled !== false && bot.tokenEnc);
+  if (!settings) { dropDnsGuardNotificationBatch(key, batch); return; }
+  let token;
+  try { token = decryptSecret(settings.tokenEnc); } catch { dropDnsGuardNotificationBatch(key, batch); return; }
+  batch.zeroNotified ||= new Set();
+  batch.sending = true;
+  try {
+    const result = await telegramCall(token, 'sendMessage', {
+      chat_id: batch.chatId, text: dnsGuardNotificationText(batch),
+      ...(dnsGuardNotificationMarkup(settings, batch) ? { reply_markup: dnsGuardNotificationMarkup(settings, batch) } : {})
+    }, { signal: AbortSignal.timeout(10000) });
+    batch.messageId = result?.message_id;
+    batch.sentAt = Date.now();
+    for (const event of batch.events.values()) if (event.remaining === 0) batch.zeroNotified.add(event.guardId);
+    batch.sending = false;
+    dnsGuardNotificationScheduleCleanup(key, batch);
+    if (batch.dirty) { batch.dirty = false; dnsGuardNotificationScheduleEdit(key, batch); }
+  } catch {
+    batch.sending = false;
+    dropDnsGuardNotificationBatch(key, batch);
+  }
+}
+
+function enqueueDnsGuardNotification(event) {
+  const state = readState(['telegramBots']);
+  const botIds = new Set(event.botIds || []);
+  for (const bot of state.telegramBots || []) {
+    if (!botIds.has(bot.id) || bot.enabled === false || !bot.tokenEnc) continue;
+    for (const chatId of [...new Set(bot.userIds || [])]) {
+      const key = `${bot.id}:${String(chatId)}`;
+      const batches = telegramRuntime.dnsNotificationRecipients.get(key) || [];
+      const now = Date.now();
+      let batch = batches.find((item) => dnsGuardNotificationHasOverlap(item, event)
+        && (!item.sentAt || now - item.sentAt <= DNS_GUARD_NOTIFICATION_MERGE_MS));
+      if (!batch) {
+        batch = { botId: bot.id, chatId, events: new Map(), removed: new Set(), zeroNotified: new Set(), sentAt: 0, sending: false, dirty: false };
+        batches.push(batch);
+        telegramRuntime.dnsNotificationRecipients.set(key, batches);
+      }
+      if (batch.events.has(event.id)) continue;
+      batch.events.set(event.id, { ...event, removed: [...new Set(event.removed)] });
+      if (event.remaining > 0) batch.zeroNotified.delete(event.guardId);
+      for (const address of event.removed) batch.removed.add(address);
+      if (!batch.sentAt && !batch.sending) {
+        batch.collectTimer ||= setTimeout(() => {
+          batch.collectTimer = null;
+          dnsGuardNotificationFlush(key, batch).catch(() => {});
+        }, DNS_GUARD_NOTIFICATION_COLLECT_MS);
+        batch.collectTimer.unref?.();
+      } else if (batch.sending || batch.sentAt + DNS_GUARD_NOTIFICATION_MERGE_MS >= now) {
+        batch.dirty = true;
+        if (batch.sentAt) dnsGuardNotificationScheduleEdit(key, batch);
+      }
     }
   }
+}
+
+function notifyDnsGuardViaTelegram(guardId, event = null) {
+  if (!event) {
+    const state = readState(['dnsGuards', 'dnsGuardRuns']);
+    const guard = state.dnsGuards?.find((item) => item.id === guardId);
+    const latestRun = state.dnsGuardRuns?.find((item) => item.guardId === guardId);
+    const removed = latestRun?.failedValues?.filter((address) => !guard?.currentValues?.includes(address)) || [];
+    if (!guard || !removed.length) return;
+    event = { id: latestRun.id || `${guardId}:${Date.now()}`, guardId, name: guard.name, domain: guard.domain,
+      recordType: guard.recordType, removed, remaining: guard.currentValues?.length || 0,
+      maxActiveIps: guard.maxActiveIps || 50, message: guard.message || '', finishedAt: latestRun.finishedAt,
+      botIds: [...(guard.alertBotIds || [])] };
+  }
+  if (!event?.removed?.length || !event.botIds?.length) return;
+  enqueueDnsGuardNotification(event);
 }
 
 function snapshotPoolInventory(state) {

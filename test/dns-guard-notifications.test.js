@@ -44,7 +44,7 @@ test('guard notification choices default empty, remain independent and can be sa
 
 test('DNS notifications collect, update shared failures, and respect current selections', async () => {
   const source = fs.readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
-  const start = source.indexOf('function dnsGuardNotificationText(');
+  const start = source.indexOf('function telegramNoticeValue(');
   const end = source.indexOf('\nfunction snapshotPoolInventory(', start);
   const calls = [], reads = [], timers = [];
   const state = { dnsGuards: [{ id: 'guard', name: '守护', domain: 'test.example.com', currentValues: ['192.0.2.2'], recordType: 'A' }],

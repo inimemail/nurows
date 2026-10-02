@@ -2574,6 +2574,32 @@ function checkProbePresence() {
   catch (error) { console.error('Probe presence:', error.message); }
 }
 
+function telegramNoticeValue(value, fallback = '未填写', max = 240) {
+  const text = String(value ?? '').replace(/[\r\n\t]+/g, ' ').trim();
+  if (!text) return fallback;
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function telegramNoticeTime(value) {
+  if (!value) return '时间未知';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? telegramNoticeValue(value, '时间未知', 80)
+    : date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function telegramNotice(title, rows, footer = '') {
+  return [title, '━━━━━━━━━━━━', ...rows.filter(Boolean), footer].filter(Boolean).join('\n');
+}
+
+function sendTelegramNotice(token, chatId, text, replyMarkup, options = {}) {
+  return telegramCall(token, 'sendMessage', {
+    chat_id: chatId,
+    text,
+    disable_web_page_preview: true,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+  }, options);
+}
+
 function notifyProbePresenceViaTelegram(events) {
   const selectedEvents = events.filter((event) => event.alertBotIds?.length);
   if (!selectedEvents.length) return;
@@ -2582,8 +2608,14 @@ function notifyProbePresenceViaTelegram(events) {
   // Send each batch in order without delaying heartbeats or waiting on Telegram.
   void (async () => {
     for (const event of selectedEvents) {
-      const label = event.status === 'offline' ? '探针离线' : event.previousStatus === 'offline' ? '探针恢复上线' : '探针上线';
-      const text = `${label}：${event.name || event.probeId}\n地区 / 线路：${[event.region, event.carrier].filter(Boolean).join(' / ') || '未填写'}\n时间：${event.at}\n最后心跳：${event.lastSeenAt || '无'}${event.status === 'offline' ? '\n超过 90 秒未收到心跳' : ''}`;
+      const label = event.status === 'offline' ? '🔴 探针离线' : event.previousStatus === 'offline' ? '🟢 探针恢复上线' : '🔵 探针上线';
+      const text = telegramNotice(label, [
+        `📡 探针：${telegramNoticeValue(event.name || event.probeId)}`,
+        `🌐 地区 / 线路：${telegramNoticeValue([event.region, event.carrier].filter(Boolean).join(' / '))}`,
+        `🕒 事件时间：${telegramNoticeTime(event.at)}`,
+        `💓 最后心跳：${telegramNoticeTime(event.lastSeenAt)}`,
+        event.status === 'offline' ? '⚠️ 已超过 90 秒未收到心跳' : '✅ 当前已收到有效心跳'
+      ]);
       for (const botId of new Set(event.alertBotIds)) {
         const bot = bots.get(botId);
         if (!bot) continue;
@@ -2591,7 +2623,7 @@ function notifyProbePresenceViaTelegram(events) {
         try { token = decryptSecret(bot.tokenEnc); } catch { continue; }
         for (const chatId of new Set(bot.userIds || [])) {
           try {
-            await telegramCall(token, 'sendMessage', { chat_id: chatId, text }, { signal: AbortSignal.timeout(10000) });
+            await sendTelegramNotice(token, chatId, text, null, { signal: AbortSignal.timeout(10000) });
           } catch { /* Notification failures must not interfere with probe processing. */ }
         }
       }
@@ -2604,12 +2636,18 @@ function notifyIncidentViaTelegram(incidentId) {
   const incident = state.incidents?.find((item) => item.id === incidentId);
   if (!incident) return;
   const configs = (state.telegramBots || []).filter((bot) => bot.enabled && bot.tokenEnc);
-  const text = `故障事件：${incident.targetName}\n状态：${STATUS_LABELS[incident.status] || incident.status}\n${incident.message || incident.error || ''}`;
+  const status = STATUS_LABELS[incident.status] || incident.status;
+  const text = telegramNotice('🚨 故障事件', [
+    `🎯 目标：${telegramNoticeValue(incident.targetName)}`,
+    `📌 状态：${telegramNoticeValue(status)}`,
+    `💬 说明：${telegramNoticeValue(incident.message || incident.error, '暂无说明', 1000)}`,
+    `🧩 备用 IP：${telegramNoticeValue(incident.allocatedIps?.join(', '), '尚未分配', 500)}`
+  ], `🕒 更新时间：${telegramNoticeTime(incident.updatedAt || incident.finishedAt || incident.startedAt)}`);
   for (const settings of configs) {
     let token = '';
     try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
     for (const chatId of [...new Set(settings.userIds || [])]) {
-      telegramCall(token, 'sendMessage', { chat_id: chatId, text }).catch(() => {});
+      sendTelegramNotice(token, chatId, text).catch(() => {});
     }
   }
 }
@@ -2620,9 +2658,12 @@ async function notifyDynamicGuardViaTelegram(guard, message) {
   await Promise.allSettled(bots.flatMap((bot) => {
     let token;
     try { token = decryptSecret(bot.tokenEnc); } catch { return []; }
-    return [...new Set(bot.userIds || [])].map((chatId) => telegramCall(token, 'sendMessage', {
-      chat_id: chatId, text: `动态 IP 守护：${guard.name}\n域名：${guard.domain}\n${message}`
-    }));
+    const text = telegramNotice('🛡️ 动态 IP 守护', [
+      `📌 任务：${telegramNoticeValue(guard.name)}`,
+      `🌐 域名：${telegramNoticeValue(guard.domain)}`,
+      `💬 结果：${telegramNoticeValue(message, '暂无说明', 1000)}`
+    ]);
+    return [...new Set(bot.userIds || [])].map((chatId) => sendTelegramNotice(token, chatId, text));
   }));
 }
 
@@ -2642,9 +2683,10 @@ function dnsGuardNotificationText(batch) {
   });
   const omitted = events.length - lines.length;
   return [
-    `DNS 守护：已处理 ${events.length} 个域名`,
-    `故障 IP：${uniqueIps.length} 个唯一 IP · 共移除 ${totalRemoved} 条记录`,
-    `IP：${uniqueIps.join(', ')}${batch.removed.size > uniqueIps.length ? ' …' : ''}`,
+    `🛡️ DNS 守护 · 已处理 ${events.length} 个域名`,
+    '━━━━━━━━━━━━',
+    `📉 故障 IP：${uniqueIps.length} 个唯一 IP · 共移除 ${totalRemoved} 条记录`,
+    `🌐 IP：${uniqueIps.join(', ')}${batch.removed.size > uniqueIps.length ? ' …' : ''}`,
     ...lines,
     omitted > 0 ? `其余 ${omitted} 个域名请在 DNS 守护记录中查看` : '',
     events.some((event) => event.remaining === 0) ? '⚠️ 有域名当前没有活动 IP，正在等待备用 IP' : ''
@@ -2696,13 +2738,16 @@ async function dnsGuardNotificationEdit(key, batch) {
   batch.sending = true;
   try {
     await telegramCall(token, 'editMessageText', {
-      chat_id: batch.chatId, message_id: batch.messageId, text: dnsGuardNotificationText(batch),
+      chat_id: batch.chatId, message_id: batch.messageId, text: dnsGuardNotificationText(batch), disable_web_page_preview: true,
       ...(dnsGuardNotificationMarkup(settings, batch) ? { reply_markup: dnsGuardNotificationMarkup(settings, batch) } : {})
     }, { signal: AbortSignal.timeout(10000) });
     if (newlyEmpty.length) {
       await telegramCall(token, 'sendMessage', {
-        chat_id: batch.chatId,
-        text: `🚨 DNS 守护：${newlyEmpty.map((event) => `${event.name || event.domain} 当前没有活动 IP`).join('；')}\n正在等待备用 IP。`,
+        chat_id: batch.chatId, disable_web_page_preview: true,
+        text: telegramNotice('🚨 DNS 守护 · 需要备用 IP', [
+          `🌐 ${newlyEmpty.map((event) => `${telegramNoticeValue(event.name || event.domain)} 当前没有活动 IP`).join('\n')}`,
+          '⏳ 正在等待备用 IP 补入'
+        ]),
         ...(dnsGuardNotificationMarkup(settings, batch) ? { reply_markup: dnsGuardNotificationMarkup(settings, batch) } : {})
       }, { signal: AbortSignal.timeout(10000) });
       for (const event of newlyEmpty) batch.zeroNotified.add(event.guardId);
@@ -2750,7 +2795,7 @@ async function dnsGuardNotificationFlush(key, batch) {
   batch.sending = true;
   try {
     const result = await telegramCall(token, 'sendMessage', {
-      chat_id: batch.chatId, text: dnsGuardNotificationText(batch),
+      chat_id: batch.chatId, text: dnsGuardNotificationText(batch), disable_web_page_preview: true,
       ...(dnsGuardNotificationMarkup(settings, batch) ? { reply_markup: dnsGuardNotificationMarkup(settings, batch) } : {})
     }, { signal: AbortSignal.timeout(10000) });
     batch.messageId = result?.message_id;
@@ -2849,9 +2894,15 @@ function notifyPoolThresholdDrops(previousInventory, next) {
       let token = '';
       try { token = decryptSecret(settings.tokenEnc); } catch (_error) { continue; }
       const recipients = settings.userIds || [];
-      const text = `备用池库存预警\n${pool.name}\n本次减少：${before - after}\n当前可用：${after}\n触达数量：${crossed.join('、')}\n状态：${pool.enabled === false ? '已停用' : '可分配'}`;
+      const text = telegramNotice('📦 备用池库存预警', [
+        `📌 备用池：${telegramNoticeValue(pool.name)}`,
+        `📉 本次减少：${before - after} 个`,
+        `📊 当前可用：${after} 个`,
+        `🎯 触达阈值：${crossed.join('、')}`,
+        `状态：${pool.enabled === false ? '⏸️ 已停用' : '✅ 可分配'}`
+      ], '请及时补充库存，避免守护任务等待备用 IP。');
       for (const chatId of [...new Set(recipients)]) {
-        telegramCall(token, 'sendMessage', { chat_id: chatId, text, reply_markup: { inline_keyboard: [[{ text: '查看备用池', callback_data: `pool:${pool.id}` }, { text: '批量补充 IP', callback_data: `pool_add:${pool.id}` }], [{ text: pool.enabled === false ? '启用备用池' : '暂停备用池', callback_data: `pool_toggle_confirm:${pool.id}` }]] } }).catch(() => {});
+        sendTelegramNotice(token, chatId, text, { inline_keyboard: [[{ text: '查看备用池', callback_data: `pool:${pool.id}` }, { text: '批量补充 IP', callback_data: `pool_add:${pool.id}` }], [{ text: pool.enabled === false ? '启用备用池' : '暂停备用池', callback_data: `pool_toggle_confirm:${pool.id}` }]] }).catch(() => {});
       }
     }
   }
@@ -3525,13 +3576,15 @@ function scheduleTelegramProgress(chatId, messageId, jobId, token, authorization
     const job = commandJobs.get(jobId);
     if (!job) { clearInterval(timer); telegramRuntime.progressTimers.delete(key); return; }
     const counts = { total: job.results.length, ok: job.results.filter((item) => item.ok).length, error: job.results.filter((item) => item.status === 'error').length, running: job.results.filter((item) => ['queued', 'running', 'awaiting_input'].includes(item.status)).length };
-    const title = job.status === 'done' ? (job.cancelled ? '自动化已取消' : '自动化已完成') : '自动化执行中';
-    const text = `${title}\n总数：${counts.total}\n成功：${counts.ok}\n失败：${counts.error}\n执行中：${counts.running}`;
+    const title = job.status === 'done' ? (job.cancelled ? '⏹️ 自动化任务已取消' : '✅ 自动化任务已完成') : '⚙️ 自动化任务执行中';
+    const taskLabel = String(job.taskName || '未命名任务').replace(/[\r\n\t]+/g, ' ').slice(0, 240);
+    const text = [title, '━━━━━━━━━━━━', `📌 任务：${taskLabel}`,
+      `📊 总数：${counts.total}`, `✅ 成功：${counts.ok}`, `❌ 失败：${counts.error}`, `⏳ 执行中：${counts.running}`].join('\n');
     const done = job.status === 'done';
     if (text === lastText && !done) return;
     busy = true;
     try {
-      await telegramCall(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: done ? { inline_keyboard: [] } : { inline_keyboard: [[{ text: '取消任务', callback_data: `canceljob:${job.id}` }]] } });
+      await telegramCall(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text, disable_web_page_preview: true, reply_markup: done ? { inline_keyboard: [] } : { inline_keyboard: [[{ text: '取消任务', callback_data: `canceljob:${job.id}` }]] } });
       lastText = text;
     } catch (_error) { /* stale message */ }
     finally { busy = false; }

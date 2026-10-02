@@ -85,7 +85,7 @@ test('notification recipients default to empty, can be selected or cleared, and 
 
 test('Telegram delivery is opt-in, deduplicates recipients, skips disabled bots and tolerates failures', async () => {
   const source = fs.readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
-  const start = source.indexOf('function notifyProbePresenceViaTelegram(');
+  const start = source.indexOf('function telegramNoticeValue(');
   const end = source.indexOf('\nfunction notifyIncidentViaTelegram(', start);
   const calls = [];
   let reads = 0;

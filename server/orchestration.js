@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import dns from 'node:dns/promises';
 import net from 'node:net';
+import { IP_USAGE_KEYS, lookupIpUsage, parseIpUsageInput } from './ip-usage-lookup.js';
 import { promisify } from 'node:util';
 import { v4 as uuidv4 } from 'uuid';
 import { sanitizeDynamicGuard, dynamicProbeTargets, acceptDynamicReports } from './dynamic-guard.js';
@@ -468,6 +469,17 @@ export function registerProbePublicRoutes(app, deps) {
 }
 
 export function registerOrchestrationRoutes(app, deps) {
+  app.post('/api/dns-guards/ip-usage', (req, res) => {
+    res.set?.('Cache-Control', 'no-store');
+    let query;
+    try {
+      // Validate limits before reading the database snapshot.
+      query = parseIpUsageInput(req.body?.addresses);
+    } catch (error) { return res.status(400).json({ error: error.message }); }
+    const state = deps.readState(IP_USAGE_KEYS);
+    res.json(lookupIpUsage(state, query, protectedIpAssets(state)));
+  });
+
   app.get('/api/orchestration/status/:section', (req, res) => {
     const views = {
       nodes: ['probes', 'telegramBots'], targets: ['probes', 'probeTargets', 'failoverPolicies'],

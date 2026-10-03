@@ -124,6 +124,7 @@ test('guard editor exposes default-empty bot selection and serializes changes wi
     if (path.endsWith('telegram-permissions.js')) return telegramPermissions;
     if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return workspaceSearch;
+    if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     throw Error(path);
   } });

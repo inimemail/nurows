@@ -18,6 +18,7 @@ function harness() {
     if (path.endsWith('telegram-permissions.js')) return permissions;
     if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return workspaceSearch;
+    if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     if (path.endsWith('polling.js')) return {};
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     throw new Error(path);

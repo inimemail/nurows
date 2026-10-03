@@ -108,6 +108,7 @@ function harness() {
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
     if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return search;
+    if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     if (path.endsWith('telegram-permissions.js')) return permissions;
     if (path.endsWith('polling.js')) return { startPolling: () => () => {} };
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { __esModule: true, default: 'dynamic' };

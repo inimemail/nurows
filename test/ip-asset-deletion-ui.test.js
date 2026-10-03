@@ -27,6 +27,7 @@ function harness(api, assets, search = '', extra = {}) {
     if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return workspaceSearch;
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
+    if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     throw Error(path);
   } });
   function render() { cursor = 0; tree = module.exports.default({ tab: 'pools', state, search, api, onState: (next) => updates.push(next), toast: (message) => messages.push(message), Dialog: 'dialog' }); }

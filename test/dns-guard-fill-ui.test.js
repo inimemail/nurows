@@ -8,7 +8,7 @@ import * as permissions from '../shared/telegram-permissions.js';
 import * as search from '../shared/workspace-search.js';
 
 const source = fs.readFileSync(new URL('../src/OrchestrationWorkspace.jsx', import.meta.url), 'utf8');
-const compiled = transformSync(`${source}\nexport { GuardEditor, PoolEditor, normalizeDraft, serializeDraft };`, { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
+const compiled = transformSync(`${source}\nexport { GuardEditor, PoolEditor, normalizeDraft, serializeDraft, sourceStatusLabel, sourceStatusTone, STATUS };`, { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
 const jsx = (type, props) => ({ type, props });
 const module = { exports: {} };
 vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone, require(path) {
@@ -19,10 +19,21 @@ vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone,
   if (path.endsWith('workspace-search.js')) return search;
   return {};
 } });
-const { GuardEditor, PoolEditor, normalizeDraft, serializeDraft } = module.exports;
+const { GuardEditor, PoolEditor, normalizeDraft, serializeDraft, sourceStatusLabel, sourceStatusTone, STATUS } = module.exports;
 const nodes = (value) => Array.isArray(value) ? value.flatMap(nodes) : value && typeof value === 'object' ? [value, ...nodes(value.props?.children)] : [];
 const field = (tree, label) => nodes(tree).find((node) => node.props?.label === label);
 const text = (value) => Array.isArray(value) ? value.map(text).join('') : value && typeof value === 'object' ? text(value.props?.children) : String(value ?? '');
+
+test('source status distinguishes partial failures and waiting for usable IPs', () => {
+  assert.equal(STATUS.waiting_ip, '等待可用 IP');
+  const partial = { status: 'synced', pending: false, failedValues: ['192.0.2.1', '192.0.2.2'] };
+  assert.equal(sourceStatusLabel(partial), '已同步 · 2 个 IP 待复检');
+  assert.equal(sourceStatusTone(partial), 'warn');
+  const recovered = { ...partial, failedValues: [] };
+  assert.equal(sourceStatusLabel(recovered), '主来源已同步');
+  assert.equal(sourceStatusTone(recovered), 'ok');
+  assert.equal(sourceStatusLabel({ status: 'resolve_error', pending: true }), '解析失败 · 待重试');
+});
 
 test('guard form defaults to repair, conditionally exposes a bounded fill target and preserves settings on save', () => {
   let value = normalizeDraft('guard', { maxActiveIps: 20 });

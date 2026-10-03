@@ -2689,7 +2689,7 @@ function dnsGuardNotificationText(batch) {
     `🌐 IP：${uniqueIps.join(', ')}${batch.removed.size > uniqueIps.length ? ' …' : ''}`,
     ...lines,
     omitted > 0 ? `其余 ${omitted} 个域名请在 DNS 守护记录中查看` : '',
-    events.some((event) => event.remaining === 0) ? '⚠️ 有域名当前没有活动 IP，正在等待备用 IP' : ''
+    events.some((event) => event.remaining === 0) ? '⚠️ 有域名当前没有活动 IP，正在等待可用来源或备用 IP' : ''
   ].filter(Boolean).join('\n').slice(0, 3900);
 }
 
@@ -2744,9 +2744,9 @@ async function dnsGuardNotificationEdit(key, batch) {
     if (newlyEmpty.length) {
       await telegramCall(token, 'sendMessage', {
         chat_id: batch.chatId, disable_web_page_preview: true,
-        text: telegramNotice('🚨 DNS 守护 · 需要备用 IP', [
+        text: telegramNotice('🚨 DNS 守护 · 暂无可用 IP', [
           `🌐 ${newlyEmpty.map((event) => `${telegramNoticeValue(event.name || event.domain)} 当前没有活动 IP`).join('\n')}`,
-          '⏳ 正在等待备用 IP 补入'
+          '⏳ 正在等待可用来源或备用 IP 补入'
         ]),
         ...(dnsGuardNotificationMarkup(settings, batch) ? { reply_markup: dnsGuardNotificationMarkup(settings, batch) } : {})
       }, { signal: AbortSignal.timeout(10000) });
@@ -3532,7 +3532,7 @@ function normalizeTelegramDomain(value) {
   return domain;
 }
 
-const STATUS_LABELS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待备用 IP', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', stabilizing: '等待 DNS 生效', discarded: '检测不可用，已丢弃', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
+const STATUS_LABELS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待可用 IP', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', queued: '等待执行', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', stabilizing: '等待 DNS 生效', discarded: '检测不可用，已丢弃', succeeded: '已完成', failed: '失败', rolled_back: '已回滚' };
 
 function resolveTelegramRole(state, settings, from, chat) {
   const userId = String(from?.id || '');

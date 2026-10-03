@@ -13,7 +13,7 @@ const sections = {
 };
 const resources = { guards: 'dns-guards', probes: 'probes', targets: 'probe-targets', policies: 'failover-policies', pools: 'ip-pools', assets: 'ip-assets' };
 const labels = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', unknown: '未检查',
-  queued: '待执行', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待备用 IP', waiting_for_ip: '等待备用 IP',
+  queued: '待执行', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待可用 IP', waiting_for_ip: '等待备用 IP',
   waiting_new_ip: '等待新 IP', waiting: '等待中', executing: '执行中', observing: '观察中', disabled: '已停用', command_error: '命令异常', resolve_error: '解析异常', cooldown: '冷却中', daily_limit: '达到每日上限',
   succeeded: '已完成', recovered: '已恢复', replaced: '已补位', degraded: '容量不足', error: '异常', failed: '失败',
   pending_approval: '待确认', allocating: '分配中', automating: '执行自动化', dns_updating: '写入 DNS', verifying: '验证中',

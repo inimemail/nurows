@@ -1124,7 +1124,8 @@ test('new DDNS sources sync while current IPs are healthy and then use cached he
 test('a failed source retries independently without resolving other healthy sources', async () => {
   const deps = sourceGuardFixture(['198.51.100.10'], {
     sources: [{ id: 'cached', domain: 'cached.example.com', backupDomain: '' }, { id: 'home', domain: 'home.example.com', backupDomain: '' }],
-    sourceState: { cached: { domains: { primary: 'cached.example.com', backup: '' }, primary: ['198.51.100.10'], pending: false } }
+    sourceState: { cached: { domains: { primary: 'cached.example.com', backup: '' }, primary: ['198.51.100.10'],
+      resolvedAt: { primary: new Date().toISOString() }, pending: false } }
   });
   let attempts = 0;
   deps.resolveDomainAddresses = async (domain) => {
@@ -1214,12 +1215,283 @@ test('backup sources are queried only after every primary IP fails on every prob
   assert.equal(deps.lookups.length, 2, 'a healthy active backup uses its cache');
 });
 
-test('a partially healthy primary syncs its good IP without checking backup or retrying bad peers forever', async () => {
+test('a partially healthy primary reuses its good IP between periodic retries without checking backup', async () => {
   const deps = sourceGuardFixture();
   await nextSourceCycle(deps, (address) => address !== '203.0.113.21');
   assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11', '203.0.113.20']);
   await nextSourceCycle(deps);
   assert.equal(deps.lookups.length, 1);
+});
+
+test('periodic refresh discovers added source IPs without DNS lookups on every healthy cycle', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const deps = sourceGuardFixture([]);
+  let answer = ['203.0.113.20'];
+  deps.resolveDomainAddresses = async (domain) => { deps.lookups.push(domain); return [...answer]; };
+  await nextSourceCycle(deps);
+  answer.push('203.0.113.21', '203.0.113.22');
+  for (let i = 0; i < 3; i++) await nextSourceCycle(deps);
+  assert.equal(deps.lookups.length, 1);
+  assert.deepEqual(deps.getRemote(), ['203.0.113.20']);
+  t.mock.timers.tick(60001);
+  assert.deepEqual(await nextSourceCycle(deps), answer);
+  assert.deepEqual(deps.getRemote(), answer);
+  assert.equal(deps.lookups.length, 2);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.failedValues.length, 0);
+});
+
+test('periodic retries recover failed source peers even while one source IP remains healthy', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const deps = sourceGuardFixture([]);
+  await nextSourceCycle(deps, (address) => address === '203.0.113.20');
+  let entry = deps.getState().dnsGuards[0].sourceState.home;
+  assert.deepEqual(entry.primary, ['203.0.113.20', '203.0.113.21']);
+  assert.deepEqual(entry.failedValues, ['203.0.113.21']);
+  assert.deepEqual(await nextSourceCycle(deps), ['203.0.113.20']);
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceState.home.failedValues, ['203.0.113.21']);
+  t.mock.timers.tick(60001);
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.getRemote(), ['203.0.113.20', '203.0.113.21']);
+  entry = deps.getState().dnsGuards[0].sourceState.home;
+  assert.deepEqual(entry.failedValues, []);
+  assert.equal(entry.status, 'synced');
+  assert.equal(deps.lookups.length, 2);
+});
+
+test('legacy healthy sources refresh once instead of permanently retaining an incomplete answer', async () => {
+  const deps = sourceGuardFixture(['203.0.113.20'], {
+    sourceOwnedValues: ['203.0.113.20'],
+    sourceState: { home: { domains: { primary: 'home.example.com', backup: 'backup.example.com' },
+      primary: ['203.0.113.20'], healthyValues: ['203.0.113.20'], status: 'synced', pending: false } }
+  });
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.getRemote(), ['203.0.113.20', '203.0.113.21']);
+  await nextSourceCycle(deps);
+  assert.equal(deps.lookups.length, 1);
+  assert.ok(deps.getState().dnsGuards[0].sourceState.home.resolvedAt.primary);
+});
+
+test('persisted source refresh metadata survives restart without extra DNS queries', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const deps = sourceGuardFixture([]);
+  await nextSourceCycle(deps);
+  const restarted = remoteDeps(normalizeOrchestrationState(deps.getState()), deps.getRemote());
+  restarted.resolveDomainAddresses = deps.resolveDomainAddresses;
+  const timestamp = deps.getState().dnsGuards[0].sourceState.home.resolvedAt.primary;
+  assert.equal(restarted.getState().dnsGuards[0].sourceState.home.resolvedAt.primary, timestamp);
+  clearDnsGuardSourceCache();
+  await nextSourceCycle(restarted);
+  assert.equal(deps.lookups.length, 1, 'persisted freshness avoids an unnecessary lookup after restart');
+  t.mock.timers.tick(60001);
+  await nextSourceCycle(restarted);
+  assert.equal(deps.lookups.length, 2, 'persisted freshness does not suppress later refreshes');
+});
+
+test('periodic DNS failure keeps healthy source-owned IPs and records a retryable resolution error', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const deps = sourceGuardFixture([]);
+  await nextSourceCycle(deps);
+  const remote = [...deps.getRemote()];
+  deps.resolveDomainAddresses = async () => { throw new Error('DNS timeout'); };
+  t.mock.timers.tick(60001);
+  await nextSourceCycle(deps);
+  const guard = deps.getState().dnsGuards[0];
+  assert.deepEqual(deps.getRemote(), remote);
+  assert.deepEqual(guard.sourceOwnedValues, remote);
+  assert.equal(guard.sourceState.home.status, 'resolve_error');
+  assert.equal(guard.sourceState.home.pending, true);
+  assert.match(guard.sourceState.home.lastError, /DNS timeout/);
+  assert.match(guard.message, /2 个健康 IP.*来源待重试/);
+});
+
+test('a healthy backup periodically reevaluates the primary and returns after recovery', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const deps = sourceGuardFixture([]);
+  await nextSourceCycle(deps, (address) => address === '203.0.113.30');
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.activeSide, 'backup');
+  await nextSourceCycle(deps);
+  assert.equal(deps.lookups.length, 2);
+  t.mock.timers.tick(60001);
+  await nextSourceCycle(deps);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.activeSide, 'primary');
+  assert.deepEqual(deps.getRemote(), ['203.0.113.20', '203.0.113.21']);
+  assert.equal(deps.lookups.length, 3);
+});
+
+test('empty guards explain source failures instead of claiming existing IPs are healthy', async () => {
+  for (const reason of ['resolve_error', 'probe_failed']) {
+    const deps = sourceGuardFixture([], { sources: [{ id: 'home', domain: 'home.example.com' }] });
+    if (reason === 'resolve_error') deps.resolveDomainAddresses = async () => { throw new Error('DNS timeout'); };
+    await nextSourceCycle(deps, () => false);
+    const guard = deps.getState().dnsGuards[0];
+    assert.equal(guard.status, 'waiting_ip');
+    assert.equal(guard.sourceState.home.status, reason);
+    assert.match(guard.message, /当前没有活动 IP/);
+    assert.match(guard.message, reason === 'resolve_error' ? /来源解析失败/ : /来源 IP 检查失败/);
+    assert.doesNotMatch(guard.message, /正常|备用池/);
+  }
+});
+
+test('many guards share initial and periodic DNS queries with independent complete answers', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  clearDnsGuardSourceCache();
+  let calls = 0, answer = ['203.0.113.20'];
+  const resolve = async () => { calls += 1; await new Promise(setImmediate); return [...answer]; };
+  const guards = Array.from({ length: 60 }, (_, i) => ({ id: `guard-${i}`, recordType: 'A', sources: [{ id: 'home', domain: 'shared.example.com' }] }));
+  const first = await Promise.all(guards.map((guard) => resolveDnsGuardSources(guard, [], resolve)));
+  assert.equal(calls, 1);
+  guards.forEach((guard, i) => {
+    guard.sourceState = selectHealthyDnsGuardSources(guard.sources, first[i].candidates, first[i].state,
+      new Map(answer.map((address) => [address, { ok: true }]))).state;
+  });
+  t.mock.timers.tick(60001);
+  answer = ['203.0.113.20', '203.0.113.21'];
+  const second = await Promise.all(guards.map((guard) => resolveDnsGuardSources(guard, ['203.0.113.20'], resolve)));
+  assert.equal(calls, 2, 'sixty guards issue only one lookup per refresh');
+  for (const result of second) assert.deepEqual(result.values, answer);
+  second[0].state.home.primary.push('203.0.113.99');
+  assert.deepEqual(second[1].state.home.primary, answer);
+});
+
+test('cache eviction does not restart completed source queries during a large concurrent refresh', async () => {
+  clearDnsGuardSourceCache();
+  let calls = 0;
+  const resolve = async () => { calls += 1; return ['203.0.113.20']; };
+  const guards = Array.from({ length: 1100 }, (_, i) => ({ recordType: 'A',
+    sources: [{ id: 'source', domain: `source-${i}.example.com` }] }));
+  const results = await Promise.all(guards.map((guard) => resolveDnsGuardSources(guard, [], resolve)));
+  assert.equal(calls, guards.length, 'eviction is not source invalidation');
+  assert.ok(results.every((result) => result.values.length === 1 && !result.errors.length));
+});
+
+test('old failed probe evidence cannot discard a newer cached source answer or invalidate its refresh', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  for (const inflight of [false, true]) {
+    clearDnsGuardSourceCache();
+    const deps = sourceGuardFixture([], { sources: [{ id: 'home', domain: 'shared.example.com' }] });
+    const refresh = Promise.withResolvers();
+    let calls = 0;
+    deps.resolveDomainAddresses = async () => {
+      const call = ++calls;
+      if (call === 1) return ['203.0.113.20'];
+      if (call === 2 && inflight) return refresh.promise;
+      return ['203.0.113.21'];
+    };
+    await runDueDnsGuards(deps);
+    const cycle = deps.getState().dnsGuards[0].cycle;
+    assert.equal(cycle.phase, 'sources');
+    clearDnsGuardSourceCache();
+    t.mock.timers.tick(1);
+    const guard = { recordType: 'A', sources: [{ id: 'home', domain: 'shared.example.com' }] };
+    const newer = resolveDnsGuardSources(guard, [], deps.resolveDomainAddresses);
+    if (!inflight) await newer;
+    for (const check of cycle.checks) {
+      for (const probe of cycle.expectedProbeIds) check.observations[probe] = {
+        ok: false, rounds: 3, attemptsPerRound: 3, roundsCompleted: 3, attempts: 9
+      };
+    }
+    await processReadyDnsGuards(deps);
+    refresh.resolve(['203.0.113.21']);
+    assert.deepEqual((await newer).values, ['203.0.113.21']);
+    assert.deepEqual((await resolveDnsGuardSources(guard, [], deps.resolveDomainAddresses)).values, ['203.0.113.21']);
+    assert.equal(calls, 2, 'old failures do not start a third DNS request');
+  }
+});
+
+test('repeated source invalidation yields a retryable error instead of an unbounded resolution loop', async () => {
+  clearDnsGuardSourceCache();
+  let calls = 0;
+  const resolve = async () => {
+    calls += 1;
+    await new Promise(setImmediate);
+    if (calls <= 5) clearDnsGuardSourceCache();
+    return ['203.0.113.20'];
+  };
+  const guard = { recordType: 'A', sources: [{ id: 'home', domain: 'changing.example.com' }] };
+  const result = await resolveDnsGuardSources(guard, [], resolve);
+  assert.equal(calls, 3, 'only two immediate follow-up requests are permitted');
+  assert.equal(result.state.home.status, 'resolve_error');
+  assert.equal(result.state.home.pending, true);
+  assert.match(result.state.home.lastError, /来源解析连续更新/);
+});
+
+test('a newer shared answer reaches another guard before its local refresh is due', async () => {
+  clearDnsGuardSourceCache();
+  let answer = ['203.0.113.20'], calls = 0;
+  const resolve = async () => { calls += 1; return [...answer]; };
+  const guard = { recordType: 'A', sources: [{ id: 'home', domain: 'shared.example.com' }] };
+  const first = await resolveDnsGuardSources(guard, [], resolve);
+  guard.sourceState = selectHealthyDnsGuardSources(guard.sources, first.candidates, first.state,
+    new Map([['203.0.113.20', { ok: true }]])).state;
+  clearDnsGuardSourceCache();
+  answer = ['203.0.113.20', '203.0.113.21'];
+  await resolveDnsGuardSources({ ...guard, sourceState: {} }, [], resolve);
+  assert.deepEqual((await resolveDnsGuardSources(guard, ['203.0.113.20'], resolve)).values, answer);
+  assert.equal(calls, 2);
+});
+
+test('shared sources update every guard while reusing DNS and existing health evidence', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  clearDnsGuardSourceCache();
+  const deps = sourceGuardFixture([], { sources: [{ id: 'home', domain: 'shared.example.com' }] });
+  const state = deps.getState();
+  state.dnsGuards.push({ ...structuredClone(state.dnsGuards[0]), id: 'second', domain: 'second.example.com' });
+  const remote = new Map(state.dnsGuards.map((guard) => [guard.domain, []]));
+  let calls = 0, writes = 0, answer = ['203.0.113.20'];
+  deps.resolveDomainAddresses = async () => { calls += 1; await new Promise(setImmediate); return [...answer]; };
+  deps.readDnsRecord = async (_account, _credentials, _zone, binding) => ({ values: [...remote.get(binding.domain)], recordIds: [] });
+  deps.writeDnsRecord = async (_account, _credentials, _zone, binding, values) => {
+    writes += 1; remote.set(binding.domain, [...values]); return [];
+  };
+  const run = async () => {
+    state.dnsGuards.forEach((guard) => { guard.nextCheckAt = ''; });
+    await runDueDnsGuards(deps);
+    const checked = [];
+    for (let turn = 0; turn < 10; turn += 1) {
+      const active = state.dnsGuards.filter((guard) => guard.cycle);
+      if (!active.length) return checked;
+      for (const guard of active) {
+        for (const check of guard.cycle.checks) {
+          checked.push([guard.id, check.address]);
+          check.observations['probe-1'] = { ok: true, attempts: 1 };
+        }
+      }
+      await processReadyDnsGuards(deps);
+    }
+    assert.fail('shared guard cycles did not settle');
+  };
+  await run();
+  assert.equal(calls, 1);
+  answer = ['203.0.113.20', '203.0.113.21', '203.0.113.22'];
+  await run();
+  assert.equal(calls, 1);
+  assert.equal(writes, 2, 'unchanged cycles do not write records');
+  t.mock.timers.tick(60001);
+  const checked = await run();
+  assert.equal(calls, 2);
+  assert.equal(writes, 4);
+  for (const guard of state.dnsGuards) {
+    assert.deepEqual(remote.get(guard.domain), answer);
+    assert.equal(guard.status, 'healthy');
+    assert.equal(guard.sourceState.home.status, 'synced');
+    assert.deepEqual(checked.filter(([id]) => id === guard.id).map(([, address]) => address), answer,
+      'each existing IP is checked only once, new IPs receive their own preflight');
+  }
+});
+
+test('periodic refresh at capacity does not probe unused source IPs or rewrite healthy records', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const deps = sourceGuardFixture(undefined, { maxActiveIps: 2 });
+  let writes = 0;
+  const write = deps.writeDnsRecord;
+  deps.writeDnsRecord = async (...args) => { writes += 1; return write(...args); };
+  await nextSourceCycle(deps);
+  t.mock.timers.tick(60001);
+  assert.deepEqual(await nextSourceCycle(deps), deps.getRemote());
+  assert.equal(deps.lookups.length, 2);
+  assert.equal(writes, 0);
+  await nextSourceCycle(deps);
+  assert.equal(deps.lookups.length, 2, 'capacity does not cause a resolution loop');
 });
 
 test('a changed DDNS source can replace its old owned IP at full capacity without removing manual records', async () => {
@@ -1303,14 +1575,29 @@ test('DNS failures are not cached and A and AAAA source answers stay separate', 
   assert.equal(lookups, 3);
 });
 
+test('the system resolver preserves every returned A and AAAA address, deduplicated by family', async (t) => {
+  clearDnsGuardSourceCache();
+  let calls = 0;
+  t.mock.method(dns, 'Resolver', function () {
+    this.resolve4 = async () => { calls += 1; return ['203.0.113.20', '203.0.113.21', '203.0.113.22', '203.0.113.20']; };
+    this.resolve6 = async () => { calls += 1; return ['2001:db8::20', '2001:db8::21', '2001:db8::22', '2001:db8::20']; };
+  });
+  const sources = [{ id: 'shared', domain: 'complete.example.com' }];
+  assert.deepEqual((await resolveDnsGuardSources({ recordType: 'A', sources }, [])).values,
+    ['203.0.113.20', '203.0.113.21', '203.0.113.22']);
+  assert.deepEqual((await resolveDnsGuardSources({ recordType: 'AAAA', sources }, [])).values,
+    ['2001:db8::20', '2001:db8::21', '2001:db8::22']);
+  assert.equal(calls, 2);
+});
+
 test('an invalidated slow DNS response cannot overwrite the newer shared answer', async () => {
   clearDnsGuardSourceCache();
   let releaseOld;
   let lookups = 0;
   const resolve = async () => {
-    lookups += 1;
-    if (lookups === 1) await new Promise((resolve) => { releaseOld = resolve; });
-    return [lookups === 1 ? '203.0.113.10' : '203.0.113.20'];
+    const lookup = ++lookups;
+    if (lookup === 1) await new Promise((resolve) => { releaseOld = resolve; });
+    return [lookup === 1 ? '203.0.113.10' : '203.0.113.20'];
   };
   const guard = { recordType: 'A', sources: [{ id: 'shared', domain: 'race.example.com' }] };
   const oldRequest = resolveDnsGuardSources(guard, [], resolve);
@@ -1322,6 +1609,22 @@ test('an invalidated slow DNS response cannot overwrite the newer shared answer'
   assert.deepEqual((await oldRequest).values, ['203.0.113.20']);
   const cached = await resolveDnsGuardSources(guard, [], resolve);
   assert.deepEqual(cached.values, ['203.0.113.20']);
+  assert.equal(lookups, 2);
+});
+
+test('an invalidated failing DNS request joins the newer shared success', async () => {
+  clearDnsGuardSourceCache();
+  const old = Promise.withResolvers();
+  let lookups = 0;
+  const resolve = async () => ++lookups === 1 ? old.promise : ['203.0.113.20', '203.0.113.21'];
+  const guard = { recordType: 'A', sources: [{ id: 'shared', domain: 'race.example.com' }] };
+  const oldRequest = resolveDnsGuardSources(guard, [], resolve);
+  clearDnsGuardSourceCache();
+  const latest = await resolveDnsGuardSources(guard, [], resolve);
+  old.reject(new Error('obsolete timeout'));
+  const result = await oldRequest;
+  assert.deepEqual(result.values, latest.values);
+  assert.deepEqual(result.errors, []);
   assert.equal(lookups, 2);
 });
 

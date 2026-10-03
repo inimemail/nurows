@@ -55,8 +55,10 @@ const DNS_GUARD_REBALANCE_INTERVAL_MINUTES = 30;
 const DNS_GUARD_REBALANCE_DEFAULT_VERSION = 1;
 const DNS_GUARD_SOURCE_RESOLVE_CONCURRENCY = 4;
 const DNS_GUARD_SOURCE_RESOLVE_TIMEOUT_MS = 5000;
-const DNS_GUARD_SOURCE_CACHE_TTL_MS = 20000;
+const DNS_GUARD_SOURCE_CACHE_TTL_MS = 60000;
+const DNS_GUARD_SOURCE_REFRESH_INTERVAL_MS = 60000;
 const DNS_GUARD_SOURCE_CACHE_LIMIT = 1024;
+const DNS_GUARD_SOURCE_REDIRECT_LIMIT = 2;
 const DNS_ZONE_CACHE_TTL_MS = 10 * 60 * 1000;
 // Probe agents poll the server for cycle progress. This is not the guard's
 // user-configured interval between complete DNS guard cycles.
@@ -1814,7 +1816,8 @@ async function advanceDnsGuardSources(guard, cycle, deps) {
       for (const [side, domain] of [['primary', source.domain], ['backup', source.backupDomain || '']]) {
         const addresses = cleanTexts(candidates[side], 500);
         if (domain && addresses.length && addresses.every((address) => results.has(address) && !results.get(address)?.ok)) {
-          invalidateDnsGuardSourceCache(domain, family);
+          const snapshot = cycle.sourceState?.[key];
+          invalidateDnsGuardSourceCache(domain, family, snapshot?.[side] || addresses, snapshot?.resolvedAt?.[side]);
         }
       }
     }
@@ -1908,66 +1911,77 @@ function dnsGuardSourceCacheKey(domain, family, resolveAddresses) {
   return `${normalizeDnsGuardSourceDomain(domain)}|${family}|${dnsGuardSourceResolverId(resolveAddresses)}`;
 }
 
-async function resolveSharedDnsGuardSource(domain, family, resolveAddresses, onMiss) {
+async function resolveSharedDnsGuardSource(domain, family, resolveAddresses, onMiss, redirects = 0) {
   const key = dnsGuardSourceCacheKey(domain, family, resolveAddresses);
   const now = Date.now();
   const cached = dnsGuardSourceCache.get(key);
   if (cached && cached.expiresAt > now) {
     dnsGuardSourceCache.delete(key);
     dnsGuardSourceCache.set(key, cached);
-    return [...cached.addresses];
+    return { addresses: [...cached.addresses], resolvedAt: cached.resolvedAt };
   }
   if (cached) dnsGuardSourceCache.delete(key);
   let epoch = dnsGuardSourceEpochs.get(key);
-  const inflight = dnsGuardSourceInflight.get(key);
-  if (inflight && inflight.epoch === epoch) return [...await inflight.promise];
-  if (!epoch || (!inflight && !dnsGuardSourceCache.has(key))) {
+  let flight = dnsGuardSourceInflight.get(key);
+  if (!flight || flight.epoch !== epoch) {
     epoch = Symbol(key);
     dnsGuardSourceEpochs.set(key, epoch);
-  }
-  onMiss?.();
-  let resolution;
-  try { resolution = resolveAddresses(domain, family); }
-  catch (error) { resolution = Promise.reject(error); }
-  let flight;
-  const pending = Promise.resolve(resolution).then((values) => {
-    const addresses = filterAddressFamily(values, family === 6 ? 'AAAA' : 'A');
-    if (!addresses.length) throw new Error(`未解析出 ${family === 6 ? 'AAAA' : 'A'} 地址`);
-    const resolvedAt = Date.now();
-    if (dnsGuardSourceEpochs.get(key) === epoch) {
-      dnsGuardSourceCache.set(key, { addresses: [...addresses], resolvedAt,
-        expiresAt: resolvedAt + DNS_GUARD_SOURCE_CACHE_TTL_MS });
-      while (dnsGuardSourceCache.size > DNS_GUARD_SOURCE_CACHE_LIMIT) {
-        const oldest = dnsGuardSourceCache.keys().next().value;
-        dnsGuardSourceCache.delete(oldest);
-        if (!dnsGuardSourceInflight.has(oldest)) dnsGuardSourceEpochs.delete(oldest);
+    onMiss?.();
+    let resolution;
+    try { resolution = resolveAddresses(domain, family); }
+    catch (error) { resolution = Promise.reject(error); }
+    const pending = Promise.resolve(resolution).then((values) => {
+      const addresses = filterAddressFamily(values, family === 6 ? 'AAAA' : 'A');
+      if (!addresses.length) throw new Error(`未解析出 ${family === 6 ? 'AAAA' : 'A'} 地址`);
+      const resolvedAt = Date.now();
+      if (dnsGuardSourceEpochs.get(key) === epoch) {
+        dnsGuardSourceCache.set(key, { addresses: [...addresses], resolvedAt,
+          expiresAt: resolvedAt + DNS_GUARD_SOURCE_CACHE_TTL_MS });
+        while (dnsGuardSourceCache.size > DNS_GUARD_SOURCE_CACHE_LIMIT) {
+          const oldest = dnsGuardSourceCache.keys().next().value;
+          dnsGuardSourceCache.delete(oldest);
+          if (!dnsGuardSourceInflight.has(oldest)) dnsGuardSourceEpochs.delete(oldest);
+        }
       }
-    }
-    return addresses;
-  }).finally(() => {
-    if (dnsGuardSourceInflight.get(key) === flight) dnsGuardSourceInflight.delete(key);
-    if (!dnsGuardSourceInflight.has(key) && !dnsGuardSourceCache.has(key)) dnsGuardSourceEpochs.delete(key);
-  });
-  flight = { epoch, promise: pending };
-  dnsGuardSourceInflight.set(key, flight);
-  return [...await pending];
+      return { addresses, resolvedAt };
+    }).finally(() => {
+      if (dnsGuardSourceInflight.get(key) === flight) dnsGuardSourceInflight.delete(key);
+      if (!dnsGuardSourceInflight.has(key) && !dnsGuardSourceCache.has(key)) dnsGuardSourceEpochs.delete(key);
+    });
+    flight = { epoch, promise: pending, invalidated: false };
+    dnsGuardSourceInflight.set(key, flight);
+  }
+  let result, failure;
+  try { result = await flight.promise; }
+  catch (error) { failure = error; }
+  // Cache eviction is not invalidation. Only an explicitly superseded request
+  // must follow a newer answer, with a bound to prevent endless refresh loops.
+  if (flight.invalidated) {
+    if (redirects >= DNS_GUARD_SOURCE_REDIRECT_LIMIT) throw new Error('来源解析连续更新，请下一轮重试');
+    return resolveSharedDnsGuardSource(domain, family, resolveAddresses, onMiss, redirects + 1);
+  }
+  if (failure) throw failure;
+  return { ...result, addresses: [...result.addresses] };
 }
 
-function invalidateDnsGuardSourceCache(domain, family) {
+function invalidateDnsGuardSourceCache(domain, family, addresses, resolutionTime) {
+  const resolvedAt = Date.parse(resolutionTime || '');
+  if (!Number.isFinite(resolvedAt)) return;
   const prefix = `${normalizeDnsGuardSourceDomain(domain)}|${family}|`;
-  for (const key of dnsGuardSourceCache.keys()) {
-    if (!key.startsWith(prefix)) continue;
+  for (const [key, cached] of dnsGuardSourceCache) {
+    if (!key.startsWith(prefix) || cached.resolvedAt !== resolvedAt || !sameStringSet(cached.addresses, addresses)) continue;
     dnsGuardSourceCache.delete(key);
     if (!dnsGuardSourceInflight.has(key)) dnsGuardSourceEpochs.delete(key);
   }
-  for (const key of dnsGuardSourceInflight.keys()) {
-    if (key.startsWith(prefix)) dnsGuardSourceEpochs.set(key, Symbol(key));
-  }
+  // Any in-flight query is newer than this completed probe snapshot.
 }
 
 export function clearDnsGuardSourceCache() {
   dnsGuardSourceCache.clear();
-  for (const key of dnsGuardSourceInflight.keys()) dnsGuardSourceEpochs.set(key, Symbol(key));
+  for (const [key, flight] of dnsGuardSourceInflight) {
+    flight.invalidated = true;
+    dnsGuardSourceEpochs.set(key, Symbol(key));
+  }
   for (const key of dnsGuardSourceEpochs.keys()) {
     if (!dnsGuardSourceInflight.has(key)) dnsGuardSourceEpochs.delete(key);
   }
@@ -1991,7 +2005,17 @@ export async function resolveDnsGuardSources(guard, currentValues, resolveAddres
       ? previous.healthyValues : previous[activeSide] || (activeSide === 'primary' ? previous.cached : []), 500);
     const domainsMatch = previousDomains.primary === domains.primary && (previousDomains.backup || '') === domains.backup;
     const atCapacity = currentValues.length >= (guard.maxActiveIps || DNS_GUARD_MAX_VALUES);
-    if (side === 'primary' && domainsMatch && !previous.pending && cachedActive.length
+    const now = Date.now();
+    const primaryResolvedAt = Date.parse(previous.resolvedAt?.primary || '');
+    const primaryKey = dnsGuardSourceCacheKey(domains.primary, family, resolveAddresses);
+    const shared = dnsGuardSourceCache.get(primaryKey);
+    const sharedChanged = shared && shared.expiresAt > now
+      && !sameStringSet(shared.addresses, previous.primary || previous.cached || []);
+    const sharedFlight = dnsGuardSourceInflight.get(primaryKey);
+    const refreshing = sharedFlight && sharedFlight.epoch === dnsGuardSourceEpochs.get(primaryKey);
+    const fresh = Number.isFinite(primaryResolvedAt) && now >= primaryResolvedAt
+      && now - primaryResolvedAt < DNS_GUARD_SOURCE_REFRESH_INTERVAL_MS;
+    if (side === 'primary' && fresh && !sharedChanged && !refreshing && domainsMatch && !previous.pending && cachedActive.length
       && (previous.status === 'capacity' ? atCapacity : cachedActive.every((address) => currentValues.includes(address)))) {
       state[key] = { ...previous, domains, activeSide, pending: false };
       candidates[key] = { primary: activeSide === 'primary' ? cachedActive : [], backup: activeSide === 'backup' ? cachedActive : [] };
@@ -2015,13 +2039,16 @@ export async function resolveDnsGuardSources(guard, currentValues, resolveAddres
       const legacyCache = side === 'primary' ? previous.cached : [];
       const cached = previousDomains[side] === domain ? cleanTexts(previous[side] || legacyCache, 500) : [];
       try {
-        entry[side] = await resolveSharedDnsGuardSource(domain, family, resolveAddresses, onResolve);
+        const resolved = await resolveSharedDnsGuardSource(domain, family, resolveAddresses, onResolve);
+        entry[side] = resolved.addresses;
+        entry.resolvedAt = { ...(side === 'backup' ? previous.resolvedAt : {}), [side]: new Date(resolved.resolvedAt).toISOString() };
         if (!entry[side].length) throw new Error(`未解析出 ${family === 6 ? 'AAAA' : 'A'} 地址`);
       } catch (error) {
         const message = `${domain}: ${cleanText(error.message, 120)}`;
         errors.push(message);
         sourceErrors.push(message);
         entry[side] = cached.filter((address) => currentValues.includes(address));
+        entry.resolveFailed = true;
       }
     }
     entry.lastError = sourceErrors.join('；');
@@ -2067,6 +2094,13 @@ export function selectHealthyDnsGuardSources(sources, candidates, sourceState, r
     const evaluated = allCandidates.filter((address) => resultByAddress.has(address));
     const primary = cleanTexts(sourceCandidates.primary, 500).filter((address) => resultByAddress.get(address)?.ok);
     const backup = cleanTexts(sourceCandidates.backup, 500).filter((address) => resultByAddress.get(address)?.ok);
+    const known = new Set([...(current.primary || []), ...(current.backup || [])]);
+    const failed = new Set(cleanTexts(current.failedValues, 500).filter((address) => known.has(address)));
+    for (const address of evaluated) {
+      if (resultByAddress.get(address)?.ok) failed.delete(address);
+      else failed.add(address);
+    }
+    current.failedValues = [...failed];
     if (!primary.length && !backup.length && evaluated.length < allCandidates.length) {
       current.pending = true;
       current.status = 'checking';
@@ -2076,10 +2110,10 @@ export function selectHealthyDnsGuardSources(sources, candidates, sourceState, r
     const activeSide = primary.length ? 'primary' : backup.length ? 'backup' : (current.activeSide === 'backup' && source.backupDomain ? 'backup' : 'primary');
     const selected = activeSide === 'backup' ? backup : primary;
     current.activeSide = activeSide;
-    current.pending = selected.length === 0;
+    current.pending = selected.length === 0 || Boolean(current.resolveFailed);
     current.healthyValues = selected;
-    current.status = selected.length ? 'ready' : allCandidates.length ? 'probe_failed' : 'resolve_error';
-    if (selected.length) current.lastError = '';
+    current.status = current.resolveFailed ? 'resolve_error' : selected.length ? 'ready' : allCandidates.length ? 'probe_failed' : 'resolve_error';
+    if (selected.length && !current.resolveFailed) current.lastError = '';
     if (!selected.length && (sourceCandidates.primary?.length || sourceCandidates.backup?.length)) {
       current.lastError = [current.lastError, '探针检查失败'].filter(Boolean).join('；');
     }
@@ -2473,7 +2507,10 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
       const healthy = entry.healthyValues || [];
       const added = healthy.filter((address) => desired.includes(address));
       entry.syncedValues = added;
-      if (desired.length >= capacity && addresses.some((address) => !desired.includes(address) && resultByAddress.get(address)?.ok !== false)) {
+      if (entry.resolveFailed) {
+        entry.status = 'resolve_error';
+        entry.pending = true;
+      } else if (desired.length >= capacity && addresses.some((address) => !desired.includes(address) && resultByAddress.get(address)?.ok !== false)) {
         entry.status = 'capacity';
         entry.pending = false;
       } else if (added.length) {
@@ -2552,13 +2589,14 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
       providerRecordId: changed ? (providerRecordIds[0] || '') : item.providerRecordId,
       providerRecordIds: changed ? providerRecordIds : item.providerRecordIds
     });
-    if (cycle.sourceSync && !failedRemote.length) {
+    if (status === 'waiting_ip') item.message = dnsGuardWaitingIpMessage(sourceState, item.sources || [], item.poolIds || []);
+    if (desired.length && cycle.sourceSync && !failedRemote.length) {
       const added = desired.filter((address) => !remote.includes(address)).length;
       const pending = Object.values(sourceState).filter((entry) => entry.pending).length;
       if (added) item.message = `已补充 ${added} 个 IP，当前 ${desired.length} 个活动 IP`;
-      else if (pending) item.message = `现有 IP 正常，${pending} 个来源待重试`;
+      else if (pending) item.message = `当前 ${desired.length} 个健康 IP，${pending} 个来源待重试`;
     }
-    if (fillMissing) item.message = `${desired.length}/${targetCount} 个健康 IP，待补 ${targetCount - desired.length} 个；等待备用池补充`;
+    if (fillMissing && desired.length) item.message = `${desired.length}/${targetCount} 个健康 IP，待补 ${targetCount - desired.length} 个；等待来源或备用池补充`;
     else if (status === 'healthy' && failedRemote.length) item.message = `已移除 ${failedRemote.length} 个故障 IP，当前 ${desired.length} 个健康 IP，已达到目标 ${targetCount} 个`;
     if (cycle.rebalancePlan) item.message = returnedAssets.length
       ? `自动均衡已调整 ${returnedAssets.length} 个 IP，健康旧 IP 已退回原池，当前 ${desired.length} 个活动 IP`
@@ -2719,6 +2757,16 @@ function dnsGuardStatusMessage(status, failed, consumed) {
   if (status === 'replaced') return `已替换 ${failed} 个故障 IP，消耗 ${consumed} 个备用 IP`;
   if (status === 'degraded') return `已移除 ${failed} 个故障 IP，等待补足容量`;
   return '全部解析 IP 故障，等待可用来源或备用 IP';
+}
+
+function dnsGuardWaitingIpMessage(sourceState, sources, poolIds) {
+  const entries = Object.values(sourceState);
+  const resolveFailed = entries.filter((entry) => entry.status === 'resolve_error').length;
+  const probeFailed = entries.filter((entry) => entry.status === 'probe_failed').length;
+  const reasons = [resolveFailed ? `${resolveFailed} 个来源解析失败` : '', probeFailed ? `${probeFailed} 个来源 IP 检查失败` : ''].filter(Boolean);
+  if (!sources.length && !poolIds.length) return '当前没有活动 IP，请配置来源域名或备用池';
+  const waiting = sources.length ? `等待来源重试${poolIds.length ? '或备用池提供可用 IP' : ''}` : '等待备用池提供可用 IP';
+  return ['当前没有活动 IP', ...reasons, waiting].join('；');
 }
 
 function addSeconds(seconds) { return new Date(Date.now() + Math.max(1, Number(seconds) || 30) * 1000).toISOString(); }

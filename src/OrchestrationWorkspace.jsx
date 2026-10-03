@@ -12,7 +12,7 @@ const PROVIDERS = {
   dnsla: 'DNSLA', era: '时代互联 / Eranet', tndns: 'Tnethk', gcore: 'Gcore', edgeone: '腾讯 EdgeOne',
   ns1: 'IBM NS1 Connect', rainyun: '雨云', dynv6: 'Dynv6', vercel: 'Vercel DNS', spaceship: 'Spaceship'
 };
-const STATUS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', unknown: '未检测', queued: '等待执行', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待备用 IP', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', stabilizing: '等待 DNS 生效', processing: '处理中', discarded: '检测不可用，已丢弃', consumed: '成功消耗', returned: '已退回原池', succeeded: '已完成', failed: '失败保留', rolled_back: '已回滚' };
+const STATUS = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', observing: '观察中', unknown: '未检测', queued: '等待执行', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待可用 IP', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_for_ip: '等待备用 IP', recovered: '目标已恢复', pending_approval: '待确认', allocating: '分配 IP', automating: '执行任务', dns_updating: '更新 DNS', verifying: '验证中', stabilizing: '等待 DNS 生效', processing: '处理中', discarded: '检测不可用，已丢弃', consumed: '成功消耗', returned: '已退回原池', succeeded: '已完成', failed: '失败保留', rolled_back: '已回滚' };
 
 const EMPTY = {
   probe: { name: '', region: '', carrier: '', maxConcurrency: 100, enabled: true, alertBotIds: [] },
@@ -620,13 +620,14 @@ function EditorSection({ title }) { return <div className="ops-editor-section"><
 
 function sourceStatusLabel(current) {
   if (!current) return '未解析';
+  if (current.status === 'synced' && current.failedValues?.length) return `已同步 · ${current.failedValues.length} 个 IP 待复检`;
   const labels = { resolving: '正在解析', checking: '等待探针检查', resolve_error: '解析失败 · 待重试',
     probe_failed: '检查失败 · 待重试', capacity: '达到 IP 上限', ready: '检查通过 · 待写入' };
   return labels[current.status] || (current.pending ? '待重试' : current.activeSide === 'backup' ? '备用来源已同步' : '主来源已同步');
 }
 
 function sourceStatusTone(current) {
-  return !current || current.pending || ['resolving', 'checking', 'capacity', 'ready'].includes(current.status) ? 'warn' : 'ok';
+  return !current || current.pending || current.failedValues?.length || ['resolving', 'checking', 'capacity', 'ready'].includes(current.status) ? 'warn' : 'ok';
 }
 
 function GuardDetails({ guard, runs, Dialog, onClose, onCheck, onManage }) {

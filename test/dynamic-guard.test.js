@@ -68,7 +68,7 @@ test('one success settles immediately without waiting for slow probes or running
   assert.equal(env.notices.length, 0);
 });
 
-test('only complete failures from every assigned probe submit once; duplicate requests are rejected', async () => {
+test('only complete failures from every assigned probe submit once; a manual retry continues the same flow', async () => {
   const env = setup();
   await env.tick();
   assert.equal(env.report('p1', false, { attempts: 3, roundsCompleted: 1 }), false);
@@ -83,8 +83,84 @@ test('only complete failures from every assigned probe submit once; duplicate re
   assert.equal(env.calls.length, 1);
   assert.equal(env.guard().status, 'waiting_ip');
   assert.equal(env.guard().daily.count, 1);
-  assert.throws(() => env.service.request(env.guard().id, true), /已有换 IP/);
+  const flowId = env.guard().flow.id;
+  env.service.request(env.guard().id, true);
+  assert.throws(() => env.service.request(env.guard().id, true), /已排队/);
+  await env.service.drain();
+  assert.equal(env.calls.length, 2);
+  assert.equal(env.guard().flow.id, flowId);
+  assert.equal(env.guard().flow.attempts, 2);
   assert.equal(env.state.dynamicGuardRuns.length, 1);
+});
+
+test('manual retry can resume an indefinitely waiting flow but does not remove the daily limit', async () => {
+  const env = setup({ waitTimeout: 0, maxDaily: 2 });
+  await failAndSubmit(env);
+  env.service.request(env.guard().id, true); await env.service.drain();
+  assert.equal(env.calls.length, 2);
+  assert.equal(env.guard().manualRequested, false);
+  assert.equal(env.guard().flow.deadlineAt, 0);
+  assert.throws(() => env.service.request(env.guard().id, true), /已达上限/);
+  assert.equal(env.guard().daily.count, 2);
+});
+
+test('manual retry stays queued during cooldown and repeated clicks cannot bypass it', async () => {
+  const env = setup({ cooldown: 60 });
+  await failAndSubmit(env);
+  env.service.request(env.guard().id, true); await env.service.drain();
+  assert.equal(env.guard().status, 'cooldown');
+  assert.equal(env.guard().manualRequested, true);
+  assert.equal(env.calls.length, 1);
+  assert.throws(() => env.service.request(env.guard().id, true), /已排队/);
+  env.advance(59); await env.tick(); assert.equal(env.calls.length, 1);
+  env.advance(1); await env.tick();
+  assert.equal(env.calls.length, 2);
+  assert.equal(env.guard().manualRequested, false);
+});
+
+test('manual retry after restart cannot overlap the orphaned command hard deadline', async () => {
+  const env = setup({ waitTimeout: 0 });
+  Object.assign(env.guard(), { commandNotBefore: env.now() + 96000,
+    flow: { id: 'old', oldIp: '192.0.2.1', initialIp: '192.0.2.1', startedAt: new Date(env.now()).toISOString(),
+      attempts: 1, submittedAt: env.now(), deadlineAt: 0, commandState: 'executing' } });
+  assert.throws(() => env.service.request(env.guard().id, true), /正在执行/);
+  await env.tick();
+  env.service.request(env.guard().id, true); await env.service.drain();
+  assert.equal(env.guard().status, 'cooldown');
+  env.advance(95); await env.tick(); assert.equal(env.calls.length, 0);
+  env.advance(1); await env.tick();
+  assert.equal(env.calls.length, 1);
+  assert.equal(env.guard().flow.id, 'old');
+  assert.equal(env.guard().flow.attempts, 2);
+});
+
+test('manual retry supersedes verification and ignores reports for the previous IP', async () => {
+  const env = setup(); await failAndSubmit(env);
+  env.address('192.0.2.2'); await env.tick();
+  const cycleId = env.guard().cycle.id;
+  assert.equal(env.guard().status, 'verifying');
+  env.service.request(env.guard().id, true); await env.service.drain();
+  assert.equal(env.report('p1', true, { targetId: cycleId, checkMarker: cycleId }), false);
+  assert.equal(env.calls.length, 2);
+  assert.equal(env.guard().flow.oldIp, '192.0.2.2');
+  assert.equal(env.guard().flow.initialIp, '192.0.2.1');
+  assert.equal(env.state.dynamicGuardRuns.length, 1);
+});
+
+test('manual requests during DNS preparation discard stale results and only submit on the next preparation', async () => {
+  let resolve;
+  const env = setup({}, { resolveIp: () => new Promise((done) => { resolve = done; }) });
+  env.service.tick(); await flush();
+  env.service.request(env.guard().id, true);
+  assert.equal(env.guard().status, 'queued');
+  assert.throws(() => env.service.request(env.guard().id, true), /已排队/);
+  resolve('192.0.2.1'); await env.service.drain();
+  assert.equal(env.calls.length, 0);
+  env.service.tick(); await flush();
+  resolve('192.0.2.2'); await env.service.drain();
+  assert.equal(env.calls.length, 1);
+  assert.equal(env.guard().flow.oldIp, '192.0.2.2');
+  assert.equal(env.guard().manualRequested, false);
 });
 
 test('old IP is retried only after the configured waiting timeout, and restarts the deadline', async () => {

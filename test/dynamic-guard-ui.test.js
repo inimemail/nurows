@@ -15,13 +15,13 @@ const fixture = () => ({ guards: [{ id: 'one', name: '测试 VPS', domain: 'test
   todayCount: 1, maxDaily: 5, checkType: 'ping', port: 443, interval: 30, checkRounds: 3, attemptsPerRound: 3, timeout: 5,
   waitTimeout: 120, queryInterval: 5, commandTimeout: 90, cooldown: 0 }],
   probes: [{ id: 'p1', name: '测试探针', enabled: true, status: 'online', lastSeenAt: new Date().toISOString() }], bots: [] });
-function harness(api, data = fixture(), initialSearch = '') {
+function harness(api, data = fixture(), initialSearch = '', initialState = undefined, cache = undefined) {
   const slots = [], effects = [];
   let cursor = 0, tree, poll, search = initialSearch;
   const hooks = {
     useState(initial) {
       const index = cursor++;
-      if (!(index in slots)) slots[index] = index === 0 ? data : typeof initial === 'function' ? initial() : initial;
+      if (!(index in slots)) slots[index] = index === 0 ? (initialState ? null : data) : typeof initial === 'function' ? initial() : initial;
       return [slots[index], (next) => { slots[index] = typeof next === 'function' ? next(slots[index]) : next; }];
     },
     useRef(initial) { const index = cursor++; slots[index] ||= { current: initial }; return slots[index]; },
@@ -40,7 +40,7 @@ function harness(api, data = fixture(), initialSearch = '') {
       if (name.endsWith('HistoryRecords.jsx')) return () => null;
       throw Error(`Unexpected import ${name}`);
     } });
-  const render = () => { cursor = 0; effects.length = 0; tree = module.exports.default({ api, toast() {}, Dialog: 'dialog', onOpenHistory() {}, search }); return tree; };
+  const render = () => { cursor = 0; effects.length = 0; tree = module.exports.default({ api, toast() {}, Dialog: 'dialog', onOpenHistory() {}, search, initialState, cache }); return tree; };
   render();
   function nodes(value = tree) {
     if (Array.isArray(value)) return value.flatMap((item) => nodes(item));
@@ -51,6 +51,15 @@ function harness(api, data = fixture(), initialSearch = '') {
   const button = (label) => nodes().find((node) => node.type === 'button' && text(node) === label);
   return { render, nodes, button, data: () => slots[0], setSearch(value) { search = value; render(); }, startPoll: () => { effects[1](); }, poll: () => poll(new AbortController().signal) };
 }
+
+test('dynamic guard menu renders the authenticated state before its refresh request returns', () => {
+  const data = fixture();
+  const view = harness(() => new Promise(() => {}), fixture(), '', {
+    dynamicGuards: data.guards, probes: data.probes, telegramBots: data.bots
+  });
+  assert.equal(view.nodes().filter((node) => node.props?.className === 'dynamic-card').length, 1);
+  assert.equal(view.nodes().some((node) => node.props?.children === '正在加载动态 IP 守护任务…'), false);
+});
 
 test('dynamic guard search filters displayed tasks and leaves editor and polling data complete', () => {
   const data = fixture();
@@ -67,10 +76,10 @@ test('dynamic guard search filters displayed tasks and leaves editor and polling
   assert.equal(view.nodes().filter((node) => node.props?.className === 'dynamic-card').length, 2);
 });
 
-test('waiting task remains editable, cannot manually duplicate a pending change, and saving keeps the encrypted command', async () => {
+test('waiting task remains editable and manually retryable, and saving keeps the encrypted command', async () => {
   const calls = [];
   const view = harness(async (url, options) => { calls.push({ url, options }); return { ok: true }; });
-  assert.equal(view.button('手动换 IP').props.disabled, true);
+  assert.equal(view.button('手动换 IP').props.disabled, false);
   assert.equal(view.button('编辑').props.disabled, false);
   view.button('编辑').props.onClick(); view.render();
   const command = view.nodes().find((node) => node.type === 'textarea');
@@ -110,6 +119,70 @@ test('manual IP change requires confirmation before sending a background request
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, '/api/dynamic-guards/one/change');
   assert.equal(JSON.parse(calls[0].options.body).confirm, 'change-ip');
+});
+
+test('manual retry during an unfinished flow clearly warns before making one request', async () => {
+  const calls = [];
+  const view = harness(async (url, options) => { calls.push({ url, options }); return { ok: true }; });
+  view.button('手动换 IP').props.onClick(); view.render();
+  assert.ok(view.nodes().some((node) => node.props?.className === 'confirm-copy' && node.props.children.includes('原流程中再次提交')));
+  assert.equal(calls.length, 0);
+  view.button('取消').props.onClick(); view.render();
+  assert.equal(calls.length, 0);
+  view.button('手动换 IP').props.onClick(); view.render();
+  view.button('确认').props.onClick();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/api/dynamic-guards/one/change');
+});
+
+test('manual change is only blocked for executing, queued manual requests, disabled tasks or pending UI actions', async () => {
+  for (const status of ['waiting_ip', 'verifying', 'query_error', 'command_error', 'waiting_probe', 'cooldown', 'checking']) {
+    const data = fixture(); data.guards[0].status = status;
+    const view = harness(() => assert.fail('render must not issue a request'), data);
+    assert.equal(view.button('手动换 IP').props.disabled, false, status);
+  }
+  for (const patch of [{ status: 'executing' }, { flow: { commandState: 'executing' } }, { manualRequested: true }, { enabled: false }]) {
+    const data = fixture(); Object.assign(data.guards[0], patch);
+    const view = harness(() => assert.fail('render must not issue a request'), data);
+    assert.equal(view.button('手动换 IP').props.disabled, true, JSON.stringify(patch));
+    assert.ok(view.button('手动换 IP').props.title);
+  }
+  let release;
+  const view = harness(() => new Promise((resolve) => { release = resolve; }));
+  view.button('立即检查').props.onClick(); view.render();
+  assert.equal(view.button('手动换 IP').props.disabled, true);
+  release({ ok: true }); await new Promise((resolve) => setImmediate(resolve)); view.render();
+  assert.equal(view.button('手动换 IP').props.disabled, false);
+});
+
+test('an action on one task does not disable manual change on other tasks', () => {
+  let release;
+  const data = fixture();
+  data.guards.push({ ...data.guards[0], id: 'two', name: '第二台', flow: null, status: 'healthy' });
+  const view = harness(() => new Promise((resolve) => { release = resolve; }), data);
+  const buttons = view.nodes().filter((node) => node.type === 'button' && node.props.children === '手动换 IP');
+  assert.equal(buttons.length, 2);
+  view.nodes().find((node) => node.type === 'button' && node.props.children === '立即检查').props.onClick();
+  view.render();
+  const after = view.nodes().filter((node) => node.type === 'button' && node.props.children === '手动换 IP');
+  assert.equal(after[0].props.disabled, true);
+  assert.equal(after[1].props.disabled, false);
+  release({ ok: true });
+});
+
+test('dynamic cards keep compact facts and a dedicated wrapping footer', () => {
+  const view = harness(() => assert.fail('render must not issue a request'));
+  const facts = view.nodes().find((node) => node.props?.className === 'dynamic-facts');
+  assert.equal(facts.props.children.length, 3);
+  const footer = view.nodes().find((node) => node.props?.className === 'dynamic-card-footer');
+  assert.equal(footer.props.children[0].props.className, 'dynamic-message');
+  assert.equal(footer.props.children[1].props.className, 'dynamic-actions');
+  const css = fs.readFileSync(new URL('../src/dynamic-guard.css', import.meta.url), 'utf8');
+  const mobile = css.slice(css.indexOf('@media (max-width: 760px)'));
+  assert.match(mobile, /\.dynamic-actions\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+  assert.match(mobile, /\.dynamic-actions button\s*\{[^}]*min-height:\s*44px[^}]*white-space:\s*normal/);
+  assert.match(css, /\.dynamic-message\s*\{[^}]*margin:\s*0/);
 });
 
 test('rapid repeated actions send one request and toggle only the enabled flag', async () => {

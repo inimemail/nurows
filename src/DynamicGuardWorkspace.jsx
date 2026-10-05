@@ -36,11 +36,15 @@ function GuardCountdown({ guard, offset }) {
   return remaining ? ` · ${remaining} 秒后仍无新 IP 则重试` : ' · 即将确认解析并重试';
 }
 
-export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistory, onState, search = '' }) {
-  const [data, setData] = useState({ guards: [], probes: [], bots: [] });
+export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistory, onState, initialState, cache, search = '' }) {
+  const [snapshot, setData] = useState(() => cache?.current?.data || null);
+  // Use the already-sanitized bootstrap list immediately, including when it
+  // arrives after mount. Subsequent visits use the latest small live snapshot.
+  const data = snapshot || { guards: initialState?.dynamicGuards || [], probes: initialState?.probes || [], bots: initialState?.telegramBots || [] };
+  const loaded = Boolean(snapshot) || Array.isArray(initialState?.dynamicGuards);
   const [editor, setEditor] = useState(null);
   const [saving, setSaving] = useState(false);
-  const [busyId, setBusyId] = useState('');
+  const [busyIds, setBusyIds] = useState([]);
   const [error, setError] = useState('');
   const [formError, setFormError] = useState('');
   const [confirmation, setConfirmation] = useState(null);
@@ -48,26 +52,48 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyGuard, setHistoryGuard] = useState(null);
   const generation = useRef(0);
-  const offset = useRef(0);
+  const offset = useRef(cache?.current?.offset || 0);
+  const latestData = useRef(data);
+  const hasFetchedRef = useRef(Boolean(cache?.current?.data));
+  latestData.current = data;
   const mounted = useRef(true);
-  const actionLock = useRef(false);
+  const actionLock = useRef(new Set());
   const saveLock = useRef(false);
   const time = Date.now() + offset.current;
   const visibleGuards = useMemo(() => filterWorkspaceRecords('dynamic', data.guards, search), [data.guards, search]);
+  const publish = (result) => {
+    latestData.current = result;
+    setData(result);
+    if (cache) cache.current = { data: result, offset: offset.current };
+    // Only a changed count needs to rerender the whole application.
+    onState?.((current) => current.dynamicGuardsCount === result.guards.length ? current : { ...current, dynamicGuardsCount: result.guards.length });
+  };
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; generation.current++; }; }, []);
   useEffect(() => {
     let cancelled = false;
-    const stop = startPolling(async (signal) => {
+    let stop;
+    const start = () => {
+      stop?.();
       if (typeof document !== 'undefined' && document.hidden) return;
-      const version = generation.current;
-      const result = await api('/api/dynamic-guards', { signal });
-      if (cancelled || version !== generation.current) return;
-      offset.current = result.serverTime - Date.now();
-      setData(result); setError('');
-      onState?.((current) => current.dynamicGuardsCount === result.guards.length ? current : { ...current, dynamicGuardsCount: result.guards.length });
-    }, 5000, { onError: (err) => { if (!cancelled) setError(err.message); } });
-    return () => { cancelled = true; stop(); };
-  }, [api, refresh, onState]);
+      let active = true;
+      const cleanup = startPolling(async (signal) => {
+        const version = generation.current;
+        try {
+          const result = await api('/api/dynamic-guards', { signal });
+          if (!active || cancelled || version !== generation.current) return;
+          offset.current = Number.isFinite(result.serverTime) ? result.serverTime - Date.now() : 0;
+          hasFetchedRef.current = true;
+          publish(result); setError('');
+        } catch (err) {
+          if (active && !cancelled && version === generation.current) setError(err.message);
+        }
+      }, 5000);
+      stop = () => { active = false; cleanup(); };
+    };
+    start();
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', start);
+    return () => { cancelled = true; stop?.(); if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', start); };
+  }, [api, refresh, onState, cache]);
 
   const mutate = async (url, method, body) => {
     generation.current++;
@@ -91,45 +117,61 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
     setSaving(true); setFormError('');
     try {
       const body = Object.fromEntries([...Object.keys(DEFAULTS)].map((key) => [key, editor[key]]));
-      await mutate(`/api/dynamic-guards${editor.id ? `/${editor.id}` : ''}`, editor.id ? 'PUT' : 'POST', body);
+      const result = await mutate(`/api/dynamic-guards${editor.id ? `/${editor.id}` : ''}`, editor.id ? 'PUT' : 'POST', body);
+      if (!mounted.current) return;
+      if (result.guard) {
+        const guards = latestData.current.guards;
+        publish({ ...latestData.current, guards: guards.some((guard) => guard.id === result.guard.id)
+          ? guards.map((guard) => guard.id === result.guard.id ? result.guard : guard) : [...guards, result.guard] });
+      }
       setEditor(null); toast('动态 IP 守护已保存');
     } catch (err) { setFormError(err.message); }
     finally { saveLock.current = false; if (mounted.current) setSaving(false); }
   };
   const act = async (guard, action) => {
-    if (actionLock.current) return;
-    actionLock.current = true;
-    setBusyId(guard.id);
+    if (actionLock.current.has(guard.id)) return;
+    actionLock.current.add(guard.id);
+    setBusyIds((ids) => [...ids, guard.id]);
     try {
       if (action === 'delete') await mutate(`/api/dynamic-guards/${guard.id}`, 'DELETE', { confirm: 'delete-guard' });
       else if (action === 'toggle') await mutate(`/api/dynamic-guards/${guard.id}/enabled`, 'POST', { enabled: !guard.enabled });
       else await mutate(`/api/dynamic-guards/${guard.id}/${action}`, 'POST', action === 'change' ? { confirm: 'change-ip' } : {});
+      if (!mounted.current) return;
+      // Commit successful local changes to the list cache before navigating
+      // away. The immediate poll still supplies authoritative runtime state.
+      if (action === 'delete') publish({ ...latestData.current, guards: latestData.current.guards.filter((item) => item.id !== guard.id) });
+      else publish({ ...latestData.current, guards: latestData.current.guards.map((item) => item.id !== guard.id ? item
+        : action === 'toggle' ? { ...item, enabled: !guard.enabled, status: !guard.enabled ? 'queued' : 'disabled', manualRequested: false }
+          : { ...item, status: 'queued', manualRequested: action === 'change' || item.manualRequested }) });
       toast(action === 'delete' ? '任务已删除' : action === 'toggle' ? '任务状态已更新' : '请求已排队，后台处理');
     } catch (err) { toast(err.message); }
-    finally { actionLock.current = false; if (mounted.current) setBusyId(''); }
+    finally { actionLock.current.delete(guard.id); if (mounted.current) setBusyIds((ids) => ids.filter((id) => id !== guard.id)); }
   };
 
   return <>
     <div className="ops-content-head dynamic-head"><div><strong>动态 IP 守护</strong><span>多探针检查 · API 自动换 IP · 新 IP 验证</span></div>
       <div className="ops-content-actions"><button className="ghost" onClick={() => onOpenHistory('dynamicGuardRuns')}>执行记录</button><button className="primary" onClick={() => openEditor(null)}>新增任务</button></div>
     </div>
-    {error ? <p className="auth-error" role="alert">读取失败：{error}，稍后自动重试</p> : null}
+    {error ? <div className="auth-error dynamic-load-error" role="alert"><span>读取失败：{error}，稍后自动重试</span><button className="ghost" onClick={() => setRefresh((value) => value + 1)}>重试</button></div> : null}
     <div className="ops-list dynamic-list">
-      {!visibleGuards.length ? <div className="ops-empty"><strong>{search.trim() ? '没有匹配的动态 IP 守护任务' : '还没有动态 IP 守护任务'}</strong><span>{search.trim() ? '请更换关键词或清空顶部搜索。' : '填写 DDNS 域名和换 IP API 命令即可开始。'}</span></div> : visibleGuards.map((guard) => {
+      {!loaded ? <div className="ops-empty" role="status"><strong>{error ? '暂时无法读取任务' : '正在加载动态 IP 守护任务…'}</strong><span>{error ? '可点击重试，或等待自动重新读取。' : '正在读取任务列表，不需要等待守护检查完成。'}</span></div> : !visibleGuards.length ? <div className="ops-empty"><strong>{search.trim() ? '没有匹配的动态 IP 守护任务' : '还没有动态 IP 守护任务'}</strong><span>{search.trim() ? '请更换关键词或清空顶部搜索。' : '填写 DDNS 域名和换 IP API 命令即可开始。'}</span></div> : visibleGuards.map((guard) => {
         const bad = ['query_error', 'command_error', 'limit', 'waiting_probe'].includes(guard.status);
         const tone = guard.status === 'healthy' ? 'ok' : bad ? 'bad' : 'warn';
-        const locked = Boolean(busyId) || guard.status === 'executing';
+        const locked = busyIds.includes(guard.id) || guard.status === 'executing' || guard.flow?.commandState === 'executing';
+        const manualBlock = locked ? '正在处理请求或执行 API 命令，请稍候' : !guard.enabled ? '请先启用任务' : guard.manualRequested ? '手动换 IP 已排队，请勿重复提交' : '';
         return <article className="dynamic-card" key={guard.id}>
           <div className="dynamic-card-title"><div><strong>{guard.name}</strong><span>{guard.domain} · {guard.recordType}</span></div><em className={`ops-status ${tone}`}>{LABELS[guard.status] || guard.status}</em></div>
-          <div className="dynamic-facts"><div><span>当前 IP</span><code>{guard.currentIp || '尚未获取'}</code></div><div><span>今日提交 · 北京时间重置</span><strong>{guard.todayCount} / {guard.maxDaily || '不限'}</strong></div><div><span>负责探针</span><strong>{guard.probeIds.length} 个</strong></div></div>
-          <p className="dynamic-message">{guard.message}<GuardCountdown guard={guard} offset={offset.current} /></p>
-          <div className="dynamic-actions">
-            <button className="ghost" onClick={() => setHistoryGuard(guard)}>查看记录</button>
-            <button className="ghost" disabled={locked || !guard.enabled} onClick={() => act(guard, 'check')}>立即检查</button>
-            <button className="ghost" disabled={locked || !guard.enabled || Boolean(guard.flow) || guard.manualRequested} onClick={() => setConfirmation({ guard, action: 'change' })}>手动换 IP</button>
-            <button className="ghost" disabled={locked} onClick={() => openEditor(guard)}>编辑</button>
-            <button className="ghost" disabled={Boolean(busyId)} onClick={() => act(guard, 'toggle')}>{guard.enabled ? '停用' : '启用'}</button>
-            <button className="ghost danger-text-button" disabled={locked} onClick={() => setConfirmation({ guard, action: 'delete' })}>删除</button>
+          <div className="dynamic-facts"><div><span>当前 IP</span><code>{guard.currentIp || '尚未获取'}</code></div><div title="每日额度按北京时间重置"><span>今日提交</span><strong>{guard.todayCount} / {guard.maxDaily || '不限'}</strong></div><div><span>探针</span><strong>{guard.probeIds.length} 个</strong></div></div>
+          <div className="dynamic-card-footer">
+            <p className="dynamic-message">{guard.message}<GuardCountdown guard={guard} offset={offset.current} /></p>
+            <div className="dynamic-actions">
+              <button className="ghost" onClick={() => setHistoryGuard(guard)}>查看记录</button>
+              <button className="ghost" disabled={locked || !guard.enabled} onClick={() => act(guard, 'check')}>立即检查</button>
+              <button className="ghost" disabled={Boolean(manualBlock)} title={manualBlock || '确认后执行换 IP API，仍遵守每日上限和冷却时间'} onClick={() => setConfirmation({ guard, action: 'change' })}>手动换 IP</button>
+              <button className="ghost" disabled={locked} onClick={() => openEditor(guard)}>编辑</button>
+              <button className="ghost" disabled={busyIds.includes(guard.id)} onClick={() => act(guard, 'toggle')}>{guard.enabled ? '停用' : '启用'}</button>
+              <button className="ghost danger-text-button" disabled={locked} onClick={() => setConfirmation({ guard, action: 'delete' })}>删除</button>
+            </div>
           </div>
         </article>;
       })}
@@ -172,7 +214,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
     </Dialog> : null}
     {historyGuard ? <Dialog title={`${historyGuard.name} · 执行记录`} wide onClose={() => setHistoryGuard(null)}><HistoryRecords key={historyGuard.id} scope="dynamicGuardRuns" guardId={historyGuard.id} api={api} /></Dialog> : null}
     {confirmation ? <Dialog title={confirmation.action === 'delete' ? '删除动态 IP 守护' : '手动换 IP'} onClose={() => setConfirmation(null)} footer={<div className="dialog-actions"><button className="ghost" onClick={() => setConfirmation(null)}>取消</button><button className="primary" onClick={() => { const { guard, action } = confirmation; setConfirmation(null); act(guard, action); }}>确认</button></div>}>
-      <p className="confirm-copy">{confirmation.action === 'delete' ? `删除「${confirmation.guard.name}」并停止后续检查及重试。已经提交给服务商的请求无法撤回，执行记录会保留。` : `立即执行「${confirmation.guard.name}」的换 IP API 命令，会消耗今日一次提交额度，并可能中断目标服务。仍遵守每日上限和冷却时间。`}</p>
+      <p className="confirm-copy">{confirmation.action === 'delete' ? `删除「${confirmation.guard.name}」并停止后续检查及重试。已经提交给服务商的请求无法撤回，执行记录会保留。` : `${confirmation.guard.flow ? '当前换 IP 流程尚未完成；确认后将在原流程中再次提交。' : ''}执行「${confirmation.guard.name}」的换 IP API 命令，会消耗今日一次提交额度，并可能中断目标服务。仍遵守每日上限和冷却时间，已排队的请求不会重复提交。`}</p>
     </Dialog> : null}
   </>;
 }

@@ -1,15 +1,22 @@
-.dynamic-list { display: flex; flex-direction: column; gap: 12px; }
-.dynamic-card { flex: 0 0 auto; min-width: 0; padding: 16px; border: 1px solid var(--border-soft); border-radius: 14px; }
-.dynamic-card-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.dynamic-card-title > div { min-width: 0; }
-.dynamic-card-title strong, .dynamic-card-title span { display: block; overflow-wrap: anywhere; }
-.dynamic-card-title strong { color: var(--text-strong); }
-.dynamic-card-title span { color: var(--text-soft); font-size: 12px; margin-top: 5px; }
-.dynamic-facts { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1.5fr) minmax(0, 1fr); gap: 12px; margin-top: 16px; }
-.dynamic-facts span { display: block; color: var(--text-soft); font-size: 11px; margin-bottom: 5px; }
-.dynamic-facts strong, .dynamic-facts code { color: var(--text-strong); font-size: 13px; overflow-wrap: anywhere; }
-.dynamic-message { color: var(--text-soft); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.dynamic-list { display: flex; flex-direction: column; gap: 8px; }
+.dynamic-load-error { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.dynamic-load-error > span { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
+.dynamic-card { flex: 0 0 auto; min-width: 0; padding: 12px 14px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--card-bg); }
+.dynamic-card-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.dynamic-card-title > div { min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; }
+.dynamic-card-title strong, .dynamic-card-title span { overflow-wrap: anywhere; }
+.dynamic-card-title strong { color: var(--text-strong); font-size: 14px; line-height: 1.5; }
+.dynamic-card-title span { color: var(--text-soft); font-size: 12px; line-height: 1.5; }
+.dynamic-card-title .ops-status { flex-shrink: 0; }
+.dynamic-facts { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 20px; margin-top: 8px; }
+.dynamic-facts > div { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+.dynamic-facts span { flex-shrink: 0; color: var(--text-soft); font-size: 11px; }
+.dynamic-facts strong, .dynamic-facts code { min-width: 0; color: var(--text-strong); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.dynamic-card-footer { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; }
+.dynamic-message { flex: 1 1 220px; min-width: 0; margin: 0; color: var(--text-soft); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .dynamic-actions, .dynamic-editor-footer { display: flex; flex-wrap: wrap; gap: 8px; }
+.dynamic-actions { min-width: 0; margin-left: auto; gap: 6px; }
+.dynamic-actions button { min-width: 0; min-height: 34px; padding: 7px 10px; border-radius: 8px; font-size: 12px; }
 .dynamic-editor-footer { margin-left: auto; justify-content: flex-end; }
 .dynamic-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .dynamic-form-grid label, .dynamic-command { display: flex; flex-direction: column; gap: 7px; min-width: 0; color: var(--text-soft); font-size: 12px; }
@@ -66,16 +73,22 @@
   .dynamic-settings-body { padding-inline: 12px; }
   .dynamic-head .ops-content-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dynamic-head { align-items: stretch; }
-  .dynamic-card { padding: 14px; }
-  .dynamic-card-title { flex-wrap: wrap; }
-  .dynamic-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .dynamic-facts > div:first-child { grid-column: 1 / -1; }
-  .dynamic-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .dynamic-actions button { min-height: 44px; padding: 10px 8px; }
+  .dynamic-card { padding: 12px; }
+  .dynamic-card-title > div { flex: 1; gap: 2px; }
+  .dynamic-card-title span { flex-basis: 100%; font-size: 11px; }
+  .dynamic-facts { gap: 4px 16px; }
+  .dynamic-facts > div:first-child { flex-basis: 100%; }
+  .dynamic-card-footer { gap: 8px; }
+  .dynamic-message { flex-basis: 100%; font-size: 11px; }
+  .dynamic-actions { width: 100%; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+  .dynamic-actions button { min-height: 44px; padding: 8px 4px; font-size: 12px; white-space: normal; }
   .dynamic-form-grid, .dynamic-choice > div { grid-template-columns: minmax(0, 1fr); }
   .dynamic-form-grid input, .dynamic-form-grid select, .dynamic-command textarea { font-size: 16px; }
   .dynamic-choice label, .dynamic-enable { min-height: 44px; }
   .dynamic-editor .dialog-footer { padding-bottom: max(14px, env(safe-area-inset-bottom)); }
   .dynamic-editor-footer { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dynamic-editor-footer button { min-height: 44px; }
+}
+@media (max-width: 380px) {
+  .dynamic-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 }

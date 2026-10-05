@@ -376,10 +376,16 @@ export function createDynamicGuardService(deps, options = {}) {
     if (!guard) throw new Error('任务不存在');
     if (guard.enabled === false) throw new Error('请先启用任务');
     if (commands.has(id) || guard.flow?.commandState === 'executing') throw new Error('换 IP 命令正在执行，请勿重复提交');
-    if (manual && (guard.flow || guard.manualRequested)) throw new Error('已有换 IP 流程，等待新 IP 或自动超时重试');
+    // An unfinished flow is not an in-flight command. An explicitly confirmed
+    // manual retry can continue that flow; submit() still enforces cooldown,
+    // the daily limit and an orphaned command's conservative hard deadline.
+    if (manual && guard.manualRequested) throw new Error('手动换 IP 请求已排队，请勿重复提交');
     if (manual && guard.maxDaily && dynamicDailyCount(guard, now()) >= guard.maxDaily) throw new Error('今日换 IP 次数已达上限');
     if (!manual && (preparing.has(id) || guard.cycle)) return;
-    change(id, null, (item) => { item.revision++; item.cycle = null; item.pendingChange = null; item.nextAt = now(); item.manualRequested = manual || item.manualRequested; });
+    change(id, null, (item) => {
+      item.revision++; item.cycle = null; item.pendingChange = null; item.nextAt = now(); item.manualRequested = manual || item.manualRequested;
+      if (manual) { item.status = 'queued'; item.message = '手动换 IP 已排队，将确认解析并按额度与冷却设置执行'; }
+    });
     tick(id);
   }
   return { tick, request, isExecuting: (id) => commands.has(id),

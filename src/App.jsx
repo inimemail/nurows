@@ -395,6 +395,8 @@ export default function App() {
     catch { return 'hbx-light'; }
   });
   const [auth, setAuth] = useState({ loading: true, configured: false, authenticated: false, username: '' });
+  // In-memory, login-scoped list cache; never persist task/API data in browser storage.
+  const dynamicGuardCache = useRef(null);
   const [authForm, setAuthForm] = useState({ username: '', password: '', confirmPassword: '' });
   const [authError, setAuthError] = useState('');
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
@@ -515,6 +517,7 @@ export default function App() {
   }, [commandJobId, interactiveKeywords]);
 
   useEffect(() => {
+    dynamicGuardCache.current = null;
     if (!auth.authenticated) {
       return;
     }
@@ -1124,6 +1127,7 @@ export default function App() {
       // Ignore logout network errors and still reset local auth.
     }
     setAuth((current) => ({ ...current, authenticated: false }));
+    dynamicGuardCache.current = null;
     setTerminalFullscreenOpen(false);
     setStateLoaded(false);
     setSettingsDialogOpen(false);
@@ -2613,7 +2617,7 @@ export default function App() {
         </aside>
 
           <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-main' : '')}>
-          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} search={search} onSearchChange={setSearch} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
+          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} stateReady={stateLoaded} dynamicGuardCache={dynamicGuardCache} search={search} onSearchChange={setSearch} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
           {tab === 'renewals' ? <RenewalWorkspace state={state} search={search} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
           {tab === 'notes' ? <Suspense fallback={<div className="surface workspace-panel">正在加载笔记...</div>}><NotesWorkspace api={api} toast={toast} search={search} onSearchScopeChange={setWorkspaceSearchScope} onBeforeLeave={handler => { notesBeforeLeave.current = handler; }} /></Suspense> : null}
           {tab === 'automation' ? (

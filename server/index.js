@@ -2067,13 +2067,42 @@ function updateDynamicGuardState(mutator, withHistory = false, guardId = null) {
 function readProbeState() {
   ensureStorage();
   if (!cachedState) cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
-  return structuredClone({
-    probes: cachedState.probes || [],
-    ipPools: poolHealthProbeState(cachedState.ipPools),
-    dynamicGuards: (cachedState.dynamicGuards || []).filter((guard) => guard.enabled !== false && guard.cycle).map((guard) => ({
+  // Probe polling happens every second. Keep this snapshot deliberately
+  // narrow so credentials, history and provider payloads are not cloned or
+  // serialized on every poll.
+  const probes = (cachedState.probes || []).map(({ id, enabled, status, lastSeenAt, agentSecretHash, agentVersion, maxConcurrency }) =>
+    ({ id, enabled, status, lastSeenAt, agentSecretHash, agentVersion, maxConcurrency }));
+  const dynamicGuards = (cachedState.dynamicGuards || []).filter((guard) => guard.enabled !== false && guard.cycle).map((guard) => {
+    const cycle = guard.cycle;
+    return {
       id: guard.id, enabled: guard.enabled, checkType: guard.checkType, port: guard.port,
-      timeout: guard.timeout, checkRounds: guard.checkRounds, attemptsPerRound: guard.attemptsPerRound, cycle: guard.cycle
-    })),
+      timeout: guard.timeout, checkRounds: guard.checkRounds, attemptsPerRound: guard.attemptsPerRound,
+      cycle: {
+        id: cycle.id, address: cycle.address, probeIds: cycle.probeIds,
+        result: cycle.result || '',
+        observations: Object.fromEntries(Object.entries(cycle.observations || {}).map(([probeId, evidence]) =>
+          [probeId, { ok: Boolean(evidence?.ok) }]))
+      }
+    };
+  });
+  const dnsGuards = (cachedState.dnsGuards || []).filter((guard) => guard.enabled !== false && guard.cycle && !guard.cycle.finalResults).map((guard) => ({
+    id: guard.id, enabled: guard.enabled, status: guard.status, probeIds: guard.probeIds,
+    checkType: guard.checkType, port: guard.port, timeout: guard.timeout,
+    checkRounds: guard.checkRounds, attemptsPerRound: guard.attemptsPerRound, maxParallel: guard.maxParallel,
+    cycle: {
+      id: guard.cycle.id, phase: guard.cycle.phase, expectedProbeIds: guard.cycle.expectedProbeIds,
+      replacementNeeded: guard.cycle.replacementNeeded,
+      checks: (guard.cycle.checks || []).map((check) => ({
+        id: check.id,
+        ...(check.address !== undefined ? { address: check.address } : {}),
+        observations: check.observations || {}
+      }))
+    }
+  }));
+  return structuredClone({
+    probes,
+    ipPools: poolHealthProbeState(cachedState.ipPools),
+    dynamicGuards,
     probeTargets: (cachedState.probeTargets || []).map((target) => ({
       id: target.id,
       enabled: target.enabled,
@@ -2088,25 +2117,7 @@ function readProbeState() {
       interval: target.interval,
       checkNowAt: target.checkNowAt
     })),
-    dnsGuards: (cachedState.dnsGuards || []).filter((guard) => guard.enabled !== false && guard.cycle && !guard.cycle.finalResults).map((guard) => ({
-      id: guard.id,
-      enabled: guard.enabled,
-      status: guard.status,
-      probeIds: guard.probeIds,
-      checkType: guard.checkType,
-      port: guard.port,
-      timeout: guard.timeout,
-      checkRounds: guard.checkRounds,
-      attemptsPerRound: guard.attemptsPerRound,
-      maxParallel: guard.maxParallel,
-      cycle: guard.cycle ? {
-        id: guard.cycle.id,
-        phase: guard.cycle.phase,
-        expectedProbeIds: guard.cycle.expectedProbeIds,
-        replacementNeeded: guard.cycle.replacementNeeded,
-        checks: guard.cycle.checks
-      } : null
-    }))
+    dnsGuards
   });
 }
 

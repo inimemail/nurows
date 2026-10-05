@@ -340,6 +340,20 @@ test('uncertain command outcomes consume one attempt and wait before retrying', 
   assert.equal(env.guard().flow, null);
 });
 
+test('definitive command failures do not leave the guard waiting for a new IP', async () => {
+  const env = setup({ waitTimeout: 300 }, { execute: async () => ({ ok: false, uncertain: false, error: '退出码 22' }) });
+  await failAndSubmit(env);
+  assert.equal(env.guard().status, 'command_error');
+  assert.equal(env.guard().flow, null);
+  assert.equal(env.guard().daily.count, 0);
+  assert.equal(env.guard().lastSubmittedAt, 0);
+  assert.match(env.guard().message, /稍后重新检查并重试/);
+  assert.equal(env.state.dynamicGuardRuns[0].status, 'failed');
+  env.advance(env.guard().interval);
+  await env.tick();
+  assert.ok(env.guard().cycle, 'the next cycle should re-check the current IP before retrying');
+});
+
 test('restart during command execution preserves the conservative deadline and does not duplicate the command', async () => {
   const env = setup();
   env.guard().flow = { id: 'flow', oldIp: '192.0.2.1', initialIp: '192.0.2.1', commandState: 'executing', executionId: 'lost', attempts: 1,
@@ -596,7 +610,7 @@ test('duplicate domain tasks are rejected and a task can still be disabled after
   assert.equal(disabled.status, 'disabled');
 });
 
-test('local command runner bounds output, uses an independent timeout and does not inherit application secrets', async () => {
+test('local command runner matches the reference login shell, bounds output, and does not inherit application secrets', async () => {
   let child, args, settings;
   const promise = executeDynamicCommand('printf safe', 30, (program, argv, options) => {
     assert.equal(program, 'timeout'); args = argv; settings = options;
@@ -605,8 +619,9 @@ test('local command runner bounds output, uses an independent timeout and does n
   child.stdout.write('x'.repeat(20000)); child.emit('close', 0);
   const result = await promise;
   assert.equal(result.ok, true); assert.equal(result.output.length, 8192);
-  assert.deepEqual(args.slice(0, 5), ['--signal=TERM', '--kill-after=5', '30s', 'bash', '--noprofile']);
-  assert.deepEqual(Object.keys(settings.env).sort(), ['LANG', 'PATH']);
+  assert.deepEqual(args.slice(0, 6), ['--signal=TERM', '--kill-after=5', '30s', 'bash', '-lc', 'printf safe']);
+  assert.deepEqual(Object.keys(settings.env).sort(), ['HOME', 'LANG', 'LC_ALL', 'PATH']);
+  assert.equal(settings.cwd, process.cwd());
   assert.equal(settings.detached, true);
 });
 

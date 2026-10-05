@@ -3,6 +3,7 @@ import { Resolver } from 'node:dns/promises';
 import { domainToASCII } from 'node:url';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
+import { homedir } from 'node:os';
 
 export const DYNAMIC_DEFAULTS = {
   name: '', domain: '', recordType: 'A', probeIds: [], botIds: [], enabled: true,
@@ -141,9 +142,16 @@ export function executeDynamicCommand(command, timeoutSeconds, spawnProcess = sp
     };
     const terminate = (signal) => { try { process.kill(-child.pid, signal); } catch { try { child.kill(signal); } catch {} } };
     try {
-      child = spawnProcess('timeout', ['--signal=TERM', '--kill-after=5', `${timeoutSeconds}s`, 'bash', '--noprofile', '--norc', '-c', command], {
+      child = spawnProcess('timeout', ['--signal=TERM', '--kill-after=5', `${timeoutSeconds}s`, 'bash', '-lc', command], {
         detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-        env: { PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8' }
+        cwd: process.cwd(),
+        // Match the command runner used by the reference script. Keep the
+        // environment allow-listed so panel secrets are never exposed.
+        env: {
+          PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+          HOME: process.env.HOME || homedir(),
+          LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8'
+        }
       });
       for (const stream of [child.stdout, child.stderr]) {
         stream.setEncoding('utf8');
@@ -254,20 +262,43 @@ export function createDynamicGuardService(deps, options = {}) {
       .then((result) => {
         const current = get(guard.id);
         if (current?.flow?.executionId !== executionId) return;
+        // The built-in runner explicitly marks non-zero exits as certain and
+        // timeouts/spawn failures as uncertain. Treat incomplete custom
+        // runner results conservatively as unknown for compatibility.
+        const knownFailure = !result.ok && result.uncertain === false;
+        const flowId = current.flow.id;
         change(guard.id, null, (item, state) => {
           const flow = item.flow;
-          flow.commandState = result.ok ? 'submitted' : 'uncertain';
+          flow.commandState = result.ok ? 'submitted' : knownFailure ? 'failed' : 'uncertain';
           flow.executionId = '';
           item.commandNotBefore = now();
           flow.submittedAt = now();
           flow.deadlineAt = item.waitTimeout ? now() + item.waitTimeout * 1000 : 0;
           item.status = result.ok ? 'waiting_ip' : 'command_error';
-          item.message = result.ok ? '请求已提交，等待域名出现新 IP' : `${result.error || '命令失败'}；先查询 IP，避免重复提交`;
-          item.nextAt = now();
-          record(item, state, { output: String(result.output || '').slice(-8192), message: item.message, commandOk: result.ok });
+          item.message = result.ok ? '请求已提交，等待域名出现新 IP'
+            : knownFailure ? `${result.error || '命令失败'}；稍后重新检查并重试`
+              : `${result.error || '命令失败'}；先查询 IP，避免重复提交`;
+          item.nextAt = knownFailure ? now() + Math.max(5, item.interval * 1000) : now();
+          record(item, state, { output: String(result.output || '').slice(-8192), message: item.message,
+            commandOk: result.ok, status: result.ok || !knownFailure ? 'processing' : 'failed',
+            ...(knownFailure ? { finishedAt: iso(now()) } : {}) });
+          // A non-zero exit is definitive. Do not hold the task in a
+          // 300-second "waiting for new IP" flow; the next normal check will
+          // establish fresh failure evidence before retrying. Timeouts and
+          // lost results remain conservative and keep the flow for confirmation.
+          if (knownFailure) {
+            // The attempt was never accepted by the API. Match the reference
+            // runner: failed submissions do not consume the daily quota or
+            // start a cooldown, while a timeout/unknown result still does.
+            if (item.daily?.date === dynamicDay(now()) && item.daily.count > 0) item.daily.count--;
+            item.lastSubmittedAt = 0;
+            item.flow = null;
+          }
           if (item.enabled === false) { item.status = 'disabled'; item.message = '已停用；上次命令已结束，停止后续检查与重试'; }
         }, true);
-        if (!result.ok) notice(guard.id, `command-error:${current.flow.id}`, '换 IP 命令未正常完成，先等待并确认 IP 变化；不会立即重复提交。');
+        if (!result.ok) notice(guard.id, `command-error:${flowId}`, knownFailure
+          ? '换 IP 命令明确失败，已记录退出码；稍后重新检查，确认目标仍故障后自动重试。'
+          : '换 IP 命令结果未知，先等待并确认 IP 变化；不会立即重复提交。');
       }).catch((error) => deps.logError?.(error)).finally(() => commands.delete(guard.id));
     commands.set(guard.id, work);
   }

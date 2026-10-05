@@ -229,7 +229,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
         {formError ? <p className="auth-error" role="alert">{formError}</p> : null}
       </form>
     </Dialog> : null}
-    {historyGuard ? <Dialog title={`${historyGuard.name} · 执行记录`} wide onClose={() => setHistoryGuard(null)}><HistoryRecords key={historyGuard.id} scope="dynamicGuardRuns" guardId={historyGuard.id} api={api} /></Dialog> : null}
+    {historyGuard ? <Dialog title={`${historyGuard.name} · 执行记录`} wide className="dynamic-history-dialog" onClose={() => setHistoryGuard(null)}><HistoryRecords key={historyGuard.id} scope="dynamicGuardRuns" guardId={historyGuard.id} api={api} /></Dialog> : null}
     {confirmation ? <Dialog title={confirmation.action === 'delete' ? '删除动态 IP 守护' : '手动换 IP'} onClose={() => setConfirmation(null)} footer={<div className="dialog-actions"><button className="ghost" onClick={() => setConfirmation(null)}>取消</button><button className="primary" onClick={() => { const { guard, action } = confirmation; setConfirmation(null); act(guard, action); }}>确认</button></div>}>
       <p className="confirm-copy">{confirmation.action === 'delete' ? `删除「${confirmation.guard.name}」并停止后续检查及重试。已经提交给服务商的请求无法撤回，执行记录会保留。` : `${confirmation.guard.flow ? '当前换 IP 流程尚未完成；确认后将在原流程中再次提交。' : ''}执行「${confirmation.guard.name}」的换 IP API 命令，会消耗今日一次提交额度，并可能中断目标服务。仍遵守每日上限和冷却时间，已排队的请求不会重复提交。`}</p>
     </Dialog> : null}

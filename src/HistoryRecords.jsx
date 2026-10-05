@@ -7,6 +7,7 @@ export const HISTORY_LABELS = {
 
 const STATUS = { running: '执行中', queued: '等待执行', paused: '已暂停', awaiting_input: '等待输入', done: '已完成',
   healthy: '正常', replaced: '已完成补位', degraded: '容量不足', error: '执行异常', waiting_ip: '等待可用 IP', processing: '处理中', succeeded: '已完成', cancelled: '已结束', returned: '已退回原池' };
+const STATUS_TONES = { done: 'ok', healthy: 'ok', replaced: 'ok', succeeded: 'ok', queued: 'warn', awaiting_input: 'warn', degraded: 'warn', waiting_ip: 'warn', processing: 'warn', error: 'bad' };
 
 // Load only while this record dialog is open, with bounded pages and no
 // background polling. Do not overwrite the guard workspace's latest-run cache.
@@ -27,7 +28,9 @@ export default function HistoryRecords({ scope, api, revision, clearing, onClear
     return () => controller.abort();
   }, [api, scope, guardId, page, refresh, revision]);
   const records = result?.records || [];
-  return <>
+  const dynamic = scope === 'dynamicGuardRuns';
+  const dedicatedDynamic = dynamic && Boolean(guardId);
+  return <div className={`history-records${dedicatedDynamic ? ' dynamic-history-records' : ''}`}>
     <div className="ops-content-head">
       <div><strong>{HISTORY_LABELS[scope]}</strong><span>默认保留 7 天{result ? ` · 共 ${result.total} 条` : ''}</span></div>
       <div className="ops-content-actions">
@@ -40,16 +43,17 @@ export default function HistoryRecords({ scope, api, revision, clearing, onClear
         const time = item.finishedAt || item.createdAt || item.startedAt;
         const title = scope === 'automationRuns' ? item.taskName : ['dnsGuardRuns', 'dynamicGuardRuns'].includes(scope) ? item.guardName || item.domain : item.summary || item.action;
         const detail = scope === 'automationRuns' ? `共 ${item.total || 0} 个 · 成功 ${item.ok || 0} · 失败 ${item.error || 0}`
-          : scope === 'dynamicGuardRuns' ? [item.domain, `${item.oldIp} → ${item.newIp || '等待新 IP'}`, `尝试 ${item.attempts} 次`, item.message].filter(Boolean).join(' · ')
+          : dynamic ? [item.domain, `${item.oldIp} → ${item.newIp || '等待新 IP'}`, `尝试 ${item.attempts} 次`, item.message].filter(Boolean).join(' · ')
           : scope === 'dnsGuardRuns' ? [item.domain, item.message].filter(Boolean).join(' · ') : [item.actor, item.action].filter(Boolean).join(' · ');
-        return <article className="ops-row" key={item.id}><div className="ops-row-main"><div><strong>{title || '历史记录'}</strong><span>{[time ? new Date(time).toLocaleString('zh-CN') : '', detail].filter(Boolean).join(' · ')}</span>{scope === 'dynamicGuardRuns' ? <details><summary>详情与最近命令输出</summary><p className="confirm-copy">{detail}</p><pre className="dynamic-run-output">{item.output || '暂无命令输出'}</pre></details> : null}</div></div>
-          {item.status ? <div className="ops-row-side"><em className="ops-status muted">{STATUS[item.status] || item.status}</em></div> : null}</article>;
+        const formattedTime = time ? new Date(time).toLocaleString('zh-CN') : '';
+        return <article className={`ops-row${dedicatedDynamic ? ' dynamic-history-row' : ''}`} key={item.id}><div className="ops-row-main"><div><strong>{title || '历史记录'}</strong><span className={dedicatedDynamic ? 'dynamic-history-meta' : ''}>{[formattedTime, detail].filter(Boolean).join(' · ')}</span>{dynamic ? <details className={dedicatedDynamic ? 'dynamic-history-details' : undefined}><summary>详情与最近命令输出</summary><p className="confirm-copy">{detail}</p><pre className="dynamic-run-output">{item.output || '暂无命令输出'}</pre></details> : null}</div></div>
+          {item.status ? <div className="ops-row-side"><em className={`ops-status ${STATUS_TONES[item.status] || 'muted'}`}>{STATUS[item.status] || item.status}</em></div> : null}</article>;
       }) : <div className="ops-empty"><strong>暂无{HISTORY_LABELS[scope]}</strong></div>}
     </div>}
-    {result?.pages > 1 ? <div className="ops-content-actions">
+    {result?.pages > 1 ? <div className="ops-content-actions history-pagination">
       <button className="ghost" disabled={loading || result.page <= 1} onClick={() => setPage(result.page - 1)}>上一页</button>
       <span>{result.page} / {result.pages}</span>
       <button className="ghost" disabled={loading || result.page >= result.pages} onClick={() => setPage(result.page + 1)}>下一页</button>
     </div> : null}
-  </>;
+  </div>;
 }

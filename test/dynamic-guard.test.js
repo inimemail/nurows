@@ -243,6 +243,20 @@ test('offline probes and incomplete reports wait safely instead of causing API c
   assert.equal(env.calls.length, 0);
 });
 
+test('manual IP changes wait for responsible probes and retain the request', async () => {
+  const env = setup();
+  env.state.probes[1].status = 'offline';
+  env.service.request(env.guard().id, true);
+  await env.tick();
+  assert.equal(env.calls.length, 0);
+  assert.equal(env.guard().status, 'waiting_probe');
+  assert.equal(env.guard().manualRequested, true);
+  env.state.probes[1].status = 'online';
+  env.advance(5);
+  await env.tick();
+  assert.equal(env.calls.length, 1);
+});
+
 test('daily limits suppress repeat submissions and notifications while a new IP can still recover', async () => {
   const env = setup({ maxDaily: 1, waitTimeout: 5 });
   await failAndSubmit(env);

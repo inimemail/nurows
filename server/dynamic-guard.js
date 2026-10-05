@@ -307,7 +307,17 @@ export function createDynamicGuardService(deps, options = {}) {
     const fresh = get(guard.id);
     if (!fresh || fresh.revision !== guard.revision || fresh.enabled === false) return;
     probes = probesNow();
+    if (fresh.lastResolvedIp !== address) {
+      change(guard.id, guard.revision, (item) => {
+        item.lastResolvedIp = address;
+        item.lastResolvedAt = iso(now());
+      });
+    }
     guard = { ...fresh, currentIp: address };
+    if (guard.manualRequested && !readiness(guard, probes)) {
+      wait(guard, 'waiting_probe', '等待负责探针上线后执行手动换 IP', 5, address);
+      return;
+    }
     if (guard.manualRequested) { submit(guard, '手动请求换 IP'); return; }
     if (guard.pendingChange) {
       const pending = guard.pendingChange;

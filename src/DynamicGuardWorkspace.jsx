@@ -18,6 +18,21 @@ const numbers = [
   ['maxDaily', '每日换 IP 上限（0 为不限）', 0, 10000]
 ];
 
+// The status endpoint also carries serverTime for countdown synchronization.
+// Exclude that clock value so a five-second poll only rerenders when the
+// displayed guard, probe, or bot state actually changed.
+export function dynamicSnapshotKey(value) {
+  const guards = (value?.guards || []).map(({ cycle, ...guard }) => ({
+    ...guard,
+    cycle: cycle ? { id: cycle.id, address: cycle.address, startedAt: cycle.startedAt } : null
+  }));
+  const probes = (value?.probes || []).map((probe) => ({
+    id: probe.id, name: probe.name, enabled: probe.enabled, status: probe.status, lastSeenAt: probe.lastSeenAt
+  }));
+  const bots = (value?.bots || []).map((bot) => ({ id: bot.id, name: bot.name, enabled: bot.enabled, configured: bot.configured }));
+  return JSON.stringify([guards, probes, bots]);
+}
+
 function GuardCountdown({ guard, offset }) {
   const [time, setTime] = useState(() => Date.now() + offset);
   const active = ['waiting_ip', 'cooldown'].includes(guard.status);
@@ -54,7 +69,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
   const generation = useRef(0);
   const offset = useRef(cache?.current?.offset || 0);
   const latestData = useRef(data);
-  const hasFetchedRef = useRef(Boolean(cache?.current?.data));
+  const snapshotKeyRef = useRef(dynamicSnapshotKey(data));
   latestData.current = data;
   const mounted = useRef(true);
   const actionLock = useRef(new Set());
@@ -63,8 +78,11 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
   const visibleGuards = useMemo(() => filterWorkspaceRecords('dynamic', data.guards, search), [data.guards, search]);
   const publish = (result) => {
     latestData.current = result;
-    setData(result);
     if (cache) cache.current = { data: result, offset: offset.current };
+    const nextKey = dynamicSnapshotKey(result);
+    if (nextKey === snapshotKeyRef.current) return;
+    snapshotKeyRef.current = nextKey;
+    setData(result);
     // Only a changed count needs to rerender the whole application.
     onState?.((current) => current.dynamicGuardsCount === result.guards.length ? current : { ...current, dynamicGuardsCount: result.guards.length });
   };
@@ -82,7 +100,6 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
           const result = await api('/api/dynamic-guards', { signal });
           if (!active || cancelled || version !== generation.current) return;
           offset.current = Number.isFinite(result.serverTime) ? result.serverTime - Date.now() : 0;
-          hasFetchedRef.current = true;
           publish(result); setError('');
         } catch (err) {
           if (active && !cancelled && version === generation.current) setError(err.message);
@@ -161,7 +178,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
         const manualBlock = locked ? '正在处理请求或执行 API 命令，请稍候' : !guard.enabled ? '请先启用任务' : guard.manualRequested ? '手动换 IP 已排队，请勿重复提交' : '';
         return <article className="dynamic-card" key={guard.id}>
           <div className="dynamic-card-title"><div><strong>{guard.name}</strong><span>{guard.domain} · {guard.recordType}</span></div><em className={`ops-status ${tone}`}>{LABELS[guard.status] || guard.status}</em></div>
-          <div className="dynamic-facts"><div><span>当前 IP</span><code>{guard.currentIp || '尚未获取'}</code></div><div title="每日额度按北京时间重置"><span>今日提交</span><strong>{guard.todayCount} / {guard.maxDaily || '不限'}</strong></div><div><span>探针</span><strong>{guard.probeIds.length} 个</strong></div></div>
+          <div className="dynamic-facts"><div><span>当前 IP</span><code>{guard.currentIp || '尚未获取'}</code></div><div><span>最近解析</span><code>{guard.lastResolvedIp || '尚未解析'}</code></div><div title="每日额度按北京时间重置"><span>今日提交</span><strong>{guard.todayCount} / {guard.maxDaily || '不限'}</strong></div><div><span>探针</span><strong>{guard.probeIds.length} 个</strong></div></div>
           <div className="dynamic-card-footer">
             <p className="dynamic-message">{guard.message}<GuardCountdown guard={guard} offset={offset.current} /></p>
             <div className="dynamic-actions">

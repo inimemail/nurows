@@ -174,7 +174,7 @@ test('an action on one task does not disable manual change on other tasks', () =
 test('dynamic cards keep compact facts and a dedicated wrapping footer', () => {
   const view = harness(() => assert.fail('render must not issue a request'));
   const facts = view.nodes().find((node) => node.props?.className === 'dynamic-facts');
-  assert.equal(facts.props.children.length, 3);
+  assert.equal(facts.props.children.length, 4);
   const footer = view.nodes().find((node) => node.props?.className === 'dynamic-card-footer');
   assert.equal(footer.props.children[0].props.className, 'dynamic-message');
   assert.equal(footer.props.children[1].props.className, 'dynamic-actions');

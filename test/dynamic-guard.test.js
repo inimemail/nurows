@@ -68,6 +68,51 @@ test('one success settles immediately without waiting for slow probes or running
   assert.equal(env.notices.length, 0);
 });
 
+test('an online probe can verify a dynamic IP while another assigned probe is offline', async () => {
+  const env = setup();
+  env.state.probes[1].status = 'offline';
+  await env.tick();
+  assert.deepEqual(env.guard().cycle.probeIds, ['p1', 'p2']);
+  env.report('p1', true);
+  await env.tick();
+  assert.equal(env.guard().status, 'healthy');
+  assert.equal(env.calls.length, 0);
+});
+
+test('an offline assigned probe prevents an all-failure result from changing IP', async () => {
+  const env = setup();
+  env.state.probes[1].status = 'offline';
+  await env.tick();
+  env.report('p1', false);
+  await env.tick();
+  assert.equal(env.calls.length, 0);
+  assert.ok(env.guard().cycle);
+  env.state.probes[1].status = 'online';
+  env.report('p2', false);
+  await env.tick();
+  assert.equal(env.calls.length, 1);
+});
+
+test('disabling an assigned probe during a cycle does not leave the guard waiting forever', async () => {
+  const env = setup();
+  await env.tick();
+  env.report('p1', false);
+  env.state.probes[1].enabled = false;
+  await env.tick();
+  assert.equal(env.calls.length, 1);
+  assert.equal(env.guard().cycle, null);
+});
+
+test('removing an assigned probe during a cycle does not leave the guard waiting forever', async () => {
+  const env = setup();
+  await env.tick();
+  env.report('p1', false);
+  env.state.probes = env.state.probes.filter((probe) => probe.id !== 'p2');
+  await env.tick();
+  assert.equal(env.calls.length, 1);
+  assert.equal(env.guard().cycle, null);
+});
+
 test('only complete failures from every assigned probe submit once; a manual retry continues the same flow', async () => {
   const env = setup();
   await env.tick();

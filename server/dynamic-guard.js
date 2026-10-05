@@ -69,8 +69,32 @@ export function dynamicProbeTargets(guards = [], probeId) {
   });
 }
 
+function dynamicProbeReadiness(guard, probes, now = Date.now()) {
+  const byId = new Map((probes || []).map((probe) => [probe.id, probe]));
+  // Disabled or removed probes are not part of an active check target. This
+  // mirrors ordinary target checks and prevents a task from waiting forever
+  // after an operator disables a probe.
+  const assignedIds = [...new Set((guard.probeIds || []).filter((id) => {
+    const probe = byId.get(id);
+    return Boolean(probe && probe.enabled !== false);
+  }))];
+  const activeIds = assignedIds.filter((id) => {
+    const probe = byId.get(id);
+    const lastSeen = Date.parse(probe?.lastSeenAt || 0);
+    return probe?.status === 'online' && Number.isFinite(lastSeen) && now - lastSeen >= 0 && now - lastSeen < 90000;
+  });
+  return {
+    assignedIds,
+    activeIds,
+    canCheck: activeIds.length > 0,
+    allOnline: assignedIds.length > 0 && activeIds.length === assignedIds.length,
+    missing: Math.max(0, assignedIds.length - activeIds.length)
+  };
+}
+
 export function acceptDynamicReports(state, probeId, reports, now = Date.now()) {
   const byId = new Map((state.dynamicGuards || []).filter((guard) => guard.enabled !== false && guard.cycle?.probeIds.includes(probeId)).map((guard) => [guard.cycle.id, guard]));
+  const activeProbeIds = new Set((state.probes || []).filter((probe) => probe.enabled !== false).map((probe) => probe.id));
   let accepted = false;
   for (const raw of reports) {
     const guard = byId.get(raw.targetId);
@@ -84,7 +108,10 @@ export function acceptDynamicReports(state, probeId, reports, now = Date.now()) 
       || /no such file|not found|permission denied|operation not permitted|getaddrinfo|name or service not known/i.test(String(raw.error || '')))) continue;
     guard.cycle.observations[probeId] = { ok: success, checkedAt: iso(now) };
     if (success) guard.cycle.result = 'healthy';
-    else if (guard.cycle.probeIds.every((id) => guard.cycle.observations[id]?.ok === false)) guard.cycle.result = 'failed';
+    else {
+      const expectedProbeIds = guard.cycle.probeIds.filter((id) => activeProbeIds.has(id));
+      if (expectedProbeIds.length > 0 && expectedProbeIds.every((id) => guard.cycle.observations[id]?.ok === false)) guard.cycle.result = 'failed';
+    }
     accepted = true;
   }
   return accepted;
@@ -172,8 +199,9 @@ export function createDynamicGuardService(deps, options = {}) {
     change(id, null, (item) => { item.notificationKeys = [...(item.notificationKeys || []), key].slice(-12); });
     Promise.resolve(deps.notifyDynamicGuard?.(guard, message)).catch(() => {});
   };
-  const readiness = (guard, probes) => guard.probeIds.length && guard.probeIds.every((id) => probes.some((probe) => probe.id === id
-    && probe.enabled !== false && probe.status === 'online' && now() - Date.parse(probe.lastSeenAt) < 90000));
+  const readiness = (guard, probes) => dynamicProbeReadiness(guard, probes, now());
+  const waitingProbeMessage = (readiness, prefix = '等待负责探针上线') =>
+    readiness.missing ? `${prefix}（还差 ${readiness.missing} 个）` : prefix;
 
   function submit(guard, reason, waitExpired = false) {
     const time = now(), count = dynamicDailyCount(guard, time);
@@ -267,6 +295,22 @@ export function createDynamicGuardService(deps, options = {}) {
     if (guard.enabled === false) return;
     let probes = probesNow();
     if (guard.cycle) {
+      // A probe can be disabled or removed while a cycle is in flight. Drop
+      // it from this cycle so an otherwise complete failure can settle, while
+      // preserving offline probes that are still assigned for late evidence.
+      const cycleReadiness = readiness(guard, probes);
+      const validCycleIds = guard.cycle.probeIds.filter((id) => cycleReadiness.assignedIds.includes(id));
+      if (validCycleIds.length !== guard.cycle.probeIds.length) {
+        change(guard.id, guard.revision, (item) => { item.cycle.probeIds = validCycleIds; });
+        guard = get(guard.id);
+        if (!guard?.cycle) return;
+      }
+      if (!guard.cycle.result && validCycleIds.length > 0
+        && validCycleIds.every((id) => guard.cycle.observations[id]?.ok === false)) {
+        change(guard.id, guard.revision, (item) => { item.cycle.result = 'failed'; });
+        guard = get(guard.id);
+        if (!guard?.cycle) return;
+      }
       if (guard.cycle.result === 'healthy') {
         const flow = guard.flow;
         change(guard.id, guard.revision, (item, state) => {
@@ -279,22 +323,29 @@ export function createDynamicGuardService(deps, options = {}) {
         if (flow) notice(guard.id, `success:${flow.id}`, `${flow.initialIp} → ${guard.currentIp}\n换 IP 完成，任意探针一次成功即通过。\n耗时 ${Math.round((time - Date.parse(flow.startedAt)) / 1000)} 秒 · 本次尝试 ${flow.attempts} 次\n今日 ${dynamicDailyCount(guard, time)}/${guard.maxDaily || '不限'}${guard.maxDaily ? `，剩余 ${Math.max(0, guard.maxDaily - dynamicDailyCount(guard, time))} 次` : ''}`);
         return;
       }
-      if (!readiness(guard, probes)) {
-        change(guard.id, guard.revision, (item) => { item.cycle = null; item.status = 'waiting_probe'; item.message = '负责探针离线，等待恢复后重新检查'; item.nextAt = time + 5000; });
-        return;
-      }
       if (guard.cycle.result === 'failed') {
+        const failedReadiness = readiness(guard, probes);
+        if (!failedReadiness.allOnline) {
+          wait(guard, 'waiting_probe', waitingProbeMessage(failedReadiness, '负责探针未全部在线，等待恢复后重新检查'), 5);
+          return;
+        }
         // Freshly resolve again before submitting; a changing DDNS target must
         // not be replaced based on evidence for its previous IP.
         const address = await resolveIp(guard.domain, guard.recordType);
         const fresh = get(guard.id);
         if (fresh?.revision !== guard.revision || fresh?.cycle?.id !== guard.cycle.id) return;
-        if (!readiness(fresh, probesNow())) { wait(fresh, 'waiting_probe', '负责探针离线，等待恢复后重新检查', 5); return; }
+        const freshReadiness = readiness(fresh, probesNow());
+        if (!freshReadiness.allOnline) { wait(fresh, 'waiting_probe', waitingProbeMessage(freshReadiness, '负责探针未全部在线，等待恢复后重新检查'), 5); return; }
         if (address !== guard.currentIp) {
           change(guard.id, guard.revision, (item) => { item.cycle = null; item.currentIp = address; item.nextAt = now(); });
           return;
         }
         submit(guard, guard.flow ? '新 IP 所有探针全部轮次失败，继续换 IP' : '所有探针全部轮次失败');
+        return;
+      }
+      const activeCycleReadiness = readiness(guard, probes);
+      if (!activeCycleReadiness.canCheck) {
+        wait(guard, 'waiting_probe', waitingProbeMessage(activeCycleReadiness), 5);
         return;
       }
       if (time - guard.cycle.startedAt > (guard.checkRounds * guard.timeout + guard.checkRounds - 1 + 30) * 1000) {
@@ -314,14 +365,15 @@ export function createDynamicGuardService(deps, options = {}) {
       });
     }
     guard = { ...fresh, currentIp: address };
-    if (guard.manualRequested && !readiness(guard, probes)) {
-      wait(guard, 'waiting_probe', '等待负责探针上线后执行手动换 IP', 5, address);
+    const currentReadiness = readiness(guard, probes);
+    if (guard.manualRequested && !currentReadiness.allOnline) {
+      wait(guard, 'waiting_probe', waitingProbeMessage(currentReadiness, '等待负责探针全部上线后执行手动换 IP'), 5, address);
       return;
     }
     if (guard.manualRequested) { submit(guard, '手动请求换 IP'); return; }
     if (guard.pendingChange) {
       const pending = guard.pendingChange;
-      if (!pending.waitExpired && address === pending.address && now() - pending.checkedAt <= 30000 && readiness(guard, probes)) {
+      if (!pending.waitExpired && address === pending.address && now() - pending.checkedAt <= 30000 && currentReadiness.allOnline) {
         submit(guard, '全部探针检查失败，API 队列空位已可用'); return;
       }
       change(guard.id, guard.revision, (item) => { item.pendingChange = null; });
@@ -330,16 +382,15 @@ export function createDynamicGuardService(deps, options = {}) {
     if (guard.flow && address === guard.flow.oldIp) {
       // Unknown submission after restart cannot overlap the old command's
       // hard deadline. Offline probes cannot trigger another automatic change.
-      if (guard.flow.deadlineAt && now() >= guard.flow.deadlineAt && readiness(guard, probes)) {
+      if (guard.flow.deadlineAt && now() >= guard.flow.deadlineAt && currentReadiness.allOnline) {
         submit(guard, `等待 ${guard.waitTimeout} 秒仍无新 IP，重新提交`, true);
       } else {
-        const ready = readiness(guard, probes);
-        wait(guard, ready ? 'waiting_ip' : 'waiting_probe', ready ? '解析仍为旧 IP，等待新 IP' : '等待负责探针恢复', guard.queryInterval, address);
+        wait(guard, currentReadiness.canCheck ? 'waiting_ip' : 'waiting_probe', currentReadiness.canCheck ? '解析仍为旧 IP，等待新 IP' : waitingProbeMessage(currentReadiness), guard.queryInterval, address);
       }
       return;
     }
-    if (!readiness(guard, probes)) {
-      wait(guard, 'waiting_probe', '等待负责探针上线', 5, address);
+    if (!currentReadiness.canCheck) {
+      wait(guard, 'waiting_probe', waitingProbeMessage(currentReadiness), 5, address);
       return;
     }
     const scheduled = deps.readDynamicGuardSchedule?.() || deps.readState(['dynamicGuards']).dynamicGuards || [];
@@ -349,7 +400,10 @@ export function createDynamicGuardService(deps, options = {}) {
     }
     change(guard.id, guard.revision, (item) => {
       item.currentIp = address; item.lastResolvedAt = iso(now());
-      item.cycle = { id: `dynamic-${randomUUID()}`, address, probeIds: [...item.probeIds], observations: {}, startedAt: now() };
+      // Keep every currently valid responsible probe in the cycle, including
+      // offline ones. Online probes can start immediately, while a failed
+      // result still requires the late probe's own complete evidence.
+      item.cycle = { id: `dynamic-${randomUUID()}`, address, probeIds: [...currentReadiness.assignedIds], observations: {}, startedAt: now() };
       item.status = item.flow ? 'verifying' : 'checking'; item.message = item.flow ? '正在验证新 IP' : '正在检查当前 IP';
     });
   }

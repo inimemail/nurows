@@ -23,6 +23,7 @@ export async function copyNoteText(value) {
   document.body.append(input);
   try {
     input.select();
+    input.setSelectionRange?.(0, text.length);
     if (!document.execCommand("copy")) throw new Error("copy denied");
   } catch {
     throw new Error("浏览器未允许复制，请选中文字后手动复制");

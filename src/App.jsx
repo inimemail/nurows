@@ -10,6 +10,9 @@ import RenewalWorkspace from './RenewalWorkspace.jsx';
 import { BookOpen, CalendarClock } from 'lucide-react';
 import { HISTORY_LABELS } from './HistoryRecords.jsx';
 import Dialog from './Dialog.jsx';
+import { copyNoteText } from './note-clipboard.js';
+import { trackMobileViewport } from './mobile-viewport.js';
+import { canAutoFocusTerminal, isTerminalSubmitKey, terminalCopyText } from './terminal-interaction.js';
 import SettingsDialog, { HistoryBrowser } from './SettingsDialog.jsx';
 const NotesWorkspace = lazy(() => import('./NotesWorkspace.jsx'));
 
@@ -389,6 +392,7 @@ function normalizeWorkspacePayload(workspace = {}) {
 }
 
 export default function App() {
+  useEffect(() => trackMobileViewport(), []);
   const restoringWorkspaceRef = useRef(false);
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem('nurossh-theme') === 'nuro-dark' ? 'nuro-dark' : 'hbx-light'; }
@@ -468,6 +472,9 @@ export default function App() {
   const [batchInputDialog, setBatchInputDialog] = useState(EMPTY_BATCH_INPUT_DIALOG);
   const batchInputValueRef = useRef('');
   const batchInputSendingRef = useRef(false);
+  const runCommandSendingRef = useRef(false);
+  const automationInputSendingRef = useRef(false);
+  const automationServerInputSendingRef = useRef(new Set());
   const commandInputEpochRef = useRef(0);
   const [resultHistory, setResultHistory] = useState(null);
   const [handledBatchInputSignature, setHandledBatchInputSignature] = useState('');
@@ -1362,10 +1369,14 @@ export default function App() {
   }
 
   async function sendAutomationInput(serverId, data = '') {
+    const key = `${automationJobId}:${serverId}`;
+    if (automationServerInputSendingRef.current.has(key)) return;
+    automationServerInputSendingRef.current.add(key);
     try {
-      await api(`/api/commands/jobs/${automationJobId}/input`, { method: 'POST', body: JSON.stringify({ serverIds: [serverId], data }) });
+      const response = await api(`/api/commands/jobs/${automationJobId}/input`, { method: 'POST', timeoutMs: 15000, body: JSON.stringify({ serverIds: [serverId], data }) });
+      if (response.sent !== 1) throw new Error('当前主机未收到输入，请检查执行状态');
       toast('输入已发送');
-    } catch (error) { toast(error.message); }
+    } catch (error) { toast(error.message); } finally { automationServerInputSendingRef.current.delete(key); }
   }
 
   function openAutomationInputDialog(mode = 'choice') {
@@ -1377,28 +1388,39 @@ export default function App() {
   }
 
   function closeAutomationInputDialog() {
+    if (automationInputSendingRef.current) return;
     setAutomationInputDialog({ open: false, mode: 'choice', value: '', awaitingServerIds: [] });
   }
 
   async function submitAutomationBroadcastInput() {
+    if (automationInputSendingRef.current) return;
     if (!automationJobId || !automationInputDialog.awaitingServerIds.length) return;
     try {
+      automationInputSendingRef.current = true;
       setActionBusy('automationInput', true);
-      const data = await api(`/api/commands/jobs/${automationJobId}/input`, { method: 'POST', body: JSON.stringify({ serverIds: automationInputDialog.awaitingServerIds, data: automationInputDialog.value }) });
+      const data = await api(`/api/commands/jobs/${automationJobId}/input`, { method: 'POST', timeoutMs: 15000, body: JSON.stringify({ serverIds: automationInputDialog.awaitingServerIds, data: automationInputDialog.value }) });
+      if (!data.sent) throw new Error('没有可接收输入的会话，内容已保留');
+      if (data.sent !== automationInputDialog.awaitingServerIds.length) throw new Error(`仅 ${data.sent} 台主机收到输入，请确认状态后再操作，避免重复发送`);
+      automationInputSendingRef.current = false;
       closeAutomationInputDialog();
       toast(`已向 ${data.sent || 0} 台主机发送输入`);
-    } catch (error) { toast(error.message); } finally { setActionBusy('automationInput', false); }
+    } catch (error) { toast(error.message); } finally { automationInputSendingRef.current = false; setActionBusy('automationInput', false); }
   }
 
   async function submitAutomationPerServerInput() {
+    if (automationInputSendingRef.current) return;
     if (!automationJobId || !automationInputDialog.awaitingServerIds.length) return;
     if (automationInputLines.length !== automationInputDialog.awaitingServerIds.length) { toast('输入行数与等待输入主机数量不一致'); return; }
     try {
+      automationInputSendingRef.current = true;
       setActionBusy('automationInput', true);
-      const data = await api(`/api/commands/jobs/${automationJobId}/input`, { method: 'POST', body: JSON.stringify({ inputs: automationInputDialog.awaitingServerIds.map((serverId, index) => ({ serverId, data: automationInputLines[index] })) }) });
+      const data = await api(`/api/commands/jobs/${automationJobId}/input`, { method: 'POST', timeoutMs: 15000, body: JSON.stringify({ inputs: automationInputDialog.awaitingServerIds.map((serverId, index) => ({ serverId, data: automationInputLines[index] })) }) });
+      if (!data.sent) throw new Error('没有可接收输入的会话，内容已保留');
+      if (data.sent !== automationInputDialog.awaitingServerIds.length) throw new Error(`仅 ${data.sent} 台主机收到输入，请确认状态后再操作，避免重复发送`);
+      automationInputSendingRef.current = false;
       closeAutomationInputDialog();
       toast(`已向 ${data.sent || 0} 台主机分别发送输入`);
-    } catch (error) { toast(error.message); } finally { setActionBusy('automationInput', false); }
+    } catch (error) { toast(error.message); } finally { automationInputSendingRef.current = false; setActionBusy('automationInput', false); }
   }
 
   function openEditor(type, item = null) {
@@ -1850,12 +1872,14 @@ export default function App() {
   }
 
   async function runCommand(overrideInteractiveKeywords = interactiveKeywords) {
+    if (runCommandSendingRef.current || isCommandRunning) return;
     if (!selectedServerIds.length) {
       toast('请先选择至少一台服务器');
       return;
     }
     const nextInteractiveKeywords = sanitizeInteractiveKeywords(overrideInteractiveKeywords, { fallbackToDefault: false });
     try {
+      runCommandSendingRef.current = true;
       setActionBusy('runCommand', true);
       setRunCommandConfirmOpen(false);
       setTemporaryKeywordsDialogOpen(false);
@@ -1882,6 +1906,8 @@ export default function App() {
     } catch (error) {
       toast(error.message);
       setActionBusy('runCommand', false);
+    } finally {
+      runCommandSendingRef.current = false;
     }
   }
 
@@ -2015,13 +2041,16 @@ export default function App() {
       setActionBusy('submitBatchInput', true);
       const data = await api(`/api/commands/jobs/${commandJobId}/input`, {
         method: 'POST',
+        timeoutMs: 15000,
         body: JSON.stringify({
           serverIds: batchInputDialog.awaitingServerIds,
           data: batchInputValueRef.current
         }),
         onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
       });
+      if (!data.sent) throw new Error('没有可接收输入的会话，内容已保留');
       markInputSent(data.serverIds || batchInputDialog.awaitingServerIds);
+      if (data.sent !== batchInputDialog.awaitingServerIds.length) throw new Error(`仅 ${data.sent} 台服务器收到输入，请确认状态后再操作，避免重复发送`);
       closeBatchInputDialog();
       toast(`已向 ${data.sent || 0} 台服务器发送输入`);
     } catch (error) {
@@ -2059,9 +2088,12 @@ export default function App() {
             data: lines[index]
           }))
         }),
+        timeoutMs: 15000,
         onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
       });
-      markInputSent(batchInputDialog.awaitingServerIds);
+      if (!data.sent) throw new Error('没有可接收输入的会话，内容已保留');
+      if (data.sent !== batchInputDialog.awaitingServerIds.length) throw new Error(`仅 ${data.sent} 台服务器收到输入，请确认状态后再操作，避免重复发送`);
+      markInputSent(data.serverIds || batchInputDialog.awaitingServerIds);
       closeBatchInputDialog();
       toast(`已向 ${data.sent || 0} 台服务器分别发送输入`);
     } catch (error) {
@@ -2709,6 +2741,7 @@ export default function App() {
                 <textarea
                   rows={7}
                   value={commandText}
+                  autoCapitalize="none" autoCorrect="off" spellCheck={false}
                   onChange={(event) => updateCommandText(event.target.value)}
                   placeholder="例如：systemctl status nginx && df -h"
                 />
@@ -2770,9 +2803,13 @@ export default function App() {
                           ((!item.ok && item.status !== 'queued' && item.status !== 'running' && item.status !== 'awaiting_input') ? 'error ' : '') +
                           ((item.status === 'running' || item.status === 'queued' || item.status === 'awaiting_input') ? 'running' : '')
                         }
-                        onClick={() => openResultTerminal(item)}
+                        onClick={(event) => {
+                          if (window.getSelection()?.toString()) return;
+                          if (window.matchMedia('(max-width: 760px)').matches && event.target.closest('pre')) return;
+                          openResultTerminal(item);
+                        }}
                         onKeyDown={(event) => {
-                          if (event.key === 'Enter' || event.key === ' ') {
+                          if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) {
                             event.preventDefault();
                             openResultTerminal(item);
                           }
@@ -2800,6 +2837,7 @@ export default function App() {
                             ? '这台服务器正在等待输入，点击后可以直接进入真实会话继续输入。'
                             : item.outputTruncated ? '列表显示最近日志，点击查看执行详情' : '点击直接打开当前执行会话'}
                         </div>
+                        <button className="ghost mobile-only result-open-terminal" type="button" onClick={(event) => { event.stopPropagation(); openResultTerminal(item); }}>进入会话</button>
                         {(item.status === 'queued' || item.status === 'running') ? (
                           <>
                             <div className="result-pending">
@@ -3050,7 +3088,7 @@ export default function App() {
                       <option value="delay">延迟</option>
                     </select>
                     <input value={step.label || ''} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, label: e.target.value } : s) }))} placeholder={step.type === 'wait' ? '等待说明（例如密码提示）' : '步骤说明'} />
-                    <textarea rows={2} value={step.value || ''} disabled={step.type === 'ctrl_c' || step.type === 'finish'} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, value: e.target.value } : s) }))} placeholder={step.type === 'command' ? '输入命令，例如 passwd' : step.type === 'wait' ? '输入需要匹配的输出文本，例如 Password:' : step.type === 'input' ? '统一模式填固定内容；按行模式可留空，执行时逐台填写' : step.type === 'delay' ? '输入延迟秒数' : step.type === 'ctrl_c' ? '等待输出匹配后发送中断信号' : step.type === 'finish' ? '等待输出匹配后结束当前主机运行' : '此步骤自动发送回车，无需填写'} />
+                    <textarea rows={2} value={step.value || ''} autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={step.type === 'ctrl_c' || step.type === 'finish'} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, value: e.target.value } : s) }))} placeholder={step.type === 'command' ? '输入命令，例如 passwd' : step.type === 'wait' ? '输入需要匹配的输出文本，例如 Password:' : step.type === 'input' ? '统一模式填固定内容；按行模式可留空，执行时逐台填写' : step.type === 'delay' ? '输入延迟秒数' : step.type === 'ctrl_c' ? '等待输出匹配后发送中断信号' : step.type === 'finish' ? '等待输出匹配后结束当前主机运行' : '此步骤自动发送回车，无需填写'} />
                     {step.type === 'input' ? (
                       <select className="automation-input-mode" value={step.inputMode || 'broadcast'} onChange={(e) => setAutomationDraft((c) => ({ ...c, steps: c.steps.map((s) => s.id === step.id ? { ...s, inputMode: e.target.value } : s) }))}>
                         <option value="broadcast">统一输入（自动发送同一内容）</option>
@@ -3076,7 +3114,24 @@ export default function App() {
           onClose={closeAutomationInputDialog}
           footer={automationInputDialog.mode === 'per-server' ? <><button className="ghost" onClick={closeAutomationInputDialog}>取消</button><button className="primary" onClick={submitAutomationPerServerInput} disabled={busy.automationInput}>{busy.automationInput ? '发送中...' : `分别发送到 ${automationInputDialog.awaitingServerIds.length} 台主机`}</button></> : automationInputDialog.mode === 'broadcast' ? <><button className="ghost" onClick={closeAutomationInputDialog}>取消</button><button className="primary" onClick={submitAutomationBroadcastInput} disabled={busy.automationInput}>{busy.automationInput ? '发送中...' : `发送到 ${automationInputDialog.awaitingServerIds.length} 台主机`}</button></> : <><button className="ghost" onClick={closeAutomationInputDialog}>取消</button><button className="ghost" onClick={() => setAutomationInputDialog((current) => ({ ...current, mode: 'per-server' }))}>按行输入</button><button className="primary" onClick={() => setAutomationInputDialog((current) => ({ ...current, mode: 'broadcast' }))}>统一输入</button></>}
         >
-          {automationInputDialog.mode === 'choice' ? <div className="automation-input-choice"><strong>有 {automationInputDialog.awaitingServerIds.length} 台主机正在等待输入</strong><span>可以统一发送同一内容，也可以按当前主机顺序逐行发送。</span><div className="automation-awaiting-hosts">{automationAwaitingResults.map((item) => <div key={item.serverId}><span>{item.host}</span><em>等待输入</em></div>)}</div></div> : <div className="field-grid single"><Field label="当前等待主机"><AutoScrollPre text={automationAwaitingResults.map((item, index) => `# ${index + 1}  ${item.host}`).join('\n')} className="batch-input-preview" /></Field><Field label={automationInputDialog.mode === 'per-server' ? '输入内容（按主机顺序逐行）' : '输入内容'}><textarea rows={7} autoFocus value={automationInputDialog.value} onChange={(event) => setAutomationInputDialog((current) => ({ ...current, value: event.target.value }))} placeholder={automationInputDialog.mode === 'per-server' ? '一行对应一台主机，空行表示回车' : '留空表示统一发送回车'} /></Field>{automationInputDialog.mode === 'per-server' ? <div className="confirm-copy">当前 {automationInputLines.length} 行，需要 {automationInputDialog.awaitingServerIds.length} 行。</div> : <div className="confirm-copy">这段内容会发送到所有等待输入的主机。</div>}</div>}
+          {automationInputDialog.mode === 'choice' ? (
+            <div className="automation-input-choice">
+              <strong>有 {automationInputDialog.awaitingServerIds.length} 台主机正在等待输入</strong>
+              <span>可以统一发送同一内容，也可以按当前主机顺序逐行发送。</span>
+              <div className="automation-awaiting-hosts">{automationAwaitingResults.map((item) => <div key={item.serverId}><span>{item.host}</span><em>等待输入</em></div>)}</div>
+            </div>
+          ) : (
+            <div className="field-grid single">
+              <Field label="当前等待主机"><AutoScrollPre text={automationAwaitingResults.map((item, index) => `# ${index + 1}  ${item.host}`).join('\n')} className="batch-input-preview" /></Field>
+              <Field label={automationInputDialog.mode === 'per-server' ? '输入内容（按主机顺序逐行）' : '输入内容'}>
+                <textarea rows={7} autoFocus value={automationInputDialog.value} disabled={busy.automationInput}
+                  autoCapitalize="none" autoCorrect="off" spellCheck={false}
+                  onChange={(event) => setAutomationInputDialog((current) => ({ ...current, value: event.target.value }))}
+                  placeholder={automationInputDialog.mode === 'per-server' ? '一行对应一台主机，空行表示回车' : '留空表示统一发送回车'} />
+              </Field>
+              {automationInputDialog.mode === 'per-server' ? <div className="confirm-copy">当前 {automationInputLines.length} 行，需要 {automationInputDialog.awaitingServerIds.length} 行。</div> : <div className="confirm-copy">这段内容会发送到所有等待输入的主机。</div>}
+            </div>
+          )}
         </Dialog>
       ) : null}
 
@@ -3108,6 +3163,7 @@ export default function App() {
               <textarea
                 rows={12}
                 value={commandDraft.command}
+                autoCapitalize="none" autoCorrect="off" spellCheck={false}
                 onChange={(event) => {
                   const value = event.target.value;
                   setCommandDraft((current) => ({ ...current, command: value }));
@@ -3755,7 +3811,7 @@ function ServerOverview({ selectedServer, state, selectedServerIds, openTerminal
 function BatchInputText({ valueRef, expectedCount, disabled }) {
   const [value, setValue] = useState('');
   useEffect(() => { valueRef.current = ''; }, [valueRef]);
-  return <><textarea rows={5} value={value} disabled={disabled}
+  return <><textarea rows={5} value={value} disabled={disabled} autoCapitalize="none" autoCorrect="off" spellCheck={false}
     onChange={(event) => { valueRef.current = event.target.value; setValue(event.target.value); }}
     placeholder={expectedCount ? '一行对应一台服务器，空行表示直接发送一个回车' : '留空表示直接发送一个回车'} />
     {expectedCount ? <span>目标 {expectedCount} 台，当前 {parsePerServerInputLines(value, expectedCount).length} 行</span> : null}</>;
@@ -4004,6 +4060,13 @@ function TerminalWorkspace({
   const [currentInput, setCurrentInput] = useState('');
   const [manualInput, setManualInput] = useState('');
   const [manualInputBusy, setManualInputBusy] = useState(false);
+  const manualInputSendingRef = useRef(false);
+  const manualInputRef = useRef(null);
+  const clipboardOperationRef = useRef(0);
+  const clipboardReturnFocusRef = useRef(null);
+  const mountedRef = useRef(true);
+  const [clipboardDialog, setClipboardDialog] = useState(null);
+  const [terminalNotice, setTerminalNotice] = useState('');
   const [suggestionTop, setSuggestionTop] = useState(12);
   const [suggestionLeft, setSuggestionLeft] = useState(72);
   const isLiveSession = mode !== 'result';
@@ -4132,47 +4195,114 @@ function TerminalWorkspace({
         data: clearCurrentInput + commandSuggestion.command + '\r'
       }));
     syncCurrentInput('');
-    terminalRef.current?.focus();
+    if (canAutoFocusTerminal()) terminalRef.current?.focus();
   }
 
   async function sendManualCommand(value, options = {}) {
-    const { appendEnter = true, preferSocket = false } = options;
+    if (manualInputSendingRef.current) return;
+    const { appendEnter = true, clearInput = true } = options;
     const socket = socketRef.current;
     const payload = appendEnter ? (value + '\r') : value;
-
-    if ((preferSocket || mode !== 'command-job' || !session.jobId) && canWriteToSocket(socket)) {
-      socket.send(JSON.stringify({ type: 'input', data: payload }));
-      if (appendEnter) {
-        setManualInput('');
-      }
-      terminalRef.current?.focus();
-      return;
-    }
-
-    if (mode !== 'command-job' || !session.jobId || !session.serverId) {
-      return;
-    }
-
+    manualInputSendingRef.current = true;
     try {
       setManualInputBusy(true);
-      await api('/api/commands/jobs/' + session.jobId + '/input', {
-        method: 'POST',
-        body: JSON.stringify({
-          serverIds: [session.serverId],
-          data: appendEnter ? value : payload,
-          raw: !appendEnter
-        })
-      });
-      if (appendEnter) {
-        setManualInput('');
+      setTerminalNotice('');
+      if (mode === 'ssh') {
+        if (!ready || !canWriteToSocket(socket)) throw new Error('终端尚未连接，输入已保留，请连接后再发送');
+        socket.send(JSON.stringify({ type: 'input', data: payload }));
+        applyInputChunk(payload);
+        // Keep the guard through this event turn, including synchronous double taps.
+        await Promise.resolve();
+      } else if (mode === 'command-job' && session.jobId && session.serverId) {
+        const response = await api('/api/commands/jobs/' + session.jobId + '/input', {
+          method: 'POST',
+          timeoutMs: 15000,
+          body: JSON.stringify({
+            serverIds: [session.serverId],
+            data: appendEnter ? value : payload,
+            raw: !appendEnter
+          })
+        });
+        if (response.sent !== 1) throw new Error('当前会话未收到输入，内容已保留');
+      } else {
+        throw new Error('当前会话不能接收输入');
       }
-      terminalRef.current?.focus();
+      if (!mountedRef.current) return;
+      if (appendEnter && clearInput) setManualInput((current) => current === value ? '' : current);
+      if (canAutoFocusTerminal()) terminalRef.current?.focus();
     } catch (error) {
-      terminalRef.current?.writeln('\r\n[系统] ' + error.message);
+      if (mountedRef.current) {
+        setTerminalNotice(error.message);
+        terminalRef.current?.writeln('\r\n[系统] ' + error.message);
+      }
     } finally {
-      setManualInputBusy(false);
+      manualInputSendingRef.current = false;
+      if (mountedRef.current) setManualInputBusy(false);
     }
   }
+
+  function reconnectTerminal() {
+    if (!canReconnectRef.current) return;
+    canReconnectRef.current = false;
+    setCanReconnect(false);
+    setStatus('重连中...');
+    setConnectNonce((current) => current + 1);
+  }
+
+  function insertManualText(value) {
+    const input = manualInputRef.current;
+    const start = input?.selectionStart ?? manualInput.length;
+    const end = input?.selectionEnd ?? start;
+    setManualInput((current) => current.slice(0, start) + value + current.slice(end));
+    input?.focus({ preventScroll: true });
+  }
+
+  async function pasteTerminalText() {
+    clipboardReturnFocusRef.current = null;
+    const operation = ++clipboardOperationRef.current;
+    try {
+      if (!navigator.clipboard?.readText) throw new Error('clipboard unavailable');
+      const value = await navigator.clipboard.readText();
+      if (!mountedRef.current || !visibleRef.current || operation !== clipboardOperationRef.current) return;
+      insertManualText(value);
+      setTerminalNotice('已粘贴到输入框，点击发送后执行');
+    } catch {
+      if (mountedRef.current && visibleRef.current && operation === clipboardOperationRef.current) setClipboardDialog({ type: 'paste', value: '', error: '' });
+    }
+  }
+
+  async function copyTerminalText(value) {
+    const operation = ++clipboardOperationRef.current;
+    try {
+      await copyNoteText(value);
+      if (mountedRef.current && visibleRef.current && operation === clipboardOperationRef.current) {
+        setTerminalNotice('已复制');
+        setClipboardDialog(null);
+      }
+    } catch (error) {
+      if (mountedRef.current && visibleRef.current && operation === clipboardOperationRef.current) setClipboardDialog({ type: 'copy', value, error: error.message });
+    }
+  }
+
+  function closeTerminalClipboard() {
+    clipboardOperationRef.current += 1;
+    setClipboardDialog(null);
+  }
+
+  function openTerminalCopy() {
+    clipboardOperationRef.current += 1;
+    clipboardReturnFocusRef.current = null;
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    const value = terminalCopyText(terminal);
+    if (terminal.hasSelection()) void copyTerminalText(value);
+    else setClipboardDialog({ type: 'copy', value, error: '' });
+  }
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; clipboardOperationRef.current += 1; };
+  }, []);
 
   useEffect(() => {
     canReconnectRef.current = canReconnect;
@@ -4180,6 +4310,10 @@ function TerminalWorkspace({
 
   useEffect(() => {
     visibleRef.current = isVisible;
+    if (!isVisible) {
+      clipboardOperationRef.current += 1;
+      setClipboardDialog(null);
+    }
   }, [isVisible]);
 
   useEffect(() => {
@@ -4208,9 +4342,7 @@ function TerminalWorkspace({
       if (isPrimary && (event.key === 'c' || event.key === 'C') && terminal.hasSelection()) {
         event.preventDefault();
         const selection = terminal.getSelection();
-        if (selection && navigator.clipboard?.writeText) {
-          void navigator.clipboard.writeText(selection).catch(() => undefined);
-        }
+        if (selection) void copyTerminalText(selection);
         return false;
       }
       return true;
@@ -4405,7 +4537,7 @@ function TerminalWorkspace({
         return;
       }
       resizeRef.current();
-      terminalRef.current?.focus();
+      if (canAutoFocusTerminal()) terminalRef.current?.focus();
     }, 30);
     return () => window.clearTimeout(timer);
   }, [isVisible, isFullscreen, ready]);
@@ -4423,6 +4555,12 @@ function TerminalWorkspace({
   return (
     <div className={'terminal-shell ' + (isVisible ? '' : 'terminal-shell-hidden') + ' ' + (isFullscreen ? 'terminal-shell-fullscreen' : '')}>
       {isLiveSession && canReconnect ? <div className="terminal-reconnect-hint">连接失败或关闭后，直接在终端里按任意键即可重连当前会话。</div> : null}
+      <div className="terminal-mobile-toolbar">
+        <span className="terminal-mobile-status">{status}</span>
+        <button className="ghost" type="button" onClick={openTerminalCopy}>复制</button>
+        {isLiveSession ? <button className="ghost" type="button" onClick={() => void pasteTerminalText()} disabled={manualInputBusy}>粘贴</button> : null}
+        {isLiveSession && canReconnect ? <button className="ghost" type="button" onClick={reconnectTerminal}>重连</button> : null}
+      </div>
       <div className="terminal-stage">
         {commandSuggestion ? (
           <button
@@ -4451,19 +4589,27 @@ function TerminalWorkspace({
         <div
           ref={rootShellRef}
           className="terminal-root"
-          onMouseDown={() => {
-            window.setTimeout(() => terminalRef.current?.focus(), 0);
+          onMouseDown={(event) => {
+            if (event.target.closest('[aria-modal="true"]')) return;
+            window.setTimeout(() => { if (canAutoFocusTerminal()) terminalRef.current?.focus(); }, 0);
           }}
         >
           <div ref={rootRef} className="terminal-host" />
         </div>
-        {mode === 'command-job' ? (
-          <div className="terminal-manual-input">
-            <input
+        {isLiveSession ? (
+          <div className={'terminal-manual-input ' + (mode === 'ssh' ? 'terminal-mobile-input' : '')}>
+            <textarea
+              ref={manualInputRef}
+              rows={1}
+              aria-label="当前终端输入"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              enterKeyHint="send"
               value={manualInput}
               onChange={(event) => setManualInput(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === 'Enter') {
+                if (isTerminalSubmitKey(event)) {
                   event.preventDefault();
                   void sendManualCommand(manualInput);
                 }
@@ -4471,11 +4617,29 @@ function TerminalWorkspace({
               placeholder="这里可以直接输入，回车发送到当前会话"
             />
             <button className={'ghost ' + (manualInputBusy ? 'is-loading' : '')} type="button" onClick={() => void sendManualCommand(manualInput)} disabled={manualInputBusy}>发送</button>
-            <button className={'ghost ' + (manualInputBusy ? 'is-loading' : '')} type="button" onClick={() => void sendManualCommand('', { appendEnter: true })} disabled={manualInputBusy}>回车</button>
+            <button className={'ghost ' + (manualInputBusy ? 'is-loading' : '')} type="button" onClick={() => void sendManualCommand('', { appendEnter: true, clearInput: false })} disabled={manualInputBusy}>回车</button>
             <button className={'ghost danger-text-button ' + (manualInputBusy ? 'is-loading' : '')} type="button" onClick={() => void sendManualCommand('\u0003', { appendEnter: false })} disabled={manualInputBusy}>Ctrl+C</button>
           </div>
         ) : null}
+        {terminalNotice ? <div className="terminal-input-notice" role="status">{terminalNotice}</div> : null}
       </div>
+      {clipboardDialog && isVisible ? (
+        <Dialog title={clipboardDialog.type === 'copy' ? '复制终端输出' : '粘贴到终端输入框'} className="terminal-clipboard-dialog"
+          restoreFocusRef={clipboardReturnFocusRef}
+          onClose={closeTerminalClipboard}
+          footer={<><button className="ghost" type="button" onClick={closeTerminalClipboard}>取消</button><button className="primary" type="button"
+            onClick={() => {
+              if (clipboardDialog.type === 'copy') void copyTerminalText(clipboardDialog.value);
+              else { clipboardReturnFocusRef.current = manualInputRef.current; insertManualText(clipboardDialog.value); closeTerminalClipboard(); setTerminalNotice('已填入输入框，点击发送后执行'); }
+            }}>{clipboardDialog.type === 'copy' ? '复制全部' : '填入输入框'}</button></>}>
+          <p className="terminal-clipboard-hint">{clipboardDialog.type === 'copy' ? '可长按选择文字复制；这里显示最近的终端输出。' : '长按下方输入框粘贴内容，填入后再点击发送。'}</p>
+          <textarea rows={10} aria-label={clipboardDialog.type === 'copy' ? '终端输出' : '粘贴内容'}
+            autoCapitalize="none" autoCorrect="off" spellCheck={false}
+            readOnly={clipboardDialog.type === 'copy'} value={clipboardDialog.value}
+            onChange={(event) => setClipboardDialog((current) => ({ ...current, value: event.target.value }))} />
+          {clipboardDialog.error ? <p className="terminal-input-notice" role="status">{clipboardDialog.error}</p> : null}
+        </Dialog>
+      ) : null}
     </div>
   );
 }
@@ -4530,24 +4694,40 @@ function QuickImportGroupPicker({ groups, value, onChange }) {
 }
 
 async function api(url, options = {}) {
-  const { onUnauthorized, authFree, ...fetchOptions } = options;
-  const response = await fetch(url, {
-    credentials: 'same-origin',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    ...fetchOptions
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    if (response.status === 401 && !authFree && onUnauthorized) {
-      onUnauthorized();
+  const { onUnauthorized, authFree, timeoutMs, ...fetchOptions } = options;
+  const controller = timeoutMs ? new AbortController() : null;
+  const abort = () => controller.abort(fetchOptions.signal?.reason);
+  if (controller && fetchOptions.signal?.aborted) abort();
+  if (controller) fetchOptions.signal?.addEventListener('abort', abort, { once: true });
+  let timedOut = false;
+  const timer = controller ? window.setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs) : null;
+  try {
+    const response = await fetch(url, {
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      ...fetchOptions,
+      ...(controller ? { signal: controller.signal } : {})
+    });
+    const data = await response.json().catch((error) => {
+      if (controller?.signal.aborted || fetchOptions.signal?.aborted) throw error;
+      return {};
+    });
+    if (!response.ok) {
+      if (response.status === 401 && !authFree && onUnauthorized) onUnauthorized();
+      const error = new Error(data.error || '请求失败');
+      error.status = response.status;
+      throw error;
     }
-    const error = new Error(data.error || '请求失败');
-    error.status = response.status;
+    return data;
+  } catch (error) {
+    if (timedOut) throw new Error('发送超时，内容已保留；请先确认服务器是否收到，避免重复执行');
     throw error;
+  } finally {
+    if (timer !== null) window.clearTimeout(timer);
+    if (controller) fetchOptions.signal?.removeEventListener('abort', abort);
   }
-  return data;
 }
 
 function SearchIcon() {

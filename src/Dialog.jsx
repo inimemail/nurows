@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef } from 'react';
 import { createPortal } from 'react-dom';
 
-export default function Dialog({ title, onClose, footer, children, wide = false, xwide = false, className = '' }) {
+export default function Dialog({ title, onClose, footer, children, wide = false, xwide = false, className = '', restoreFocusRef }) {
   const titleId = useId();
   const dialog = useRef(null);
   const close = useRef(onClose);
@@ -24,7 +24,11 @@ export default function Dialog({ title, onClose, footer, children, wide = false,
       else if (!event.shiftKey && (document.activeElement === last || document.activeElement === element)) { event.preventDefault(); first.focus(); }
     };
     document.addEventListener('keydown', keydown);
-    return () => { document.removeEventListener('keydown', keydown); if (previous?.isConnected) previous.focus({ preventScroll: true }); };
+    return () => {
+      document.removeEventListener('keydown', keydown);
+      const target = restoreFocusRef?.current || previous;
+      if (target?.isConnected) target.focus({ preventScroll: true });
+    };
   }, []);
 
   // Fixed overlays must escape surface/backdrop-filter containing blocks.

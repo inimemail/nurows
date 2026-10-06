@@ -1376,10 +1376,19 @@ svg {
   background: color-mix(in srgb, var(--panel-strong) 90%, transparent);
 }
 
-.terminal-manual-input input {
+.terminal-manual-input input,
+.terminal-manual-input textarea {
   min-width: 0;
   flex: 1;
 }
+
+.terminal-manual-input textarea { resize: none; max-height: 120px; }
+.terminal-mobile-toolbar, .terminal-mobile-input { display: none; }
+.terminal-input-notice { margin: 0; color: var(--text-soft); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.terminal-clipboard-dialog textarea { width: 100%; font-family: var(--font-mono); user-select: text; -webkit-user-select: text; }
+.terminal-clipboard-hint { margin: 0 0 12px; color: var(--text-soft); font-size: 13px; }
+/* A portal opened from a full-screen terminal must sit above that terminal. */
+.dialog-backdrop:has(.terminal-clipboard-dialog) { z-index: 50; }
 
 .terminal-manual-input button {
   white-space: nowrap;

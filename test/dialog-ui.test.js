@@ -8,7 +8,7 @@ const compiled = transformSync(fs.readFileSync(new URL('../src/Dialog.jsx', impo
   loader: 'jsx', format: 'cjs', jsx: 'automatic'
 }).code;
 
-function renderDialog() {
+function renderDialog(restoreFocusRef) {
   const effects = [], listeners = new Map();
   let dismissed = 0;
   const document = { body: {}, activeElement: null, querySelectorAll: () => [element],
@@ -29,7 +29,7 @@ function renderDialog() {
     if (name === 'react/jsx-runtime') return { jsx, jsxs: jsx };
     throw Error(`Unexpected import ${name}`);
   } });
-  module.exports.default({ title: '动态 IP 守护', onClose: () => dismissed++, footer: 'Save', children: 'Form' });
+  module.exports.default({ title: '动态 IP 守护', onClose: () => dismissed++, footer: 'Save', children: 'Form', restoreFocusRef });
   const cleanup = effects[0]();
   const key = (value, shiftKey = false) => { let prevented = false; listeners.get('keydown')({ key: value, shiftKey, preventDefault() { prevented = true; }, stopPropagation() {} }); return prevented; };
   return { document, element, first, last, trigger, portalTarget, tree, key, cleanup, listeners, dismissed: () => dismissed };
@@ -67,4 +67,14 @@ test('only the topmost dialog handles Escape and focus trapping', () => {
   assert.equal(view.key('Escape'), false);
   assert.equal(view.dismissed(), 0);
   view.cleanup();
+});
+
+test('applying terminal paste restores the input focus instead of the toolbar trigger', () => {
+  const restore = { current: null };
+  const view = renderDialog(restore);
+  let focusOptions;
+  restore.current = { isConnected: true, focus(options) { focusOptions = options; view.document.activeElement = this; } };
+  view.cleanup();
+  assert.equal(view.document.activeElement, restore.current);
+  assert.equal(focusOptions.preventScroll, true);
 });

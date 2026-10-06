@@ -259,7 +259,10 @@
 
   /* A single scrollable modal body keeps close/save actions reachable. */
   .dialog-backdrop {
-    height: 100dvh;
+    top: var(--mobile-viewport-top, 0px);
+    bottom: auto;
+    height: var(--mobile-viewport-height, 100dvh);
+    z-index: 50;
     padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
     place-items: center;
     overflow: hidden;
@@ -316,16 +319,23 @@
   .session-strip { gap: 8px; overscroll-behavior-x: contain; }
   .session-tab { min-height: 48px; padding: 5px 6px 5px 12px; }
   .session-close { width: 44px; height: 44px; }
-  .terminal-deck { height: 65dvh; min-height: 300px; }
+  .terminal-deck { height: max(280px, calc(var(--mobile-viewport-height, 100dvh) * .65)); min-height: 0; }
+  .terminal-mobile-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; flex: 0 0 auto; }
+  .terminal-mobile-toolbar .ghost { padding: 8px 12px; }
+  .terminal-mobile-status { margin-right: auto; color: var(--text-soft); font-size: 12px; }
+  .terminal-mobile-input { display: grid; }
   .terminal-stage, .terminal-root { min-height: 0; }
   .terminal-root { padding: 8px; border-radius: 12px; }
   /* xterm owns its hidden textarea geometry and font size. */
   .terminal-host .xterm-helper-textarea { min-height: 0; min-width: 0; font-size: inherit; }
   .terminal-manual-input { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; padding: 10px; }
-  .terminal-manual-input input { grid-column: 1 / -1; }
+  .terminal-manual-input input, .terminal-manual-input textarea { grid-column: 1 / -1; width: 100%; }
   .terminal-manual-input button { padding: 10px 6px; }
-  .terminal-shell-fullscreen { height: 100dvh; padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
-  .console-shell-terminal-fullscreen { height: 100dvh; min-height: 0; padding: 0; gap: 0; overflow: hidden; }
+  .terminal-input-notice { flex: 0 0 auto; max-height: 64px; overflow-y: auto; }
+  .terminal-shell-fullscreen { top: var(--mobile-viewport-top, 0px); bottom: auto; height: var(--mobile-viewport-height, 100dvh); padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+  .console-shell-terminal-fullscreen { position: fixed; inset: var(--mobile-viewport-top, 0px) 0 auto; width: 100%; height: var(--mobile-viewport-height, 100dvh); min-height: 0; padding: 0; gap: 0; overflow: hidden; }
+  .terminal-clipboard-dialog textarea { min-height: 120px; max-height: 40dvh; }
+  .result-open-terminal { align-self: flex-start; }
   .console-shell-terminal-fullscreen .console-body { display: flex; min-height: 0; }
   .main-column-terminal-fullscreen { flex: 1; min-height: 0; }
   .workspace-panel-terminal-fullscreen { min-height: 0; padding: 0; border-radius: 0; }
@@ -345,7 +355,7 @@
   .auth-form-head strong { font-size: 18px; }
   .auth-form-head span { font-size: 13px; color: var(--text-soft); }
   .auth-form-card .primary { min-height: 48px; }
-  .toast-stack { inset: auto 16px max(16px, env(safe-area-inset-bottom)); max-width: none; pointer-events: none; }
+  .toast-stack { inset: auto 16px calc(var(--mobile-viewport-bottom, 0px) + max(16px, env(safe-area-inset-bottom))); transform: none; max-width: none; pointer-events: none; z-index: 60; }
   .toast { min-width: 0; width: 100%; padding: 14px 16px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 }
 

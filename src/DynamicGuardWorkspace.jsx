@@ -4,7 +4,7 @@ import { filterWorkspaceRecords } from '../shared/workspace-search.js';
 import HistoryRecords from './HistoryRecords.jsx';
 import './dynamic-guard.css';
 
-const DEFAULTS = { name: '', domain: '', command: '', recordType: 'A', probeIds: [], botIds: [], enabled: true,
+const DEFAULTS = { name: '', domain: '', command: '', webhookTaskId: '', recordType: 'A', probeIds: [], botIds: [], enabled: true,
   checkType: 'ping', port: 443, interval: 30, checkRounds: 3, attemptsPerRound: 3, timeout: 5,
   waitTimeout: 300, queryInterval: 5, commandTimeout: 90, cooldown: 0, maxDaily: 5 };
 const LABELS = { queued: '等待执行', healthy: '正常', checking: '检查中', verifying: '验证新 IP', executing: '执行换 IP',
@@ -58,6 +58,8 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
   const data = snapshot || { guards: initialState?.dynamicGuards || [], probes: initialState?.probes || [], bots: initialState?.telegramBots || [] };
   const loaded = Boolean(snapshot) || Array.isArray(initialState?.dynamicGuards);
   const [editor, setEditor] = useState(null);
+  const [webhookTasks, setWebhookTasks] = useState([]);
+  const [webhookError, setWebhookError] = useState('');
   const [saving, setSaving] = useState(false);
   const [busyIds, setBusyIds] = useState([]);
   const [error, setError] = useState('');
@@ -111,6 +113,12 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', start);
     return () => { cancelled = true; stop?.(); if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', start); };
   }, [api, refresh, onState, cache]);
+  useEffect(() => {
+    if (!editor) return;
+    const controller = new AbortController();
+    api('/api/webhooks/choices', { signal: controller.signal }).then((result) => { if (!controller.signal.aborted) { setWebhookTasks(result.tasks); setWebhookError(''); } }).catch((err) => { if (!controller.signal.aborted) setWebhookError(err.message); });
+    return () => controller.abort();
+  }, [api, Boolean(editor)]);
 
   const mutate = async (url, method, body) => {
     generation.current++;
@@ -210,8 +218,10 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
         </section>
         <section className="dynamic-form-section" aria-labelledby="dynamic-api-title">
         <div className="dynamic-section-title"><h3 id="dynamic-api-title">换 IP 命令</h3><span>在面板执行 API 请求，无需 SSH 登录目标</span></div>
-        <label className="dynamic-command"><span className="dynamic-field-caption">API 命令</span><textarea required={!editor.commandConfigured} rows={4} maxLength={32768} autoCapitalize="none" spellCheck={false} value={editor.command} onChange={(event) => patch({ command: event.target.value })} placeholder={editor.commandConfigured ? '已保存加密命令；留空保持原命令' : 'curl --fail --max-time 60 ...\n支持多行 API 命令'} /></label>
-        {editor.commandConfigured ? <button type="button" className="ghost" disabled={saving} onClick={async () => {
+        <label className="dynamic-command"><span className="dynamic-field-caption">命令来源</span><select value={editor.webhookTaskId || ''} onChange={(event) => patch({ webhookTaskId: event.target.value })}><option value="">直接填写 API 命令</option>{editor.webhookTaskId && !webhookTasks.some((task) => task.id === editor.webhookTaskId) ? <option value={editor.webhookTaskId}>正在读取关联任务…</option> : null}{webhookTasks.map((task) => <option key={task.id} value={task.id} disabled={!task.enabled}>{task.name}{!task.enabled ? '（已停用）' : ''}</option>)}</select></label>
+        {webhookError ? <p className="auth-error" role="alert">Webhook 任务读取失败：{webhookError}</p> : null}
+        {!editor.webhookTaskId ? <label className="dynamic-command"><span className="dynamic-field-caption">API 命令</span><textarea required={!editor.commandConfigured} rows={4} maxLength={32768} autoCapitalize="none" spellCheck={false} value={editor.command} onChange={(event) => patch({ command: event.target.value })} placeholder={editor.commandConfigured ? '已保存加密命令；留空保持原命令' : 'curl --fail --max-time 60 ...\n支持多行 API 命令'} /></label> : <p className="dynamic-help">复用已保存的 Webhook 命令与执行超时。等待新 IP 和验证期间保持占用，最终结果由动态守护通知。</p>}
+        {editor.commandConfigured && !editor.webhookTaskId ? <button type="button" className="ghost" disabled={saving} onClick={async () => {
           const id = editor.id;
           try { const result = await api(`/api/dynamic-guards/${id}/command`, { signal: AbortSignal.timeout(15000) }); setEditor((current) => current?.id === id ? { ...current, command: result.command } : current); }
           catch (err) { setFormError(err.message); }
@@ -220,7 +230,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
         </section>
         <details className="dynamic-settings" open={settingsOpen} onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
           <summary><span>检查与重试设置<small>每 {editor.interval} 秒检查 · {editor.checkRounds} 轮 × {editor.attemptsPerRound} 次 · {Number(editor.waitTimeout) === 0 ? '持续等待新 IP' : `等待 ${editor.waitTimeout} 秒后重试`}</small></span><span className="dynamic-settings-action">{settingsOpen ? '收起' : '调整'}<span aria-hidden="true">⌄</span></span></summary>
-          <div className="dynamic-settings-body">{[['探针检查', numbers.slice(0, 4)], ['换 IP 与重试', numbers.slice(4)]].map(([title, fields]) => <section key={title}><h4>{title}</h4><div className="dynamic-form-grid">{fields.map(([key, label, min, max]) => <label key={key}>{label}<input type="number" inputMode="numeric" required min={min} max={max} value={editor[key]} onChange={(event) => patch({ [key]: event.target.value })} /></label>)}</div></section>)}<p className="dynamic-help">失败轮次连续执行；等待新 IP 超时后会再次提交，受冷却时间与每日额度限制。</p></div>
+          <div className="dynamic-settings-body">{[['探针检查', numbers.slice(0, 4)], ['换 IP 与重试', numbers.slice(4)]].map(([title, fields]) => <section key={title}><h4>{title}</h4><div className="dynamic-form-grid">{fields.filter(([key]) => key !== 'commandTimeout' || !editor.webhookTaskId).map(([key, label, min, max]) => <label key={key}>{label}<input type="number" inputMode="numeric" required min={min} max={max} value={editor[key]} onChange={(event) => patch({ [key]: event.target.value })} /></label>)}</div></section>)}<p className="dynamic-help">失败轮次连续执行；等待新 IP 超时后会再次提交，受冷却时间与每日额度限制。</p></div>
         </details>
         <section className="dynamic-form-section dynamic-notifications">
         <fieldset className="dynamic-choice"><legend>结果通知 <span>可选</span></legend><div>{data.bots.filter((bot) => bot.enabled !== false && bot.configured).map((bot) => <label key={bot.id}><input type="checkbox" checked={editor.botIds.includes(bot.id)} onChange={(event) => patch({ botIds: event.target.checked ? [...editor.botIds, bot.id] : editor.botIds.filter((id) => id !== bot.id) })} /><span>{bot.name}</span></label>)}</div><p>{data.bots.some((bot) => bot.enabled !== false && bot.configured) ? '正常检查不通知；完成、超时重试、异常或达到上限时通知，同类异常去重。' : '暂无可用通知机器人，可稍后在 Telegram 中配置。'}</p></fieldset>

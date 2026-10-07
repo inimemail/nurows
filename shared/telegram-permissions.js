@@ -3,7 +3,7 @@ export const TELEGRAM_FEATURES = [
   ['guards', 'DNS 守护'], ['dynamic', '动态 IP 守护'],
   ['probes', '探针节点'], ['targets', '检查目标'], ['policies', '切换策略'],
   ['assets', 'IP 资产'], ['pools', '备用 IP 池'], ['usage', 'IP 使用记录'],
-  ['dns', '解析管理'], ['automation', '自动化任务']
+  ['dns', '解析管理'], ['automation', '自动化任务'], ['webhooks', 'Webhook 任务']
 ];
 const known = new Set(TELEGRAM_FEATURES.map(([key]) => key));
 export function telegramScopes(settings = {}) {

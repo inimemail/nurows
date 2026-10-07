@@ -17,7 +17,7 @@ function harness(extra = {}, options = {}) {
     async call(token, method, body) { const packet = { token, method, ...body, message_id: body.message_id || ++sequence }; packets.push(packet); return packet; },
     async invoke(...args) { operations.push(args); return options.invoke?.(...args); },
     clearFinishedIncidents: (ids) => { operations.push(['clear', ids]); return { removed: ids.length }; },
-    liveJob: options.liveJob, cancelJob: (id) => operations.push(['cancel', id])
+    liveJob: options.liveJob, cancelJob: (id) => operations.push(['cancel', id]), webhookTasks: () => state.webhookTasks || []
   });
   const latest = () => packets.findLast((packet) => packet.method !== 'answerCallbackQuery');
   const buttons = () => latest()?.reply_markup?.inline_keyboard.flat() || [];
@@ -38,11 +38,11 @@ test('scope migration preserves old combined capabilities and explicit empty nev
   assert.deepEqual(migrated.menuScopes, ['probes', 'guards']);
 });
 
-test('main menu has four rows, granular permissions, and no implicit management for notification-only bots', async () => {
+test('main menu includes Webhook tasks, granular permissions, and no implicit management for notification-only bots', async () => {
   const h = harness();
   await h.send('/menu');
   assert.deepEqual(h.latest().reply_markup.inline_keyboard.map((row) => row.map((item) => item.text)), [
-    ['系统总览', '故障事件'], ['DNS 守护', '动态 IP 守护'], ['探针与检查', 'IP 资产与备用池'], ['解析管理', '自动化任务']
+    ['系统总览', '故障事件'], ['DNS 守护', '动态 IP 守护'], ['探针与检查', 'IP 资产与备用池'], ['解析管理', '自动化任务'], ['Webhook 任务']
   ]);
   h.bot.menuScopes = ['guards'];
   await h.send('/menu');
@@ -54,6 +54,18 @@ test('main menu has four rows, granular permissions, and no implicit management 
   await h.click('guard_check:g');
   assert.match(h.latest().text, /没有访问权限/);
   assert.equal(h.operations.length, 0);
+});
+
+test('Webhook Telegram commands keep output private and recheck permission before execution', async () => {
+  const h = harness({ webhookTasks: [{ id: 'w1', name: '换 IP API', enabled: true, timeout: 30, location: '面板本机', status: 'success', run: { status: 'success' } }] });
+  await h.send('/webhooks'); await h.press('换 IP API · 成功');
+  assert.match(h.latest().text, /面板本机/); assert.ok(!/token|commandEnc|output/i.test(h.latest().text));
+  await h.press('执行任务'); const confirmation = h.find('确认');
+  h.bot.menuScopes = []; await h.click(confirmation); assert.equal(h.operations.length, 0);
+  h.bot.menuScopes = ['webhooks']; await h.send('/webhooks'); await h.press('换 IP API · 成功'); await h.press('执行任务'); await h.press('确认');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.operations.length, 1); assert.equal(h.operations[0][0], 'POST'); assert.equal(h.operations[0][1], '/api/webhooks/:id/run');
+  assert.match(h.latest().text, /请求已提交/);
 });
 
 test('list pagination, detail return, search and abnormal filter retain context while editing messages', async () => {

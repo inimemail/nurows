@@ -26,12 +26,13 @@ function harness() {
   return module.exports;
 }
 
-test('bot editor exposes twelve independent permissions and saves explicit empty selection', () => {
+test('bot editor exposes all independent permissions including Webhook and saves explicit empty selection', () => {
   const ui = harness();
   let draft = ui.normalizeDraft('bot', { menuScopeVersion: 2, menuScopes: ['probes'], automationTaskIds: ['t'], userIds: ['123'] });
   const tree = ui.BotEditor({ value: draft, patch: (next) => { draft = { ...draft, ...next }; }, state: { automationTasks: [] } });
   const picker = nodes(tree).find((node) => node.props?.label === 'TG 可用管理功能');
-  assert.equal(picker.props.items.length, 12);
+  assert.equal(picker.props.items.length, permissions.TELEGRAM_FEATURES.length);
+  assert.ok(picker.props.items.some((item) => item.id === 'webhooks'));
   assert.deepEqual(picker.props.value, ['probes']);
   assert.equal(picker.props.selectable, true);
   picker.props.onChange(['guards', 'dynamic']);

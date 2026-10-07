@@ -11,6 +11,7 @@ export function createTelegramActions(deps, dynamicService) {
   registerOrchestrationRoutes(app, localDeps);
   registerDynamicGuardRoutes(app, localDeps, dynamicService);
   return async (method, route, params, body, actor) => {
+    if (method === 'POST' && route === '/api/webhooks/:id/run') return deps.webhookService().trigger(params.id, 'telegram');
     const handler = routes.get(`${method} ${route}`);
     if (!handler) throw new Error('不支持的操作');
     let result, status = 200, failure;

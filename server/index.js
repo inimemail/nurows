@@ -10,6 +10,8 @@ import { telegramScopeAllowed } from '../shared/telegram-permissions.js';
 import { createDynamicGuardService, registerDynamicGuardRoutes, sanitizeDynamicGuard } from './dynamic-guard.js';
 import { createRenewalService, registerRenewalRoutes, normalizeRenewalState, renewalSnapshot } from './renewals.js';
 import { createNotesService, registerNotesRoutes } from './notes.js';
+import { createWebhookService, registerWebhookRoutes } from './webhooks.js';
+import { runLocalWebhook, runSshWebhook } from './webhook-runtime.js';
 import { poolHealthSummary, poolHealthProbeState, poolHealthSchedule, clonePoolHealthPools } from './pool-health-check.js';
 import { parseStoredRecord } from './storage-validation.js';
 import { loadStorageKey } from './storage-key.js';
@@ -158,13 +160,17 @@ const orchestrationDeps = {
   syncDnsBinding
 };
 
+let webhookService;
 const dynamicGuardService = createDynamicGuardService({
   readState, updateState, updateDynamicGuardState, encryptSecret, decryptSecret, readDynamicGuard, readDynamicGuardSchedule, readDynamicProbeStatus,
   notifyDynamicGuard: notifyDynamicGuardViaTelegram,
+  executeWebhook: (id, guard) => webhookService.executeForGuard(id, guard),
+  webhookTimeout: (id) => webhookService.store.task(id)?.timeout,
+  webhookEnabled: (id) => webhookService.store.task(id)?.enabled === true,
   logError: (error) => console.error('Dynamic IP guard:', error.message)
 });
 
-const telegramActions = createTelegramActions({ ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus }, dynamicGuardService);
+const telegramActions = createTelegramActions({ ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus, webhookService: () => webhookService, webhookTasks: () => webhookService.choices(), webhookActive: (id) => webhookService.store.active(id) }, dynamicGuardService);
 const renewalDeps = {
   read: () => readState(['renewals', 'renewalSettings', 'renewalRevision']),
   update: updateRenewalState,
@@ -179,6 +185,7 @@ const renewalDeps = {
 const renewalService = createRenewalService(renewalDeps);
 const telegramWorkspace = createTelegramWorkspace({
   readState, readGuardHistoryPage, invoke: telegramActions, call: telegramCall, authorized: telegramAuthorized,
+  webhookTasks: () => webhookService.telegramTasks(),
   clearFinishedIncidents: (ids, actor) => clearFinishedIncidents(orchestrationDeps, ids, actor),
   role: (settings, from, chat) => resolveTelegramRole(null, settings, from, chat),
   liveJob: (id) => commandJobs.get(id), cancelJob: (id) => { const job = commandJobs.get(id); if (job?.type !== 'automation') throw new Error('任务已结束或不存在'); cancelCommandJob(job); },
@@ -260,6 +267,48 @@ function loadRuntimeEnv() {
 ensureStorage();
 cleanupExpiredSessions();
 const notesService = createNotesService({ dataDir: DATA_DIR });
+webhookService = createWebhookService({
+  db: getSqliteDb(), encrypt: encryptSecret, decrypt: decryptSecret,
+  servers: () => (cachedState.servers || []).map(({ id, name, host }) => ({ id, name, host })),
+  bots: () => cachedState.telegramBots || [],
+  guards: () => (cachedState.dynamicGuards || []).map(({ id, webhookTaskId, enabled, flow, manualRequested, pendingChange, status, message }) => ({ id, webhookTaskId, enabled, flow, manualRequested, pendingChange, status, message })),
+  requestGuard: (id) => dynamicGuardService.request(id, true),
+  stopGuard: (id) => updateDynamicGuardState((draft) => {
+    const guard = draft.dynamicGuards.find((item) => item.id === id);
+    if (guard) { guard.enabled = false; guard.revision++; guard.manualRequested = false; guard.pendingChange = null; guard.cycle = null;
+      const history = draft.dynamicGuardRuns?.find((run) => run.id === guard.flow?.id);
+      if (history) Object.assign(history, { status: 'cancelled', finishedAt: new Date().toISOString(), message: 'Webhook 执行已停止' });
+      guard.flow = null; guard.status = 'disabled'; guard.message = '已停止任务；已提交的 API 请求无法撤回'; }
+  }, true),
+  execute: async (config, signal, onOutput) => {
+    const command = decryptSecret(config.commandEnc);
+    const secrets = [decryptSecret(config.tokenEnc)];
+    for (const match of command.matchAll(/(?:Bearer\s+|(?:token|secret|password|api[_-]?key)[=:]\s*["']?)([^\s"'&;]+)/gi)) secrets.push(match[1]);
+    if (!config.serverId) return runLocalWebhook(command, config.timeout, { signal, secrets, onOutput });
+    const { servers, proxies } = readState(['servers', 'proxies']);
+    const target = servers.find((item) => item.id === config.serverId);
+    if (!target) return { ok: false, status: 'failed', uncertain: false, error: '执行服务器已删除' };
+    const proxy = proxies.find((item) => item.id === target.proxyId);
+    const password = getStoredSecretValue(target); secrets.push(password);
+    const proxyPassword = proxy ? getStoredSecretValue(proxy) : ''; secrets.push(proxyPassword);
+    return runSshWebhook(command, config.timeout, { server: target, options: buildConnectOptions(target, password), signal, secrets, onOutput,
+      proxySocket: proxy ? () => createProxySocket({ ...proxy, password: proxyPassword }, target.host, target.port) : null });
+  },
+  notify: async (task, run) => {
+    if (!task?.botIds.length) return;
+    const { telegramBots, servers } = readState(['telegramBots', 'servers']);
+    const labels = { success: '✅ 执行成功', failed: '❌ 执行失败', timeout: '⏳ 执行超时', uncertain: '⚠️ 结果待确认', cancelled: '⏹ 已停止' };
+    const elapsed = Math.max(0, Math.round((Date.parse(run.finishedAt) - Date.parse(run.startedAt || new Date(run.created).toISOString())) / 1000));
+    const text = telegramNotice('⚡ Webhook 任务', [`📌 任务：${telegramNoticeValue(run.taskName)}`, labels[run.status] || run.status,
+      `🖥 执行位置：${telegramNoticeValue(run.serverId ? servers.find((item) => item.id === run.serverId)?.name || '已删除服务器' : '面板本机')}`,
+      `📨 来源：${{ panel: '手动执行', webhook: '外部调用', telegram: 'Telegram' }[run.source] || run.source}`, `⏱ 耗时：${elapsed} 秒`], `🕒 完成：${telegramNoticeTime(run.finishedAt)}`);
+    for (const bot of telegramBots.filter((item) => task.botIds.includes(item.id) && item.enabled !== false && item.tokenEnc)) {
+      const token = decryptSecret(bot.tokenEnc);
+      await Promise.allSettled([...new Set(bot.userIds || [])].map((chatId) => sendTelegramNotice(token, chatId, text)));
+    }
+  },
+  logError: (error) => console.error('Webhook:', error.message)
+});
 
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
@@ -287,6 +336,7 @@ app.use((req, res, next) => {
   next();
 });
 app.use(cors());
+registerWebhookRoutes(app, webhookService, { publicOnly: true });
 registerProbePublicRoutes(app, {
   ...orchestrationDeps,
   onIncidentCreated: (incidentId) => runIncidentWorkflow(incidentId, orchestrationDeps),
@@ -456,7 +506,8 @@ app.delete('/api/history', (req, res) => {
 });
 
 registerOrchestrationRoutes(app, orchestrationDeps);
-registerDynamicGuardRoutes(app, { ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus }, dynamicGuardService);
+registerDynamicGuardRoutes(app, { ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus, webhookTasks: () => webhookService.choices(), webhookActive: (id) => webhookService.store.active(id) }, dynamicGuardService);
+registerWebhookRoutes(app, webhookService);
 registerRenewalRoutes(app, renewalDeps, renewalService);
 registerNotesRoutes(app, notesService, { dataDir: DATA_DIR });
 
@@ -1186,6 +1237,7 @@ server.listen(PORT, HOST, () => {
   cleanupHistoryRecords();
   restartTelegramPolling();
   renewalService.tick();
+  setInterval(() => { try { webhookService.tick(); } catch (error) { console.error('Webhook:', error.message); } }, 1000).unref();
   setInterval(() => renewalService.tick(), 60000).unref();
   checkProbePresence();
   processPoolHealthChecks(orchestrationDeps, true);
@@ -2274,7 +2326,7 @@ function getWorkspaceForUser(state, auth = null) {
     };
   }
   return {
-    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(source.tab) ? source.tab : 'servers',
+    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(source.tab) ? source.tab : 'servers',
     search: typeof source.search === 'string' ? source.search : '',
     selectedServerId: typeof source.selectedServerId === 'string' ? source.selectedServerId : '',
     selectedCommandId: typeof source.selectedCommandId === 'string' ? source.selectedCommandId : '',
@@ -2335,7 +2387,7 @@ function getWorkspaceForUser(state, auth = null) {
 
 function normalizeWorkspaceInput(input = {}) {
   return {
-    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(input.tab) ? input.tab : 'servers',
+    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(input.tab) ? input.tab : 'servers',
     search: typeof input.search === 'string' ? input.search : '',
     selectedServerId: typeof input.selectedServerId === 'string' ? input.selectedServerId : '',
     selectedCommandId: typeof input.selectedCommandId === 'string' ? input.selectedCommandId : '',
@@ -3644,6 +3696,7 @@ async function configureTelegramMenu(token, settings) {
     { command: 'status', description: '系统总览', scope: 'overview' },
     { command: 'guards', description: 'DNS 守护', scope: 'guards' },
     { command: 'dynamic', description: '动态 IP 守护', scope: 'dynamic' },
+    { command: 'webhooks', description: 'Webhook 任务', scope: 'webhooks' },
     { command: 'probes', description: '探针与检查', scope: 'probes' },
     { command: 'targets', description: '检查目标', scope: 'targets' },
     { command: 'policies', description: '切换策略', scope: 'policies' },

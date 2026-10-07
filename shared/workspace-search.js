@@ -1,4 +1,5 @@
 export const WORKSPACE_SEARCH = {
+  webhooks: { key: 'webhookTasks', placeholder: '搜索 Webhook 名称、服务器、备注', fields: ['name', 'location', 'note'] },
   notes: { key: 'notes', placeholder: '搜索笔记标题、正文、标签', fields: ['title'] },
   renewals: { key: 'renewals', placeholder: '搜索续费名称、IP、域名、备注', fields: ['name', 'address', 'note'] },
   nodes: { key: 'probes', placeholder: '搜索探针名称、地区、运营商', fields: ['name', 'region', 'carrier'] },
@@ -17,6 +18,7 @@ export const WORKSPACE_SEARCH = {
 };
 
 const COMPACT_SEARCH_LABELS = {
+  webhooks: '搜索 Webhook 任务',
   notes: '搜索笔记',
   renewals: '搜索续费记录',
   nodes: '搜索探针', targets: '搜索检查目标', guards: '搜索 DNS 守护', dynamic: '搜索动态守护',
@@ -25,7 +27,7 @@ const COMPACT_SEARCH_LABELS = {
 };
 
 export function workspaceSearchPlaceholder(tab, section, compact = false) {
-  const defaults = { probes: 'nodes', pools: 'assets', dns: 'accounts', renewals: 'renewals', telegram: 'bots', notes: 'notes' };
+  const defaults = { webhooks: 'webhooks', probes: 'nodes', pools: 'assets', dns: 'accounts', renewals: 'renewals', telegram: 'bots', notes: 'notes' };
   if (compact && COMPACT_SEARCH_LABELS[section || defaults[tab]]) return COMPACT_SEARCH_LABELS[section || defaults[tab]];
   return WORKSPACE_SEARCH[section || defaults[tab]]?.placeholder || ({
     servers: '搜索服务器名称、IP', commands: '搜索命令名称', automation: '搜索自动化任务', proxies: '搜索代理名称、地址'

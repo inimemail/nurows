@@ -9,7 +9,7 @@ const sections = {
   probes: ['探针节点', 'probes'], targets: ['检查目标', 'probeTargets'], policies: ['切换策略', 'failoverPolicies'],
   incidents: ['故障事件', 'incidents'], assets: ['IP 资产', 'ipAssets'], pools: ['备用 IP 池', 'ipPools'],
   usage: ['IP 使用记录', 'ipUsageRecords'], dns: ['解析管理', 'dnsBindings'], automation: ['自动化任务', 'automationTasks'],
-  runs: ['自动化执行记录', 'automationRuns']
+  runs: ['自动化执行记录', 'automationRuns'], webhooks: ['Webhook 任务', 'webhookTasks']
 };
 const resources = { guards: 'dns-guards', probes: 'probes', targets: 'probe-targets', policies: 'failover-policies', pools: 'ip-pools', assets: 'ip-assets' };
 const labels = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', unknown: '未检查',
@@ -18,10 +18,10 @@ const labels = { online: '在线', offline: '离线', pending: '待接入', revo
   succeeded: '已完成', recovered: '已恢复', replaced: '已补位', degraded: '容量不足', error: '异常', failed: '失败',
   pending_approval: '待确认', allocating: '分配中', automating: '执行自动化', dns_updating: '写入 DNS', verifying: '验证中',
   stabilizing: '等待生效', rolling_back: '回滚中', rolled_back: '已回滚', consumed: '已使用', discarded: '已丢弃', returned: '已退回原池',
-  done: '已结束', running: '执行中', cancelled: '已取消', processing: '处理中',
+  done: '已结束', running: '执行中', cancelled: '已取消', processing: '处理中', success: '成功', timeout: '超时', uncertain: '待确认', waiting_guard: '守护处理中', idle: '暂无执行',
   resolving: '正在解析', probe_failed: '检查失败，待重试', capacity: '达到 IP 上限', ready: '检查通过，待写入', synced: '已同步' };
 const finished = new Set(['succeeded', 'recovered', 'rolled_back', 'cancelled', 'done']);
-const bad = new Set(['offline', 'down', 'error', 'failed', 'degraded', 'waiting_probe', 'waiting_ip', 'waiting_for_ip', 'unhealthy', 'command_error', 'resolve_error', 'daily_limit', 'query_error', 'limit']);
+const bad = new Set(['offline', 'down', 'error', 'failed', 'timeout', 'uncertain', 'degraded', 'waiting_probe', 'waiting_ip', 'waiting_for_ip', 'unhealthy', 'command_error', 'resolve_error', 'daily_limit', 'query_error', 'limit']);
 const dynamicLabels = { waiting_ip: '等待新 IP', verifying: '验证新 IP', executing: '执行换 IP', query_error: '查询异常', limit: '达到每日上限' };
 const searchSection = (section) => ({ probes: 'nodes', dns: 'bindings' })[section] || section;
 const short = (value, max = 80) => String(value ?? '').replace(/[\r\n]+/g, ' ').slice(0, max);
@@ -67,7 +67,7 @@ export function createTelegramWorkspace(deps) {
   }
   function records(ctx, section) {
     const key = sections[section][1];
-    let items = deps.readState([key])[key] || [];
+    let items = section === 'webhooks' ? deps.webhookTasks?.() || [] : deps.readState([key])[key] || [];
     if (section === 'automation') items = items.filter((item) => ctx.settings.automationTaskIds?.includes(item.id));
     if (section === 'runs') items = items.filter((item) => ctx.settings.automationTaskIds?.includes(item.taskId));
     return items;
@@ -100,7 +100,7 @@ export function createTelegramWorkspace(deps) {
       [allowed(ctx, 'overview') ? button(ctx, '系统总览', { kind: 'overview', section: 'overview' }) : null, link('incidents', '故障事件')],
       [link('guards', 'DNS 守护'), link('dynamic', '动态 IP 守护')],
       [group('探针与检查', ['probes', 'targets', 'policies']), group('IP 资产与备用池', ['assets', 'pools', 'usage'])],
-      [link('dns', '解析管理'), link('automation', '自动化任务')]
+      [link('dns', '解析管理'), link('automation', '自动化任务')], [link('webhooks', 'Webhook 任务')]
     ].map((row) => row.filter(Boolean));
     return show(ctx, `NuroSSH 操作菜单\n选择模块查看状态或执行操作。${rows.every((row) => !row.length) ? '\n当前机器人未开放管理功能；任务通知仍按各自配置发送。' : ''}`, rows);
   }
@@ -179,6 +179,9 @@ export function createTelegramWorkspace(deps) {
         if (item.dnsChangeIds?.length && item.status !== 'rolled_back') rows.push([action('回滚', 'confirm', 'rollback')]);
         if (canWrite(ctx)) rows.push([action('清理事件', 'confirm', 'delete')]);
       }
+    } else if (section === 'webhooks') {
+      lines.push(`执行位置：${short(item.location)}`, `超时：${item.timeout} 秒`, `最近执行：${item.run ? short(item.run.message) : '暂无'}`);
+      if (item.enabled !== false && canWrite(ctx)) rows.push([action('执行任务', 'confirm', 'runwebhook')]);
     } else if (section === 'automation') {
       lines.push(`步骤：${item.steps?.length || 0}`, `并发：${item.concurrency || 1}`);
       if (canWrite(ctx)) rows.push([legacy('输入目标并执行', `task:${id}`)]);
@@ -237,6 +240,7 @@ export function createTelegramWorkspace(deps) {
     }
     if (op === 'check') return call(ctx, 'POST', section === 'guards' ? '/api/dns-guards/:id/check-now' : section === 'dynamic' ? '/api/dynamic-guards/:id/check' : '/api/probe-targets/:id/check-now', { id });
     if (op === 'change') return call(ctx, 'POST', '/api/dynamic-guards/:id/change', { id }, { confirm: 'change-ip' });
+    if (op === 'runwebhook') return call(ctx, 'POST', '/api/webhooks/:id/run', { id });
     if (op === 'sync') return call(ctx, 'POST', section === 'guards' ? '/api/dns-guards/:id/sync' : '/api/dns-bindings/:id/sync', { id });
     if (op === 'write') {
       if (!sameValues(item.currentValues || [], action.expectedValues)) throw new Error('记录已变化，请重新读取并确认');
@@ -272,7 +276,7 @@ export function createTelegramWorkspace(deps) {
     queue.push(async () => {
       try {
         const result = await execute(resultCtx, action);
-        await show(resultCtx, `${['check', 'change', 'execute', 'rollback'].includes(action.op) ? '请求已提交，请查看最新状态' : '操作完成'}${result?.verificationPending ? '，后台正在确认远程写入结果' : ''}${result?.removed !== undefined ? `\n清理 ${result.removed} 条，保留 ${result.kept || 0} 条` : ''}`, [[...(action.id && action.op !== 'delete' ? [button(resultCtx, '查看最新状态', { kind: 'detail', section: action.section, id: action.id })] : []), listButton(resultCtx, action.section)]]).catch(() => {});
+        await show(resultCtx, `${['check', 'change', 'execute', 'rollback', 'runwebhook'].includes(action.op) ? '请求已提交，请查看最新状态' : '操作完成'}${result?.verificationPending ? '，后台正在确认远程写入结果' : ''}${result?.removed !== undefined ? `\n清理 ${result.removed} 条，保留 ${result.kept || 0} 条` : ''}`, [[...(action.id && action.op !== 'delete' ? [button(resultCtx, '查看最新状态', { kind: 'detail', section: action.section, id: action.id })] : []), listButton(resultCtx, action.section)]]).catch(() => {});
       } catch (error) { await show(resultCtx, `操作未完成：${short(error.message, 700)}`, [[listButton(resultCtx, action.section), rootButton(resultCtx)]]); }
       finally { busy.delete(key); }
     });
@@ -281,7 +285,7 @@ export function createTelegramWorkspace(deps) {
   async function confirm(ctx, action) {
     assertAccess(ctx, action.section, true, action.op);
     const item = action.id ? get(ctx, action.section, action.id) : null;
-    const titles = { delete: '删除', clear: '清理已结束事件', execute: '执行 / 重试', rollback: '回滚', change: '执行换 IP API', canceljob: '取消执行', toggle: action.enabled ? '启用' : '暂停' };
+    const titles = { runwebhook: '执行 Webhook 任务', delete: '删除', clear: '清理已结束事件', execute: '执行 / 重试', rollback: '回滚', change: '执行换 IP API', canceljob: '取消执行', toggle: action.enabled ? '启用' : '暂停' };
     const next = { ...action, kind: 'execute', address: item?.address, identity: action.identity || (item ? identity(item) : ''),
       ...(action.op === 'clear' ? { ids: records(ctx, 'incidents').filter((entry) => finished.has(entry.status) || entry.status === 'failed').map((entry) => entry.id) } : {}) };
     ctx.session.pending = { ...next, nonce: randomBytes(12).toString('hex') };
@@ -305,7 +309,7 @@ export function createTelegramWorkspace(deps) {
     if (kind === 'incident_execute' || kind === 'incident_rollback') return { kind: 'confirm', section: 'incidents', id, op: kind === 'incident_execute' ? 'execute' : 'rollback' };
     if (kind === 'canceljob') return { kind: 'confirm', section: 'runs', id, op: 'canceljob' };
     const command = text.split(/\s/)[0].split('@')[0];
-    const commands = { '/start': 'root', '/menu': 'root', '菜单': 'root', '/status': 'overview', '总览': 'overview', '/probes': 'probes', '探针管理': 'probes', '/guards': 'guards', 'DNS守护': 'guards', '/dynamic': 'dynamic', '/targets': 'targets', '/policies': 'policies', '/assets': 'assets', '/pools': 'pools', '备用 IP 池': 'pools', '/dns': 'dns', '解析管理': 'dns', '/incidents': 'incidents', '故障事件': 'incidents', '/run': 'automation', '执行自动化': 'automation' };
+    const commands = { '/webhooks': 'webhooks', '/start': 'root', '/menu': 'root', '菜单': 'root', '/status': 'overview', '总览': 'overview', '/probes': 'probes', '探针管理': 'probes', '/guards': 'guards', 'DNS守护': 'guards', '/dynamic': 'dynamic', '/targets': 'targets', '/policies': 'policies', '/assets': 'assets', '/pools': 'pools', '备用 IP 池': 'pools', '/dns': 'dns', '解析管理': 'dns', '/incidents': 'incidents', '故障事件': 'incidents', '/run': 'automation', '执行自动化': 'automation' };
     if (commands[text]) { const section = commands[text]; return menuAliases[section] || { kind: 'list', section, page: 0 }; }
     const section = commands[command]; return section ? menuAliases[section] || { kind: 'list', section, page: 0 } : null;
   }

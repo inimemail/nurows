@@ -30,7 +30,10 @@ export function normalizeDynamicGuard(input, existing, state, encrypt, now = Dat
   const botIds = [...new Set(Array.isArray(input.botIds) ? input.botIds : [])];
   if (input.enabled !== false && botIds.some((id) => !state.telegramBots?.some((bot) => bot.id === id && bot.enabled !== false && bot.tokenEnc))) throw new Error('请选择有效的通知机器人');
   const command = String(input.command || '').trim();
-  if ((!command && !existing?.commandEnc) || command.length > 32768 || command.includes('\0')) throw new Error('请填写换 IP API 命令，最多 32768 字符');
+  const webhookTaskId = String(input.webhookTaskId ?? existing?.webhookTaskId ?? '');
+  if (webhookTaskId && !state.webhookTasks?.some((task) => task.id === webhookTaskId && (task.enabled || existing?.webhookTaskId === webhookTaskId))) throw new Error('请选择已启用的 Webhook 任务');
+  if (webhookTaskId && state.dynamicGuards?.some((guard) => guard.id !== existing?.id && guard.webhookTaskId === webhookTaskId)) throw new Error('这个 Webhook 任务已关联其他动态守护');
+  if ((!webhookTaskId && !command && !existing?.commandEnc) || command.length > 32768 || command.includes('\0')) throw new Error('请填写换 IP API 命令，最多 32768 字符');
   if (!['ping', 'tcp'].includes(input.checkType || 'ping')) throw new Error('检查方式仅支持 Ping 或 TCP');
   const config = {
     name: String(input.name || domain).trim().slice(0, 100), domain, recordType: input.recordType === 'AAAA' ? 'AAAA' : 'A',
@@ -44,7 +47,7 @@ export function normalizeDynamicGuard(input, existing, state, encrypt, now = Dat
   const identityChanged = existing && (existing.domain !== domain || existing.recordType !== config.recordType);
   return {
     ...DYNAMIC_DEFAULTS, ...existing, ...config, id: existing?.id || randomUUID(),
-    commandEnc: command ? encrypt(command) : existing.commandEnc,
+    webhookTaskId, commandEnc: command ? encrypt(command) : existing?.commandEnc || null,
     revision: (existing?.revision || 0) + 1, createdAt: existing?.createdAt || iso(now), updatedAt: iso(now),
     currentIp: identityChanged ? '' : existing?.currentIp || '', cycle: null, pendingChange: null, manualRequested: false,
     flow: identityChanged ? null : existing?.flow || null,
@@ -214,6 +217,10 @@ export function createDynamicGuardService(deps, options = {}) {
   function submit(guard, reason, waitExpired = false) {
     const time = now(), count = dynamicDailyCount(guard, time);
     if (commands.has(guard.id)) return;
+    if (guard.webhookTaskId && deps.webhookEnabled && !deps.webhookEnabled(guard.webhookTaskId)) {
+      wait(guard, 'command_error', '关联 Webhook 任务已停用，等待任务重新启用', guard.interval);
+      return;
+    }
     if (guard.maxDaily && count >= guard.maxDaily) {
       wait(guard, 'limit', '达到每日换 IP 上限，继续观察当前 IP', guard.interval);
       if (guard.manualRequested) change(guard.id, guard.revision, (item) => { item.manualRequested = false; });
@@ -230,7 +237,8 @@ export function createDynamicGuardService(deps, options = {}) {
       return;
     }
     let command;
-    try { command = deps.decryptSecret(guard.commandEnc); if (!command?.trim()) throw new Error('empty command'); }
+    const commandTimeout = guard.webhookTaskId ? deps.webhookTimeout?.(guard.webhookTaskId) || guard.commandTimeout : guard.commandTimeout;
+    try { command = guard.webhookTaskId ? '' : deps.decryptSecret(guard.commandEnc); if (!guard.webhookTaskId && !command?.trim()) throw new Error('empty command'); }
     catch {
       change(guard.id, guard.revision, (item) => { item.cycle = null; item.manualRequested = false; item.status = 'command_error'; item.message = '命令解密失败，请重新保存命令'; item.nextAt = time + item.interval * 1000; });
       notice(guard.id, 'decrypt-error', '换 IP 命令解密失败，请重新保存命令。');
@@ -244,8 +252,8 @@ export function createDynamicGuardService(deps, options = {}) {
       item.flow ||= { id: randomUUID(), initialIp: item.currentIp, startedAt: iso(time), attempts: 0 };
       const flow = item.flow;
       Object.assign(flow, { oldIp: item.currentIp, executionId, commandState: 'executing', submittedAt: time,
-        deadlineAt: item.waitTimeout ? time + (item.commandTimeout + 6 + item.waitTimeout) * 1000 : 0, attempts: flow.attempts + 1 });
-      item.commandNotBefore = time + (item.commandTimeout + 6) * 1000;
+        deadlineAt: item.waitTimeout ? time + (commandTimeout + 6 + item.waitTimeout) * 1000 : 0, attempts: flow.attempts + 1 });
+      item.commandNotBefore = time + (commandTimeout + 6) * 1000;
       item.daily = { date: dynamicDay(time), count: count + 1 };
       item.lastSubmittedAt = time; item.cycle = null; item.manualRequested = false;
       item.status = 'executing'; item.message = '正在执行换 IP API 命令';
@@ -258,7 +266,7 @@ export function createDynamicGuardService(deps, options = {}) {
     }, true);
     if (!saved) return;
     if (waitExpired) notice(guard.id, `wait-timeout:${get(guard.id).flow.id}`, `等待 ${guard.waitTimeout} 秒仍未出现新 IP，已安排再次提交。`);
-    const work = Promise.resolve().then(() => execute(command, guard.commandTimeout)).catch(() => ({ ok: false, uncertain: true, error: '命令执行结果未知', output: '' }))
+    const work = Promise.resolve().then(() => guard.webhookTaskId ? deps.executeWebhook(guard.webhookTaskId, get(guard.id)) : execute(command, guard.commandTimeout)).catch(() => ({ ok: false, uncertain: true, error: '命令执行结果未知', output: '' }))
       .then((result) => {
         const current = get(guard.id);
         if (current?.flow?.executionId !== executionId) return;
@@ -516,9 +524,12 @@ export function registerDynamicGuardRoutes(app, deps, service) {
   }));
   const save = (req, res) => {
     const state = deps.readState(['dynamicGuards', 'probes', 'telegramBots']);
+    state.webhookTasks = deps.webhookTasks?.() || [];
     const existing = req.params.id ? state.dynamicGuards?.find((item) => item.id === req.params.id) : null;
     if (req.params.id && !existing) throw new Error('任务不存在');
     if (existing && (service.isExecuting(existing.id) || existing.flow?.commandState === 'executing')) throw new Error('API 命令正在执行，结束后可编辑；等待新 IP 时可以编辑');
+    if ((existing?.webhookTaskId || '') !== (req.body.webhookTaskId ?? existing?.webhookTaskId ?? '') && existing?.flow) throw new Error('正在等待或验证新 IP，请结束流程后更改命令来源');
+    if (req.body.webhookTaskId && deps.webhookActive?.(req.body.webhookTaskId) && existing?.webhookTaskId !== req.body.webhookTaskId) throw new Error('Webhook 任务正在执行，结束后可以关联');
     const next = normalizeDynamicGuard(req.body, existing, state, deps.encryptSecret);
     update((draft) => {
       draft.dynamicGuards ||= [];
@@ -541,6 +552,7 @@ export function registerDynamicGuardRoutes(app, deps, service) {
   app.post('/api/dynamic-guards/:id/enabled', route((req, res) => {
     if (typeof req.body?.enabled !== 'boolean') throw new Error('启用状态无效');
     const state = deps.readState(['dynamicGuards', 'probes', 'telegramBots']);
+    state.webhookTasks = deps.webhookTasks?.() || [];
     const existing = state.dynamicGuards?.find((item) => item.id === req.params.id);
     if (!existing) throw new Error('任务不存在');
     if (req.body.enabled) normalizeDynamicGuard({ ...existing, enabled: true }, existing, state, deps.encryptSecret);

@@ -7,7 +7,7 @@ import { workspaceSearchPlaceholder } from '../shared/workspace-search.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
 import RenewalWorkspace from './RenewalWorkspace.jsx';
-import { BookOpen, CalendarClock } from 'lucide-react';
+import { BookOpen, CalendarClock, Webhook } from 'lucide-react';
 import { HISTORY_LABELS } from './HistoryRecords.jsx';
 import Dialog from './Dialog.jsx';
 import { copyNoteText } from './note-clipboard.js';
@@ -15,6 +15,7 @@ import { trackMobileViewport } from './mobile-viewport.js';
 import { canAutoFocusTerminal, isTerminalSubmitKey, terminalCopyText } from './terminal-interaction.js';
 import SettingsDialog, { HistoryBrowser } from './SettingsDialog.jsx';
 const NotesWorkspace = lazy(() => import('./NotesWorkspace.jsx'));
+const WebhookWorkspace = lazy(() => import('./WebhookWorkspace.jsx'));
 
 const EMPTY_SERVER = {
   id: '',
@@ -81,6 +82,7 @@ const DEFAULT_INTERACTIVE_KEYWORDS = ['请', '请输入', '请选择', '按回�
 const TABS = [
   { key: 'servers', label: '服务器', icon: ServerIcon },
   { key: 'commands', label: '命令中心', icon: CommandIcon },
+  { key: 'webhooks', label: 'Webhook 任务', icon: Webhook },
   { key: 'automation', label: '自动化任务', icon: AutomationIcon },
   { key: 'proxies', label: '代理网络', icon: ProxyIcon },
   { key: 'probes', label: '探针管理', icon: ProbeIcon },
@@ -345,7 +347,7 @@ function readStoredActiveTerminalId() {
 
 function normalizeWorkspacePayload(workspace = {}) {
   return {
-    tab: ['commands', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(workspace.tab) ? workspace.tab : 'servers',
+    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(workspace.tab) ? workspace.tab : 'servers',
     search: typeof workspace.search === 'string' ? workspace.search : '',
     selectedServerId: typeof workspace.selectedServerId === 'string' ? workspace.selectedServerId : '',
     selectedCommandId: typeof workspace.selectedCommandId === 'string' ? workspace.selectedCommandId : '',
@@ -401,6 +403,7 @@ export default function App() {
   const [auth, setAuth] = useState({ loading: true, configured: false, authenticated: false, username: '' });
   // In-memory, login-scoped list cache; never persist task/API data in browser storage.
   const dynamicGuardCache = useRef(null);
+  const webhookCache = useRef(null);
   const [authForm, setAuthForm] = useState({ username: '', password: '', confirmPassword: '' });
   const [authError, setAuthError] = useState('');
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
@@ -525,6 +528,7 @@ export default function App() {
 
   useEffect(() => {
     dynamicGuardCache.current = null;
+    webhookCache.current = null;
     if (!auth.authenticated) {
       return;
     }
@@ -1135,6 +1139,7 @@ export default function App() {
     }
     setAuth((current) => ({ ...current, authenticated: false }));
     dynamicGuardCache.current = null;
+    webhookCache.current = null;
     setTerminalFullscreenOpen(false);
     setStateLoaded(false);
     setSettingsDialogOpen(false);
@@ -2430,7 +2435,7 @@ export default function App() {
           >
             <ThemeIcon theme={theme} />
           </button>
-          <button className="ghost mobile-only" onClick={() => setAssetDrawerOpen((value) => !value)}>列表</button>
+          {tab !== 'webhooks' ? <button className="ghost mobile-only" onClick={() => setAssetDrawerOpen((value) => !value)}>列表</button> : null}
           {tab === 'servers' ? <button className="ghost" onClick={() => setImportDialog((current) => ({ ...current, open: true }))}>导入</button> : null}
           <button className="ghost user-pill" onClick={() => setSettingsDialogOpen(true)}>
             <GearIcon />
@@ -2439,7 +2444,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-layout' : '')}>
+      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-layout' : '')}>
         {!workspaceFullscreenActive ? (
           <button
             className={'mobile-drawer-scrim ' + (assetDrawerOpen ? 'open' : '')}
@@ -2448,24 +2453,26 @@ export default function App() {
             onClick={() => setAssetDrawerOpen(false)}
           />
         ) : null}
-        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-aside' : '')}>
+        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-aside' : '')}>
           <div className="side-head">
             <div>
-              <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'dns' ? '解析管理' : '代理列表'}</strong>
+              <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : tab === 'webhooks' ? 'Webhook 任务' : tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'dns' ? '解析管理' : '代理列表'}</strong>
               <span>
                 {tab === 'servers'
                   ? `${state.servers.length} 台服务器`
-                  : tab === 'commands'
-                    ? `${state.commands.length} 条命令`
-                    : tab === 'automation'
-                      ? `${automationTasks.length} 个任务`
-                    : tab === 'probes'
-                      ? `${state.probes?.length || 0} 个探针`
-                      : tab === 'pools'
-                        ? `${state.ipPools?.length || 0} 个池`
-                        : tab === 'dns'
-                          ? `${state.dnsAccounts?.length || 0} 个账号`
-                          : `${state.proxies.length} 个代理`}
+                    : tab === 'commands'
+                      ? `${state.commands.length} 条命令`
+                      : tab === 'automation'
+                        ? `${automationTasks.length} 个任务`
+                        : tab === 'webhooks'
+                          ? '独立工作区'
+                          : tab === 'probes'
+                            ? `${state.probes?.length || 0} 个探针`
+                            : tab === 'pools'
+                              ? `${state.ipPools?.length || 0} 个池`
+                              : tab === 'dns'
+                                ? `${state.dnsAccounts?.length || 0} 个账号`
+                                : `${state.proxies.length} 个代理`}
               </span>
             </div>
             <div className="toolbar">
@@ -2648,7 +2655,8 @@ export default function App() {
           ) : null}
         </aside>
 
-          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-main' : '')}>
+          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-main' : '')}>
+          {tab === 'webhooks' ? <Suspense fallback={<div className="ops-empty">正在加载 Webhook 任务…</div>}><WebhookWorkspace api={api} toast={toast} Dialog={Dialog} cache={webhookCache} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
           {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} stateReady={stateLoaded} dynamicGuardCache={dynamicGuardCache} search={search} onSearchChange={setSearch} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
           {tab === 'renewals' ? <RenewalWorkspace state={state} search={search} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
           {tab === 'notes' ? <Suspense fallback={<div className="surface workspace-panel">正在加载笔记...</div>}><NotesWorkspace api={api} toast={toast} search={search} onSearchScopeChange={setWorkspaceSearchScope} onBeforeLeave={handler => { notesBeforeLeave.current = handler; }} /></Suspense> : null}

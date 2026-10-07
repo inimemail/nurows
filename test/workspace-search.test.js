@@ -112,6 +112,7 @@ function harness() {
     if (path.endsWith('telegram-permissions.js')) return permissions;
     if (path.endsWith('polling.js')) return { startPolling: () => () => {} };
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { __esModule: true, default: 'dynamic' };
+    if (path.endsWith('GuardSortableList.jsx')) return { __esModule: true, default: 'guard-sort' };
     throw new Error(path);
   } });
   return { ui: module.exports, call(fn, props) { cursor = 0; effects.length = 0; return fn(props); }, render(props) { cursor = 0; effects.length = 0; return module.exports.default(props); }, runEffects() { effects.forEach((fn) => fn()); } };
@@ -126,8 +127,9 @@ test('actual list renderers filter rows and preserve unfiltered editing context'
     const state = { ...related, [key]: [item, { id: 'other', name: 'other', address: '203.0.113.1' }] };
     let edited;
     const view = ui.renderSection(section, { state, search: keyword, guardSyncingIds: [], openEdit: (_type, target) => { edited = target; } });
-    assert.equal(view.props.children.length, 1, section);
-    const edit = nodes(view.props.children[0].props.actions).find((node) => node.type === 'button' && ['编辑', '编辑规则'].includes(text(node)));
+    const rows = section === 'guards' ? view.props.children.props.items.map(view.props.children.props.children) : view.props.children;
+    assert.equal(rows.length, 1, section);
+    const edit = nodes(rows[0].props.actions).find((node) => node.type === 'button' && ['编辑', '编辑规则'].includes(text(node)));
     if (edit) { edit.props.onClick(); assert.equal(edited, item); }
     assert.equal(state[key].length, 2);
     const emptyView = ui.renderSection(section, { state, search: 'absent', guardSyncingIds: [] });
@@ -147,7 +149,8 @@ test('search propagates through workspace, follows sub-menu changes, and reaches
   tree = h.render(props); h.runEffects();
   assert.equal(scopes.at(-1).section, 'guards');
   view = nodes(tree).find((node) => node.type === h.ui.DataView);
-  assert.equal(view.props.children[0].props.title, 'guard-hit');
+  assert.equal(view.props.children.props.items.length, 1);
+  assert.equal(view.props.children.props.children(view.props.children.props.items[0]).props.title, 'guard-hit');
   nodes(tree).find((node) => node.type === 'button' && text(node).startsWith('动态 IP 守护')).props.onClick();
   tree = h.render(props); h.runEffects();
   assert.equal(scopes.at(-1).section, 'dynamic');

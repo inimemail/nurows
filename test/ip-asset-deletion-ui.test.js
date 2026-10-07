@@ -27,6 +27,7 @@ function harness(api, assets, search = '', extra = {}) {
     if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return workspaceSearch;
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
+    if (path.endsWith('GuardSortableList.jsx')) return { default: 'guard-sort', __esModule: true };
     if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     throw Error(path);
   } });

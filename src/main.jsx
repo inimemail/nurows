@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import 'xterm/css/xterm.css';
 import './styles.css';
 import './mobile.css';
+import './guard-sort.css';
 import './auth.css';
 import App from './App';
 

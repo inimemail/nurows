@@ -21,6 +21,7 @@ function harness() {
     if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     if (path.endsWith('polling.js')) return {};
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
+    if (path.endsWith('GuardSortableList.jsx')) return { default: 'guard-sort', __esModule: true };
     throw new Error(path);
   } });
   return module.exports;

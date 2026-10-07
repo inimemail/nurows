@@ -141,6 +141,8 @@ const orchestrationDeps = {
   readPoolHealthSchedule,
   updatePoolHealthState,
   readDnsGuardStatusState,
+  readDnsGuardOrderState,
+  updateDnsGuardOrderState,
   readOrchestrationStatusState,
   updateState,
   sanitizeState: sanitizeStateForClient,
@@ -2044,6 +2046,22 @@ function readState(keys = null) {
     cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
   }
   return structuredClone(keys ? Object.fromEntries(keys.map((key) => [key, cachedState[key]])) : cachedState);
+}
+
+function readDnsGuardOrderState() {
+  ensureStorage();
+  return { dnsGuards: (cachedState.dnsGuards || []).map(({ id }) => ({ id })), dnsGuardOrder: [...(cachedState.dnsGuardOrder || [])] };
+}
+
+function updateDnsGuardOrderState(mutator) {
+  ensureStorage();
+  const selected = readDnsGuardOrderState();
+  mutator(selected);
+  const next = { ...cachedState, dnsGuardOrder: selected.dnsGuardOrder };
+  // Publish after persistence succeeds. Sorting never clones/migrates running
+  // guards, reads pool inventory or changes any collection except display order.
+  dbSetJson(STORAGE_KEYS.state, next);
+  cachedState = next;
 }
 
 function updateRenewalState(mutator) {

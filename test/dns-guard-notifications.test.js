@@ -126,6 +126,7 @@ test('guard editor exposes default-empty bot selection and serializes changes wi
     if (path.endsWith('workspace-search.js')) return workspaceSearch;
     if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
+    if (path.endsWith('GuardSortableList.jsx')) return { default: 'guard-sort', __esModule: true };
     throw Error(path);
   } });
   let draft = module.exports.normalizeDraft('guard', { probeIds: ['probe'], poolIds: ['pool'] });

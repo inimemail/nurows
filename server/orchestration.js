@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { dnsGuardOrder, moveDnsGuard } from '../shared/dns-guard-order.js';
 import { telegramScopes } from '../shared/telegram-permissions.js';
 import { supportsPoolHealthCheck } from '../shared/probe-capabilities.js';
 import { execFile as execFileCallback } from 'node:child_process';
@@ -80,6 +81,7 @@ export function orchestrationDefaults() {
     probes: [],
     probeTargets: [],
     dnsGuards: [],
+    dnsGuardOrder: [],
     dynamicGuards: [],
     dynamicGuardRuns: [],
     ipAssets: [],
@@ -101,6 +103,7 @@ export function orchestrationDefaults() {
 export function normalizeOrchestrationState(parsed = {}) {
   const defaults = orchestrationDefaults();
   const normalized = Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
+  normalized.dnsGuardOrder = dnsGuardOrder(normalized.dnsGuards, normalized.dnsGuardOrder);
   normalized.telegramBots = normalized.telegramBots.map((bot) => ({ ...bot, menuScopes: telegramScopes(bot), menuScopeVersion: 2 }));
   normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, alertChatIds, ...pool }) => pool);
   normalized.ipPools = normalized.ipPools.map((pool) => {
@@ -469,6 +472,25 @@ export function registerProbePublicRoutes(app, deps) {
 }
 
 export function registerOrchestrationRoutes(app, deps) {
+  app.put('/api/dns-guards/order', (req, res) => {
+    const { id, targetId, placement } = req.body || {};
+    if (typeof id !== 'string' || typeof targetId !== 'string' || id.length > 200 || targetId.length > 200 || !['before', 'after'].includes(placement)) {
+      return res.status(400).json({ error: '无效的排序请求' });
+    }
+    const current = deps.readDnsGuardOrderState?.() || deps.readState(['dnsGuards', 'dnsGuardOrder']);
+    if (![id, targetId].every(value => current.dnsGuards.some(guard => guard.id === value))) {
+      return res.status(404).json({ error: '守护任务已删除，请刷新列表后重试' });
+    }
+    const order = dnsGuardOrder(current.dnsGuards, current.dnsGuardOrder);
+    const next = moveDnsGuard(order, id, targetId, placement);
+    if (next.some((value, index) => value !== order[index])) {
+      (deps.updateDnsGuardOrderState || deps.updateState)(draft => {
+        draft.dnsGuardOrder = moveDnsGuard(dnsGuardOrder(draft.dnsGuards, draft.dnsGuardOrder), id, targetId, placement);
+        return draft;
+      });
+    }
+    res.json({ dnsGuardOrder: next });
+  });
   app.post('/api/dns-guards/ip-usage', (req, res) => {
     res.set?.('Cache-Control', 'no-store');
     let query;
@@ -483,7 +505,7 @@ export function registerOrchestrationRoutes(app, deps) {
   app.get('/api/orchestration/status/:section', (req, res) => {
     const views = {
       nodes: ['probes', 'telegramBots'], targets: ['probes', 'probeTargets', 'failoverPolicies'],
-      guards: ['probes', 'dnsGuards', 'dnsGuardRuns', 'dnsAccounts', 'ipPools', 'telegramBots'],
+      guards: ['probes', 'dnsGuards', 'dnsGuardOrder', 'dnsGuardRuns', 'dnsAccounts', 'ipPools', 'telegramBots'],
       policies: ['failoverPolicies', 'ipPools', 'dnsBindings', 'telegramBots', 'automationTasks'], incidents: ['incidents', 'probeTargets'],
       assets: ['ipAssets', 'ipPools', 'telegramBots'], pools: ['ipPools', 'ipAssets', 'telegramBots', 'probes'],
       usage: ['ipUsageRecords'], accounts: ['dnsAccounts'], bindings: ['dnsBindings', 'dnsAccounts'],

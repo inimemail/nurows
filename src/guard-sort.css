@@ -1,0 +1,21 @@
+.guard-sort-list { min-width: 0; }
+.guard-sort-item { position: relative; padding-left: 38px; border-bottom: 1px solid var(--border-card); }
+.guard-sort-item:last-child { border-bottom: 0; }
+.guard-sort-item > .ops-row { border-bottom: 0; }
+.guard-sort-handle { position: absolute; left: 0; top: 16px; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 36px; padding: 0; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--text-muted); cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+.guard-sort-handle:hover, .guard-sort-handle:focus-visible { color: var(--text-strong); background: var(--button-ghost-bg); border-color: var(--border-soft); }
+.guard-sort-handle:active { cursor: grabbing; }
+.guard-sort-handle:disabled { opacity: .3; cursor: default; }
+.guard-sort-item.is-dragging { opacity: .55; }
+.guard-sort-item.drop-before::before, .guard-sort-item.drop-after::after { content: ''; position: absolute; left: 0; right: 0; height: 3px; border-radius: 3px; background: #5b8def; pointer-events: none; z-index: 1; }
+.guard-sort-item.drop-before::before { top: -2px; }
+.guard-sort-item.drop-after::after { bottom: -2px; }
+@media (max-width: 760px) {
+  .guard-sort-list { display: flex; flex-direction: column; gap: 12px; }
+  .guard-sort-item { padding-left: 0; border: 0; }
+  .guard-sort-item > .ops-row { border: 1px solid var(--border-card); }
+  .guard-sort-item .ops-row-main { padding-right: 38px; box-sizing: border-box; }
+  .guard-sort-handle { left: auto; right: 8px; top: 8px; width: 40px; height: 44px; z-index: 1; background: var(--button-ghost-bg); border-color: var(--border-soft); }
+  .guard-sort-item.drop-before::before { top: -7px; }
+  .guard-sort-item.drop-after::after { bottom: -7px; }
+}

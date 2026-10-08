@@ -3,6 +3,7 @@ import path from 'node:path';
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import { createAuthenticatorStore, registerAuthenticatorRoutes } from './authenticator.js';
 import { HISTORY_RETENTION_DAYS, HISTORY_KEYS, HISTORY_STATE_KEYS, pruneHistory } from './history.js';
 import { createTelegramWorkspace } from './telegram-workspace.js';
 import { createTelegramActions } from './telegram-actions.js';
@@ -347,6 +348,26 @@ registerProbePublicRoutes(app, {
   onDynamicGuardReport: () => dynamicGuardService.tick()
 });
 app.use('/api', authGuard);
+
+registerAuthenticatorRoutes(app, createAuthenticatorStore(getSqliteDb(), encryptSecret, decryptSecret), async req => {
+  enforceAuthRateLimit(req, 'authenticator');
+  const auth = readAuth();
+  const password = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
+  const hash = password.length <= 1024 && auth.configured
+    ? await new Promise((resolve, reject) => crypto.scrypt(password, auth.salt, 64, (error, key) => error ? reject(error) : resolve(key))) : null;
+  const expected = Buffer.from(auth.hash || '', 'hex');
+  const valid = hash && hash.length === expected.length && crypto.timingSafeEqual(hash, expected);
+  hash?.fill(0);
+  if (!valid) {
+    registerAuthFailure(req, 'authenticator');
+    const error = new Error('密码错误'); error.statusCode = 403; throw error;
+  }
+  const currentAuth = readAuth();
+  if (getSessionFromRequest(req) !== req.auth || req.auth.username !== currentAuth.username || auth.hash !== currentAuth.hash) {
+    const error = new Error('登录已失效，请重新登录'); error.statusCode = 401; throw error;
+  }
+  clearAuthRateLimit(req, 'authenticator');
+}, { sessionValid: req => getSessionFromRequest(req) === req.auth });
 
 app.get('/api/auth/status', (req, res) => {
   const auth = readAuth();
@@ -2344,7 +2365,7 @@ function getWorkspaceForUser(state, auth = null) {
     };
   }
   return {
-    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(source.tab) ? source.tab : 'servers',
+    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator'].includes(source.tab) ? source.tab : 'servers',
     search: typeof source.search === 'string' ? source.search : '',
     selectedServerId: typeof source.selectedServerId === 'string' ? source.selectedServerId : '',
     selectedCommandId: typeof source.selectedCommandId === 'string' ? source.selectedCommandId : '',
@@ -2405,7 +2426,7 @@ function getWorkspaceForUser(state, auth = null) {
 
 function normalizeWorkspaceInput(input = {}) {
   return {
-    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(input.tab) ? input.tab : 'servers',
+    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator'].includes(input.tab) ? input.tab : 'servers',
     search: typeof input.search === 'string' ? input.search : '',
     selectedServerId: typeof input.selectedServerId === 'string' ? input.selectedServerId : '',
     selectedCommandId: typeof input.selectedCommandId === 'string' ? input.selectedCommandId : '',

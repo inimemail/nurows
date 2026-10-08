@@ -7,7 +7,7 @@ import { workspaceSearchPlaceholder } from '../shared/workspace-search.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
 import RenewalWorkspace from './RenewalWorkspace.jsx';
-import { BookOpen, CalendarClock, Webhook } from 'lucide-react';
+import { BookOpen, CalendarClock, Webhook, ShieldCheck } from 'lucide-react';
 import { HISTORY_LABELS } from './HistoryRecords.jsx';
 import Dialog from './Dialog.jsx';
 import { copyNoteText } from './note-clipboard.js';
@@ -16,6 +16,7 @@ import { canAutoFocusTerminal, isTerminalSubmitKey, terminalCopyText } from './t
 import SettingsDialog, { HistoryBrowser } from './SettingsDialog.jsx';
 const NotesWorkspace = lazy(() => import('./NotesWorkspace.jsx'));
 const WebhookWorkspace = lazy(() => import('./WebhookWorkspace.jsx'));
+const AuthenticatorWorkspace = lazy(() => import('./AuthenticatorWorkspace.jsx'));
 
 const EMPTY_SERVER = {
   id: '',
@@ -90,7 +91,8 @@ const TABS = [
   { key: 'dns', label: '解析管理', icon: DnsIcon },
   { key: 'renewals', label: '续费管理', icon: CalendarClock },
   { key: 'telegram', label: 'Telegram', icon: TelegramIcon },
-  { key: 'notes', label: '笔记', icon: BookOpen }
+  { key: 'notes', label: '笔记', icon: BookOpen },
+  { key: 'authenticator', label: '2FA 验证器', icon: ShieldCheck }
 ];
 
 const TERMINAL_SESSIONS_STORAGE_KEY = 'nurossh-terminal-sessions';
@@ -347,7 +349,7 @@ function readStoredActiveTerminalId() {
 
 function normalizeWorkspacePayload(workspace = {}) {
   return {
-    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(workspace.tab) ? workspace.tab : 'servers',
+    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator'].includes(workspace.tab) ? workspace.tab : 'servers',
     search: typeof workspace.search === 'string' ? workspace.search : '',
     selectedServerId: typeof workspace.selectedServerId === 'string' ? workspace.selectedServerId : '',
     selectedCommandId: typeof workspace.selectedCommandId === 'string' ? workspace.selectedCommandId : '',
@@ -2435,7 +2437,7 @@ export default function App() {
           >
             <ThemeIcon theme={theme} />
           </button>
-          {tab !== 'webhooks' ? <button className="ghost mobile-only" onClick={() => setAssetDrawerOpen((value) => !value)}>列表</button> : null}
+          {!['webhooks', 'authenticator'].includes(tab) ? <button className="ghost mobile-only" onClick={() => setAssetDrawerOpen((value) => !value)}>列表</button> : null}
           {tab === 'servers' ? <button className="ghost" onClick={() => setImportDialog((current) => ({ ...current, open: true }))}>导入</button> : null}
           <button className="ghost user-pill" onClick={() => setSettingsDialogOpen(true)}>
             <GearIcon />
@@ -2444,7 +2446,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-layout' : '')}>
+      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator'].includes(tab) ? ' orchestration-layout' : '')}>
         {!workspaceFullscreenActive ? (
           <button
             className={'mobile-drawer-scrim ' + (assetDrawerOpen ? 'open' : '')}
@@ -2453,7 +2455,7 @@ export default function App() {
             onClick={() => setAssetDrawerOpen(false)}
           />
         ) : null}
-        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-aside' : '')}>
+        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator'].includes(tab) ? ' orchestration-aside' : '')}>
           <div className="side-head">
             <div>
               <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : tab === 'webhooks' ? 'Webhook 任务' : tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'dns' ? '解析管理' : '代理列表'}</strong>
@@ -2655,11 +2657,12 @@ export default function App() {
           ) : null}
         </aside>
 
-          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes'].includes(tab) ? ' orchestration-main' : '')}>
+          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator'].includes(tab) ? ' orchestration-main' : '')}>
           {tab === 'webhooks' ? <Suspense fallback={<div className="ops-empty">正在加载 Webhook 任务…</div>}><WebhookWorkspace api={api} toast={toast} Dialog={Dialog} cache={webhookCache} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
           {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} stateReady={stateLoaded} dynamicGuardCache={dynamicGuardCache} search={search} onSearchChange={setSearch} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
           {tab === 'renewals' ? <RenewalWorkspace state={state} search={search} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
           {tab === 'notes' ? <Suspense fallback={<div className="surface workspace-panel">正在加载笔记...</div>}><NotesWorkspace api={api} toast={toast} search={search} onSearchScopeChange={setWorkspaceSearchScope} onBeforeLeave={handler => { notesBeforeLeave.current = handler; }} /></Suspense> : null}
+          {tab === 'authenticator' ? <Suspense fallback={<div className="ops-empty">正在加载验证器…</div>}><AuthenticatorWorkspace api={api} toast={toast} Dialog={Dialog} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
           {tab === 'automation' ? (
             <section className="automation-board">
               <div className="automation-page-head surface">

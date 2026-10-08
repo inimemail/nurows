@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { GripVertical } from 'lucide-react';
 import { dnsGuardOrder, moveDnsGuard } from '../shared/dns-guard-order.js';
 
-export default function GuardSortableList({ items, records, order, scope, api, onState, toast, onSaving, children }) {
+export default function GuardSortableList({ items, records, order, scope, api, onState, toast, onSaving, onReorder, disabled = false, children }) {
   const [preview, setPreview] = useState(null);
   const [dragging, setDragging] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -41,11 +41,11 @@ export default function GuardSortableList({ items, records, order, scope, api, o
   }, []);
   // Filtering while dragging must not drop onto a now-hidden task.
   const ids = items.map(item => item.id).join('|');
-  useEffect(() => { cancel(); }, [scope, ids]);
+  useEffect(() => { cancel(); }, [scope, ids, disabled]);
   useEffect(() => { if (drag.current) drag.current.rows = null; }, [visible]);
 
   const save = async (id, targetId, placement) => {
-    if (pending.current) return;
+    if (pending.current || disabled) return;
     const next = moveDnsGuard(currentOrder, id, targetId, placement);
     if (next.every((value, index) => value === currentOrder[index])) return;
     if (onSaving(true) === false) { toast('正在保存排序，请稍候'); return; }
@@ -53,8 +53,11 @@ export default function GuardSortableList({ items, records, order, scope, api, o
     setSaving(true);
     setPreview(next);
     try {
-      const data = await api('/api/dns-guards/order', { method: 'PUT', timeoutMs: 15000, body: JSON.stringify({ id, targetId, placement }) });
-      onState(current => ({ ...current, dnsGuardOrder: data.dnsGuardOrder }));
+      if (onReorder) await onReorder({ id, targetId, placement });
+      else {
+        const data = await api('/api/dns-guards/order', { method: 'PUT', timeoutMs: 15000, body: JSON.stringify({ id, targetId, placement }) });
+        onState(current => ({ ...current, dnsGuardOrder: data.dnsGuardOrder }));
+      }
       toast('排序已保存');
     } catch (error) { toast(`排序保存失败：${error.message}`); }
     finally {
@@ -102,7 +105,7 @@ export default function GuardSortableList({ items, records, order, scope, api, o
   };
 
   const start = (event, id) => {
-    if (pending.current || visible.length < 2 || (event.pointerType === 'mouse' && event.button !== 0) || event.isPrimary === false) return;
+    if (disabled || pending.current || visible.length < 2 || (event.pointerType === 'mouse' && event.button !== 0) || event.isPrimary === false) return;
     event.preventDefault();
     cancel();
     let scroller = root.current?.parentElement;
@@ -132,7 +135,7 @@ export default function GuardSortableList({ items, records, order, scope, api, o
   return <div className={`guard-sort-list${saving ? ' is-saving' : ''}`} ref={root} aria-busy={saving}>
     {visible.map((item, index) => <div key={item.id} data-guard-sort-id={item.id}
       className={`guard-sort-item${dragging?.id === item.id ? ' is-dragging' : ''}${dragging?.targetId === item.id ? ` drop-${dragging.placement}` : ''}`}>
-      <button className="guard-sort-handle" type="button" disabled={saving || visible.length < 2}
+      <button className="guard-sort-handle" type="button" disabled={disabled || saving || visible.length < 2}
         aria-label={`拖动排序：${item.name}`} title="拖动排序，也可用上下方向键移动"
         onPointerDown={event => start(event, item.id)} onPointerMove={move} onPointerUp={finish}
         onPointerCancel={cancel} onLostPointerCapture={cancel}

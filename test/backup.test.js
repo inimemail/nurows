@@ -7,6 +7,7 @@ import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import Database from "better-sqlite3";
 import { createNotesStore } from "../server/notes-store.js";
+import { createAuthenticatorStore } from '../server/authenticator.js';
 
 const root = path.resolve(import.meta.dirname, "..");
 async function dir(t) {
@@ -37,6 +38,13 @@ test("online snapshots recover committed WAL writes, independent notes and attac
     "auth",
     JSON.stringify({ configured: false }),
   );
+  const authenticatorSecret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+  // This fixture's mock codec checks table preservation; encryption is covered
+  // by the authenticator tests using AES-GCM and the real application API.
+  const encode = value => ({ fixture: Buffer.from(value).toString('base64') });
+  const decode = value => Buffer.from(value.fixture, 'base64').toString('utf8');
+  const authenticators = createAuthenticatorStore(db, encode, decode);
+  authenticators.save({ issuer: 'backup', account: 'test', secret: authenticatorSecret });
   const notes = new Database(path.join(data, "notes.db"));
   const store = createNotesStore(notes);
   const doc = store.create({
@@ -63,6 +71,8 @@ test("online snapshots recover committed WAL writes, independent notes and attac
     "keep-me",
   );
   assert.equal(saved.pragma("quick_check", { simple: true }), "ok");
+  const savedAuthenticator = saved.prepare('SELECT secret_enc FROM authenticator_accounts').get();
+  assert.equal(decode(JSON.parse(savedAuthenticator.secret_enc)), authenticatorSecret);
   saved.close();
   const savedNotes = new Database(path.join(snapshot, "notes.db"));
   assert.equal(

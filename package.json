@@ -10,6 +10,7 @@
     "start": "node server/index.js"
   },
   "dependencies": {
+    "@floating-ui/dom": "^1.8.0",
     "@tiptap/extension-code-block-lowlight": "^3.31.3",
     "@tiptap/extension-image": "^3.31.3",
     "@tiptap/extension-placeholder": "^3.31.3",
@@ -24,9 +25,12 @@
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "image-size": "^2.0.4",
+    "jsqr": "^1.4.0",
     "lowlight": "^3.3.0",
     "lucide-react": "^1.47.0",
     "marked": "^18.0.13",
+    "otpauth": "^9.5.2",
+    "qrcode": "^1.5.4",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "sanitize-html": "^2.17.7",

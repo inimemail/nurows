@@ -281,6 +281,22 @@ svg {
   background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
 }
 
+@media (min-width: 761px) {
+  .top-tabs {
+    /* Keep scrollbar space constant; equal visible padding centers the buttons. */
+    padding: 7px 5px 3px;
+    --menu-scrollbar-thumb: transparent;
+  }
+  .top-tabs::-webkit-scrollbar { height: 4px; }
+  .top-tabs::-webkit-scrollbar-track { background: transparent; }
+  .top-tabs::-webkit-scrollbar-thumb { background: var(--menu-scrollbar-thumb); border-radius: 999px; }
+  .top-tabs:hover, .top-tabs:focus-within { --menu-scrollbar-thumb: var(--text-muted); }
+  @supports not selector(::-webkit-scrollbar) {
+    .top-tabs { scrollbar-width: thin; scrollbar-color: transparent transparent; padding: 5px; }
+    .top-tabs:hover, .top-tabs:focus-within { scrollbar-color: var(--text-muted) transparent; }
+  }
+}
+
 .top-tab,
 .session-tab,
 .ghost,

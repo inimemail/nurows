@@ -35,6 +35,8 @@ export default function OrchestrationWorkspace({ tab, state, stateReady = true, 
   });
   const [editor, setEditor] = useState({ open: false, type: '', value: null });
   const [editorBusy, setEditorBusy] = useState(false);
+  const [dnsDeletion, setDnsDeletion] = useState(null);
+  const dnsDeletingRef = useRef(false);
   const [install, setInstall] = useState(null);
   const [assetImport, setAssetImport] = useState({ open: false, addresses: '', region: '', carrier: '', labels: '' });
   const [incidentCleanup, setIncidentCleanup] = useState({ open: false, id: '', all: false, busy: false });
@@ -224,6 +226,10 @@ export default function OrchestrationWorkspace({ tab, state, stateReady = true, 
   const remove = async () => {
     if (editorBusy) return;
     if (editor.type === 'asset') { setAssetDeletion({ id: editor.value.id, address: editor.value.address, busy: false }); return; }
+    if (['guard', 'account', 'binding'].includes(editor.type)) {
+      setDnsDeletion({ type: editor.type, id: editor.value.id, name: editor.value.name || editor.value.domain, domain: editor.value.domain || '', busy: false });
+      return;
+    }
     setEditorBusy(true);
     try {
       const data = await api(`/api/orchestration/${resourceFor(editor.type)}/${editor.value.id}`, { method: 'DELETE' });
@@ -232,6 +238,25 @@ export default function OrchestrationWorkspace({ tab, state, stateReady = true, 
       toast('已删除');
     } catch (error) { toast(error.message); }
     finally { setEditorBusy(false); }
+  };
+  const closeDnsDeletion = () => { if (!dnsDeletingRef.current) setDnsDeletion(null); };
+  const confirmDnsDeletion = async () => {
+    if (!dnsDeletion || dnsDeletingRef.current) return;
+    const target = dnsDeletion;
+    dnsDeletingRef.current = true;
+    setEditorBusy(true);
+    setDnsDeletion(current => ({ ...current, busy: true }));
+    try {
+      const data = await api(`/api/orchestration/${resourceFor(target.type)}/${encodeURIComponent(target.id)}`, { method: 'DELETE' });
+      onState(data.state);
+      setEditor(current => current.type === target.type && current.value?.id === target.id
+        ? { open: false, type: '', value: null } : current);
+      setDnsDeletion(null);
+      toast('已删除');
+    } catch (error) {
+      setDnsDeletion(current => current ? { ...current, busy: false } : null);
+      toast(error.message);
+    } finally { dnsDeletingRef.current = false; setEditorBusy(false); }
   };
   const closeAssetDeletion = () => { if (!assetDeletingRef.current) setAssetDeletion(null); };
   const confirmAssetDeletion = async () => {
@@ -384,6 +409,9 @@ export default function OrchestrationWorkspace({ tab, state, stateReady = true, 
       {install ? <Dialog title="探针安装 / 升级" onClose={() => setInstall(null)} footer={<><span /><button className="primary" onClick={() => setInstall(null)}>完成</button></>}><div className="ops-install"><CommandBlock label="安装 / 升级命令" value={install.installCommand} toast={toast} /><CommandBlock label="卸载命令" value={install.uninstallCommand} toast={toast} /><span>重复执行安装命令会下载最新代理并重启探针服务，现有长期注册令牌继续使用。</span></div></Dialog> : null}
       {assetImport.open ? <Dialog title="批量导入 IP 资产" className="ops-editor-dialog" wide onClose={() => setAssetImport((current) => ({ ...current, open: false }))} footer={<><span /><div className="dialog-actions"><button className="ghost" onClick={() => setAssetImport((current) => ({ ...current, open: false }))}>取消</button><button className="primary" onClick={importAssets}>导入</button></div></>}><EditorGrid><Field label="IP 地址" full><textarea className="ops-batch-ip-input" rows="12" value={assetImport.addresses} onChange={(e) => setAssetImport((current) => ({ ...current, addresses: e.target.value }))} placeholder={'每行一个，也支持空格或逗号分隔\n1.1.1.1\n2001:db8::1'} /></Field><Field label="地区（选填，批量设置）"><input value={assetImport.region} onChange={(e) => setAssetImport((current) => ({ ...current, region: e.target.value }))} /></Field><Field label="运营商（选填，批量设置）"><input value={assetImport.carrier} onChange={(e) => setAssetImport((current) => ({ ...current, carrier: e.target.value }))} /></Field><Field label="标签（选填，逗号分隔）" full><input value={assetImport.labels} onChange={(e) => setAssetImport((current) => ({ ...current, labels: e.target.value }))} /></Field></EditorGrid></Dialog> : null}
       {incidentCleanup.open ? <Dialog title={incidentCleanup.all ? '清理故障事件' : '删除故障事件'} onClose={() => !incidentCleanup.busy && setIncidentCleanup({ open: false, id: '', all: false, busy: false })} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={incidentCleanup.busy} onClick={() => setIncidentCleanup({ open: false, id: '', all: false, busy: false })}>取消</button><button className="primary danger-action" disabled={incidentCleanup.busy} onClick={confirmIncidentCleanup}>{incidentCleanup.busy ? '清理中...' : '确认清理'}</button></div></>}><div className="confirm-copy">{incidentCleanup.all ? '将清理全部非执行中的故障事件，正在运行的自动化、DNS 更新和回滚事件会自动保留。' : '将删除这条故障事件；IP 使用记录、DNS 变更记录和审计记录仍会保留。'}</div></Dialog> : null}
+      {dnsDeletion ? <Dialog title={`删除${typeLabel(dnsDeletion.type)}`} onClose={closeDnsDeletion} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={dnsDeletion.busy} onClick={closeDnsDeletion}>取消</button><button className="primary danger-action" disabled={dnsDeletion.busy} onClick={confirmDnsDeletion}>{dnsDeletion.busy ? '删除中...' : '确认删除'}</button></div></>}>
+        <div className="confirm-copy"><p>确定删除「{dnsDeletion.name}」{dnsDeletion.domain && dnsDeletion.domain !== dnsDeletion.name ? `（${dnsDeletion.domain}）` : ''}吗？</p><p>{dnsDeletion.type === 'guard' ? '删除后停止此任务的自动检查和补位。' : dnsDeletion.type === 'binding' ? '仅删除面板中的解析绑定配置。' : '将删除此服务商账号及保存的凭证；有关联任务或解析绑定时无法删除。'}远程 DNS 记录不会删除，此操作无法撤销。</p></div>
+      </Dialog> : null}
       {assetDeletion ? <Dialog title="删除 IP 资产" onClose={closeAssetDeletion} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={assetDeletion.busy} onClick={closeAssetDeletion}>取消</button><button className="primary danger-action" disabled={assetDeletion.busy} onClick={confirmAssetDeletion}>{assetDeletion.busy ? '删除中...' : '确认删除'}</button></div></>}>
         <div className="confirm-copy">确定删除 IP「{assetDeletion.address}」吗？将自动从所有关联备用池移除该 IP，备用池和历史使用记录保留。正在使用或被任务占用的 IP 无法删除。</div>
       </Dialog> : null}

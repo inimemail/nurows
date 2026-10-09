@@ -15,6 +15,7 @@ const module = { exports: {} };
 vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone, crypto, require(path) {
   if (path === 'react') return { useState: (value) => [typeof value === 'function' ? value() : value, () => {}] };
   if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
+  if (path === 'lucide-react') return { Plus: 'plus-icon', Trash2: 'trash-icon', ScanSearch: 'scan-icon', LoaderCircle: 'loading-icon' };
   if (path.endsWith('telegram-permissions.js')) return permissions;
   if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
   if (path.endsWith('workspace-search.js')) return search;
@@ -41,7 +42,7 @@ test('each source has an independent fallback switch that survives editing and c
   const migrated = normalizeDraft('guard', { sourcesFallbackOnly: true, sources: [{ domain: 'old.example.com' }, { domain: 'explicit.example.com', fallbackOnly: false }] });
   assert.deepEqual(Array.from(migrated.sources, (source) => source.fallbackOnly), [true, false]);
   assert.equal(migrated.sourcesFallbackOnly, false);
-  const add = nodes(render()).find((node) => node.type === 'button' && node.props.children === '添加来源');
+  const add = nodes(render()).find((node) => node.type === 'button' && node.props.className === 'ghost ops-add-source');
   add.props.onClick();
   assert.equal(value.sources.at(-1).fallbackOnly, false);
   assert.equal(sourceStatusLabel({ status: 'fallback_idle', failedValues: ['192.0.2.1'] }), '兜底待命 · 已有其他健康 IP');
@@ -57,6 +58,35 @@ test('source status distinguishes partial failures and waiting for usable IPs', 
   assert.equal(sourceStatusLabel(recovered), '主来源已同步');
   assert.equal(sourceStatusTone(recovered), 'ok');
   assert.equal(sourceStatusLabel({ status: 'resolve_error', pending: true }), '解析失败 · 待重试');
+});
+
+test('source layout groups named inputs and actions without changing field editing or deletion', () => {
+  let value = normalizeDraft('guard', { sources: [{ id: 'a', domain: 'a.example.com', fallbackOnly: true },
+    { id: 'b', domain: 'b.example.com', fallbackOnly: false }], sourceState: { a: { status: 'fallback_idle' } } });
+  const state = { probes: [], ipPools: [], dnsAccounts: [], telegramBots: [] };
+  const render = () => GuardEditor({ value, state, patch: (next) => { value = { ...value, ...next }; } });
+  let tree = render();
+  const items = nodes(tree).filter((node) => node.props?.className === 'ops-source-item');
+  assert.equal(items.length, 2);
+  for (const item of items) {
+    const header = nodes(item).find((node) => node.props?.className === 'ops-source-header');
+    assert.ok(nodes(header).find((node) => node.props?.className === 'ops-source-options'));
+    assert.equal(nodes(item).filter((node) => node.props?.className === 'ops-source-field').length, 2);
+  }
+  nodes(tree).find((node) => node.props?.['aria-label'] === '来源 1 名称').props.onChange({ target: { value: 'Home' } });
+  assert.equal(value.sources[0].name, 'Home');
+  assert.equal(value.sources[0].fallbackOnly, true);
+  tree = render();
+  nodes(tree).find((node) => node.props?.['aria-label'] === '来源 1 主域名').props.onChange({ target: { value: 'new.example.com' } });
+  assert.equal(value.sources[0].domain, 'new.example.com');
+  assert.equal(value.sourceState.a, undefined);
+  tree = render();
+  nodes(tree).find((node) => node.props?.['aria-label'] === '来源 1 备用域名').props.onChange({ target: { value: 'backup.example.com' } });
+  assert.equal(value.sources[0].backupDomain, 'backup.example.com');
+  tree = render();
+  nodes(tree).find((node) => node.props?.['aria-label'] === '删除来源 1').props.onClick();
+  assert.deepEqual(Array.from(value.sources, (source) => source.id), ['b']);
+  assert.equal(value.sources[0].fallbackOnly, false);
 });
 
 test('guard form defaults to repair, conditionally exposes a bounded fill target and preserves settings on save', () => {

@@ -120,6 +120,7 @@ test('guard editor exposes default-empty bot selection and serializes changes wi
   vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone, require(path) {
     if (path === 'react') return { useState: (initial) => [initial, () => {}] };
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
+    if (path === 'lucide-react') return { Plus: 'plus-icon', Trash2: 'trash-icon', ScanSearch: 'scan-icon', LoaderCircle: 'loading-icon' };
     if (path.endsWith('polling.js')) return {};
     if (path.endsWith('telegram-permissions.js')) return telegramPermissions;
     if (path.endsWith('probe-capabilities.js')) return probeCapabilities;

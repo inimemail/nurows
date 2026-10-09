@@ -220,10 +220,19 @@
   .ops-multi label { min-height: 48px; padding: 10px; font-size: 13px; gap: 10px; }
   .ops-multi label span, .ops-multi em { white-space: normal; overflow-wrap: anywhere; }
   .ops-multi em { margin-top: 4px; font-size: 12px; }
-  .ops-source-list { gap: 14px; padding: 12px; }
-  .ops-source-row { gap: 10px; }
-  .ops-source-domain { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+  .ops-source-list { gap: 12px; padding: 0; }
+  .ops-source-item { padding: 12px; }
+  .ops-source-header { flex-wrap: wrap; gap: 4px 12px; margin-bottom: 10px; }
+  .ops-source-header .ops-source-name { width: 100%; min-height: 40px; font-size: 16px; }
+  .ops-source-options { width: 100%; justify-content: space-between; gap: 12px; }
+  .ops-source-options .ops-source-delete { width: 44px; height: 44px; min-height: 44px; }
+  .ops-source-field > span { font-size: 12px; }
+  .ops-source-row { gap: 14px; }
+  .ops-source-domain { grid-template-columns: minmax(0, 1fr) 76px; gap: 7px; }
+  .ops-source-domain .ops-source-check { height: 46px; min-height: 46px; gap: 4px; padding: 0 6px; }
   .ops-source-domain .ghost { justify-self: stretch; }
+  .ops-source-addresses { margin-top: 12px; padding-top: 10px; }
+  .ops-source-addresses em { margin-top: 0; }
   .ops-source-addresses span { font-size: 12px; padding: 6px 8px; }
   .guard-detail-summary strong { white-space: normal; overflow-wrap: anywhere; font-size: 15px; }
   .guard-ip-grid > div { padding: 12px 2px; }

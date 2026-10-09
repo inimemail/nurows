@@ -24,6 +24,23 @@ const nodes = (value) => Array.isArray(value) ? value.flatMap(nodes) : value && 
 const field = (tree, label) => nodes(tree).find((node) => node.props?.label === label);
 const text = (value) => Array.isArray(value) ? value.map(text).join('') : value && typeof value === 'object' ? text(value.props?.children) : String(value ?? '');
 
+test('source fallback toggle follows pruning, defaults off and survives editing and copying', () => {
+  let value = normalizeDraft('guard', {});
+  const state = { probes: [], ipPools: [], dnsAccounts: [], telegramBots: [] };
+  const render = () => GuardEditor({ value, state, patch: (next) => { value = { ...value, ...next }; } });
+  const label = '来源域名仅作兜底（有其他健康 IP 时跳过解析）';
+  const toggles = nodes(render()).filter((node) => node.type?.name === 'Toggle');
+  const index = toggles.findIndex((node) => node.props.children === label);
+  assert.equal(toggles[index - 1].props.children, '移除来源已不再提供的旧 IP');
+  assert.equal(toggles[index].props.checked, false);
+  toggles[index].props.onChange(true);
+  const saved = serializeDraft('guard', value);
+  assert.equal(saved.sourcesFallbackOnly, true);
+  assert.equal(normalizeDraft('guard', saved).sourcesFallbackOnly, true);
+  assert.equal(sourceStatusLabel({ status: 'fallback_idle', failedValues: ['192.0.2.1'] }), '兜底待命 · 已有其他健康 IP');
+  assert.equal(sourceStatusTone({ status: 'fallback_idle', failedValues: ['192.0.2.1'] }), 'ok');
+});
+
 test('source status distinguishes partial failures and waiting for usable IPs', () => {
   assert.equal(STATUS.waiting_ip, '等待可用 IP');
   const partial = { status: 'synced', pending: false, failedValues: ['192.0.2.1', '192.0.2.2'] };

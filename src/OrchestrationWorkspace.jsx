@@ -19,7 +19,7 @@ const STATUS = { online: '在线', offline: '离线', pending: '待接入', revo
 const EMPTY = {
   probe: { name: '', region: '', carrier: '', maxConcurrency: 100, enabled: true, alertBotIds: [] },
   target: { name: '', address: '', allowPrivate: false, checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, probeIds: [], policyId: '', enabled: true },
-  guard: { name: '', accountId: '', domain: '', recordType: 'A', recordLine: '默认', ttl: 60, maxActiveIps: 50, poolFillMode: 'repair', poolTargetCount: 50, poolSelectionMode: 'ordered', poolRebalanceEnabled: false, poolRebalanceIntervalMinutes: 30, probeIds: [], poolIds: [], alertBotIds: [], checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, maxParallel: 20, pruneStale: true, sources: [], enabled: true },
+  guard: { name: '', accountId: '', domain: '', recordType: 'A', recordLine: '默认', ttl: 60, maxActiveIps: 50, poolFillMode: 'repair', poolTargetCount: 50, poolSelectionMode: 'ordered', poolRebalanceEnabled: false, poolRebalanceIntervalMinutes: 30, probeIds: [], poolIds: [], alertBotIds: [], checkType: 'ping', port: 443, interval: 30, timeout: 5, checkRounds: 3, attemptsPerRound: 3, maxParallel: 20, pruneStale: true, sourcesFallbackOnly: false, sources: [], enabled: true },
   asset: { name: '', address: '', region: '', carrier: '', labels: '', health: 'unknown', enabled: true, note: '' },
   pool: { name: '', assetIds: [], newAssetAddresses: '', allocationMode: 'one', allocationCount: 1, selectionMode: 'ordered', enabled: true, alertEnabled: false, alertThresholds: [5, 3, 1, 0], alertBotIds: [], note: '' },
   account: { name: '', provider: 'huawei', enabled: true, credentials: {} },
@@ -685,6 +685,7 @@ function GuardEditor({ value, patch, state, api }) {
     <EditorSection title="DDNS 来源域名" />
     <div className="ops-multi"><div className="ops-multi-head"><strong>来源域名</strong><span>{sources.length} 个来源</span></div><div className="ops-source-list">{sources.map((source, index) => { const key = source.id || index; const primaryCheck = sourceChecks[`${key}:primary`]; const backupCheck = sourceChecks[`${key}:backup`]; const sourceStatus = value.sourceState?.[key]; return <div className="ops-source-item" key={key}><div className="ops-source-row"><input value={source.name || ''} placeholder="来源名称（选填）" onChange={(e) => updateSource(index, { name: e.target.value })} /><div className="ops-source-domain"><input value={source.domain || ''} placeholder="主 DDNS 完整域名" onChange={(e) => updateSource(index, { domain: e.target.value })} /><button type="button" className="ghost ops-source-check" disabled={!source.domain || primaryCheck?.checking} onClick={() => checkSource(index, 'primary')}>{primaryCheck?.checking ? '检测中' : '检测主'}</button></div><div className="ops-source-domain"><input value={source.backupDomain || ''} placeholder="备用 DDNS 域名（选填）" onChange={(e) => updateSource(index, { backupDomain: e.target.value })} /><button type="button" className="ghost ops-source-check" disabled={!source.backupDomain || backupCheck?.checking} onClick={() => checkSource(index, 'backup')}>{backupCheck?.checking ? '检测中' : '检测备'}</button></div><button type="button" className="icon-button danger" title="删除来源" onClick={() => patch({ sources: sources.filter((_, current) => current !== index) })}>×</button></div>{primaryCheck || backupCheck || sourceStatus ? <div className="ops-source-addresses">{primaryCheck?.addresses?.map((address) => <span key={`primary-${address}`}>主 · {address}</span>)}{backupCheck?.addresses?.map((address) => <span key={`backup-${address}`}>备 · {address}</span>)}{primaryCheck?.error ? <em className="warn">主：{primaryCheck.error}</em> : null}{backupCheck?.error ? <em className="warn">备：{backupCheck.error}</em> : null}{sourceStatus ? <em className={sourceStatusTone(sourceStatus)}>{sourceStatusLabel(sourceStatus)}</em> : null}{primaryCheck?.addresses?.length || backupCheck?.addresses?.length ? <em>仅检测域名解析；保存后由守护检查 IP 并同步</em> : null}</div> : null}</div>; })}<button type="button" className="ghost ops-add-source" onClick={() => patch({ sources: [...sources, { id: crypto.randomUUID(), name: '', domain: '', backupDomain: '' }] })}>添加来源</button></div></div>
     <Toggle checked={value.pruneStale} onChange={(pruneStale) => patch({ pruneStale })}>移除来源已不再提供的旧 IP</Toggle>
+    <Toggle checked={value.sourcesFallbackOnly} onChange={(sourcesFallbackOnly) => patch({ sourcesFallbackOnly })}>来源域名仅作兜底（有其他健康 IP 时跳过解析）</Toggle>
 
     <EditorSection title="备用池补位" />
     <div className="ops-editor-grid guard-pool-settings">
@@ -745,11 +746,12 @@ function sourceStatusLabel(current) {
   if (!current) return '未解析';
   if (current.status === 'synced' && current.failedValues?.length) return `已同步 · ${current.failedValues.length} 个 IP 待复检`;
   const labels = { resolving: '正在解析', checking: '等待探针检查', resolve_error: '解析失败 · 待重试',
-    probe_failed: '检查失败 · 待重试', capacity: '达到 IP 上限', ready: '检查通过 · 待写入' };
+    probe_failed: '检查失败 · 待重试', capacity: '达到 IP 上限', ready: '检查通过 · 待写入', fallback_idle: '兜底待命 · 已有其他健康 IP' };
   return labels[current.status] || (current.pending ? '待重试' : current.activeSide === 'backup' ? '备用来源已同步' : '主来源已同步');
 }
 
 function sourceStatusTone(current) {
+  if (current?.status === 'fallback_idle') return 'ok';
   return !current || current.pending || current.failedValues?.length || ['resolving', 'checking', 'capacity', 'ready'].includes(current.status) ? 'warn' : 'ok';
 }
 

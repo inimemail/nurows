@@ -102,6 +102,224 @@ async function nextSourceCycle(deps, succeeds) {
   return finishGuardChecks(deps, succeeds);
 }
 
+test('fallback sources skip primary and backup DNS while other healthy IPs exist and retain source ownership', async () => {
+  const deps = sourceGuardFixture(undefined, {
+    sourcesFallbackOnly: true, sourceOwnedValues: ['198.51.100.11'], ownedValues: ['198.51.100.11'],
+    sourceState: { home: { primary: ['198.51.100.11'], backup: ['203.0.113.30'], pending: true,
+      resolveFailed: true, lastError: 'old DNS failure' } }
+  });
+  assert.deepEqual(await nextSourceCycle(deps), ['198.51.100.10', '198.51.100.11']);
+  assert.deepEqual(deps.lookups, []);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11']);
+  const guard = deps.getState().dnsGuards[0];
+  assert.deepEqual(guard.sourceOwnedValues, ['198.51.100.11']);
+  assert.equal(guard.status, 'healthy');
+  assert.equal(guard.sourceState.home.status, 'fallback_idle');
+  assert.equal(guard.sourceState.home.pending, false);
+  assert.deepEqual(guard.sourceErrors, []);
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.lookups, [], 'repeated cycles must not resolve skipped sources');
+});
+
+test('fallback sources activate after the last non-source IP fails, even if an old source IP is healthy', async () => {
+  const deps = sourceGuardFixture(undefined, { sourcesFallbackOnly: true,
+    sourceOwnedValues: ['198.51.100.11'], ownedValues: ['198.51.100.11'] });
+  await nextSourceCycle(deps, (address) => address !== '198.51.100.10');
+  assert.ok(deps.lookups.some(([domain]) => domain === 'home.example.com'));
+  assert.deepEqual(deps.getRemote(), ['203.0.113.20', '203.0.113.21']);
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues, ['203.0.113.20', '203.0.113.21']);
+});
+
+test('one healthy non-source IP is enough to skip DNS while failed peers are removed', async () => {
+  const deps = sourceGuardFixture(undefined, { sourcesFallbackOnly: true });
+  await nextSourceCycle(deps, (address) => address === '198.51.100.10');
+  assert.deepEqual(deps.lookups, []);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10']);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.status, 'fallback_idle');
+});
+
+test('fallback applies to IPv6 and resolves sources once all external IPv6 addresses fail', async () => {
+  const deps = sourceGuardFixture(['2001:db8::10'], { recordType: 'AAAA', sourcesFallbackOnly: true });
+  deps.resolveDomainAddresses = async (domain, family) => {
+    deps.lookups.push([domain, family]); return ['2001:db8::20'];
+  };
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.lookups, []);
+  await nextSourceCycle(deps, (address) => address === '2001:db8::20');
+  assert.deepEqual(deps.lookups, [['home.example.com', 6]]);
+  assert.deepEqual(deps.getRemote(), ['2001:db8::20']);
+});
+
+test('fallback skips DNS during automatic pool balancing and never returns healthy source IPs to a pool', async () => {
+  const deps = autoBalanceFixture(5, ['a', 'b']);
+  addFillStock(deps, 3, 1, 'b');
+  const guard = deps.getState().dnsGuards[0];
+  const sourceAddress = deps.getRemote().at(-1);
+  Object.assign(guard, { sourcesFallbackOnly: true, sources: [{ id: 'home', domain: 'home.example.com' }], sourceOwnedValues: [sourceAddress] });
+  let lookups = 0;
+  deps.resolveDomainAddresses = async () => { lookups++; throw new Error('should not resolve'); };
+  await nextSourceCycle(deps);
+  assert.equal(lookups, 0);
+  assert.equal(deps.getRemote().length, 5);
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues, [sourceAddress]);
+  assert.ok(!deps.getState().ipAssets.some((asset) => asset.address === sourceAddress));
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.status, 'fallback_idle');
+  assert.equal(Object.values(deps.getState().dnsGuards[0].poolOrigins).filter((id) => id === 'b').length, 2);
+});
+
+test('fallback sources activate on empty records and use backup DNS after failed primary probes', async () => {
+  const deps = sourceGuardFixture([], { sourcesFallbackOnly: true });
+  await nextSourceCycle(deps, (address) => address === '203.0.113.30');
+  assert.deepEqual(deps.lookups.map(([domain]) => domain), ['home.example.com', 'backup.example.com']);
+  assert.deepEqual(deps.getRemote(), ['203.0.113.30']);
+});
+
+test('fallback sources do not block pool filling and return to idle after a pool IP is added', async () => {
+  const deps = sourceGuardFixture(['198.51.100.10'], {
+    sourcesFallbackOnly: true, poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 3,
+    maxActiveIps: 3, sourceOwnedValues: []
+  });
+  addFillStock(deps, 2);
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.lookups, []);
+  assert.equal(deps.getRemote().length, 3);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.status, 'fallback_idle');
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues, []);
+  assert.equal(deps.getState().ipAssets.length, 0);
+});
+
+test('fallback respects a lower fill target after failed peers are removed without creating a false deficit', async () => {
+  const deps = sourceGuardFixture(['198.51.100.10', '198.51.100.11', '198.51.100.12'], {
+    sourcesFallbackOnly: true, poolFillMode: 'fill', poolTargetCount: 1
+  });
+  await nextSourceCycle(deps, (address) => address === '198.51.100.10');
+  const guard = deps.getState().dnsGuards[0];
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10']);
+  assert.deepEqual(deps.lookups, []);
+  assert.equal(guard.status, 'healthy');
+  assert.equal(guard.repairTargetCount, 0);
+  assert.match(guard.message, /已达到目标 1 个/);
+});
+
+test('leaving fallback idle revalidates source state instead of reusing a suppressed DNS error', async () => {
+  const deps = sourceGuardFixture(undefined, { sourcesFallbackOnly: true, maxActiveIps: 2,
+    sourceOwnedValues: ['198.51.100.11'], ownedValues: ['198.51.100.11'], sourceState: { home: {
+      domains: { primary: 'home.example.com', backup: 'backup.example.com' }, primary: ['198.51.100.11'],
+      healthyValues: ['198.51.100.11'], resolvedAt: { primary: new Date().toISOString() }, resolveFailed: true, pending: true
+    } }
+  });
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.lookups, []);
+  await nextSourceCycle(deps, (address) => address !== '198.51.100.10');
+  assert.deepEqual(deps.lookups.map(([domain]) => domain), ['home.example.com']);
+  assert.deepEqual(deps.getRemote(), ['203.0.113.20', '203.0.113.21']);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.resolveFailed, undefined);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.status, 'synced');
+});
+
+test('fallback replacement resumes after restart without resolving DNS or dropping source ownership', async () => {
+  const deps = sourceGuardFixture(undefined, { sourcesFallbackOnly: true, poolFillMode: 'fill', poolTargetCount: 3,
+    poolIds: ['fill-pool'], sourceOwnedValues: ['198.51.100.11'], ownedValues: ['198.51.100.11'] });
+  addFillStock(deps, 2);
+  await runDueDnsGuards(deps);
+  await processReadyDnsGuardsWithHealthyRemote(deps);
+  assert.equal(deps.getState().dnsGuards[0].cycle.sourcesSkipped, true);
+  assert.equal(deps.getState().dnsGuards[0].cycle.phase, 'replacement');
+  const restarted = remoteDeps(normalizeOrchestrationState(deps.getState()), deps.getRemote());
+  restarted.resolveDomainAddresses = async () => { assert.fail('restart must not resolve skipped sources'); };
+  await finishGuardChecks(restarted);
+  assert.equal(restarted.getRemote().length, 3);
+  assert.deepEqual(restarted.getState().dnsGuards[0].sourceOwnedValues, ['198.51.100.11']);
+  assert.equal(restarted.getState().dnsGuards[0].sourceState.home.status, 'fallback_idle');
+});
+
+test('fallback decision and source ownership survive a provider timeout before fault removal', async () => {
+  const deps = sourceGuardFixture(['198.51.100.10', '198.51.100.11', '198.51.100.12'], {
+    sourcesFallbackOnly: true, sourceOwnedValues: ['198.51.100.11'], ownedValues: ['198.51.100.11']
+  });
+  await runDueDnsGuards(deps);
+  const guard = deps.getState().dnsGuards[0];
+  for (const check of guard.cycle.checks) {
+    const ok = check.address !== '198.51.100.12';
+    for (const probe of ok ? ['probe-1'] : guard.cycle.expectedProbeIds) {
+      check.observations[probe] = { ok, rounds: 3, attemptsPerRound: 3,
+        roundsCompleted: ok ? 1 : 3, attempts: ok ? 1 : 9 };
+    }
+  }
+  const readRecord = deps.readDnsRecord;
+  deps.readDnsRecord = async () => { throw Object.assign(new Error('timeout'), { name: 'TimeoutError' }); };
+  await processReadyDnsGuards(deps);
+  assert.equal(deps.getState().dnsGuards[0].cycle.sourcesSkipped, true);
+  assert.ok(deps.getState().dnsGuards[0].cycle.finalResults);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11', '198.51.100.12']);
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues, ['198.51.100.11']);
+  deps.readDnsRecord = readRecord;
+  let notifications = 0;
+  deps.notifyDnsGuard = () => { notifications++; };
+  await processReadyDnsGuards(deps);
+  await processReadyDnsGuards(deps);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11']);
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues, ['198.51.100.11']);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.status, 'fallback_idle');
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+  assert.deepEqual(deps.lookups, []);
+  assert.equal(notifications, 1);
+});
+
+async function processReadyDnsGuardsWithHealthyRemote(deps) {
+  const guard = deps.getState().dnsGuards[0];
+  for (const check of guard.cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  await processReadyDnsGuards(deps);
+}
+
+test('editing fallback while provider preparation is pending cannot publish the old cycle', async () => {
+  const deps = sourceGuardFixture();
+  let resolveRead;
+  deps.readDnsRecord = () => new Promise((resolve) => { resolveRead = resolve; });
+  const preparation = runDueDnsGuards(deps);
+  while (!resolveRead) await new Promise((resolve) => setImmediate(resolve));
+  await guardConfigSaver(deps)({ sourcesFallbackOnly: true });
+  resolveRead({ values: ['198.51.100.10'], recordIds: ['record-1'] });
+  await preparation;
+  assert.equal(deps.getState().dnsGuards[0].cycle, null);
+  assert.deepEqual(deps.lookups, []);
+});
+
+test('fallback sources activate again after leaving idle and DNS failure cannot prune healthy owned IPs', async () => {
+  const deps = sourceGuardFixture(undefined, { sourcesFallbackOnly: true,
+    sourceOwnedValues: ['198.51.100.11'], ownedValues: ['198.51.100.11'] });
+  await nextSourceCycle(deps);
+  deps.resolveDomainAddresses = async () => { throw new Error('DNS unavailable'); };
+  await nextSourceCycle(deps, (address) => address === '198.51.100.11');
+  assert.deepEqual(deps.getRemote(), ['198.51.100.11']);
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues, ['198.51.100.11']);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.status, 'resolve_error');
+});
+
+test('fallback config defaults off, persists through reload, preserves omitted values and accepts explicit opt-out', async () => {
+  assert.equal(normalizeOrchestrationState({ dnsGuards: [{}] }).dnsGuards[0].sourcesFallbackOnly, false);
+  const deps = sourceGuardFixture();
+  const routes = new Map();
+  registerOrchestrationRoutes(Object.fromEntries(['get', 'post', 'put', 'delete'].map((method) => [method, (path, fn) => routes.set(`${method} ${path}`, fn)])),
+    { ...deps, sanitizeState: (value) => value });
+  const save = async (setting) => {
+    const body = { ...deps.getState().dnsGuards[0] };
+    if (setting === undefined) delete body.sourcesFallbackOnly;
+    else body.sourcesFallbackOnly = setting;
+    await routes.get('put /api/orchestration/:resource/:id')({ params: { resource: 'dns-guards', id: 'guard-1' },
+      auth: { username: 'test' }, body }, { json() {} }, (error) => { throw error; });
+  };
+  await save(true);
+  assert.equal(deps.getState().dnsGuards[0].sourcesFallbackOnly, true);
+  assert.equal(normalizeOrchestrationState(deps.getState()).dnsGuards[0].sourcesFallbackOnly, true);
+  await save(undefined);
+  assert.equal(deps.getState().dnsGuards[0].sourcesFallbackOnly, true);
+  await save(false);
+  assert.equal(deps.getState().dnsGuards[0].sourcesFallbackOnly, false);
+  await nextSourceCycle(deps);
+  assert.ok(deps.lookups.length > 0, 'opt-out restores normal source synchronization');
+});
+
 function addFillStock(deps, count, start = 1, poolId = 'fill-pool') {
   const state = deps.getState();
   let pool = state.ipPools.find((item) => item.id === poolId);

@@ -1657,7 +1657,8 @@ function dnsGuardPreparationKey(guard) {
     poolRebalanceEnabled: guard.poolRebalanceEnabled,
     poolRebalanceIntervalMinutes: guard.poolRebalanceIntervalMinutes,
     sources: guard.sources,
-    pruneStale: guard.pruneStale
+    pruneStale: guard.pruneStale,
+    sourcesFallbackOnly: guard.sourcesFallbackOnly
   });
 }
 
@@ -1768,7 +1769,16 @@ function dnsGuardPoolTarget(guard, remoteValues) {
 
 async function startDnsGuardReplacement(guard, cycle, failedRemote, deps) {
   const healthyRemote = (cycle.remoteValues || []).filter((address) => !failedRemote.includes(address));
-  const sourceResult = await resolveDnsGuardCycleSources(guard, cycle, healthyRemote, deps);
+  const sourceOwned = guard.sourcesFallbackOnly === true ? new Set(guard.sourceOwnedValues || []) : null;
+  const sourcesSkipped = Boolean(sourceOwned && healthyRemote.some((address) => !sourceOwned.has(address)));
+  // Skipped DNS must not be treated as an empty answer or a probe failure.
+  const sourceResult = sourcesSkipped ? {
+    values: [], candidates: {}, errors: [],
+    state: Object.fromEntries((guard.sources || []).map((source) => {
+      const key = source.id || source.domain;
+      return [key, { ...structuredClone(guard.sourceState?.[key] || {}), status: 'fallback_idle', pending: false, lastError: '' }];
+    }))
+  } : await resolveDnsGuardCycleSources(guard, cycle, healthyRemote, deps);
   if (!deps.readState(['dnsGuards']).dnsGuards.some((item) => item.id === guard.id && item.cycle?.id === cycle.id)) return;
   // DDNS additions use the configured capacity. Pool consumption follows the
   // explicit fill target or the original population and its outstanding deficit.
@@ -1780,7 +1790,8 @@ async function startDnsGuardReplacement(guard, cycle, failedRemote, deps) {
     ...cycle,
     startedAt: nowIso(),
     phase: 'sources',
-    sourceSync: true,
+    sourceSync: !sourcesSkipped,
+    sourcesSkipped,
     failedRemote,
     targetCount,
     replacementNeeded: Math.max(0, targetCount - healthyRemote.length),
@@ -1840,9 +1851,9 @@ function saveDnsGuardCandidateCycle(guard, cycle, deps) {
 async function advanceDnsGuardSources(guard, cycle, deps) {
   if (!deps.readState(['dnsGuards']).dnsGuards.some((item) => item.id === guard.id && item.cycle?.id === cycle.id)) return;
   const results = dnsGuardCycleResults(cycle);
-  const selected = selectHealthyDnsGuardSources(guard.sources, cycle.sourceCandidates, cycle.sourceState, results);
+  const selected = selectHealthyDnsGuardSources(cycle.sourcesSkipped ? [] : guard.sources, cycle.sourceCandidates, cycle.sourceState, results);
   const healthyRemote = (cycle.remoteValues || []).filter((address) => results.get(address)?.ok);
-  if (cycle.phase === 'sources') {
+  if (cycle.phase === 'sources' && !cycle.sourcesSkipped) {
     const family = guard.recordType === 'AAAA' ? 6 : 4;
     for (const source of guard.sources || []) {
       const key = source.id || source.domain;
@@ -1856,7 +1867,7 @@ async function advanceDnsGuardSources(guard, cycle, deps) {
       }
     }
   }
-  const protectedRemote = guard.pruneStale === false ? healthyRemote
+  const protectedRemote = cycle.sourcesSkipped || guard.pruneStale === false ? healthyRemote
     : healthyRemote.filter((address) => !(guard.sourceOwnedValues || []).includes(address));
   const occupied = new Set([...protectedRemote, ...selected.values]);
   const full = occupied.size >= (guard.maxActiveIps || DNS_GUARD_MAX_VALUES);
@@ -1870,7 +1881,7 @@ async function advanceDnsGuardSources(guard, cycle, deps) {
   }
   // Probe primary addresses first. A healthy primary never waits for backup
   // DNS or backup probes; only sources without a healthy primary fall back.
-  const fallbackSources = full ? [] : (guard.sources || []).filter((source) => {
+  const fallbackSources = full || cycle.sourcesSkipped ? [] : (guard.sources || []).filter((source) => {
     const key = source.id || source.domain;
     const entry = cycle.sourceState[key];
     const primary = cycle.sourceCandidates[key]?.primary || [];
@@ -2049,7 +2060,7 @@ export async function resolveDnsGuardSources(guard, currentValues, resolveAddres
     const refreshing = sharedFlight && sharedFlight.epoch === dnsGuardSourceEpochs.get(primaryKey);
     const fresh = Number.isFinite(primaryResolvedAt) && now >= primaryResolvedAt
       && now - primaryResolvedAt < DNS_GUARD_SOURCE_REFRESH_INTERVAL_MS;
-    if (side === 'primary' && fresh && !sharedChanged && !refreshing && domainsMatch && !previous.pending && cachedActive.length
+    if (side === 'primary' && previous.status !== 'fallback_idle' && fresh && !sharedChanged && !refreshing && domainsMatch && !previous.pending && cachedActive.length
       && (previous.status === 'capacity' ? atCapacity : cachedActive.every((address) => currentValues.includes(address)))) {
       state[key] = { ...previous, domains, activeSide, pending: false };
       candidates[key] = { primary: activeSide === 'primary' ? cachedActive : [], backup: activeSide === 'backup' ? cachedActive : [] };
@@ -2391,20 +2402,20 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
   const remote = cycle.remoteValues || [];
   const failedRemote = cycle.failedRemote || remote.filter((address) => !resultByAddress.get(address)?.ok);
   const healthyRemote = remote.filter((address) => resultByAddress.get(address)?.ok);
-  const selectedSources = cycle.sourceSync || cycle.phase === 'replacement'
+  const selectedSources = !cycle.sourcesSkipped && (cycle.sourceSync || cycle.phase === 'replacement')
     ? selectHealthyDnsGuardSources(guard.sources, cycle.sourceCandidates, cycle.sourceState, resultByAddress)
-    : { values: [], state: structuredClone(guard.sourceState || {}) };
+    : { values: [], state: structuredClone(cycle.sourcesSkipped ? cycle.sourceState : guard.sourceState || {}) };
   const healthySources = [...new Set([
     ...(!cycle.sourceSync || Object.values(selectedSources.state).some((entry) => entry.pending)
       ? (guard.sourceOwnedValues || []).filter((address) => healthyRemote.includes(address)) : []),
     ...selectedSources.values
   ])];
-  const staleOwned = (!cycle.sourceSync && cycle.phase !== 'replacement') || guard.pruneStale === false
+  const staleOwned = cycle.sourcesSkipped || (!cycle.sourceSync && cycle.phase !== 'replacement') || guard.pruneStale === false
     ? new Set()
     : new Set((guard.sourceOwnedValues || []).filter((address) => !healthySources.includes(address)));
   const desired = healthyRemote.filter((address) => !staleOwned.has(address));
   const capacity = guard.maxActiveIps || DNS_GUARD_MAX_VALUES;
-  const targetCount = Math.min(capacity, cycle.sourceSync || cycle.phase === 'replacement' ? Math.max(1, Number(cycle.targetCount) || remote.length || 1) : remote.length);
+  const targetCount = Math.min(capacity, cycle.sourceSync || cycle.sourcesSkipped || cycle.phase === 'replacement' ? Math.max(1, Number(cycle.targetCount) || remote.length || 1) : remote.length);
   for (const address of healthySources) if (!desired.includes(address) && desired.length < capacity) desired.push(address);
   const usedAssets = [];
   const unusableAssets = [];
@@ -2532,7 +2543,7 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
     committed = true;
     const cycleSnapshot = structuredClone(cycle);
     const sourceState = selectedSources.state;
-    for (const source of item.sources || []) {
+    for (const source of cycle.sourcesSkipped ? [] : item.sources || []) {
       const key = source.id || source.domain;
       const entry = sourceState[key];
       if (!entry) continue;
@@ -2930,6 +2941,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
       attemptsPerRound: clampNumber(input.attemptsPerRound, 1, 10, 3),
       maxParallel: clampNumber(input.maxParallel, 1, 300, 20),
       pruneStale: input.pruneStale !== false,
+      sourcesFallbackOnly: (input.sourcesFallbackOnly ?? existing?.sourcesFallbackOnly) === true,
       sources,
       enabled: input.enabled !== false,
       status: 'queued',
@@ -4233,6 +4245,7 @@ function normalizeDnsGuardState(value = {}) {
     maxParallel: clampNumber(value.maxParallel, 1, 300, 20),
     sources: normalizeDdnsSources(value.sources || value.ddnsSources),
     pruneStale: value.pruneStale !== false,
+    sourcesFallbackOnly: value.sourcesFallbackOnly === true,
     enabled: value.enabled !== false,
     status: cleanText(value.status, 40) || 'queued',
     message: cleanText(value.message, 300),

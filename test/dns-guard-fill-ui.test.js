@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import * as probeCapabilities from '../shared/probe-capabilities.js';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import vm from 'node:vm';
 import test from 'node:test';
 import { transformSync } from 'esbuild';
@@ -11,7 +12,7 @@ const source = fs.readFileSync(new URL('../src/OrchestrationWorkspace.jsx', impo
 const compiled = transformSync(`${source}\nexport { GuardEditor, PoolEditor, normalizeDraft, serializeDraft, sourceStatusLabel, sourceStatusTone, STATUS };`, { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
 const jsx = (type, props) => ({ type, props });
 const module = { exports: {} };
-vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone, require(path) {
+vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone, crypto, require(path) {
   if (path === 'react') return { useState: (value) => [typeof value === 'function' ? value() : value, () => {}] };
   if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
   if (path.endsWith('telegram-permissions.js')) return permissions;
@@ -24,19 +25,25 @@ const nodes = (value) => Array.isArray(value) ? value.flatMap(nodes) : value && 
 const field = (tree, label) => nodes(tree).find((node) => node.props?.label === label);
 const text = (value) => Array.isArray(value) ? value.map(text).join('') : value && typeof value === 'object' ? text(value.props?.children) : String(value ?? '');
 
-test('source fallback toggle follows pruning, defaults off and survives editing and copying', () => {
-  let value = normalizeDraft('guard', {});
+test('each source has an independent fallback switch that survives editing and copying', () => {
+  let value = normalizeDraft('guard', { sources: [{ id: 'a', domain: 'a.example.com' }, { id: 'b', domain: 'b.example.com' }] });
   const state = { probes: [], ipPools: [], dnsAccounts: [], telegramBots: [] };
   const render = () => GuardEditor({ value, state, patch: (next) => { value = { ...value, ...next }; } });
-  const label = '来源域名仅作兜底（有其他健康 IP 时跳过解析）';
-  const toggles = nodes(render()).filter((node) => node.type?.name === 'Toggle');
-  const index = toggles.findIndex((node) => node.props.children === label);
-  assert.equal(toggles[index - 1].props.children, '移除来源已不再提供的旧 IP');
-  assert.equal(toggles[index].props.checked, false);
-  toggles[index].props.onChange(true);
+  const toggles = nodes(render()).filter((node) => node.type?.name === 'Toggle' && node.props.className === 'ops-source-fallback');
+  assert.equal(toggles.length, 2);
+  assert.equal(toggles[0].props.switchControl, true);
+  assert.equal(toggles[0].props.checked, false);
+  assert.equal(toggles[1].props.checked, false);
+  toggles[0].props.onChange(true);
   const saved = serializeDraft('guard', value);
-  assert.equal(saved.sourcesFallbackOnly, true);
-  assert.equal(normalizeDraft('guard', saved).sourcesFallbackOnly, true);
+  assert.deepEqual(Array.from(saved.sources, (source) => source.fallbackOnly), [true, false]);
+  assert.deepEqual(Array.from(normalizeDraft('guard', saved).sources, (source) => source.fallbackOnly), [true, false]);
+  const migrated = normalizeDraft('guard', { sourcesFallbackOnly: true, sources: [{ domain: 'old.example.com' }, { domain: 'explicit.example.com', fallbackOnly: false }] });
+  assert.deepEqual(Array.from(migrated.sources, (source) => source.fallbackOnly), [true, false]);
+  assert.equal(migrated.sourcesFallbackOnly, false);
+  const add = nodes(render()).find((node) => node.type === 'button' && node.props.children === '添加来源');
+  add.props.onClick();
+  assert.equal(value.sources.at(-1).fallbackOnly, false);
   assert.equal(sourceStatusLabel({ status: 'fallback_idle', failedValues: ['192.0.2.1'] }), '兜底待命 · 已有其他健康 IP');
   assert.equal(sourceStatusTone({ status: 'fallback_idle', failedValues: ['192.0.2.1'] }), 'ok');
 });

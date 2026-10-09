@@ -102,6 +102,114 @@ async function nextSourceCycle(deps, succeeds) {
   return finishGuardChecks(deps, succeeds);
 }
 
+function mixedFallbackFixture() {
+  return sourceGuardFixture(['198.51.100.10', '198.51.100.11', '198.51.100.12'], {
+    sources: [{ id: 'home', domain: 'home.example.com', fallbackOnly: true },
+      { id: 'always', domain: 'always.example.com', fallbackOnly: false }],
+    sourceOwnedValues: ['198.51.100.11', '198.51.100.12'],
+    ownedValues: ['198.51.100.11', '198.51.100.12'],
+    sourceState: { home: { primary: ['198.51.100.11'], healthyValues: ['198.51.100.11'] },
+      always: { primary: ['198.51.100.12'], healthyValues: ['198.51.100.12'] } }
+  });
+}
+
+test('mixed source switches skip only fallback DNS and preserve its healthy IP while pruning an active source', async () => {
+  const deps = mixedFallbackFixture();
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.lookups.map(([domain]) => domain), ['always.example.com']);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11', '203.0.113.30']);
+  const guard = deps.getState().dnsGuards[0];
+  assert.deepEqual(guard.sourceOwnedValues, ['198.51.100.11', '203.0.113.30']);
+  assert.equal(guard.sourceState.home.status, 'fallback_idle');
+  assert.equal(guard.sourceState.always.status, 'synced');
+});
+
+test('mixed fallback activates when the last external IP fails even while another source remains healthy', async () => {
+  const deps = mixedFallbackFixture();
+  await nextSourceCycle(deps, (address) => address !== '198.51.100.10');
+  assert.deepEqual(deps.lookups.map(([domain]) => domain).sort(), ['always.example.com', 'home.example.com']);
+  assert.deepEqual(deps.getRemote(), ['203.0.113.20', '203.0.113.21', '203.0.113.30']);
+});
+
+test('mixed fallback preserves a healthy IP shared with an active source that no longer offers it', async () => {
+  const deps = mixedFallbackFixture();
+  deps.getState().dnsGuards[0].sourceState.always.primary.push('198.51.100.11');
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11', '203.0.113.30']);
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues, ['198.51.100.11', '203.0.113.30']);
+});
+
+test('mixed fallback preserves legacy source ownership without evidence but still prunes known active ownership', async () => {
+  const deps = mixedFallbackFixture();
+  delete deps.getState().dnsGuards[0].sourceState.home;
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11', '203.0.113.30']);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.status, 'fallback_idle');
+});
+
+test('mixed fallback counts retained idle IPs toward capacity and does not dispatch unnecessary source probes', async () => {
+  const deps = mixedFallbackFixture();
+  deps.getState().dnsGuards[0].maxActiveIps = 2;
+  await deps.writeDnsRecord(null, null, null, null, ['198.51.100.10', '198.51.100.11']);
+  const checked = await nextSourceCycle(deps);
+  assert.deepEqual(checked, ['198.51.100.10', '198.51.100.11']);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11']);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.status, 'fallback_idle');
+  assert.equal(deps.getState().dnsGuards[0].sourceState.always.status, 'capacity');
+});
+
+test('mixed fallback removes failed idle IPs and fills from pools without resolving that source', async () => {
+  const deps = mixedFallbackFixture();
+  Object.assign(deps.getState().dnsGuards[0], { poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 3 });
+  addFillStock(deps, 1);
+  await nextSourceCycle(deps, (address) => address !== '198.51.100.11');
+  assert.deepEqual(deps.lookups.map(([domain]) => domain), ['always.example.com']);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '203.0.113.30', '203.0.113.1']);
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues, ['203.0.113.30']);
+  assert.equal(deps.getState().ipAssets.length, 0);
+});
+
+test('an active source can use its backup without awakening another fallback-only source', async () => {
+  const deps = mixedFallbackFixture();
+  deps.getState().dnsGuards[0].sources[1].backupDomain = 'always-backup.example.com';
+  deps.resolveDomainAddresses = async (domain, family) => {
+    deps.lookups.push([domain, family]);
+    return domain === 'always.example.com' ? ['203.0.113.30'] : ['203.0.113.40'];
+  };
+  await nextSourceCycle(deps, (address) => address !== '203.0.113.30');
+  assert.deepEqual(deps.lookups.map(([domain]) => domain), ['always.example.com', 'always-backup.example.com']);
+  assert.deepEqual(deps.getRemote(), ['198.51.100.10', '198.51.100.11', '203.0.113.40']);
+  assert.equal(deps.getState().dnsGuards[0].sourceState.home.status, 'fallback_idle');
+  assert.equal(deps.getState().dnsGuards[0].sourceState.always.activeSide, 'backup');
+});
+
+test('mixed fallback keeps an immutable ownership snapshot across provider retry and restart', async () => {
+  const deps = mixedFallbackFixture();
+  await runDueDnsGuards(deps);
+  await processReadyDnsGuardsWithHealthyRemote(deps);
+  const guard = deps.getState().dnsGuards[0];
+  assert.equal(guard.cycle.phase, 'sources');
+  assert.deepEqual(guard.cycle.skippedSourceIds, ['home']);
+  for (const check of guard.cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  deps.readDnsRecord = async () => { throw Object.assign(new Error('timeout'), { name: 'TimeoutError' }); };
+  await processReadyDnsGuards(deps);
+  assert.ok(deps.getState().dnsGuards[0].cycle.finalResults);
+  const restarted = remoteDeps(normalizeOrchestrationState(deps.getState()), deps.getRemote());
+  restarted.resolveDomainAddresses = async () => assert.fail('retry must reuse completed source checks');
+  await processReadyDnsGuards(restarted);
+  assert.deepEqual(restarted.getRemote(), ['198.51.100.10', '198.51.100.11', '203.0.113.30']);
+  assert.deepEqual(restarted.getState().dnsGuards[0].sourceOwnedValues, ['198.51.100.11', '203.0.113.30']);
+});
+
+test('per-source fallback configuration persists independently and overrides the legacy task default', async () => {
+  const deps = mixedFallbackFixture();
+  const saved = await guardConfigSaver(deps)({ sourcesFallbackOnly: true });
+  assert.deepEqual(saved.sources.map((source) => source.fallbackOnly), [true, false]);
+  assert.deepEqual(normalizeOrchestrationState(deps.getState()).dnsGuards[0].sources.map((source) => source.fallbackOnly), [true, false]);
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.lookups.map(([domain]) => domain), ['always.example.com']);
+});
+
 test('fallback sources skip primary and backup DNS while other healthy IPs exist and retain source ownership', async () => {
   const deps = sourceGuardFixture(undefined, {
     sourcesFallbackOnly: true, sourceOwnedValues: ['198.51.100.11'], ownedValues: ['198.51.100.11'],
@@ -316,6 +424,8 @@ test('fallback config defaults off, persists through reload, preserves omitted v
   assert.equal(deps.getState().dnsGuards[0].sourcesFallbackOnly, true);
   await save(false);
   assert.equal(deps.getState().dnsGuards[0].sourcesFallbackOnly, false);
+  assert.equal(deps.getState().dnsGuards[0].sources[0].fallbackOnly, true, 'explicit source settings override the legacy default');
+  await guardConfigSaver(deps)({ sources: deps.getState().dnsGuards[0].sources.map((source) => ({ ...source, fallbackOnly: false })) });
   await nextSourceCycle(deps);
   assert.ok(deps.lookups.length > 0, 'opt-out restores normal source synchronization');
 });
@@ -2047,7 +2157,7 @@ test('keeps primary and backup DDNS domains paired during normalization', () => 
     dnsGuards: [{ id: 'guard-1', recordType: 'A', sources: [{ id: 'home', name: '家庭宽带', domain: 'home.example.com', backupDomain: 'home-backup.example.com' }] }]
   });
   assert.deepEqual(normalized.dnsGuards[0].sources, [{
-    id: 'home', name: '家庭宽带', domain: 'home.example.com', backupDomain: 'home-backup.example.com'
+    id: 'home', name: '家庭宽带', domain: 'home.example.com', backupDomain: 'home-backup.example.com', fallbackOnly: false
   }]);
 });
 
@@ -2064,7 +2174,7 @@ test('migrates legacy flattened backup sources back into a primary pair', () => 
   });
 
   assert.deepEqual(normalized.dnsGuards[0].sources, [{
-    id: 'home', name: '家庭宽带', domain: 'home.example.com', backupDomain: 'home-backup.example.com'
+    id: 'home', name: '家庭宽带', domain: 'home.example.com', backupDomain: 'home-backup.example.com', fallbackOnly: false
   }]);
 });
 

@@ -1769,16 +1769,22 @@ function dnsGuardPoolTarget(guard, remoteValues) {
 
 async function startDnsGuardReplacement(guard, cycle, failedRemote, deps) {
   const healthyRemote = (cycle.remoteValues || []).filter((address) => !failedRemote.includes(address));
-  const sourceOwned = guard.sourcesFallbackOnly === true ? new Set(guard.sourceOwnedValues || []) : null;
-  const sourcesSkipped = Boolean(sourceOwned && healthyRemote.some((address) => !sourceOwned.has(address)));
+  const sources = guard.sources || [];
+  const fallbackSources = sources.filter((source) => (source.fallbackOnly ?? guard.sourcesFallbackOnly) === true);
+  const sourceOwned = fallbackSources.length ? new Set(guard.sourceOwnedValues || []) : null;
+  const skippedSourceIds = sourceOwned && healthyRemote.some((address) => !sourceOwned.has(address))
+    ? fallbackSources.map((source) => source.id || source.domain) : [];
+  const skipped = new Set(skippedSourceIds);
+  const activeSources = sources.filter((source) => !skipped.has(source.id || source.domain));
+  const sourcesSkipped = Boolean(skipped.size && !activeSources.length);
+  const idleOwnedValues = dnsGuardIdleOwnedValues(guard, { sourcesSkipped, skippedSourceIds });
   // Skipped DNS must not be treated as an empty answer or a probe failure.
-  const sourceResult = sourcesSkipped ? {
-    values: [], candidates: {}, errors: [],
-    state: Object.fromEntries((guard.sources || []).map((source) => {
-      const key = source.id || source.domain;
-      return [key, { ...structuredClone(guard.sourceState?.[key] || {}), status: 'fallback_idle', pending: false, lastError: '' }];
-    }))
-  } : await resolveDnsGuardCycleSources(guard, cycle, healthyRemote, deps);
+  const sourceResult = activeSources.length
+    ? await resolveDnsGuardCycleSources({ ...guard, sources: activeSources }, cycle, healthyRemote, deps)
+    : { values: [], candidates: {}, errors: [], state: {} };
+  for (const key of skippedSourceIds) sourceResult.state[key] = {
+    ...structuredClone(guard.sourceState?.[key] || {}), status: 'fallback_idle', pending: false, lastError: ''
+  };
   if (!deps.readState(['dnsGuards']).dnsGuards.some((item) => item.id === guard.id && item.cycle?.id === cycle.id)) return;
   // DDNS additions use the configured capacity. Pool consumption follows the
   // explicit fill target or the original population and its outstanding deficit.
@@ -1792,6 +1798,8 @@ async function startDnsGuardReplacement(guard, cycle, failedRemote, deps) {
     phase: 'sources',
     sourceSync: !sourcesSkipped,
     sourcesSkipped,
+    skippedSourceIds,
+    idleOwnedValues,
     failedRemote,
     targetCount,
     replacementNeeded: Math.max(0, targetCount - healthyRemote.length),
@@ -1830,6 +1838,31 @@ function dnsGuardCycleResults(cycle) {
   ]);
 }
 
+function dnsGuardActiveSources(guard, cycle) {
+  if (cycle.sourcesSkipped) return [];
+  const skipped = new Set(cycle.skippedSourceIds || []);
+  return (guard.sources || []).filter((source) => !skipped.has(source.id || source.domain));
+}
+
+function dnsGuardIdleOwnedValues(guard, cycle) {
+  if (Array.isArray(cycle.idleOwnedValues)) return cycle.idleOwnedValues;
+  if (cycle.sourcesSkipped) return guard.sourceOwnedValues || [];
+  if (!cycle.skippedSourceIds?.length) return [];
+  const skipped = new Set(cycle.skippedSourceIds);
+  const known = new Set(), idle = new Set();
+  for (const source of guard.sources || []) {
+    const key = source.id || source.domain;
+    const entry = guard.sourceState?.[key] || {};
+    for (const address of [...(entry.primary || []), ...(entry.backup || []), ...(entry.cached || []),
+      ...(entry.healthyValues || []), ...(entry.syncedValues || [])]) {
+      known.add(address);
+      if (skipped.has(key)) idle.add(address);
+    }
+  }
+  // Legacy ownership may lack per-source evidence; preserve it until a full sync.
+  return (guard.sourceOwnedValues || []).filter((address) => idle.has(address) || !known.has(address));
+}
+
 function saveDnsGuardCandidateCycle(guard, cycle, deps) {
   let active = false;
   deps.updateState((draft) => {
@@ -1851,11 +1884,12 @@ function saveDnsGuardCandidateCycle(guard, cycle, deps) {
 async function advanceDnsGuardSources(guard, cycle, deps) {
   if (!deps.readState(['dnsGuards']).dnsGuards.some((item) => item.id === guard.id && item.cycle?.id === cycle.id)) return;
   const results = dnsGuardCycleResults(cycle);
-  const selected = selectHealthyDnsGuardSources(cycle.sourcesSkipped ? [] : guard.sources, cycle.sourceCandidates, cycle.sourceState, results);
+  const activeSources = dnsGuardActiveSources(guard, cycle);
+  const selected = selectHealthyDnsGuardSources(activeSources, cycle.sourceCandidates, cycle.sourceState, results);
   const healthyRemote = (cycle.remoteValues || []).filter((address) => results.get(address)?.ok);
   if (cycle.phase === 'sources' && !cycle.sourcesSkipped) {
     const family = guard.recordType === 'AAAA' ? 6 : 4;
-    for (const source of guard.sources || []) {
+    for (const source of activeSources) {
       const key = source.id || source.domain;
       const candidates = cycle.sourceCandidates?.[key] || {};
       for (const [side, domain] of [['primary', source.domain], ['backup', source.backupDomain || '']]) {
@@ -1867,8 +1901,9 @@ async function advanceDnsGuardSources(guard, cycle, deps) {
       }
     }
   }
-  const protectedRemote = cycle.sourcesSkipped || guard.pruneStale === false ? healthyRemote
-    : healthyRemote.filter((address) => !(guard.sourceOwnedValues || []).includes(address));
+  const idleOwned = new Set(dnsGuardIdleOwnedValues(guard, cycle));
+  const protectedRemote = guard.pruneStale === false ? healthyRemote
+    : healthyRemote.filter((address) => !(guard.sourceOwnedValues || []).includes(address) || idleOwned.has(address));
   const occupied = new Set([...protectedRemote, ...selected.values]);
   const full = occupied.size >= (guard.maxActiveIps || DNS_GUARD_MAX_VALUES);
   if (!full && cycle.remainingAddresses.length) {
@@ -1881,7 +1916,7 @@ async function advanceDnsGuardSources(guard, cycle, deps) {
   }
   // Probe primary addresses first. A healthy primary never waits for backup
   // DNS or backup probes; only sources without a healthy primary fall back.
-  const fallbackSources = full || cycle.sourcesSkipped ? [] : (guard.sources || []).filter((source) => {
+  const fallbackSources = full ? [] : activeSources.filter((source) => {
     const key = source.id || source.domain;
     const entry = cycle.sourceState[key];
     const primary = cycle.sourceCandidates[key]?.primary || [];
@@ -2403,9 +2438,10 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
   const failedRemote = cycle.failedRemote || remote.filter((address) => !resultByAddress.get(address)?.ok);
   const healthyRemote = remote.filter((address) => resultByAddress.get(address)?.ok);
   const selectedSources = !cycle.sourcesSkipped && (cycle.sourceSync || cycle.phase === 'replacement')
-    ? selectHealthyDnsGuardSources(guard.sources, cycle.sourceCandidates, cycle.sourceState, resultByAddress)
+    ? selectHealthyDnsGuardSources(dnsGuardActiveSources(guard, cycle), cycle.sourceCandidates, cycle.sourceState, resultByAddress)
     : { values: [], state: structuredClone(cycle.sourcesSkipped ? cycle.sourceState : guard.sourceState || {}) };
   const healthySources = [...new Set([
+    ...dnsGuardIdleOwnedValues(guard, cycle).filter((address) => healthyRemote.includes(address)),
     ...(!cycle.sourceSync || Object.values(selectedSources.state).some((entry) => entry.pending)
       ? (guard.sourceOwnedValues || []).filter((address) => healthyRemote.includes(address)) : []),
     ...selectedSources.values
@@ -2543,7 +2579,7 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
     committed = true;
     const cycleSnapshot = structuredClone(cycle);
     const sourceState = selectedSources.state;
-    for (const source of cycle.sourcesSkipped ? [] : item.sources || []) {
+    for (const source of dnsGuardActiveSources(item, cycle)) {
       const key = source.id || source.domain;
       const entry = sourceState[key];
       if (!entry) continue;
@@ -2897,7 +2933,8 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     const fillChanged = existing && ((existing.poolFillMode || 'repair') !== poolFillMode
       || (poolFillMode === 'fill' && (existing.poolTargetCount ?? existing.maxActiveIps ?? 50) !== poolTargetCount));
     validateDdnsSources(input.sources || input.ddnsSources);
-    const sources = normalizeDdnsSources(input.sources || input.ddnsSources);
+    const sources = normalizeDdnsSources(input.sources || input.ddnsSources,
+      (input.sourcesFallbackOnly ?? existing?.sourcesFallbackOnly) === true);
     const targetChanged = Boolean(existing && (existing.accountId !== accountId || existing.domain !== domain || existing.recordType !== recordType));
     const rebalanceReset = !poolRebalanceEnabled || !existing?.poolRebalanceEnabled || targetChanged
       || (existing?.enabled === false && input.enabled !== false) || !sameStringSet(poolIds, existing?.poolIds);
@@ -4152,7 +4189,7 @@ async function discoverProviderRecordIds(account, credentials, zone, binding) {
   return (data.Response?.RecordList || []).map((item) => String(item.RecordId));
 }
 
-function normalizeDdnsSources(value) {
+function normalizeDdnsSources(value, fallbackDefault = null) {
   if (!Array.isArray(value)) return [];
   const result = [];
   const domains = new Set();
@@ -4182,7 +4219,8 @@ function normalizeDdnsSources(value) {
       id: itemId,
       name: itemName,
       domain,
-      backupDomain
+      backupDomain,
+      ...(fallbackDefault !== null ? { fallbackOnly: (item.fallbackOnly ?? fallbackDefault) === true } : {})
     });
     if (legacyBackup) index += 1;
   }
@@ -4243,7 +4281,7 @@ function normalizeDnsGuardState(value = {}) {
     checkRounds: clampNumber(value.checkRounds, 1, 10, 3),
     attemptsPerRound: clampNumber(value.attemptsPerRound, 1, 10, 3),
     maxParallel: clampNumber(value.maxParallel, 1, 300, 20),
-    sources: normalizeDdnsSources(value.sources || value.ddnsSources),
+    sources: normalizeDdnsSources(value.sources || value.ddnsSources, value.sourcesFallbackOnly === true),
     pruneStale: value.pruneStale !== false,
     sourcesFallbackOnly: value.sourcesFallbackOnly === true,
     enabled: value.enabled !== false,

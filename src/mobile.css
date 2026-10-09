@@ -222,7 +222,7 @@
   .ops-multi em { margin-top: 4px; font-size: 12px; }
   .ops-source-list { gap: 14px; padding: 12px; }
   .ops-source-row { gap: 10px; }
-  .ops-source-domain { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .ops-source-domain { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
   .ops-source-domain .ghost { justify-self: stretch; }
   .ops-source-addresses span { font-size: 12px; padding: 6px 8px; }
   .guard-detail-summary strong { white-space: normal; overflow-wrap: anywhere; font-size: 15px; }

@@ -309,7 +309,8 @@ test('finished incident cleanup preserves live allocations and rollback recovery
 test('route adapter propagates web validation and does not serialize full application state', async () => {
   let state = { ...orchestrationDefaults(), ipAssets: [{ id: 'a', address: '192.0.2.1' }], dnsGuards: [{ ...guard(), cycle: { id: 'c' } }] };
   const calls = [];
-  const invoke = createTelegramActions({ readState: () => state, updateState(fn) { state = fn(structuredClone(state)); return state; }, sanitizeState() { throw new Error('full serialization'); } }, { request: (...args) => calls.push(args) });
+  let liveUses = [{ address: '192.0.2.1', name: 'live' }];
+  const invoke = createTelegramActions({ runningAutomationIpUses: () => liveUses, readState: () => state, updateState(fn) { state = fn(structuredClone(state)); return state; }, sanitizeState() { throw new Error('full serialization'); } }, { request: (...args) => calls.push(args) });
   await assert.rejects(invoke('DELETE', '/api/orchestration/:resource/:id', { resource: 'ip-assets', id: 'a' }, {}, 'test'), /正在使用或被任务占用/);
   await assert.rejects(invoke('POST', '/api/dns-guards/:id/check-now', { id: 'g' }, {}, 'test'), /守护检查正在执行/);
   assert.equal(state.dnsGuards[0].cycle.id, 'c');
@@ -317,6 +318,7 @@ test('route adapter propagates web validation and does not serialize full applic
   await assert.rejects(invoke('POST', '/api/dynamic-guards/:id/change', { id: 'd' }, {}, 'test'), /请确认/);
   assert.deepEqual(calls, [['d']]);
   state.dnsGuards = [];
+  liveUses = [];
   const result = await invoke('DELETE', '/api/orchestration/:resource/:id', { resource: 'ip-assets', id: 'a' }, {}, 'test');
   assert.equal(result.state, undefined);
   assert.equal(state.ipAssets.length, 0);

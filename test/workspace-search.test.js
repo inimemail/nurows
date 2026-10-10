@@ -106,6 +106,7 @@ function harness() {
   vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone, require(path) {
     if (path === 'react') return { useState, useMemo: (fn) => fn(), useRef: (current) => useState({ current })[0], useEffect: (fn) => effects.push(fn) };
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
+    if (path === 'lucide-react') return {};
     if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return search;
     if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };

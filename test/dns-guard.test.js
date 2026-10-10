@@ -461,6 +461,111 @@ function guardConfigSaver(deps) {
   };
 }
 
+for (const phase of ['read', 'write']) test(`manual candidate deletion during provider ${phase} cannot race a DNS commit`, async () => {
+  const deps = sourceGuardFixture(['198.51.100.10'], { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 2 });
+  addFillStock(deps, 1);
+  await runDueDnsGuards(deps);
+  await processReadyDnsGuardsWithHealthyRemote(deps);
+  assert.equal(deps.getState().dnsGuards[0].cycle.phase, 'replacement');
+  for (const check of deps.getState().dnsGuards[0].cycle.checks) check.observations['probe-1'] = { ok: true, attempts: 1 };
+  const method = phase === 'read' ? 'readDnsRecord' : 'writeDnsRecord';
+  const original = deps[method];
+  let release, entered, paused = false;
+  const started = new Promise(resolve => { entered = resolve; });
+  deps[method] = async (...args) => {
+    if (!paused) {
+      paused = true;
+      entered();
+      await new Promise(resolve => { release = resolve; });
+    }
+    return original(...args);
+  };
+  const finalizing = processReadyDnsGuards(deps);
+  await started;
+  const routes = new Map();
+  registerOrchestrationRoutes(Object.fromEntries(['get', 'post', 'put', 'delete'].map(method => [method, (path, handler) => routes.set(`${method} ${path}`, handler)])),
+    { ...deps, sanitizeState: state => state });
+  const remove = id => routes.get('delete /api/orchestration/:resource/:id')({ params: { resource: 'ip-assets', id }, auth: { username: 'test' } },
+    { json() {} }, error => { throw error; });
+  try {
+    if (phase === 'read') {
+      await remove('fill-1');
+      assert.equal(deps.getState().dnsGuards[0].cycle, null);
+    } else {
+      await assert.rejects(remove('fill-1'), /DNS 守护「入口守护」正在写入/);
+      assert.equal(deps.getState().ipAssets.length, 1);
+    }
+  } finally { release(); await finalizing; }
+  if (phase === 'read') {
+    assert.deepEqual(deps.getRemote(), ['198.51.100.10']);
+    assert.equal(deps.getState().dnsChanges.length, 0);
+  } else {
+    assert.deepEqual(deps.getRemote(), ['198.51.100.10', '203.0.113.1']);
+    deps.getState().ipAssets.push({ id: 'again', address: '203.0.113.1' });
+    await remove('again');
+    assert.deepEqual(deps.getRemote(), ['198.51.100.10', '203.0.113.1']);
+  }
+  assert.equal(deps.getState().ipAssets.length, 0);
+});
+
+for (const mode of ['fill', 'rebalance', 'remove-only']) for (const batch of [false, true]) {
+  test(`deleting an unused candidate during ${mode} DNS write preserves local commit (${batch ? 'batch' : 'single'})`, async () => {
+    const deps = mode === 'rebalance' ? autoBalanceFixture(2)
+      : sourceGuardFixture(['198.51.100.10'], { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 2 });
+    addFillStock(deps, mode === 'remove-only' ? 1 : 2, 1, mode === 'rebalance' ? 'b' : 'fill-pool');
+    await runDueDnsGuards(deps);
+    const guard = deps.getState().dnsGuards[0];
+    for (const check of guard.cycle.checks) for (const probe of guard.cycle.expectedProbeIds) {
+      check.observations[probe] = { ok: mode !== 'remove-only', rounds: 3, attemptsPerRound: 3, roundsCompleted: 3, attempts: 9 };
+    }
+    await processReadyDnsGuards(deps);
+    const unusedId = mode === 'remove-only' ? 'fill-1' : 'fill-2';
+    assert.ok(guard.cycle.candidateAssets.some(candidate => candidate.assetId === unusedId));
+    for (const check of guard.cycle.checks) for (const probe of guard.cycle.expectedProbeIds) {
+      check.observations[probe] = { ok: check.address === '203.0.113.1' && mode !== 'remove-only',
+        rounds: 3, attemptsPerRound: 3, roundsCompleted: 3, attempts: 9 };
+    }
+    let release, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const write = deps.writeDnsRecord;
+    deps.writeDnsRecord = async (...args) => {
+      entered();
+      await new Promise(resolve => { release = resolve; });
+      return write(...args);
+    };
+    const finalizing = processReadyDnsGuards(deps);
+    await started;
+    const cycleId = deps.getState().dnsGuards[0].cycle.id;
+    const routes = new Map();
+    registerOrchestrationRoutes(Object.fromEntries(['get', 'post', 'put', 'delete'].map(method => [method, (path, handler) => routes.set(`${method} ${path}`, handler)])),
+      { ...deps, sanitizeState: state => state });
+    try {
+      if (batch) {
+        let result;
+        await routes.get('post /api/ip-pools/:id/delete-unused')({ params: { id: mode === 'rebalance' ? 'b' : 'fill-pool' },
+          body: { assetIds: deps.getState().ipAssets.map(asset => asset.id), confirm: 'delete-unused-pool-assets' }, auth: { username: 'test' } },
+          { json(value) { result = value; } }, error => { throw error; });
+        assert.equal(result.deletedCount, 1);
+        assert.equal(result.occupiedCount, mode === 'remove-only' ? 0 : 1);
+      } else {
+        await routes.get('delete /api/orchestration/:resource/:id')({ params: { resource: 'ip-assets', id: unusedId }, auth: { username: 'test' } },
+          { json() {} }, error => { throw error; });
+      }
+      assert.equal(deps.getState().dnsGuards[0].cycle?.id, cycleId);
+    } finally { release(); await finalizing; }
+    const finished = deps.getState().dnsGuards[0];
+    assert.equal(finished.cycle, null);
+    assert.deepEqual(finished.currentValues, deps.getRemote());
+    assert.equal(deps.getState().dnsChanges.length, 1);
+    assert.equal(deps.getState().dnsGuardRuns.length, 1);
+    assert.equal(deps.getState().ipAssets.some(asset => asset.id === unusedId), false);
+    if (mode === 'rebalance') {
+      assert.equal(deps.getState().ipUsageRecords.filter(record => record.status === 'returned').length, 1);
+      assert.equal(deps.getState().ipPools.find(pool => pool.id === 'a').assetIds.length, 1);
+    }
+  });
+}
+
 test('automatic rebalancing swaps a full domain to 25/25 and returns old healthy IPs only after verification', async () => {
   const deps = autoBalanceFixture();
   addFillStock(deps, 30, 1, 'b');

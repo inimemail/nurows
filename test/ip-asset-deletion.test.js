@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { orchestrationDefaults, registerOrchestrationRoutes } from '../server/orchestration.js';
+import { orchestrationDefaults, registerOrchestrationRoutes, runningAutomationIpUses } from '../server/orchestration.js';
 
-function harness(extra = {}) {
+function harness(extra = {}, overrides = {}) {
   let state = { ...orchestrationDefaults(),
     ipAssets: [{ id: 'a', address: '192.0.2.1' }, { id: 'b', address: '192.0.2.2' }],
     ipPools: [{ id: 'p1', assetIds: ['a', 'b'] }, { id: 'p2', assetIds: ['a'] }],
@@ -13,7 +13,7 @@ function harness(extra = {}) {
   registerOrchestrationRoutes(app, {
     readState: () => state,
     updateState(mutate) { const next = mutate(structuredClone(state)); state = next; writes++; return state; },
-    sanitizeState: () => ({ sanitized: true })
+    sanitizeState: () => ({ sanitized: true }), ...overrides
   });
   return { state: () => state, writes: () => writes,
     async cleanup(assetIds = ['a', 'b'], id = 'p1', confirm = 'delete-unused-pool-assets') {
@@ -43,12 +43,9 @@ test('asset deletion removes all pool memberships in one write and preserves poo
   assert.equal(h.state().auditLogs[0].action, 'ipAssets.delete');
 });
 
-test('locked, active, and still-running expired allocations cannot be deleted', async () => {
+test('only live incident allocations block deletion, including expired leases while execution is active', async () => {
   for (const extra of [
-    { ipLeases: [{ assetId: 'a', status: 'locked', expiresAt: new Date(Date.now() + 60000).toISOString() }] },
-    { ipLeases: [{ assetId: 'a', status: 'active' }] },
-    { ipLeases: [{ assetId: 'a', status: 'locked', expiresAt: 'invalid' }] },
-    { ipLeases: [{ assetId: 'a', status: 'locked', incidentId: 'i', expiresAt: '2000-01-01' }], incidents: [{ id: 'i', status: 'stabilizing' }] },
+    { ipLeases: [{ assetId: 'a', status: 'locked', incidentId: 'i', expiresAt: '2000-01-01' }], incidents: [{ id: 'i', executionId: 'live', status: 'allocating' }] },
     { incidents: [{ id: 'i', status: 'automating', allocatedIps: ['192.0.2.1'] }] }
   ]) {
     const h = harness(extra);
@@ -59,16 +56,23 @@ test('locked, active, and still-running expired allocations cannot be deleted', 
   }
 });
 
-test('DNS guard candidates and current DNS addresses are protected', async () => {
+test('static DNS associations and idle or stale leases do not block manual asset deletion', async () => {
   for (const extra of [
     { dnsGuards: [{ cycle: { candidateAssets: [{ assetId: 'a', address: '192.0.2.1' }] } }] },
     { dnsGuards: [{ currentValues: ['192.0.2.1'] }] },
-    { dnsBindings: [{ currentValues: ['192.0.2.1'] }] }
+    { dnsBindings: [{ currentValues: ['192.0.2.1'], managedValues: ['192.0.2.1'], backupIps: ['192.0.2.1'] }] },
+    { ipLeases: [{ assetId: 'a', status: 'locked', expiresAt: new Date(Date.now() + 60000).toISOString() }] },
+    { ipLeases: [{ assetId: 'a', status: 'active' }] },
+    { ipLeases: [{ assetId: 'a', status: 'locked', expiresAt: 'invalid' }] },
+    { incidents: [{ id: 'i', status: 'failed', executionId: 'stale', allocatedIps: ['192.0.2.1'] }] },
+    { incidents: [{ id: 'i', status: 'stabilizing', allocatedIps: ['192.0.2.1'] }], ipLeases: [{ assetId: 'a', incidentId: 'i', status: 'locked' }] }
   ]) {
     const h = harness(extra);
-    await assert.rejects(h.remove(), /正在使用或被任务占用/);
-    assert.equal(h.writes(), 0);
-    assert.deepEqual(h.state().ipPools[0].assetIds, ['a', 'b']);
+    await h.remove();
+    assert.equal(h.writes(), 1);
+    assert.deepEqual(h.state().ipPools[0].assetIds, ['b']);
+    assert.deepEqual(h.state().dnsBindings, extra.dnsBindings || []);
+    assert.equal(h.state().ipUsageRecords.length, 1);
   }
 });
 
@@ -86,6 +90,16 @@ test('deletion without pool membership works and missing assets do not modify st
   assert.equal(h.writes(), 1);
 });
 
+test('the reported IP appearing only in DNS configuration can be removed from asset inventory', async () => {
+  const h = harness({ ipAssets: [{ id: 'a', address: '172.235.18.185' }],
+    dnsGuards: [{ currentValues: ['172.235.18.185'] }],
+    dnsBindings: [{ currentValues: ['172.235.18.185'], backupIps: ['172.235.18.185'] }] });
+  await h.remove();
+  assert.equal(h.state().ipAssets.length, 0);
+  assert.deepEqual(h.state().dnsGuards[0].currentValues, ['172.235.18.185']);
+  assert.deepEqual(h.state().dnsBindings[0].backupIps, ['172.235.18.185']);
+});
+
 test('pool deletion still rejects a referenced pool', async () => {
   const h = harness({ dnsGuards: [{ poolIds: ['p1'] }] });
   await assert.rejects(h.remove('p1', 'ip-pools'), /解除关联/);
@@ -93,7 +107,7 @@ test('pool deletion still rejects a referenced pool', async () => {
 });
 
 test('batch removes shared unused assets in one write, preserving history and occupied IPs', async () => {
-  const h = harness({ ipLeases: [{ assetId: 'b', status: 'locked' }] });
+  const h = harness({ ipLeases: [{ assetId: 'b', incidentId: 'i', status: 'locked' }], incidents: [{ id: 'i', status: 'automating' }] });
   const history = structuredClone(h.state().ipUsageRecords);
   const result = await h.cleanup();
   assert.equal(result.deletedCount, 1);
@@ -128,16 +142,12 @@ test('batch requires a valid explicit confirmation and leaves state untouched on
   }
 });
 
-test('batch and single deletion protect guard checks, rebalance confirmations and current/configured DNS', async () => {
+test('batch and single deletion protect only running tasks and unconfirmed rebalance writes', async () => {
   for (const extra of [
-    { dnsGuards: [{ cycle: { candidateAssets: [{ address: '192.0.2.1' }] } }] },
-    { dnsGuards: [{ cycle: { remoteValues: ['192.0.2.1'] } }] },
     { dnsGuards: [{ cycle: { rebalanceCommit: { writeAttempted: true, desired: ['192.0.2.1'] } } }] },
-    { dnsGuards: [{ cycle: { rebalanceCommit: { returnedAssets: [{ assetId: 'a' }] } } }] },
-    { dnsBindings: [{ managedValues: ['192.0.2.1'] }] },
-    { dnsBindings: [{ backupIps: ['192.0.2.1'] }] },
+    { dnsGuards: [{ cycle: { rebalanceCommit: { writeAttempted: true, returnedAssets: [{ assetId: 'a' }] } } }] },
     { incidents: [{ id: 'i', status: 'automating', allocatedIps: ['192.0.2.1'] }] },
-    { incidents: [{ id: 'i', executionId: 'running' }], ipLeases: [{ assetId: 'a', incidentId: 'i', status: 'locked', expiresAt: '2000-01-01' }] }
+    { incidents: [{ id: 'i', status: 'allocating', executionId: 'running' }], ipLeases: [{ assetId: 'a', incidentId: 'i', status: 'locked', expiresAt: '2000-01-01' }] }
   ]) {
     const h = harness(extra);
     await assert.rejects(h.remove(), /正在使用或被任务占用/);
@@ -146,6 +156,56 @@ test('batch and single deletion protect guard checks, rebalance confirmations an
     assert.equal(result.occupiedCount, 1);
     assert.deepEqual(h.state().ipAssets.map(a => a.id), ['a']);
   }
+});
+
+test('manual deletion cancels only affected candidate cycles and retains DNS state and history', async () => {
+  const h = harness({ dnsGuards: [
+    { id: 'g1', domain: 'one.example.com', currentValues: ['192.0.2.8'], sourceOwnedValues: ['192.0.2.8'], cycle: { id: 'c1', candidateAssets: [{ assetId: 'a', address: '192.0.2.1' }] } },
+    { id: 'g2', cycle: { id: 'c2', candidateAssets: [{ assetId: 'b', address: '192.0.2.2' }] } }
+  ] });
+  await h.remove();
+  assert.equal(h.state().dnsGuards[0].cycle, null);
+  assert.equal(h.state().dnsGuards[0].status, 'queued');
+  assert.deepEqual(h.state().dnsGuards[0].currentValues, ['192.0.2.8']);
+  assert.deepEqual(h.state().dnsGuards[0].sourceOwnedValues, ['192.0.2.8']);
+  assert.equal(h.state().dnsGuards[1].cycle.id, 'c2');
+});
+
+test('removing an unused candidate preserves a pending rebalance commit after restart', async () => {
+  for (const batch of [false, true]) {
+    const cycle = { id: 'pending', candidateAssets: [{ assetId: 'a', address: '192.0.2.1' }, { assetId: 'b', address: '192.0.2.2' }],
+      rebalanceCommit: { writeAttempted: true, desired: ['192.0.2.1'], usedAssets: [{ assetId: 'a', address: '192.0.2.1' }] } };
+    const h = harness({ dnsGuards: [{ id: 'g', cycle }] });
+    if (batch) {
+      const result = await h.cleanup();
+      assert.equal(result.deletedCount, 1);
+      assert.equal(result.occupiedCount, 1);
+    } else await h.remove('b');
+    assert.deepEqual(h.state().dnsGuards[0].cycle, cycle);
+    assert.deepEqual(h.state().ipAssets.map(asset => asset.id), ['a']);
+    await assert.rejects(h.remove('a'), /正在写入或确认 DNS 结果/);
+  }
+});
+
+test('automation occupation comes from live jobs and unfinished hosts, never persisted run history', async () => {
+  const jobs = [{ type: 'automation', taskName: '部署网站', status: 'running', results: [
+    { serverId: 'a', host: '192.0.2.1', status: 'awaiting_input' }, { host: '192.0.2.2', status: 'done' },
+    { host: '192.0.2.3', status: 'queued' }
+  ] }, { type: 'automation', status: 'done', results: [{ host: '192.0.2.9', status: 'running' }] },
+  { type: 'command', status: 'running', results: [{ host: '192.0.2.10', status: 'running' }] }];
+  const uses = runningAutomationIpUses(jobs);
+  assert.deepEqual(uses.map((use) => use.address), ['192.0.2.1', '192.0.2.3']);
+  const h = harness({ automationRuns: [{ status: 'running' }] }, { runningAutomationIpUses: () => runningAutomationIpUses(jobs) });
+  await assert.rejects(h.remove(), /自动化任务「部署网站」正在执行/);
+  await h.remove('b');
+  jobs[0].cancelled = true;
+  await h.remove();
+});
+
+test('IPv6 equivalent addresses in live automation jobs are protected', async () => {
+  const h = harness({ ipAssets: [{ id: 'a', address: '2606:4700:4700:0:0:0:0:1111' }] },
+    { runningAutomationIpUses: () => [{ address: '2606:4700:4700::1111', name: 'IPv6 deploy' }] });
+  await assert.rejects(h.remove(), /IPv6 deploy/);
 });
 
 test('large pool cleanup persists once rather than once per IP', async () => {

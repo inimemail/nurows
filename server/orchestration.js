@@ -359,7 +359,7 @@ export function registerProbePublicRoutes(app, deps) {
         probe.agentVersion = cleanText(req.body.version, 40) || probe.agentVersion;
       }
       acceptedDynamicReport = acceptDynamicReports(draft, auth.probe.id, reports);
-      acceptPoolHealthReports(draft, auth.probe.id, reports, poolHealthHooks(draft));
+      acceptPoolHealthReports(draft, auth.probe.id, reports, poolHealthHooks(draft, deps));
       const targetById = new Map((draft.probeTargets || []).map((item) => [item.id, item]));
       const guardCheckById = new Map();
       const touchedGuards = new Set();
@@ -462,7 +462,7 @@ export function registerProbePublicRoutes(app, deps) {
         presenceEvents = markProbeOnline(draft, probe);
         probe.agentVersion = cleanText(req.body.version, 40) || probe.agentVersion;
       }
-      acceptPoolHealthReports(draft, auth.probe.id, reports, poolHealthHooks(draft));
+      acceptPoolHealthReports(draft, auth.probe.id, reports, poolHealthHooks(draft, deps));
       return draft;
     });
     deps.notifyProbePresence?.(presenceEvents);
@@ -556,15 +556,15 @@ export function registerOrchestrationRoutes(app, deps) {
       const pool = draft.ipPools.find((item) => item.id === req.params.id);
       if (!pool) throw new Error('备用池不存在，请刷新列表');
       const members = new Set(pool.assetIds || []);
-      const { ids, addresses } = protectedIpAssets(draft);
+      const { ids, addresses } = manuallyProtectedIpAssets(draft, deps);
       const deleted = new Set();
       let occupiedCount = 0;
       for (const asset of draft.ipAssets) {
         if (!requested.has(asset.id) || !members.has(asset.id)) continue;
-        if (ids.has(asset.id) || addresses.has(asset.address)) occupiedCount++;
+        if (ids.has(asset.id) || addresses.has(canonicalAssetAddress(asset.address))) occupiedCount++;
         else deleted.add(asset.id);
       }
-      removeIpAssets(draft, deleted);
+      removeIpAssets(draft, deleted, true);
       result = { deletedCount: deleted.size, skippedCount: requested.size - deleted.size, occupiedCount,
         changedCount: requested.size - deleted.size - occupiedCount, remainingCount: (pool.assetIds || []).length };
       pushAudit(draft, 'ipPools.delete_unused', 'ipPools', pool.id,
@@ -581,7 +581,7 @@ export function registerOrchestrationRoutes(app, deps) {
       createPoolHealthCheck(pool, req.body || {}, draft, req.auth.username);
       pushAudit(draft, 'ipPools.health_check_started', 'ipPools', pool.id,
         `开始检测 ${pool.healthCheck.total} 个 IP，仅删除确认不通的空闲资产`, req.auth.username);
-      advancePoolHealthChecks(draft, poolHealthHooks(draft));
+      advancePoolHealthChecks(draft, poolHealthHooks(draft, deps));
       return draft;
     });
     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
@@ -592,8 +592,8 @@ export function registerOrchestrationRoutes(app, deps) {
       const pool = draft.ipPools.find((item) => item.id === req.params.id);
       if (!pool) throw new Error('备用池不存在，请刷新列表');
       if (!req.body?.jobId || pool.healthCheck?.id !== req.body.jobId) throw new Error('检测任务已变化，请刷新后重试');
-      finishPoolHealthCheck(pool, 'stopped', '已停止，未确认的 IP 已保留', poolHealthHooks(draft));
-      advancePoolHealthChecks(draft, poolHealthHooks(draft));
+      finishPoolHealthCheck(pool, 'stopped', '已停止，未确认的 IP 已保留', poolHealthHooks(draft, deps));
+      advancePoolHealthChecks(draft, poolHealthHooks(draft, deps));
       return draft;
     });
     res.json({ ok: true, state: deps.sanitizeState(state, req.auth) });
@@ -678,7 +678,7 @@ export function registerOrchestrationRoutes(app, deps) {
     if (key === 'dnsGuards') assertDnsGuardIdle(req.params.id, deps, '守护检查正在执行，请结束后再删除');
     const state = deps.updateState((draft) => {
       if (key === 'ipAssets') {
-        deleteUnusedIpAsset(draft, req.params.id);
+        deleteUnusedIpAsset(draft, req.params.id, deps);
       } else {
         ensureNotReferenced(draft, key, req.params.id);
         draft[key] = draft[key].filter((entry) => entry.id !== req.params.id);
@@ -1412,6 +1412,7 @@ export function requestWaitingIncidentRechecks(deps) {
 
 const dnsGuardRuntime = new Set();
 const dnsGuardProviderRuntime = new Set();
+const dnsGuardAssetWrites = new Map();
 const dnsGuardPreparationVersions = new Map();
 const dnsGuardProcessors = new WeakMap();
 
@@ -2431,6 +2432,11 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
 }
 
 async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, deps) {
+  try { await commitDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, deps); }
+  finally { dnsGuardAssetWrites.delete(cycleId); }
+}
+
+async function commitDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, deps) {
   let state = deps.readState(['dnsGuards', 'dnsAccounts']);
   const guard = state.dnsGuards.find((item) => item.id === guardId && item.cycle?.id === cycleId);
   if (!guard) return;
@@ -2517,6 +2523,9 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
       const active = deps.readState(['dnsGuards']).dnsGuards.some((item) => item.id === guardId && item.cycle?.id === cycleId);
       if (!active) return { canceled: true, stale: false, recordIds: [] };
       const latest = await readDnsRecord(account, credentials, zone, returnedAssets.length ? withoutProviderRecordIds(binding) : binding);
+      if (!deps.readState(['dnsGuards']).dnsGuards.some((item) => item.id === guardId && item.cycle?.id === cycleId)) {
+        return { canceled: true, stale: false, recordIds: [] };
+      }
       const pending = deps.readState(['dnsGuards']).dnsGuards.find((item) => item.id === guardId)?.cycle?.rebalanceCommit;
       if (pending?.writeAttempted && sameStringSet(filterAddressFamily(latest.values, guard.recordType), desired)) {
         return { canceled: false, stale: false, recordIds: latest.recordIds || (latest.recordId ? [latest.recordId] : []) };
@@ -2537,6 +2546,9 @@ async function finalizeDnsGuardCycle(guardId, cycleId, cycle, resultByAddress, d
         if (invalid) return { canceled: false, stale: true, recordIds: [], message: '备用池库存或设置已变化，等待重新检查' };
       }
       const latestRecordIds = cleanTexts(latest.recordIds || (latest.recordId ? [latest.recordId] : []), 500);
+      dnsGuardAssetWrites.set(cycleId, {
+        guardName: guard.name || guard.domain, assets: [...usedAssets, ...returnedAssets]
+      });
       if (returnedAssets.length) {
         // Persist the intent before the API request. A timeout or restart must
         // keep both sides reserved until the exact remote outcome is verified.
@@ -3200,7 +3212,7 @@ function ensureResourceReferences(state, key, item, deps) {
   }
 }
 
-function protectedIpAssets(state) {
+function protectedIpAssets(state, deps = {}) {
   const ids = new Set(), addresses = new Set(), now = Date.now();
   const activeIncidents = new Set((state.incidents || [])
     .filter((item) => item.executionId || ['allocating', 'automating', 'dns_updating', 'verifying', 'stabilizing', 'rolling_back'].includes(item.status))
@@ -3228,11 +3240,12 @@ function protectedIpAssets(state) {
   for (const binding of state.dnsBindings || []) {
     for (const address of [...(binding.currentValues || []), ...(binding.managedValues || []), ...(binding.backupIps || [])]) addresses.add(address);
   }
+  for (const use of deps.runningAutomationIpUses?.() || []) addresses.add(use.address);
   return { ids, addresses };
 }
 
-const poolHealthHooks = (state) => ({
-  protected: protectedIpAssets,
+const poolHealthHooks = (state, deps = {}) => ({
+  protected: (draft) => protectedIpAssets(draft, deps),
   remove: removeIpAssets,
   allowed: (address) => !isForbiddenProbeIp(address, false),
   audit: (pool, job) => pushAudit(state, 'ipPools.health_check_finished', 'ipPools', pool.id,
@@ -3245,14 +3258,28 @@ export function processPoolHealthChecks(deps, restart = false, now = Date.now())
   if (!schedule.length || (!restart && !poolHealthTickNeeded(schedule, snapshot.probes || [], now))) return;
   (deps.updatePoolHealthState || deps.updateState)((draft) => {
     if (restart) {
-      for (const pool of draft.ipPools || []) finishPoolHealthCheck(pool, 'interrupted', '服务已重启，未确认的 IP 已保留，请重新检测', poolHealthHooks(draft), now);
-    } else advancePoolHealthChecks(draft, poolHealthHooks(draft), now);
+      for (const pool of draft.ipPools || []) finishPoolHealthCheck(pool, 'interrupted', '服务已重启，未确认的 IP 已保留，请重新检测', poolHealthHooks(draft, deps), now);
+    } else advancePoolHealthChecks(draft, poolHealthHooks(draft, deps), now);
     return draft;
   });
 }
 
-function removeIpAssets(state, ids) {
+function removeIpAssets(state, ids, cancelGuardCandidates = false) {
   if (!ids.size) return;
+  if (cancelGuardCandidates) {
+    const addresses = new Set(state.ipAssets.filter((item) => ids.has(item.id)).map((item) => canonicalAssetAddress(item.address)));
+    for (const guard of state.dnsGuards || []) {
+      // Selected/returned IPs are already protected. Deleting other candidates
+      // must not cancel a remote write before its local commit finishes.
+      const cycleId = guard.cycle?.id;
+      if (cycleId && (dnsGuardAssetWrites.has(cycleId) || guard.cycle?.rebalanceCommit?.writeAttempted)) continue;
+      const candidates = [...(guard.cycle?.candidateAssets || []), ...(guard.cycle?.rebalancePlan?.donors || []),
+        ...(guard.cycle?.rebalanceCommit?.usedAssets || []), ...(guard.cycle?.rebalanceCommit?.returnedAssets || [])];
+      if (!candidates.some((item) => ids.has(item.assetId) || addresses.has(canonicalAssetAddress(item.address)))) continue;
+      Object.assign(guard, { cycle: null, status: 'queued', nextCheckAt: '', lastError: '',
+        message: '备用 IP 已删除，等待重新检查', updatedAt: nowIso() });
+    }
+  }
   state.ipAssets = state.ipAssets.filter((item) => !ids.has(item.id));
   for (const pool of state.ipPools) {
     const remaining = (pool.assetIds || []).filter((id) => !ids.has(id));
@@ -3264,12 +3291,66 @@ function removeIpAssets(state, ids) {
   state.ipLeases = (state.ipLeases || []).filter((lease) => !ids.has(lease.assetId));
 }
 
-function deleteUnusedIpAsset(state, id) {
+function deleteUnusedIpAsset(state, id, deps) {
   const asset = state.ipAssets.find((item) => item.id === id);
   if (!asset) throw new Error('IP 资产不存在，请刷新列表');
-  const { ids, addresses } = protectedIpAssets(state);
-  if (ids.has(id) || addresses.has(asset.address)) throw new Error('该 IP 正在使用或被任务占用，暂时不能删除');
-  removeIpAssets(state, new Set([id]));
+  const { ids, addresses } = manuallyProtectedIpAssets(state, deps);
+  const reason = ids.get(id) || addresses.get(canonicalAssetAddress(asset.address));
+  if (reason) throw new Error(`该 IP 正在使用或被任务占用：${reason}，暂时不能删除`);
+  removeIpAssets(state, new Set([id]), true);
+}
+
+function canonicalAssetAddress(address) {
+  const value = String(address || '').trim();
+  return net.isIPv6(value) ? new URL(`http://[${value}]/`).hostname : value;
+}
+
+export function runningAutomationIpUses(jobs) {
+  const uses = [];
+  for (const job of jobs) {
+    if (job.type !== 'automation' || job.status === 'done' || job.cancelled) continue;
+    for (const result of job.results || []) {
+      if (!['queued', 'running', 'awaiting_input'].includes(result.status)) continue;
+      const host = job.serverById?.get(result.serverId)?.host || result.host;
+      if (net.isIP(String(host || '').trim())) uses.push({ address: host, name: job.taskName || '自动化任务' });
+    }
+  }
+  return uses;
+}
+
+function manuallyProtectedIpAssets(state, deps = {}) {
+  const ids = new Map(), addresses = new Map();
+  const protectAddress = (address, reason) => { if (address) addresses.set(canonicalAssetAddress(address), reason); };
+  const active = new Map((state.incidents || []).filter((item) =>
+    !['succeeded', 'recovered', 'rolled_back', 'failed', 'cancelled'].includes(item.status)
+    && (item.executionId || ['allocating', 'automating', 'dns_updating', 'verifying', 'rolling_back'].includes(item.status))
+  ).map((item) => [item.id, item]));
+  for (const incident of active.values()) {
+    const reason = `故障任务「${incident.targetName || incident.policyName || incident.id}」正在执行`;
+    for (const address of incident.allocatedIps || []) protectAddress(address, reason);
+  }
+  for (const lease of state.ipLeases || []) {
+    if (['locked', 'active'].includes(lease.status) && active.has(lease.incidentId)) {
+      ids.set(lease.assetId, `故障任务「${active.get(lease.incidentId).targetName || lease.incidentId}」正在执行`);
+    }
+  }
+  for (const use of deps.runningAutomationIpUses?.() || []) protectAddress(use.address, `自动化任务「${use.name}」正在执行`);
+  const protectCandidates = (assets, name) => {
+    const reason = `DNS 守护「${name}」正在写入或确认 DNS 结果`;
+    for (const candidate of assets) {
+      if (candidate.assetId) ids.set(candidate.assetId, reason);
+      protectAddress(candidate.address, reason);
+    }
+  };
+  for (const guard of state.dnsGuards || []) {
+    const commit = guard.cycle?.rebalanceCommit;
+    if (commit?.writeAttempted) protectCandidates([
+      ...(commit.usedAssets || []), ...(commit.returnedAssets || []),
+      ...(commit.desired || []).map((address) => ({ address }))
+    ], guard.name || guard.domain || guard.id);
+  }
+  for (const write of dnsGuardAssetWrites.values()) protectCandidates(write.assets, write.guardName);
+  return { ids, addresses };
 }
 
 function ensureNotReferenced(state, key, id) {

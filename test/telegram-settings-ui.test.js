@@ -15,6 +15,7 @@ function harness() {
   vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone, require(path) {
     if (path === 'react') return { useState: (value) => [typeof value === 'function' ? value() : value, () => {}], useRef: (current) => ({ current }), useEffect() {}, useMemo: (fn) => fn() };
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
+    if (path === 'lucide-react') return {};
     if (path.endsWith('telegram-permissions.js')) return permissions;
     if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
     if (path.endsWith('workspace-search.js')) return workspaceSearch;

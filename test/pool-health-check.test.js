@@ -4,13 +4,13 @@ import test from 'node:test';
 import { orchestrationDefaults, registerOrchestrationRoutes, registerProbePublicRoutes, processPoolHealthChecks,
   sanitizeOrchestrationState, normalizeOrchestrationState } from '../server/orchestration.js';
 import { poolHealthProbeState, poolHealthSchedule } from '../server/pool-health-check.js';
-import { supportsPoolHealthCheck } from '../shared/probe-capabilities.js';
+import { supportsPoolHealthCheck, POOL_HEALTH_PROBE_VERSION } from '../shared/probe-capabilities.js';
 
 function harness(count = 3, extra = {}) {
   const assets = Array.from({ length: count }, (_, i) => ({ id: `a${i}`, address: `8.8.${Math.floor(i / 256)}.${i % 256}`, enabled: true }));
   let state = { ...orchestrationDefaults(), ipAssets: assets,
     ipPools: [{ id: 'pool', name: '备用池', assetIds: assets.map(asset => asset.id) }],
-    probes: ['p1', 'p2'].map(id => ({ id, status: 'online', enabled: true, agentVersion: '1.4.9', lastSeenAt: new Date().toISOString(),
+    probes: ['p1', 'p2'].map(id => ({ id, status: 'online', enabled: true, agentVersion: POOL_HEALTH_PROBE_VERSION, lastSeenAt: new Date().toISOString(),
       agentSecretHash: crypto.createHash('sha256').update('secret').digest('hex') })), ...extra };
   let writes = 0;
   const routes = new Map();
@@ -155,6 +155,20 @@ test('occupation, removal, disabled status and address changes during checking a
   }
 });
 
+test('automatic health cleanup still protects live automation hosts before final deletion', async () => {
+  const h = harness(1);
+  let liveUses = [];
+  h.deps.runningAutomationIpUses = () => liveUses;
+  await h.start();
+  const check = h.job().checks[0];
+  await h.report('p1', [h.evidence(check)]);
+  liveUses = [{ address: '8.8.0.0', name: 'deploy' }];
+  await h.report('p2', [h.evidence(check)]);
+  assert.equal(h.state().ipAssets.length, 1);
+  assert.equal(h.job().skippedCount, 1);
+  assert.equal(h.job().deletedCount, 0);
+});
+
 test('snapshot excludes later additions and initially skips occupied/private/disabled assets', async () => {
   const h = harness(5);
   h.state().ipLeases.push({ assetId: 'a0', status: 'active' });
@@ -246,13 +260,13 @@ test('idle ticks use compact schedule metadata and never persist or load full qu
 
 test('pool checks require the independent worker version and never reach old probe agents', async () => {
   const h = harness(1);
-  for (const version of ['', '1.4.8', 'invalid', '1.3.99']) {
+  for (const version of ['', '1.4.8', '1.4.9', 'invalid', '1.3.99']) {
     h.state().probes[0].agentVersion = version;
     await assert.rejects(h.start(), /升级/);
     assert.equal(h.writes(), 0);
     assert.equal(supportsPoolHealthCheck(version), false);
   }
-  h.state().probes[0].agentVersion = '1.4.9';
+  h.state().probes[0].agentVersion = POOL_HEALTH_PROBE_VERSION;
   await h.start();
   const target = (await h.config()).targets[0];
   assert.equal(target.poolCheckId, 'pool');

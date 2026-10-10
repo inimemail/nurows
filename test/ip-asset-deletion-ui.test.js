@@ -22,6 +22,7 @@ function harness(api, assets, search = '', extra = {}) {
   vm.runInNewContext(compiled, { module, exports: module.exports, structuredClone, require(path) {
     if (path === 'react') return { useState, useRef: (initial) => useState({ current: initial })[0], useEffect() {}, useMemo: (fn) => fn() };
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
+    if (path === 'lucide-react') return {};
     if (path.endsWith('polling.js')) return { startPolling() {} };
     if (path.endsWith('telegram-permissions.js')) return telegramPermissions;
     if (path.endsWith('probe-capabilities.js')) return probeCapabilities;
@@ -45,7 +46,7 @@ function harness(api, assets, search = '', extra = {}) {
 
 const poolFixture = () => ({ ipPools: [{ id: 'p1', name: '备用池一', assetIds: ['a'], enabled: true }] });
 
-const healthFixture = () => ({ ...poolFixture(), probes: [{ id: 'probe', name: '在线探针', status: 'online', agentVersion: '1.4.9', lastSeenAt: new Date().toISOString() }] });
+const healthFixture = () => ({ ...poolFixture(), probes: [{ id: 'probe', name: '在线探针', status: 'online', agentVersion: probeCapabilities.POOL_HEALTH_PROBE_VERSION, lastSeenAt: new Date().toISOString() }] });
 
 test('pool health check confirms selected probes and snapshot, defaults to 50 parallel IPs and prevents duplicate starts', async () => {
   const calls = [];

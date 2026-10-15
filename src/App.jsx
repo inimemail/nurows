@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { parsePerServerInputLines } from '../shared/command-input.js';
 import { openAuthenticatedWebSocket } from '../shared/websocket-client.js';
 import { workspaceSearchPlaceholder } from '../shared/workspace-search.js';
+import { filterPickerServers } from '../shared/server-picker-search.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
 import RenewalWorkspace from './RenewalWorkspace.jsx';
@@ -819,21 +820,10 @@ export default function App() {
     });
   }, [search, state.servers]);
 
-  const pickerFilteredServers = useMemo(() => {
-    const keyword = pickerSearch.trim().toLowerCase();
-    return state.servers.filter((item) => {
-      const matchGroup = pickerGroupId === 'all' ? true : item.groupId === pickerGroupId;
-      if (!matchGroup) {
-        return false;
-      }
-      if (!keyword) {
-        return true;
-      }
-      return [item.name, item.host, item.username, item.note].some((text) =>
-        String(text || '').toLowerCase().includes(keyword)
-      );
-    });
-  }, [pickerGroupId, pickerSearch, state.servers]);
+  const pickerFilteredServers = useMemo(
+    () => filterPickerServers(state.servers, pickerSearch, pickerGroupId),
+    [pickerGroupId, pickerSearch, state.servers]
+  );
 
   const filteredCommands = useMemo(() => {
     const keyword = search.trim().toLowerCase();
@@ -2151,6 +2141,17 @@ export default function App() {
     setServerPickerOpen(true);
   }
 
+  function pastePickerSearch(event) {
+    const text = event.clipboardData.getData('text');
+    if (!/[\r\n\t]/.test(text)) return;
+    // Single-line inputs otherwise remove newlines and join adjacent IPs.
+    // Replace only the selected text and keep the caret after the insertion.
+    event.preventDefault();
+    const input = event.currentTarget;
+    input.setRangeText(text.replace(/\s+/g, ' '), input.selectionStart, input.selectionEnd, 'end');
+    setPickerSearch(input.value);
+  }
+
   function toggleGroupChecked(groupId) {
     const ids = state.servers.filter((item) => item.groupId === groupId).map((item) => item.id);
     const fullySelected = ids.length > 0 && ids.every((id) => pickerSelectedIds.includes(id));
@@ -3315,7 +3316,7 @@ export default function App() {
                 </div>
                 <div className="search-shell picker-search">
                   <SearchIcon />
-                  <input value={pickerSearch} onChange={(event) => setPickerSearch(event.target.value)} placeholder="搜索服务器名或 IP" />
+                  <input value={pickerSearch} onChange={(event) => setPickerSearch(event.target.value)} onPaste={pastePickerSearch} placeholder="名称 / IP，空格多项" aria-label="搜索服务器名称或 IP，多个条件用空格分隔，匹配任意一项" title="多个名称或 IP 用空格分隔，匹配任意一项；支持混合搜索" />
                 </div>
                 <div className="dialog-actions">
                   <button className="ghost" onClick={selectCurrentPickerGroup}>全选当前</button>

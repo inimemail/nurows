@@ -11,6 +11,7 @@ import { IP_USAGE_KEYS, lookupIpUsage, parseIpUsageInput } from './ip-usage-look
 import { promisify } from 'node:util';
 import { v4 as uuidv4 } from 'uuid';
 import { sanitizeDynamicGuard, dynamicProbeTargets, acceptDynamicReports } from './dynamic-guard.js';
+import { seedDnsGuardHealth, shareGuardHealthReports, validIpHealthEvidence } from './shared-ip-health.js';
 import { poolHealthSummary, poolHealthTargets, createPoolHealthCheck, finishPoolHealthCheck,
   acceptPoolHealthReports, advancePoolHealthChecks, poolHealthSchedule, poolHealthTickNeeded } from './pool-health-check.js';
 
@@ -300,8 +301,9 @@ export function registerProbePublicRoutes(app, deps) {
     });
     // DNS guard cycles are latency-sensitive: start them before ordinary
     // targets so a busy probe cannot make a two-IP guard wait behind a queue.
-    const checks = [...guardChecks, ...dynamicProbeTargets(auth.state.dynamicGuards, auth.probe.id),
+    const allChecks = [...guardChecks, ...dynamicProbeTargets(auth.state.dynamicGuards, auth.probe.id),
       ...targets, ...(supportsPoolHealthCheck(auth.probe.agentVersion) ? poolHealthTargets(auth.state.ipPools, auth.probe.id) : [])];
+    const checks = deps.sharedIpHealth?.deduplicate(allChecks, auth.probe.id) || allChecks;
     const version = configVersion(checks);
     const unchanged = cleanText(req.query?.version, 100) === version;
     res.json({
@@ -352,13 +354,17 @@ export function registerProbePublicRoutes(app, deps) {
     let acceptedTargetReport = false;
     let acceptedDynamicReport = false;
     let presenceEvents = [];
+    // Publish to the process cache only after the state transaction succeeds.
+    const sharedHealth = deps.sharedIpHealth?.stage();
     const state = deps.updateState((draft) => {
       const probe = draft.probes.find((item) => item.id === auth.probe.id);
       if (probe) {
         presenceEvents = markProbeOnline(draft, probe);
         probe.agentVersion = cleanText(req.body.version, 40) || probe.agentVersion;
       }
-      acceptedDynamicReport = acceptDynamicReports(draft, auth.probe.id, reports);
+      const shared = shareGuardHealthReports(draft, auth.probe.id, reports, sharedHealth);
+      acceptedGuardReport = shared.dns;
+      acceptedDynamicReport = acceptDynamicReports(draft, auth.probe.id, reports) || shared.dynamic;
       acceptPoolHealthReports(draft, auth.probe.id, reports, poolHealthHooks(draft, deps));
       const targetById = new Map((draft.probeTargets || []).map((item) => [item.id, item]));
       const guardCheckById = new Map();
@@ -380,6 +386,10 @@ export function registerProbePublicRoutes(app, deps) {
           const guardEntry = guardCheckById.get(targetId);
           if (!guardEntry) continue;
           const { guard, check } = guardEntry;
+          // Older agents may omit the marker/address list. Supplied identity
+          // and tooling errors must still be validated before local removal.
+          if ((raw.checkMarker && raw.checkMarker !== guard.cycle.id)
+            || !validIpHealthEvidence(check.address, guard, raw, { requireAddress: false })) continue;
           acceptedGuardReport = true;
           check.observations ||= {};
           check.observations[auth.probe.id] = normalizeCheckEvidence(raw, guard);
@@ -438,6 +448,7 @@ export function registerProbePublicRoutes(app, deps) {
       draft.incidents = draft.incidents.slice(0, 500);
       return draft;
     });
+    sharedHealth?.commit();
     deps.notifyProbePresence?.(presenceEvents);
     for (const incidentId of createdIncidentIds) deps.onIncidentCreated?.(incidentId);
     for (const incidentId of [...new Set(retryIncidentIds)]) deps.onIncidentCreated?.(incidentId);
@@ -1697,6 +1708,7 @@ async function prepareDnsGuardCycle(guardId, deps) {
   const currentValues = filterAddressFamily(before.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
   const providerRecordIds = cleanTexts(before.recordIds || (before.recordId ? [before.recordId] : []), 500);
   const cycle = createDnsGuardRemoteCycle(guard, expectedProbeIds, currentValues, resolved.zone, resolved.normalizedBinding, providerRecordIds);
+  seedDnsGuardHealth(guard, cycle, deps.sharedIpHealth);
   deps.updateState((draft) => updateDnsGuard(draft, guardId, {
     status: 'checking',
     message: currentValues.length ? `正在检查活动 IP：0/${currentValues.length}` : '正在寻找替补',
@@ -1706,6 +1718,7 @@ async function prepareDnsGuardCycle(guardId, deps) {
   }));
   const prepared = { guard, cycle, currentValues };
   if (prepared && !prepared.currentValues.length) await startDnsGuardReplacement(prepared.guard, prepared.cycle, [], deps);
+  else if (dnsGuardCycleReady({ ...guard, cycle })) await applyDnsGuardCycle(guardId, cycle.id, deps);
 }
 
 function activeDnsGuardProbeIds(guard, state) {
@@ -1864,7 +1877,8 @@ function dnsGuardIdleOwnedValues(guard, cycle) {
   return (guard.sourceOwnedValues || []).filter((address) => idle.has(address) || !known.has(address));
 }
 
-function saveDnsGuardCandidateCycle(guard, cycle, deps) {
+async function saveDnsGuardCandidateCycle(guard, cycle, deps) {
+  seedDnsGuardHealth(guard, cycle, deps.sharedIpHealth);
   let active = false;
   deps.updateState((draft) => {
     const item = draft.dnsGuards.find((entry) => entry.id === guard.id && entry.cycle?.id === cycle.id);
@@ -1879,6 +1893,7 @@ function saveDnsGuardCandidateCycle(guard, cycle, deps) {
       lastError: ''
     });
   });
+  if (active && dnsGuardCycleReady({ ...guard, cycle })) await applyDnsGuardCycle(guard.id, cycle.id, deps);
   return active;
 }
 
@@ -1912,7 +1927,7 @@ async function advanceDnsGuardSources(guard, cycle, deps) {
     cycle.remainingAddresses = cycle.remainingAddresses.slice(batch.length);
     cycle.checks = batch.map(createDnsGuardCheck);
     cycle.startedAt = nowIso();
-    saveDnsGuardCandidateCycle(guard, cycle, deps);
+    await saveDnsGuardCandidateCycle(guard, cycle, deps);
     return;
   }
   // Probe primary addresses first. A healthy primary never waits for backup
@@ -1956,7 +1971,7 @@ async function advanceDnsGuardSources(guard, cycle, deps) {
     cycle.remainingAddresses = addresses.slice(batch.length);
     cycle.checks = batch.map(createDnsGuardCheck);
     cycle.startedAt = nowIso();
-    if (batch.length) { saveDnsGuardCandidateCycle(guard, cycle, deps); return; }
+    if (batch.length) { await saveDnsGuardCandidateCycle(guard, cycle, deps); return; }
   }
   // An empty queue is a valid result (DNS failure, cached source, or capacity),
   // so commit it immediately rather than waiting for a nonexistent probe report.
@@ -2057,6 +2072,17 @@ function invalidateDnsGuardSourceCache(domain, family, addresses, resolutionTime
   // Any in-flight query is newer than this completed probe snapshot.
 }
 
+// A dynamic guard just queried this DDNS domain. Expire only older conflicting
+// snapshots; a newer or in-flight source query must keep its own authority.
+export function invalidateChangedDnsGuardSource(domain, recordType, address, queriedAt = Date.now()) {
+  const prefix = `${normalizeDnsGuardSourceDomain(domain)}|${recordType === 'AAAA' ? 6 : 4}|`;
+  for (const [key, cached] of dnsGuardSourceCache) {
+    if (!key.startsWith(prefix) || cached.resolvedAt > queriedAt || cached.addresses.includes(address)) continue;
+    cached.expiresAt = 0;
+    cached.invalidated = true;
+  }
+}
+
 export function clearDnsGuardSourceCache() {
   dnsGuardSourceCache.clear();
   for (const [key, flight] of dnsGuardSourceInflight) {
@@ -2090,8 +2116,8 @@ export async function resolveDnsGuardSources(guard, currentValues, resolveAddres
     const primaryResolvedAt = Date.parse(previous.resolvedAt?.primary || '');
     const primaryKey = dnsGuardSourceCacheKey(domains.primary, family, resolveAddresses);
     const shared = dnsGuardSourceCache.get(primaryKey);
-    const sharedChanged = shared && shared.expiresAt > now
-      && !sameStringSet(shared.addresses, previous.primary || previous.cached || []);
+    const sharedChanged = shared && (shared.invalidated || (shared.expiresAt > now
+      && !sameStringSet(shared.addresses, previous.primary || previous.cached || [])));
     const sharedFlight = dnsGuardSourceInflight.get(primaryKey);
     const refreshing = sharedFlight && sharedFlight.epoch === dnsGuardSourceEpochs.get(primaryKey);
     const fresh = Number.isFinite(primaryResolvedAt) && now >= primaryResolvedAt
@@ -2416,10 +2442,12 @@ async function applyDnsGuardCycle(guardId, cycleId, deps) {
         remainingAddresses: item.cycle.remainingAddresses.slice(batch.length),
         checks: batch.map(createDnsGuardCheck)
       });
+      seedDnsGuardHealth(item, item.cycle, deps.sharedIpHealth);
       item.message = `${guard.cycle.rebalancePlan ? '正在预检均衡 IP' : '正在寻找替补'}：已找到 ${found}/${needed}`;
       item.updatedAt = nowIso();
       return draft;
     });
+    await applyDnsGuardCycle(guardId, cycleId, deps);
     return;
   }
 

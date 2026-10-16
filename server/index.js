@@ -9,6 +9,7 @@ import { createTelegramWorkspace } from './telegram-workspace.js';
 import { createTelegramActions } from './telegram-actions.js';
 import { telegramScopeAllowed } from '../shared/telegram-permissions.js';
 import { createDynamicGuardService, registerDynamicGuardRoutes, sanitizeDynamicGuard } from './dynamic-guard.js';
+import { createSharedIpHealth } from './shared-ip-health.js';
 import { createRenewalService, registerRenewalRoutes, normalizeRenewalState, renewalSnapshot } from './renewals.js';
 import { createNotesService, registerNotesRoutes } from './notes.js';
 import { createWebhookService, registerWebhookRoutes } from './webhooks.js';
@@ -47,6 +48,7 @@ import {
   requestWaitingIncidentRechecks,
   runDueDnsGuards,
   processReadyDnsGuards,
+  invalidateChangedDnsGuardSource,
   retryWaitingIpIncidents,
   runIncidentWorkflow,
   rollbackIncident,
@@ -137,7 +139,9 @@ const SHELL_PROMPT_PATTERNS = [
   /^[A-Za-z]:\\.*>\s*$/
 ];
 
+const sharedIpHealth = createSharedIpHealth();
 const orchestrationDeps = {
+  sharedIpHealth,
   readState,
   readProbeState,
   readPoolHealthSchedule,
@@ -167,6 +171,8 @@ const orchestrationDeps = {
 
 let webhookService;
 const dynamicGuardService = createDynamicGuardService({
+  sharedIpHealth,
+  onDynamicResolved: invalidateChangedDnsGuardSource,
   readState, updateState, updateDynamicGuardState, encryptSecret, decryptSecret, readDynamicGuard, readDynamicGuardSchedule, readDynamicProbeStatus,
   notifyDynamicGuard: notifyDynamicGuardViaTelegram,
   executeWebhook: (id, guard) => webhookService.executeForGuard(id, guard),

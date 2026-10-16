@@ -4,6 +4,7 @@ import { domainToASCII } from 'node:url';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
+import { seedDynamicGuardHealth, validIpHealthEvidence } from './shared-ip-health.js';
 
 export const DYNAMIC_DEFAULTS = {
   name: '', domain: '', recordType: 'A', probeIds: [], botIds: [], enabled: true,
@@ -103,13 +104,9 @@ export function acceptDynamicReports(state, probeId, reports, now = Date.now()) 
   for (const raw of reports) {
     const guard = byId.get(raw.targetId);
     if (!guard || raw.checkMarker !== guard.cycle.id || guard.cycle.result) continue;
-    const success = raw.ok === true && Number(raw.attempts) >= 1;
-    const failure = raw.ok === false && raw.rounds === guard.checkRounds && raw.attemptsPerRound === guard.attemptsPerRound
-      && raw.roundsCompleted === guard.checkRounds && raw.attempts === guard.checkRounds * guard.attemptsPerRound;
-    if (!success && !failure) continue;
-    // DNS lookup errors and missing tooling are not complete reachability evidence.
-    if (failure && (!raw.resolvedAddresses?.includes(guard.cycle.address)
-      || /no such file|not found|permission denied|operation not permitted|getaddrinfo|name or service not known/i.test(String(raw.error || '')))) continue;
+    // Apply the same identity/completeness checks to direct and shared reports.
+    if (!validIpHealthEvidence(guard.cycle.address, guard, raw)) continue;
+    const success = raw.ok === true;
     guard.cycle.observations[probeId] = { ok: success, checkedAt: iso(now) };
     if (success) guard.cycle.result = 'healthy';
     else {
@@ -370,9 +367,11 @@ export function createDynamicGuardService(deps, options = {}) {
         }
         // Freshly resolve again before submitting; a changing DDNS target must
         // not be replaced based on evidence for its previous IP.
+        const resolvedAt = now();
         const address = await resolveIp(guard.domain, guard.recordType);
         const fresh = get(guard.id);
         if (fresh?.revision !== guard.revision || fresh?.cycle?.id !== guard.cycle.id) return;
+        deps.onDynamicResolved?.(guard.domain, guard.recordType, address, resolvedAt);
         const freshReadiness = readiness(fresh, probesNow());
         if (!freshReadiness.allOnline) { wait(fresh, 'waiting_probe', waitingProbeMessage(freshReadiness, '负责探针未全部在线，等待恢复后重新检查'), 5); return; }
         if (address !== guard.currentIp) {
@@ -393,9 +392,11 @@ export function createDynamicGuardService(deps, options = {}) {
       return;
     }
     if (guard.nextAt > time) return;
+    const resolvedAt = now();
     const address = await resolveIp(guard.domain, guard.recordType);
     const fresh = get(guard.id);
     if (!fresh || fresh.revision !== guard.revision || fresh.enabled === false) return;
+    deps.onDynamicResolved?.(guard.domain, guard.recordType, address, resolvedAt);
     probes = probesNow();
     if (fresh.lastResolvedIp !== address) {
       change(guard.id, guard.revision, (item) => {
@@ -443,8 +444,11 @@ export function createDynamicGuardService(deps, options = {}) {
       // offline ones. Online probes can start immediately, while a failed
       // result still requires the late probe's own complete evidence.
       item.cycle = { id: `dynamic-${randomUUID()}`, address, probeIds: [...currentReadiness.assignedIds], observations: {}, startedAt: now() };
+      seedDynamicGuardHealth(item, deps.sharedIpHealth, now());
       item.status = item.flow ? 'verifying' : 'checking'; item.message = item.flow ? '正在验证新 IP' : '正在检查当前 IP';
     });
+    // No probe report will arrive for a cycle settled by recent shared evidence.
+    if (get(guard.id)?.cycle?.result) await processGuard({ id: guard.id });
   }
 
   function tick(requestedId = '') {

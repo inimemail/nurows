@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import net from 'node:net';
 import { domainToASCII } from 'node:url';
-import { beijingDate, validRenewalDate, renewalDays, renewalStage, renewalAmount, renewalIdentityIndex, renewalDuplicateField, renewalBotIds, DEFAULT_RENEWAL_SETTINGS, RENEWAL_CURRENCIES } from '../shared/renewals.js';
+import { beijingDate, validRenewalDate, renewalDays, renewalStage, renewalAmount, renewalIdentityIndex, renewalDuplicateField, renewalBotIds, renewalExtension, DEFAULT_RENEWAL_SETTINGS, RENEWAL_CURRENCIES } from '../shared/renewals.js';
+import { telegramScopeAllowed } from '../shared/telegram-permissions.js';
 
 const MAX_RECORDS = 5000;
 const fail = (message, statusCode = 400) => { throw Object.assign(new Error(message), { statusCode }); };
@@ -83,6 +84,25 @@ function assertUniqueRenewal(item, records) {
   if (field) fail(field === 'name' ? '服务器名称已存在，请使用其他名称' : 'IP / 域名已存在，请勿重复添加', 409);
 }
 
+export function extendRenewal(deps, id, input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) fail('请提供有效的续费参数');
+  const bots = deps.bots(), now = deps.now?.() ?? Date.now();
+  let updated;
+  deps.update((draft) => {
+    const index = draft.renewals.findIndex((item) => item.id === id);
+    if (index < 0) fail('续费记录不存在', 404);
+    const previous = draft.renewals[index];
+    if (!input.version || previous.version !== input.version) fail('记录已被修改，请刷新后重新确认续费', 409);
+    let extension;
+    try { extension = renewalExtension(previous.dueDate, input, now); } catch (error) { fail(error.message); }
+    if (input.expectedDueDate !== undefined && extension.dueDate !== input.expectedDueDate) fail('续费起算日期已变化，请重新确认', 409);
+    updated = validateRenewal({ ...previous, dueDate: extension.dueDate }, bots, previous, now);
+    draft.renewals[index] = updated;
+  });
+  const { deliveries, immediateDate, ...record } = updated;
+  return record;
+}
+
 export function registerRenewalRoutes(app, deps, service) {
   const route = (fn) => async (req, res, next) => { try { await fn(req, res); } catch (error) { next(error); } };
   const snapshot = () => ({ ...renewalSnapshot(deps.read()), bots: deps.bots().map((bot) => ({ id: bot.id, name: bot.name, enabled: bot.enabled !== false, configured: Boolean(bot.tokenEnc), hasRecipients: Boolean(bot.userIds?.length) })) });
@@ -125,6 +145,11 @@ export function registerRenewalRoutes(app, deps, service) {
     res.json(snapshot());
     service.tick();
   }));
+  app.post('/api/renewals/:id/extend', route((req, res) => {
+    extendRenewal(deps, req.params.id, req.body);
+    res.json(snapshot());
+    service.tick();
+  }));
   app.post('/api/renewals/delete', route((req, res) => {
     if (req.body.confirm !== true) fail('请先确认删除');
     deps.update((draft) => {
@@ -148,6 +173,13 @@ export function renewalMessage(items, now = Date.now()) {
     return [`🖥 <b>${escapeHtml(item.name)}</b>`, item.address ? `🌐 地址：${escapeHtml(item.address)}` : '',
       item.price !== '' ? `💰 续费：${escapeHtml(renewalAmount(item))}` : '', `📅 到期：${item.dueDate}`, status].filter(Boolean).join('\n');
   }).join('\n\n');
+}
+
+export function renewalNotificationMarkup(bot, items) {
+  // This durable link only opens options. Every mutation still requires a
+  // fresh, user-bound confirmation and current permissions/version checks.
+  if (!telegramScopeAllowed(bot, 'renewals')) return undefined;
+  return { inline_keyboard: items.map((item) => [{ text: `📅 续费 · ${String(item.name).replace(/[\r\n]+/g, ' ').slice(0, 36)}`, callback_data: `renewal:${item.id}` }]) };
 }
 
 // One scheduler, bounded sequential batches, no per-record timers. Persist the
@@ -220,7 +252,7 @@ export function createRenewalService(deps) {
           });
           batches++;
           let failure;
-          try { await deps.send(bot, chatId, renewalMessage(chunk, at)); }
+          try { await deps.send(bot, chatId, renewalMessage(chunk, at), renewalNotificationMarkup(bot, chunk)); }
           catch (error) { failure = error; }
           deps.update((draft) => {
             for (const original of chunk) {

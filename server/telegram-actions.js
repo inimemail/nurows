@@ -1,5 +1,6 @@
 import { registerOrchestrationRoutes } from './orchestration.js';
 import { registerDynamicGuardRoutes } from './dynamic-guard.js';
+import { extendRenewal } from './renewals.js';
 
 // Reuse the web route business rules in-process, without HTTP, credentials,
 // or serializing a full client state for each Telegram operation.
@@ -11,6 +12,11 @@ export function createTelegramActions(deps, dynamicService) {
   registerOrchestrationRoutes(app, localDeps);
   registerDynamicGuardRoutes(app, localDeps, dynamicService);
   return async (method, route, params, body, actor) => {
+    if (method === 'POST' && route === '/api/renewals/:id/extend') {
+      const result = extendRenewal(deps.renewalDeps, params.id, body);
+      deps.renewalService.tick();
+      return result;
+    }
     if (method === 'POST' && route === '/api/webhooks/:id/run') return deps.webhookService().trigger(params.id, 'telegram');
     const handler = routes.get(`${method} ${route}`);
     if (!handler) throw new Error('不支持的操作');

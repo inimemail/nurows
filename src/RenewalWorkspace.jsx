@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { CalendarClock, Plus, Settings, Trash2, Copy, Pencil, MoreHorizontal, X, RefreshCw } from 'lucide-react';
 import { startPolling } from '../shared/polling.js';
 import { filterWorkspaceRecords } from '../shared/workspace-search.js';
-import { DEFAULT_RENEWAL_SETTINGS, RENEWAL_CURRENCIES, beijingDate, renewalStatus, renewalAmount, sortRenewals, renewalIdentityIndex, renewalDuplicateField, renewalBotIds } from '../shared/renewals.js';
+import { DEFAULT_RENEWAL_SETTINGS, RENEWAL_CURRENCIES, RENEWAL_PERIODS, beijingDate, renewalStatus, renewalAmount, sortRenewals, renewalIdentityIndex, renewalDuplicateField, renewalBotIds, renewalExtension } from '../shared/renewals.js';
 import './renewals.css';
 
 const EMPTY = { name: '', address: '', price: '', currency: 'CNY', dueDate: '', botIds: [], notificationEnabled: true, note: '' };
@@ -16,6 +16,7 @@ export default function RenewalWorkspace({ state, search = '', api, onState, toa
   const [loading, setLoading] = useState(true), [error, setError] = useState('');
   const [filter, setFilter] = useState('all'), [page, setPage] = useState(1), [selected, setSelected] = useState([]);
   const [editor, setEditor] = useState(null), [settings, setSettings] = useState(null), [deletion, setDeletion] = useState(null);
+  const [extension, setExtension] = useState(null);
   const [busy, setBusy] = useState(false), [today, setToday] = useState(() => beijingDate());
   const working = useRef(false), epoch = useRef(0), mounted = useRef(true);
   const [refresh, setRefresh] = useState(0);
@@ -71,12 +72,13 @@ export default function RenewalWorkspace({ state, search = '', api, onState, toa
       const next = await api(path, { method, body: JSON.stringify(body) });
       if (!mounted.current) return;
       setData(next); onState?.((prior) => ({ ...prior, renewals: next.renewals, renewalSettings: next.renewalSettings, renewalRevision: next.renewalRevision }));
-      setEditor(null); setSettings(null); setDeletion(null); setSelected([]); setError(''); toast('已保存');
+      setEditor(null); setSettings(null); setDeletion(null); setExtension(null); setSelected([]); setError(''); toast('已保存');
     } catch (err) { if (mounted.current) { toast(err.message); setRefresh((value) => value + 1); } }
     finally { working.current = false; if (mounted.current) setBusy(false); }
   }
   const requestDelete = (ids, all = false) => setDeletion({ ids, all, count: all ? data.renewals.length : ids.length, revision: data.renewalRevision });
   const openCopy = (item) => { if (!busy && !loading) setEditor(duplicateRenewal({ ...item, botIds: item.botIds.filter((id) => data.bots.some((bot) => bot.id === id)) })); };
+  const extensionPreview = extension ? previewExtension(extension) : null;
   return <section className="ops-workspace renewal-workspace">
     <header className="surface ops-header"><div><span className="ops-eyebrow">到期与续费</span><strong>续费管理</strong></div><div className="renewal-summary"><CalendarClock size={16} /><span>{counts.all} 条记录 · {counts.soon} 条即将到期</span></div></header>
     <div className="ops-tabs" role="tablist" aria-label="续费状态">{FILTERS.map(([key, label]) => <button key={key} role="tab" aria-selected={filter === key} className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{label}<em>{counts[key]}</em></button>)}</div>
@@ -97,12 +99,17 @@ export default function RenewalWorkspace({ state, search = '', api, onState, toa
           <div className="renewal-price"><span className="renewal-mobile-label">续费金额</span><span className={item.price === '' ? 'renewal-muted' : ''}>{renewalAmount(item)}</span></div>
           <div className="renewal-date"><span className="renewal-mobile-label">到期日期</span><time dateTime={item.dueDate || undefined}>{item.dueDate || '未知日期'}</time></div>
           <div className={`renewal-status ${status.tone}`}><strong>{status.countdown}</strong><span>{status.label}</span></div>
-          <div className="renewal-row-actions"><button className="ghost icon-button" title="编辑" aria-label={`编辑 ${item.name}`} disabled={busy || loading} onClick={() => setEditor(structuredClone(item))}><Pencil size={16} /></button><details className="renewal-menu"><summary className="ghost icon-button" aria-label={`${item.name} 的更多操作`} title="更多操作"><MoreHorizontal size={18} /></summary><div><button disabled={busy || loading} onClick={(event) => { event.currentTarget.closest('details').open = false; openCopy(item); }}><Copy size={15} />复制</button><button className="danger-text-button" disabled={busy || loading} onClick={(event) => { event.currentTarget.closest('details').open = false; requestDelete([item.id]); }}><Trash2 size={15} />删除</button></div></details></div>
+          <div className="renewal-row-actions"><button className="ghost renewal-extend-button" disabled={busy || loading} aria-label={`续费 ${item.name}`} onClick={() => { setToday(beijingDate()); setExtension({ item: structuredClone(item), period: '1', mode: 'months', months: '1', dueDate: '' }); }}><CalendarClock size={15} />续费</button><button className="ghost icon-button" title="编辑" aria-label={`编辑 ${item.name}`} disabled={busy || loading} onClick={() => setEditor(structuredClone(item))}><Pencil size={16} /></button><details className="renewal-menu"><summary className="ghost icon-button" aria-label={`${item.name} 的更多操作`} title="更多操作"><MoreHorizontal size={18} /></summary><div><button disabled={busy || loading} onClick={(event) => { event.currentTarget.closest('details').open = false; openCopy(item); }}><Copy size={15} />复制</button><button className="danger-text-button" disabled={busy || loading} onClick={(event) => { event.currentTarget.closest('details').open = false; requestDelete([item.id]); }}><Trash2 size={15} />删除</button></div></details></div>
         </article>;
       })}</div>
       {!visible.length ? <div className="ops-empty"><CalendarClock size={28} /><strong>{loading ? '正在读取...' : data.renewals.length ? '没有匹配的续费记录' : '暂无续费记录'}</strong></div> : null}
       {pages > 1 ? <div className="renewal-pagination"><button className="ghost" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}>上一页</button><span>{currentPage} / {pages}</span><button className="ghost" disabled={currentPage >= pages} onClick={() => setPage(currentPage + 1)}>下一页</button></div> : null}
     </div>
+    {extension ? <Dialog title="快速续费" className="renewal-dialog renewal-extend-dialog" onClose={() => !busy && setExtension(null)} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setExtension(null)}>取消</button><button className="primary" form="renewal-extension" type="submit" disabled={busy || !extensionPreview.dueDate}>{busy ? '保存中...' : '确认续费'}</button></div></>}>
+      <form id="renewal-extension" onSubmit={(event) => { event.preventDefault(); if (extensionPreview.dueDate) mutate(`/api/renewals/${encodeURIComponent(extension.item.id)}/extend`, { ...extensionPreview.input, version: extension.item.version, expectedDueDate: extensionPreview.dueDate }); }}>
+        <RenewalExtension value={extension} preview={extensionPreview} busy={busy} patch={(patch) => setExtension((prior) => ({ ...prior, ...patch }))} />
+      </form>
+    </Dialog> : null}
     {editor ? <Dialog title={editor.id ? '编辑续费记录' : '添加续费记录'} className="ops-editor-dialog renewal-dialog" onClose={() => !busy && setEditor(null)} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setEditor(null)}>取消</button><button className="primary" form="renewal-form" type="submit" disabled={busy || Boolean(duplicate)}>{busy ? '保存中...' : '保存'}</button></div></>}>
       <form id="renewal-form" className="ops-editor-grid" onSubmit={(event) => { event.preventDefault(); if (!duplicate) mutate(editor.id ? `/api/renewals/${encodeURIComponent(editor.id)}` : '/api/renewals', editor, editor.id ? 'PUT' : 'POST'); }}>
         <RenewalEditor value={editor} bots={data.bots} duplicate={duplicate} notificationNames={notificationNames(renewalBotIds(editor, data.renewalSettings))} patch={(patch) => setEditor((prior) => ({ ...prior, ...patch }))} />
@@ -111,6 +118,23 @@ export default function RenewalWorkspace({ state, search = '', api, onState, toa
     {settings ? <Dialog title="续费提醒设置" className="renewal-dialog" onClose={() => !busy && setSettings(null)} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setSettings(null)}>取消</button><button className="primary" type="submit" form="renewal-settings" disabled={busy}>{busy ? '保存中...' : '保存设置'}</button></div></>}><RenewalSettings value={settings} bots={data.bots} onChange={setSettings} onSave={(next) => mutate('/api/renewals/settings', next, 'PUT')} /></Dialog> : null}
     {deletion ? <Dialog title={deletion.all ? '删除全部续费记录' : '删除续费记录'} onClose={() => !busy && setDeletion(null)} footer={<><span /><div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setDeletion(null)}>取消</button><button className="primary danger-action" disabled={busy} onClick={() => mutate('/api/renewals/delete', { ...deletion, confirm: true })}>{busy ? '删除中...' : '确认删除'}</button></div></>}><p className="confirm-copy">将永久删除{deletion.all ? '全部' : '所选'} {deletion.count} 条续费记录及其提醒状态。{deletion.all ? '包含当前搜索或筛选中未显示的记录。' : ''}实际服务器、SSH 和守护任务不受影响。</p></Dialog> : null}
   </section>;
+}
+
+function previewExtension(value) {
+  const input = value.period === 'custom' && value.mode === 'date' ? { dueDate: value.dueDate } : { months: Number(value.period === 'custom' ? value.months : value.period) };
+  try { return { ...renewalExtension(value.item.dueDate, input), input }; }
+  catch (error) { return { input, error: error.message }; }
+}
+
+export function RenewalExtension({ value, preview, patch, busy }) {
+  return <div className="renewal-extension">
+    <div className="renewal-extension-identity"><strong>{value.item.name}</strong>{value.item.address ? <span>{value.item.address}</span> : null}</div>
+    <div className="renewal-periods" role="group" aria-label="续费时长">{[...RENEWAL_PERIODS.map(([months, label]) => [String(months), label]), ['custom', '自定义']].map(([period, label]) => <button key={period} type="button" className={value.period === period ? 'active' : ''} aria-pressed={value.period === period} disabled={busy} onClick={() => patch({ period })}>{label}</button>)}</div>
+    {value.period === 'custom' ? <div className="renewal-extension-custom"><label className="ops-field"><span>续费方式</span><select value={value.mode} disabled={busy} onChange={(event) => patch({ mode: event.target.value })}><option value="months">按月延长</option><option value="date">指定到期日期</option></select></label>{value.mode === 'date' ? <label className="ops-field"><span>新到期日期</span><input type="date" required min={preview.base || beijingDate()} max="2199-12-31" value={value.dueDate} disabled={busy} onChange={(event) => patch({ dueDate: event.target.value })} /></label> : <label className="ops-field"><span>续费月数</span><input type="number" inputMode="numeric" required min="1" max="120" step="1" value={value.months} disabled={busy} onChange={(event) => patch({ months: event.target.value })} /></label>}</div> : null}
+    <div className="renewal-extension-preview"><div><span>原到期日</span><time>{value.item.dueDate || '未知日期'}</time></div><div><span>新到期日</span><strong>{preview.dueDate || '请选择有效日期'}</strong></div></div>
+    <p className="renewal-extension-hint">未过期从原到期日延长；已过期或未填日期从今天起算。仅更新续费记录，请先完成实际付款。</p>
+    {preview.error ? <p className="renewal-field-error" role="alert">{preview.error}</p> : null}
+  </div>;
 }
 
 export function RenewalEditor({ value, patch, bots, duplicate = '', notificationNames = '未选择' }) {
@@ -147,6 +171,7 @@ export function RenewalSettings({ value, bots = [], onChange, onSave }) {
     onSave({ ...value, days });
   }}>
     <RenewalBotPicker label="默认 TG 通知机器人" bots={bots} value={value.botIds || []} onChange={(botIds) => onChange({ ...value, botIds })} />
+    <p className="renewal-extension-hint">TG 提醒中使用快速续费：请在 Telegram 机器人的「TG 可用管理功能」中勾选「续费管理」。</p>
     <div className="ops-field"><span>提前通知（天）</span><div className="renewal-reminder-days">{value.days.filter((number) => number > 0).map((number) => <span key={number}>{number} 天<button type="button" title={`移除提前 ${number} 天`} aria-label={`移除提前 ${number} 天`} onClick={() => onChange({ ...value, days: value.days.filter((item) => item !== number) })}><X size={14} /></button></span>)}</div></div>
     <div className="renewal-day-add"><input type="number" inputMode="numeric" min="1" max="365" step="1" aria-label="提前通知天数" placeholder="天数" value={day} disabled={value.days.length >= 20} onChange={(event) => setDay(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); add(); } }} /><button type="button" className="ghost" disabled={!day || value.days.length >= 20 || !Number.isInteger(Number(day)) || Number(day) < 1 || Number(day) > 365} onClick={add}><Plus size={16} />添加节点</button></div>
     <label className="ops-toggle"><input type="checkbox" checked={value.days.includes(0)} disabled={!value.days.includes(0) && value.days.length >= 20} onChange={(event) => onChange({ ...value, days: event.target.checked ? [...value.days, 0] : value.days.filter((number) => number !== 0) })} /><span>到期当天通知</span></label>

@@ -1,5 +1,22 @@
 export const RENEWAL_CURRENCIES = ['CNY', 'USD', 'EUR', 'HKD', 'JPY', 'GBP', 'SGD', 'AUD', 'CAD', 'TWD', 'KRW'];
 export const DEFAULT_RENEWAL_SETTINGS = { days: [7, 3, 1, 0], time: '09:00', botIds: [] };
+export const RENEWAL_PERIODS = [[1, '1 个月'], [3, '3 个月'], [6, '半年'], [12, '1 年']];
+
+// Calendar months, clamped to the last day of the destination month.
+export function renewalExtension(dueDate, input, now = Date.now()) {
+  const base = validRenewalDate(dueDate || '') && dueDate > beijingDate(now) ? dueDate : beijingDate(now);
+  let next;
+  if (input.months !== undefined) {
+    if (input.dueDate !== undefined || !Number.isInteger(input.months) || input.months < 1 || input.months > 120) throw new Error('续费月数须为 1–120 的整数');
+    const [year, month, day] = base.split('-').map(Number);
+    const target = new Date(Date.UTC(year, month - 1 + input.months, 1));
+    const last = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+    target.setUTCDate(Math.min(day, last));
+    next = target.toISOString().slice(0, 10);
+  } else next = input.dueDate;
+  if (!validRenewalDate(next || '') || next <= base) throw new Error('新到期日期须晚于续费起算日，且不超过 2199 年');
+  return { base, dueDate: next };
+}
 
 export function renewalBotIds(item, settings) {
   if (item.notificationEnabled === false) return [];

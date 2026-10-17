@@ -4,6 +4,8 @@ import { createTelegramWorkspace } from '../server/telegram-workspace.js';
 import { createTelegramActions } from '../server/telegram-actions.js';
 import { clearFinishedIncidents, normalizeOrchestrationState, orchestrationDefaults } from '../server/orchestration.js';
 import { TELEGRAM_FEATURES, telegramScopes } from '../shared/telegram-permissions.js';
+import { normalizeRenewalState, validateRenewal } from '../server/renewals.js';
+import { renewalExtension } from '../shared/renewals.js';
 
 function harness(extra = {}, options = {}) {
   const bot = { id: 'bot', enabled: true, menuScopeVersion: 2, menuScopes: TELEGRAM_FEATURES.map(([key]) => key), automationTaskIds: ['task'], role: 'operator' };
@@ -42,7 +44,7 @@ test('main menu includes Webhook tasks, granular permissions, and no implicit ma
   const h = harness();
   await h.send('/menu');
   assert.deepEqual(h.latest().reply_markup.inline_keyboard.map((row) => row.map((item) => item.text)), [
-    ['系统总览', '故障事件'], ['DNS 守护', '动态 IP 守护'], ['探针与检查', 'IP 资产与备用池'], ['解析管理', '自动化任务'], ['Webhook 任务']
+    ['系统总览', '故障事件'], ['DNS 守护', '动态 IP 守护'], ['探针与检查', 'IP 资产与备用池'], ['解析管理', '自动化任务'], ['📅 续费管理', 'Webhook 任务']
   ]);
   h.bot.menuScopes = ['guards'];
   await h.send('/menu');
@@ -66,6 +68,62 @@ test('Webhook Telegram commands keep output private and recheck permission befor
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(h.operations.length, 1); assert.equal(h.operations[0][0], 'POST'); assert.equal(h.operations[0][1], '/api/webhooks/:id/run');
   assert.match(h.latest().text, /请求已提交/);
+});
+
+test('renewal management checks granular scope, previews before extending, and uses shared API validation', async () => {
+  const renewal = { id: 'r1', version: 'v1', name: 'HK', address: 'hk.example.com', price: '12.50', currency: 'USD', dueDate: '2099-09-24', botIds: [], notificationEnabled: true };
+  const h = harness({ renewals: [renewal] }, { invoke: async () => ({ ...renewal, dueDate: '2100-03-24' }) });
+  h.bot.menuScopes = ['renewals'];
+  await h.send('/renewals');
+  assert.match(h.latest().text, /续费管理/);
+  await h.click(h.buttons()[0].callback_data);
+  await h.press('📅 快速续费');
+  await h.press('续费 半年');
+  assert.match(h.latest().text, /新到期：/);
+  assert.equal(h.operations.length, 0);
+  await h.press('确认'); await h.workspace.drain();
+  assert.equal(h.operations[0][0], 'POST');
+  assert.equal(h.operations[0][1], '/api/renewals/:id/extend');
+  assert.equal(h.operations[0][2].id, 'r1');
+  assert.equal(h.operations[0][3].months, 6);
+  assert.equal(h.operations[0][3].version, 'v1');
+  h.bot.menuScopes = [];
+  await h.click('renewal:r1');
+  assert.match(h.latest().text, /没有访问权限/);
+});
+
+test('renewal notice and custom input require fresh permissions, version and single-use confirmation', async () => {
+  const renewal = { id: 'r', version: 'v1', name: 'server', price: '', currency: 'USD', dueDate: '2098-01-31' };
+  const h = harness({ renewals: [renewal] });
+  await h.click('renewal:r');
+  assert.ok(h.buttons().some((button) => button.text === '续费 1 个月'));
+  await h.press('自定义续费'); await h.send('2099-12-31');
+  assert.match(h.latest().text, /新到期：2099-12-31/);
+  const confirm = h.find('确认');
+  h.bot.role = 'viewer'; await h.click(confirm); await h.workspace.drain();
+  assert.equal(h.operations.length, 0);
+  h.bot.role = 'operator'; await h.click('renewal:r'); await h.press('自定义续费');
+  renewal.version = 'v2'; await h.send('3');
+  assert.match(h.latest().text, /已被修改/);
+  assert.equal(h.operations.length, 0);
+  await h.click('renewal:r'); await h.press('自定义续费'); await h.send('2099-12-31');
+  const once = h.find('确认'); await h.click(once); await h.workspace.drain(); await h.click(once); await h.workspace.drain();
+  assert.equal(h.operations.length, 1);
+  assert.equal(h.operations[0][3].dueDate, '2099-12-31');
+  assert.equal(h.operations[0][3].version, 'v2');
+  assert.ok(h.packets.some((packet) => packet.method === 'answerCallbackQuery' && /已过期/.test(packet.text || '')));
+});
+
+test('Telegram renewal adapter reuses atomic renewal update and preserves other state', async () => {
+  let state = { ...normalizeRenewalState(), renewals: [validateRenewal({ name: 'server', address: '', price: '', currency: 'USD', dueDate: '2098-01-31', botIds: [] }, [])] }, ticks = 0;
+  const deps = { read: () => state, bots: () => [], update(fn) { const next = structuredClone(state); fn(next); next.renewalRevision++; state = next; } };
+  const invoke = createTelegramActions({ readState: () => ({}), renewalDeps: deps, renewalService: { tick() { ticks++; } } }, {});
+  const original = state.renewals[0];
+  const result = await invoke('POST', '/api/renewals/:id/extend', { id: original.id }, { version: original.version, months: 1, expectedDueDate: renewalExtension(original.dueDate, { months: 1 }).dueDate }, 'telegram:test');
+  assert.equal(result.dueDate, '2098-02-28');
+  assert.equal(state.renewals[0].dueDate, result.dueDate);
+  assert.equal(ticks, 1);
+  await assert.rejects(invoke('POST', '/api/renewals/:id/extend', { id: original.id }, { version: original.version, months: 1 }), { statusCode: 409 });
 });
 
 test('list pagination, detail return, search and abnormal filter retain context while editing messages', async () => {

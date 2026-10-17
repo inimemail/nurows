@@ -174,3 +174,33 @@ test('renewal reminder settings expose actual robots, default unchecked, and sub
   view.render();
   assert.ok(view.nodes().some((node) => node.props?.className === 'renewal-notification-summary' && node.props.children.includes('通知')));
 });
+
+test('quick renewal previews presets and custom dates, validates inputs and suppresses repeat submits', async () => {
+  const calls = []; let release;
+  const view = harness(async (path, options) => {
+    if (!options.method) return fixture();
+    calls.push({ path, body: JSON.parse(options.body) });
+    return new Promise((resolve) => { release = () => resolve({ ...fixture(), renewalRevision: 2 }); });
+  });
+  await view.poll(); view.render();
+  view.button('续费 香港入口').props.onClick(); view.render();
+  const editor = () => view.nodes().find((node) => node.type === view.exports.RenewalExtension);
+  let content = view.exports.RenewalExtension(editor().props);
+  assert.equal(view.nodes(content).filter((node) => node.type === 'button').length, 5);
+  for (const period of ['1', '3', '6', '12']) {
+    editor().props.patch({ period }); view.render();
+    assert.equal(editor().props.preview.input.months, Number(period));
+    assert.equal(editor().props.preview.dueDate, renewals.renewalExtension(item.dueDate, { months: Number(period) }).dueDate);
+  }
+  editor().props.patch({ period: 'custom', months: '0' }); view.render();
+  assert.equal(view.button('确认续费').props.disabled, true);
+  editor().props.patch({ mode: 'date', dueDate: '2099-12-31' }); view.render();
+  assert.equal(editor().props.preview.dueDate, '2099-12-31');
+  const submit = view.nodes().find((node) => node.props?.id === 'renewal-extension').props.onSubmit;
+  submit({ preventDefault() {} }); submit({ preventDefault() {} });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, '/api/renewals/one/extend');
+  assert.deepEqual(calls[0].body, { dueDate: '2099-12-31', version: 'v1', expectedDueDate: '2099-12-31' });
+  release(); await new Promise((resolve) => setImmediate(resolve)); view.render();
+  assert.equal(editor(), undefined);
+});

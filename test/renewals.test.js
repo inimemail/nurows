@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
-import { beijingDate, validRenewalDate, renewalDays, renewalStatus, sortRenewals, renewalStage, renewalAmount, renewalIdentityIndex, renewalDuplicateField, DEFAULT_RENEWAL_SETTINGS } from '../shared/renewals.js';
-import { validateRenewal, validateRenewalSettings, normalizeRenewalState, renewalSnapshot, registerRenewalRoutes, createRenewalService, renewalMessage } from '../server/renewals.js';
+import { beijingDate, validRenewalDate, renewalDays, renewalStatus, sortRenewals, renewalStage, renewalAmount, renewalIdentityIndex, renewalDuplicateField, renewalExtension, DEFAULT_RENEWAL_SETTINGS } from '../shared/renewals.js';
+import { validateRenewal, validateRenewalSettings, normalizeRenewalState, renewalSnapshot, registerRenewalRoutes, createRenewalService, renewalMessage, renewalNotificationMarkup } from '../server/renewals.js';
 import { pruneHistory } from '../server/history.js';
 import { filterWorkspaceRecords, workspaceSearchPlaceholder } from '../shared/workspace-search.js';
 
@@ -38,6 +38,55 @@ test('renewal dates use Beijing calendar days, strict dates and stable expiratio
   assert.equal(renewalStatus({ dueDate: '2026-09-21' }, undefined, NOW).tone, 'bad');
   assert.equal(renewalStatus({ dueDate: '2026-09-24' }, undefined, NOW).key, 'soon');
   assert.equal(renewalStatus({ dueDate: '2026-10-21' }, undefined, NOW).key, 'valid');
+});
+
+test('quick renewal uses calendar months, handles expired and unknown dates, and clamps month end', () => {
+  assert.equal(renewalExtension('2026-01-31', { months: 1 }, NOW).dueDate, '2026-10-21');
+  assert.equal(renewalExtension('2026-09-21', { months: 1 }, NOW).dueDate, '2026-10-21');
+  assert.equal(renewalExtension('2026-09-20', { months: 1 }, NOW).dueDate, '2026-10-21');
+  assert.equal(renewalExtension('', { months: 1 }, NOW).dueDate, '2026-10-21');
+  assert.equal(renewalExtension('2026-01-31', { months: 1 }, Date.parse('2026-01-01T00:00:00Z')).dueDate, '2026-02-28');
+  const early = Date.parse('2024-01-01T00:00:00Z');
+  assert.equal(renewalExtension('2024-01-31', { months: 1 }, early).dueDate, '2024-02-29');
+  assert.equal(renewalExtension('2024-02-29', { months: 12 }, early).dueDate, '2025-02-28');
+  assert.equal(renewalExtension('2024-10-31', { months: 6 }, early).dueDate, '2025-04-30');
+  assert.equal(renewalExtension('', { dueDate: '2027-01-15' }, NOW).dueDate, '2027-01-15');
+  for (const months of [0, -1, 121, 1.5, '3', null]) assert.throws(() => renewalExtension('', { months }, NOW));
+  for (const input of [{}, { dueDate: '2026-09-21' }, { dueDate: '2026-02-30' }, { months: 1, dueDate: '2027-01-01' }]) assert.throws(() => renewalExtension('', input, NOW));
+  assert.throws(() => renewalExtension('2199-12-31', { months: 1 }, NOW));
+});
+
+test('quick renewal route is version guarded and resets reminder deduplication state', async () => {
+  const h = harness([record()]); const handlers = new Map(); let ticks = 0;
+  registerRenewalRoutes(Object.fromEntries(['get', 'put', 'post'].map((method) => [method, (path, handler) => handlers.set(`${method} ${path}`, handler)])), h.deps, { tick() { ticks++; } });
+  const invoke = async (body) => {
+    let result, error;
+    await handlers.get('post /api/renewals/:id/extend')({ params: { id: h.state.renewals[0].id }, body }, { json(value) { result = value; } }, (value) => { error = value; });
+    if (error) throw error;
+    return result;
+  };
+  await assert.rejects(invoke({ months: 1, version: 'stale' }), { statusCode: 409 });
+  const before = h.state.renewals[0];
+  before.deliveries['["bot","1"]'] = { stage: 3, status: 'sent' };
+  for (const body of [{ months: 0 }, { months: 1.5 }, { months: 121 }, { dueDate: '2026-09-23' }]) await assert.rejects(invoke({ version: before.version, ...body }), { statusCode: 400 });
+  await assert.rejects(invoke({ months: 1, version: before.version, expectedDueDate: '2026-10-25' }), { statusCode: 409 });
+  assert.equal(h.writes, 0);
+  const response = await invoke({ months: 3, version: before.version, expectedDueDate: renewalExtension(before.dueDate, { months: 3 }, NOW).dueDate });
+  assert.equal(response.renewals[0].dueDate, renewalExtension(before.dueDate, { months: 3 }, NOW).dueDate);
+  assert.deepEqual(h.state.renewals[0].deliveries, {});
+  assert.equal(h.state.renewals[0].immediateDate, beijingDate(NOW));
+  for (const key of ['id', 'name', 'address', 'price', 'currency', 'notificationEnabled', 'note', 'createdAt']) assert.equal(response.renewals[0][key], before[key]);
+  assert.deepEqual(response.renewals[0].botIds, before.botIds);
+  assert.notEqual(response.renewals[0].version, before.version);
+  assert.equal(response.renewals[0].deliveries, undefined);
+  await assert.rejects(invoke({ months: 3, version: before.version }), { statusCode: 409 });
+  assert.equal(ticks, 1);
+});
+
+test('renewal notification buttons only expose details when the bot has the renewals scope', () => {
+  const item = record();
+  assert.equal(renewalNotificationMarkup({ menuScopeVersion: 2, menuScopes: [] }, [item]), undefined);
+  assert.equal(renewalNotificationMarkup({ menuScopeVersion: 2, menuScopes: ['renewals'] }, [item]).inline_keyboard[0][0].callback_data, `renewal:${item.id}`);
 });
 
 test('renewal validation handles optional fields, zero amounts and rejects invalid input', () => {

@@ -1061,7 +1061,7 @@ export default function App() {
         }, 0);
       }
       const telegramSection = new URLSearchParams(window.location.search).get('tgSection');
-      const telegramTab = { guards: 'probes', dynamic: 'probes', probes: 'probes', targets: 'probes', policies: 'probes', incidents: 'probes', assets: 'pools', pools: 'pools', usage: 'pools', dns: 'dns', automation: 'automation' }[telegramSection];
+      const telegramTab = { guards: 'probes', dynamic: 'probes', probes: 'probes', targets: 'probes', policies: 'probes', incidents: 'probes', assets: 'pools', pools: 'pools', usage: 'pools', dns: 'dns', automation: 'automation', renewals: 'renewals' }[telegramSection];
       if (telegramTab) setTab(telegramTab);
       if (/^#note=[a-f0-9-]{36}$/.test(window.location.hash)) setTab('notes');
       setStateLoaded(true);

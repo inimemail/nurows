@@ -15,7 +15,7 @@
 .renewal-settings > .renewal-bots { padding-bottom: 16px; border-bottom: 1px solid var(--border-soft); }
 .renewal-actions button, .renewal-day-add button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
 .renewal-actions .icon-button, .renewal-row-actions .icon-button { width: 38px; height: 38px; flex: 0 0 38px; padding: 0; }
-.renewal-table-head, .renewal-row { display: grid; grid-template-columns: minmax(180px, 1.8fr) minmax(100px, .8fr) minmax(100px, .8fr) minmax(110px, .9fr) 84px; gap: 16px; align-items: center; }
+.renewal-table-head, .renewal-row { display: grid; grid-template-columns: minmax(160px, 1.8fr) minmax(90px, .8fr) minmax(100px, .8fr) minmax(100px, .9fr) 156px; gap: 12px; align-items: center; }
 .renewal-table-head { padding: 10px 0; color: var(--text-muted); font-size: 11px; border-bottom: 1px solid var(--border-soft); }
 .renewal-table-head label, .renewal-identity { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .renewal-table-head input, .renewal-identity > input { width: 16px; height: 16px; flex: 0 0 16px; accent-color: var(--accent-solid); }
@@ -37,6 +37,23 @@
 .renewal-status.bad { color: #d35555; }
 .renewal-status.muted { color: var(--text-muted); }
 .renewal-row-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.renewal-extend-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 38px; padding: 0 10px; white-space: nowrap; color: var(--accent-solid); }
+.renewal-extension { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.renewal-extend-dialog .dialog-body { padding-top: 20px; }
+.renewal-extension-identity { display: flex; flex-direction: column; gap: 5px; overflow-wrap: anywhere; }
+.renewal-extension-identity strong { font-size: 16px; color: var(--text-strong); }
+.renewal-extension-identity span, .renewal-extension-hint { font-size: 12px; color: var(--text-soft); line-height: 1.7; }
+.renewal-extension-hint { margin: 0; }
+.renewal-periods { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.renewal-periods button { min-height: 44px; border: 1px solid var(--border-card); border-radius: 8px; cursor: pointer; }
+.renewal-periods button:last-child { grid-column: 1 / -1; }
+.renewal-periods button.active { border-color: var(--accent-solid); color: var(--accent-solid); background: var(--card-hover); }
+.renewal-extension-custom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.renewal-extension-custom input, .renewal-extension-custom select { min-width: 0; width: 100%; box-sizing: border-box; }
+.renewal-extension-preview { display: flex; flex-direction: column; gap: 12px; padding: 16px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--card-hover); }
+.renewal-extension-preview > div { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.renewal-extension-preview span { color: var(--text-soft); }
+.renewal-extension-preview strong { color: var(--accent-solid); }
 .renewal-menu { position: relative; }
 .renewal-menu summary { list-style: none; display: flex; align-items: center; justify-content: center; cursor: pointer; }
 .renewal-menu summary::-webkit-details-marker { display: none; }
@@ -60,7 +77,7 @@
 .renewal-reminder-days button { display: grid; place-items: center; width: 28px; height: 28px; cursor: pointer; }
 .renewal-day-add { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
 @media (max-width: 1000px) and (min-width: 761px) {
-  .renewal-table-head, .renewal-row { grid-template-columns: minmax(150px, 1.5fr) 100px 100px 100px 84px; gap: 10px; }
+  .renewal-table-head, .renewal-row { grid-template-columns: minmax(110px, 1.5fr) 80px 90px 90px 150px; gap: 8px; }
 }
 @media (max-width: 760px) {
   .renewal-workspace .ops-header { align-items: flex-start; gap: 10px; }
@@ -81,6 +98,9 @@
   .renewal-price, .renewal-date { grid-column: 1 / -1; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding-left: 28px; font-size: 13px; }
   .renewal-mobile-label { display: inline; color: var(--text-muted); flex-shrink: 0; font-size: 12px; }
   .renewal-row-actions { grid-column: 1 / -1; }
+  .renewal-extend-button { min-height: 44px; margin-right: auto; padding: 0 16px; }
+  .renewal-periods { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .renewal-extension-custom { grid-template-columns: minmax(0, 1fr); }
   .renewal-bots { grid-template-columns: 1fr; }
   .renewal-bots label { min-height: 44px; }
   .renewal-reminder-days button { width: 36px; height: 36px; }

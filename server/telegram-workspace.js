@@ -3,13 +3,14 @@ import { telegramScopeAllowed } from '../shared/telegram-permissions.js';
 import { WORKSPACE_SEARCH, filterWorkspaceRecords } from '../shared/workspace-search.js';
 import { parseIpBatch } from './orchestration.js';
 import net from 'node:net';
+import { renewalStatus, renewalAmount, renewalExtension, sortRenewals, RENEWAL_PERIODS } from '../shared/renewals.js';
 
 const sections = {
   guards: ['DNS 守护', 'dnsGuards'], dynamic: ['动态 IP 守护', 'dynamicGuards'],
   probes: ['探针节点', 'probes'], targets: ['检查目标', 'probeTargets'], policies: ['切换策略', 'failoverPolicies'],
   incidents: ['故障事件', 'incidents'], assets: ['IP 资产', 'ipAssets'], pools: ['备用 IP 池', 'ipPools'],
   usage: ['IP 使用记录', 'ipUsageRecords'], dns: ['解析管理', 'dnsBindings'], automation: ['自动化任务', 'automationTasks'],
-  runs: ['自动化执行记录', 'automationRuns'], webhooks: ['Webhook 任务', 'webhookTasks']
+  runs: ['自动化执行记录', 'automationRuns'], webhooks: ['Webhook 任务', 'webhookTasks'], renewals: ['续费管理', 'renewals']
 };
 const resources = { guards: 'dns-guards', probes: 'probes', targets: 'probe-targets', policies: 'failover-policies', pools: 'ip-pools', assets: 'ip-assets' };
 const labels = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', unknown: '未检查',
@@ -27,7 +28,7 @@ const searchSection = (section) => ({ probes: 'nodes', dns: 'bindings' })[sectio
 const short = (value, max = 80) => String(value ?? '').replace(/[\r\n]+/g, ' ').slice(0, max);
 const date = (value) => value && Number.isFinite(new Date(value).getTime()) ? new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '暂无';
 const scopeOf = (section) => section === 'runs' ? 'automation' : section;
-const status = (item, section) => item.enabled === false ? '已停用' : section === 'probes' && item.status === 'online' && Date.now() - Date.parse(item.lastSeenAt || 0) > 90000 ? '离线' : (section === 'dynamic' && dynamicLabels[item.status]) || labels[item.status || item.health] || item.status || item.health || '已配置';
+const status = (item, section) => section === 'renewals' ? renewalStatus(item).countdown : item.enabled === false ? '已停用' : section === 'probes' && item.status === 'online' && Date.now() - Date.parse(item.lastSeenAt || 0) > 90000 ? '离线' : (section === 'dynamic' && dynamicLabels[item.status]) || labels[item.status || item.health] || item.status || item.health || '已配置';
 const name = (item) => short(item.name || item.taskName || item.targetName || item.address || item.domain || item.id);
 const sameValues = (a = [], b = []) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
 const identity = (item) => JSON.stringify([item.accountId, item.domain, item.recordType]);
@@ -100,7 +101,7 @@ export function createTelegramWorkspace(deps) {
       [allowed(ctx, 'overview') ? button(ctx, '系统总览', { kind: 'overview', section: 'overview' }) : null, link('incidents', '故障事件')],
       [link('guards', 'DNS 守护'), link('dynamic', '动态 IP 守护')],
       [group('探针与检查', ['probes', 'targets', 'policies']), group('IP 资产与备用池', ['assets', 'pools', 'usage'])],
-      [link('dns', '解析管理'), link('automation', '自动化任务')], [link('webhooks', 'Webhook 任务')]
+      [link('dns', '解析管理'), link('automation', '自动化任务')], [link('renewals', '📅 续费管理'), link('webhooks', 'Webhook 任务')]
     ].map((row) => row.filter(Boolean));
     return show(ctx, `NuroSSH 操作菜单\n选择模块查看状态或执行操作。${rows.every((row) => !row.length) ? '\n当前机器人未开放管理功能；任务通知仍按各自配置发送。' : ''}`, rows);
   }
@@ -112,10 +113,12 @@ export function createTelegramWorkspace(deps) {
     const filter = ctx.session.filters[section] || {};
     const query = (filter.query || '').trim().toLowerCase();
     const related = query && section === 'pools' ? deps.readState(['ipAssets']) : {};
-    const searched = section === 'automation' || section === 'runs'
+    const found = section === 'automation' || section === 'runs'
       ? records(ctx, section).filter((item) => !query || [item.name, item.taskName].some((value) => String(value || '').toLowerCase().includes(query)))
       : filterWorkspaceRecords(searchSection(section), records(ctx, section), query, related);
-    const items = filter.bad ? searched.filter((item) => bad.has(item.status || item.health) || status(item, section) === '离线') : searched;
+    const searched = section === 'renewals' ? sortRenewals(found) : found;
+    const renewalSettings = section === 'renewals' ? deps.readState(['renewalSettings']).renewalSettings : undefined;
+    const items = filter.bad ? searched.filter((item) => section === 'renewals' ? ['soon', 'expired'].includes(renewalStatus(item, renewalSettings).key) : bad.has(item.status || item.health) || status(item, section) === '离线') : searched;
     const pages = Math.max(1, Math.ceil(items.length / 8));
     page = Math.min(pages - 1, Math.max(0, page || 0)); ctx.session.pages[section] = page;
     const rows = items.slice(page * 8, page * 8 + 8).map((item) => [button(ctx, `${short(name(item), 38)} · ${status(item, section)}`, { kind: 'detail', section, id: item.id })]);
@@ -138,7 +141,12 @@ export function createTelegramWorkspace(deps) {
     const action = (text, kind, op) => button(ctx, text, { kind, section, id, op });
     if (item.domain) lines.push(`域名：${short(item.domain, 253)} · ${item.recordType || ''}`);
     if (item.address) lines.push(`地址：${short(item.address, 253)}`);
-    if (section === 'guards') {
+    if (section === 'renewals') {
+      lines.push(`💰 续费金额：${renewalAmount(item)}`, `📅 到期日期：${item.dueDate || '未知日期'}`);
+      if (item.note) lines.push(`📝 备注：${short(item.note, 500)}`);
+      if (canWrite(ctx)) rows.push([action('📅 快速续费', 'renewalOptions')]);
+      rows.push([webButton(ctx, section, id)]);
+    } else if (section === 'guards') {
       lines.push(`活动 IP：${item.currentValues?.length || 0} / ${item.maxActiveIps || 50}`, `来源：${item.sources?.length || 0} 个`, `最近检查：${date(item.lastCheckAt)}`);
       lines.push(`备用池补位：${item.poolFillMode === 'fill' ? `补满 ${item.poolTargetCount || item.maxActiveIps || 50} 个健康 IP` : '故障补位'}`);
       lines.push(`备用池取用：${item.poolSelectionMode === 'balanced' ? '均衡取用' : '按顺序取用'}`);
@@ -225,12 +233,19 @@ export function createTelegramWorkspace(deps) {
       [[...(page ? [button(ctx, '上一页', { kind: 'history', section, id, page: page - 1 })] : []), ...(page + 1 < pages ? [button(ctx, '下一页', { kind: 'history', section, id, page: page + 1 })] : [])], [button(ctx, '返回详情', { kind: 'detail', section, id }), rootButton(ctx)]]);
   }
   function call(ctx, method, route, params = {}, body = {}) { return deps.invoke(method, route, params, body, `telegram:${ctx.settings.id}:${ctx.from.id}`); }
+  async function renewalOptions(ctx, id) {
+    assertAccess(ctx, 'renewals', true);
+    const item = get(ctx, 'renewals', id);
+    const choices = RENEWAL_PERIODS.map(([months, label]) => button(ctx, `续费 ${label}`, { kind: 'confirm', section: 'renewals', id, op: 'extend', months, version: item.version }));
+    return show(ctx, `📅 ${name(item)}\n当前到期：${item.dueDate || '未知日期'}\n选择续费时长，下一步确认新到期日。\n仅更新记录，请先完成实际付款。`, [choices.slice(0, 2), choices.slice(2), [button(ctx, '自定义续费', { kind: 'renewalInput', section: 'renewals', id, version: item.version })], [button(ctx, '返回详情', { kind: 'detail', section: 'renewals', id }), rootButton(ctx)]]);
+  }
   async function execute(ctx, action) {
     const { section, id, op } = action;
     assertAccess(ctx, section, true, op);
     if (op === 'clear') return deps.clearFinishedIncidents(action.ids || [], `telegram:${ctx.settings.id}:${ctx.from.id}`);
     if (op === 'create') return call(ctx, 'POST', '/api/orchestration/:resource', { resource: 'dns-bindings' }, { ...action.body, expectedValues: [] });
     const item = get(ctx, section, id);
+    if (op === 'extend' && section === 'renewals') return call(ctx, 'POST', '/api/renewals/:id/extend', { id }, { version: action.version, ...(action.months !== undefined ? { months: action.months } : { dueDate: action.dueDate }), expectedDueDate: action.expectedDueDate });
     if (action.address && item.address !== action.address) throw new Error('IP 已变更，请重新确认');
     if (action.identity && identity(item) !== action.identity) throw new Error('目标配置已变化，请重新确认');
     if (op === 'toggle') {
@@ -276,6 +291,11 @@ export function createTelegramWorkspace(deps) {
     queue.push(async () => {
       try {
         const result = await execute(resultCtx, action);
+        if (action.op === 'extend') {
+          const item = result || get(resultCtx, 'renewals', action.id);
+          await show(resultCtx, `✅ 续费记录已更新\n🖥 ${name(item)}\n📅 新到期日期：${result?.dueDate || item.dueDate}`, [[button(resultCtx, '查看最新状态', { kind: 'detail', section: 'renewals', id: action.id }), listButton(resultCtx, 'renewals')]]);
+          return;
+        }
         await show(resultCtx, `${['check', 'change', 'execute', 'rollback', 'runwebhook'].includes(action.op) ? '请求已提交，请查看最新状态' : '操作完成'}${result?.verificationPending ? '，后台正在确认远程写入结果' : ''}${result?.removed !== undefined ? `\n清理 ${result.removed} 条，保留 ${result.kept || 0} 条` : ''}`, [[...(action.id && action.op !== 'delete' ? [button(resultCtx, '查看最新状态', { kind: 'detail', section: action.section, id: action.id })] : []), listButton(resultCtx, action.section)]]).catch(() => {});
       } catch (error) { await show(resultCtx, `操作未完成：${short(error.message, 700)}`, [[listButton(resultCtx, action.section), rootButton(resultCtx)]]); }
       finally { busy.delete(key); }
@@ -285,6 +305,13 @@ export function createTelegramWorkspace(deps) {
   async function confirm(ctx, action) {
     assertAccess(ctx, action.section, true, action.op);
     const item = action.id ? get(ctx, action.section, action.id) : null;
+    if (action.op === 'extend') {
+      if (item.version !== action.version) throw new Error('记录已被修改，请重新选择续费');
+      const preview = renewalExtension(item.dueDate, action);
+      const next = { ...action, kind: 'execute', expectedDueDate: preview.dueDate, nonce: randomBytes(12).toString('hex') };
+      ctx.session.pending = next;
+      return show(ctx, `确认更新续费记录？\n🖥 ${name(item)}\n📅 原到期：${item.dueDate || '未知日期'}\n🕒 起算日：${preview.base}\n✅ 新到期：${preview.dueDate}\n仅更新记录，请先完成实际付款。`, [[button(ctx, '确认', next), button(ctx, '取消', { kind: 'renewalOptions', section: 'renewals', id: item.id })]]);
+    }
     const titles = { runwebhook: '执行 Webhook 任务', delete: '删除', clear: '清理已结束事件', execute: '执行 / 重试', rollback: '回滚', change: '执行换 IP API', canceljob: '取消执行', toggle: action.enabled ? '启用' : '暂停' };
     const next = { ...action, kind: 'execute', address: item?.address, identity: action.identity || (item ? identity(item) : ''),
       ...(action.op === 'clear' ? { ids: records(ctx, 'incidents').filter((entry) => finished.has(entry.status) || entry.status === 'failed').map((entry) => entry.id) } : {}) };
@@ -299,6 +326,7 @@ export function createTelegramWorkspace(deps) {
       const section = raw.slice(5); return menuAliases[section] || (sections[section] ? { kind: 'list', section, page: 0 } : null);
     }
     const [kind, id] = raw.split(':');
+    if (kind === 'renewal') return { kind: 'renewalNotice', section: 'renewals', id };
     if (detailAliases[kind]) return { kind: 'detail', section: detailAliases[kind], id };
     if (kind === 'guard_check') return { kind: 'action', section: 'guards', id, op: 'check' };
     if (kind === 'dns_sync') return { kind: 'action', section: 'dns', id, op: 'sync' };
@@ -309,6 +337,7 @@ export function createTelegramWorkspace(deps) {
     if (kind === 'incident_execute' || kind === 'incident_rollback') return { kind: 'confirm', section: 'incidents', id, op: kind === 'incident_execute' ? 'execute' : 'rollback' };
     if (kind === 'canceljob') return { kind: 'confirm', section: 'runs', id, op: 'canceljob' };
     const command = text.split(/\s/)[0].split('@')[0];
+    if (command === '/renewals' || text === '续费管理') return { kind: 'list', section: 'renewals', page: 0 };
     const commands = { '/webhooks': 'webhooks', '/start': 'root', '/menu': 'root', '菜单': 'root', '/status': 'overview', '总览': 'overview', '/probes': 'probes', '探针管理': 'probes', '/guards': 'guards', 'DNS守护': 'guards', '/dynamic': 'dynamic', '/targets': 'targets', '/policies': 'policies', '/assets': 'assets', '/pools': 'pools', '备用 IP 池': 'pools', '/dns': 'dns', '解析管理': 'dns', '/incidents': 'incidents', '故障事件': 'incidents', '/run': 'automation', '执行自动化': 'automation' };
     if (commands[text]) { const section = commands[text]; return menuAliases[section] || { kind: 'list', section, page: 0 }; }
     const section = commands[command]; return section ? menuAliases[section] || { kind: 'list', section, page: 0 } : null;
@@ -332,6 +361,15 @@ export function createTelegramWorkspace(deps) {
     }
     if (raw.startsWith('tg2:') && (!action || action.sessionKey !== key || action.expiresAt < Date.now())) {
       await deps.call(token, 'answerCallbackQuery', { callback_query_id: callback.id, text: '按钮已过期或属于其他用户，请发送 /menu。' }); return true;
+    }
+    if (!action && !callback && session.pending?.kind === 'renewalInput') {
+      try {
+        assertAccess(ctx, 'renewals', true);
+        const pending = session.pending;
+        const input = /^\d{1,3}$/.test(text) ? { months: Number(text) } : { dueDate: text };
+        await confirm(ctx, { section: 'renewals', id: pending.id, version: pending.version, op: 'extend', ...input });
+      } catch (error) { await show(ctx, short(error.message, 500), [[listButton(ctx, 'renewals'), rootButton(ctx)]]); }
+      return true;
     }
     if (!action && !callback && session.pending?.kind === 'searchInput') {
       action = { kind: 'list', section: session.pending.section, page: 0 };
@@ -389,6 +427,15 @@ export function createTelegramWorkspace(deps) {
       else if (kind === 'overview') await overview(ctx);
       else if (kind === 'list') await list(ctx, section, action.page);
       else if (kind === 'detail') await detail(ctx, section, id);
+      else if (kind === 'renewalNotice') { if (canWrite(ctx)) await renewalOptions(ctx, id); else await detail(ctx, section, id); }
+      else if (kind === 'renewalOptions') await renewalOptions(ctx, id);
+      else if (kind === 'renewalInput') {
+        assertAccess(ctx, 'renewals', true);
+        const item = get(ctx, 'renewals', id);
+        if (item.version !== action.version) throw new Error('记录已被修改，请重新选择续费');
+        session.pending = { kind, section, id, version: item.version };
+        await show(ctx, `📅 ${name(item)}\n请输入续费月数（1–120），或新到期日期（如 2027-12-31）。\n下一步会显示日期并确认。`, [[button(ctx, '取消', { kind: 'renewalOptions', section, id }), rootButton(ctx)]]);
+      }
       else if (kind === 'ips') await ips(ctx, section, id, action.page);
       else if (kind === 'history') await history(ctx, section, id, action.page);
       else if (kind === 'filter' || kind === 'clearSearch') {

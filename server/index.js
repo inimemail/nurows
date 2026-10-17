@@ -181,19 +181,19 @@ const dynamicGuardService = createDynamicGuardService({
   logError: (error) => console.error('Dynamic IP guard:', error.message)
 });
 
-const telegramActions = createTelegramActions({ ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus, webhookService: () => webhookService, webhookTasks: () => webhookService.choices(), webhookActive: (id) => webhookService.store.active(id) }, dynamicGuardService);
 const renewalDeps = {
   read: () => readState(['renewals', 'renewalSettings', 'renewalRevision']),
   update: updateRenewalState,
   bots: () => readState(['telegramBots']).telegramBots,
-  send: async (bot, chatId, text) => {
+  send: async (bot, chatId, text, replyMarkup) => {
     let token;
     try { token = decryptSecret(bot.tokenEnc); } catch { throw Object.assign(new Error('机器人凭证不可用'), { definite: true }); }
-    await telegramCall(token, 'sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true }, { signal: AbortSignal.timeout(10000) });
+    await telegramCall(token, 'sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }, { signal: AbortSignal.timeout(10000) });
   },
   logError: (error) => console.error('Renewal reminders:', error.message)
 };
 const renewalService = createRenewalService(renewalDeps);
+const telegramActions = createTelegramActions({ ...orchestrationDeps, renewalDeps, renewalService, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus, webhookService: () => webhookService, webhookTasks: () => webhookService.choices(), webhookActive: (id) => webhookService.store.active(id) }, dynamicGuardService);
 const telegramWorkspace = createTelegramWorkspace({
   readState, readGuardHistoryPage, invoke: telegramActions, call: telegramCall, authorized: telegramAuthorized,
   webhookTasks: () => webhookService.telegramTasks(),
@@ -3744,6 +3744,7 @@ async function configureTelegramMenu(token, settings) {
     { command: 'guards', description: 'DNS 守护', scope: 'guards' },
     { command: 'dynamic', description: '动态 IP 守护', scope: 'dynamic' },
     { command: 'webhooks', description: 'Webhook 任务', scope: 'webhooks' },
+    { command: 'renewals', description: '续费管理', scope: 'renewals' },
     { command: 'probes', description: '探针与检查', scope: 'probes' },
     { command: 'targets', description: '检查目标', scope: 'targets' },
     { command: 'policies', description: '切换策略', scope: 'policies' },

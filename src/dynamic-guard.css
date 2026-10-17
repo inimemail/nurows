@@ -104,6 +104,7 @@
   .dynamic-settings summary { padding: 14px 12px; align-items: flex-start; }
   .dynamic-settings-body { padding-inline: 12px; }
   .dynamic-head .ops-content-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dynamic-head .ops-content-actions > .primary { grid-column: 1 / -1; }
   .dynamic-head { align-items: stretch; }
   .dynamic-card { padding: 12px; }
   .dynamic-card-title > div { flex: 1; gap: 2px; }

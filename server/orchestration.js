@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { bulkDeleteIds, partitionDeletion } from './bulk-delete.js';
 import { dnsGuardOrder, moveDnsGuard } from '../shared/dns-guard-order.js';
 import { telegramScopes } from '../shared/telegram-permissions.js';
 import { supportsPoolHealthCheck } from '../shared/probe-capabilities.js';
@@ -617,6 +618,40 @@ export function registerOrchestrationRoutes(app, deps) {
     res.json({ ok: true, domain, recordType, addresses });
   }));
 
+  app.post('/api/orchestration/:resource/delete-all', asyncRoute(async (req, res) => {
+    const key = Object.hasOwn(RESOURCE_MAP, req.params.resource) ? RESOURCE_MAP[req.params.resource] : '';
+    if (!key) return res.status(404).json({ error: '未知资源类型' });
+    const requested = bulkDeleteIds(req.body);
+    let result;
+    const state = deps.updateState((draft) => {
+      const references = deletionReferences(draft, key);
+      const protectedAssets = key === 'ipAssets' ? manuallyProtectedIpAssets(draft, deps) : null;
+      const partition = partitionDeletion(draft[key] || [], requested, (item) => {
+        if (references.has(item.id)) return '仍被其他配置或活动事件引用，请先解除关联';
+        if (key === 'dnsBindings' && dnsBindingSaveRuntime.has(item.id)) return '解析记录正在写入远程 DNS，请稍后再删除';
+        if (key === 'dnsAccounts' && dnsAccountSaveRuntime.has(item.id)) return '账号正在处理远程 DNS 操作，请稍后再删除';
+        if (key === 'dnsGuards' && (item.cycle || dnsGuardRuntime.has(item.id) || dnsGuardProviderRuntime.has(item.id))) return '守护检查或远程 DNS 操作正在执行';
+        if (key === 'ipPools' && item.healthCheck?.status === 'running') return '备用池检测正在执行，请先停止';
+        if (protectedAssets && (protectedAssets.ids.has(item.id) || protectedAssets.addresses.has(canonicalAssetAddress(item.address)))) return 'IP 正被运行中的任务或远程 DNS 写入占用';
+        return '';
+      });
+      const { deleted } = partition;
+      result = partition.result;
+      if (key === 'ipAssets') removeIpAssets(draft, deleted, true);
+      else draft[key] = (draft[key] || []).filter(item => !deleted.has(item.id));
+      if (key === 'dnsGuards') draft.dnsGuardOrder = (draft.dnsGuardOrder || []).filter(id => !deleted.has(id));
+      if (key === 'telegramBots') {
+        for (const list of [draft.ipPools, draft.probes, draft.dnsGuards]) for (const item of list || []) item.alertBotIds = (item.alertBotIds || []).filter(id => !deleted.has(id));
+        for (const item of [...(draft.dynamicGuards || []), ...(draft.renewals || [])]) item.botIds = (item.botIds || []).filter(id => !deleted.has(id));
+        if (draft.renewalSettings) draft.renewalSettings.botIds = (draft.renewalSettings.botIds || []).filter(id => !deleted.has(id));
+      }
+      pushAudit(draft, `${key}.delete_all`, key, '', `批量删除 ${result.deletedCount} 项，保留 ${result.skippedCount} 项`, req.auth.username);
+      return draft;
+    });
+    if (key === 'telegramBots' && result.deletedCount) deps.onTelegramChanged?.();
+    res.json({ ok: true, ...result, state: deps.sanitizeState(state, req.auth) });
+  }));
+
   app.post('/api/orchestration/:resource', asyncRoute(async (req, res) => {
     const key = RESOURCE_MAP[req.params.resource];
     if (!key) return res.status(404).json({ error: '未知资源类型' });
@@ -1174,6 +1209,23 @@ export async function saveDnsBindingConfiguration(input, bindingId, deps, actor 
   const account = state.dnsAccounts.find((item) => item.id === candidate.accountId && item.enabled !== false);
   if (!account) throw new Error('DNS 账号不可用');
   const credentials = decryptCredentials(account, deps);
+  // Acquire before the first await, including account-only protection for a
+  // new binding. Counts keep overlapping saves protected until both finish.
+  const locks = [[dnsBindingSaveRuntime, candidate.id], [dnsAccountSaveRuntime, account.id]];
+  if (existing?.accountId && existing.accountId !== account.id) locks.push([dnsAccountSaveRuntime, existing.accountId]);
+  for (const [runtime, id] of locks) runtime.set(id, (runtime.get(id) || 0) + 1);
+  try {
+    return await persistDnsBindingConfiguration(input, bindingId, deps, actor, { state, existing, candidate, account, credentials, resolveDnsBinding, readDnsRecord, writeDnsRecord });
+  } finally {
+    for (const [runtime, id] of locks) {
+      const remaining = runtime.get(id) - 1;
+      if (remaining) runtime.set(id, remaining);
+      else runtime.delete(id);
+    }
+  }
+}
+
+async function persistDnsBindingConfiguration(input, bindingId, deps, actor, { state, existing, candidate, account, credentials, resolveDnsBinding, readDnsRecord, writeDnsRecord }) {
   const { zone, normalizedBinding } = await resolveDnsBinding(state, account, credentials, candidate);
   const remote = await readDnsRecord(account, credentials, zone, withoutProviderRecordIds(normalizedBinding));
   const providerBinding = {
@@ -1423,6 +1475,8 @@ export function requestWaitingIncidentRechecks(deps) {
 
 const dnsGuardRuntime = new Set();
 const dnsGuardProviderRuntime = new Set();
+const dnsBindingSaveRuntime = new Map();
+const dnsAccountSaveRuntime = new Map();
 const dnsGuardAssetWrites = new Map();
 const dnsGuardPreparationVersions = new Map();
 const dnsGuardProcessors = new WeakMap();
@@ -3381,7 +3435,32 @@ function manuallyProtectedIpAssets(state, deps = {}) {
   return { ids, addresses };
 }
 
+function deletionReferences(state, key) {
+  const ids = new Set();
+  const add = values => { for (const id of values || []) if (id) ids.add(id); };
+  const fields = (items, field) => { for (const item of items || []) add(Array.isArray(item[field]) ? item[field] : [item[field]]); };
+  if (key === 'probes') {
+    fields(state.probeTargets, 'probeIds'); fields(state.dnsGuards, 'probeIds'); fields(state.dynamicGuards, 'probeIds');
+    for (const pool of state.ipPools || []) if (pool.healthCheck?.status === 'running') add(pool.healthCheck.probeIds);
+  }
+  if (key === 'ipPools') { fields(state.failoverPolicies, 'poolIds'); fields(state.dnsGuards, 'poolIds'); }
+  if (key === 'dnsAccounts') { fields(state.dnsZones, 'accountId'); fields(state.dnsBindings, 'accountId'); fields(state.dnsGuards, 'accountId'); }
+  if (key === 'dnsZones') fields(state.dnsBindings, 'zoneId');
+  if (key === 'dnsBindings') fields(state.failoverPolicies, 'dnsBindingIds');
+  if (key === 'failoverPolicies') fields(state.probeTargets, 'policyId');
+  if (key === 'telegramBots') fields((state.ipPools || []).filter(item => item.alertEnabled), 'alertBotIds');
+  // Pending failovers also need their target and policy to remain available.
+  for (const incident of state.incidents || []) {
+    if (!incident.executionId && !ACTIVE_INCIDENT_STATES.has(incident.status)) continue;
+    if (key === 'probeTargets') add([incident.targetId]);
+    if (key === 'failoverPolicies') add([incident.policyId]);
+  }
+  return ids;
+}
+
 function ensureNotReferenced(state, key, id) {
+  if (key === 'dnsBindings' && dnsBindingSaveRuntime.has(id)) throw new Error('解析记录正在写入远程 DNS，请稍后再删除');
+  if (key === 'dnsAccounts' && dnsAccountSaveRuntime.has(id)) throw new Error('账号正在处理远程 DNS 操作，请稍后再删除');
   const references = {
     probes: state.probeTargets.some((item) => item.probeIds?.includes(id)) || state.dnsGuards.some((item) => item.probeIds?.includes(id)),
     ipPools: state.failoverPolicies.some((item) => item.poolIds?.includes(id)) || state.dnsGuards.some((item) => item.poolIds?.includes(id)),

@@ -26,6 +26,10 @@ export function createWebhookStore(db) {
     taskSummaries: () => taskSummaries ||= sql("SELECT json_set(json_remove(body,'$.commandEnc','$.tokenEnc','$.tokenHash'),'$.commandConfigured',json(CASE WHEN json_extract(body,'$.commandEnc') IS NOT NULL THEN 'true' ELSE 'false' END)) AS body FROM webhook_tasks ORDER BY rowid DESC").all().map(parse),
     saveTask(item) { sql('INSERT INTO webhook_tasks VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,body=excluded.body').run(item.id, item.name, JSON.stringify(item)); taskSummaries = null; },
     deleteTask(id) { sql('DELETE FROM webhook_tasks WHERE id=?').run(id); taskSummaries = null; },
+    deleteTasks(ids) {
+      db.transaction(() => { for (const id of ids) sql('DELETE FROM webhook_tasks WHERE id=?').run(id); })();
+      taskSummaries = null;
+    },
     settings: () => parse(sql('SELECT body FROM webhook_settings WHERE id=1').get()),
     saveSettings: (item) => sql('UPDATE webhook_settings SET body=? WHERE id=1').run(JSON.stringify(item)),
     active: (id) => parse(sql("SELECT body FROM webhook_runs WHERE task_id=? AND status IN ('queued','running','waiting_guard')").get(id)),

@@ -65,6 +65,8 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
   const [error, setError] = useState('');
   const [formError, setFormError] = useState('');
   const [confirmation, setConfirmation] = useState(null);
+  const [bulkDeletion, setBulkDeletion] = useState(null);
+  const bulkDeleteLock = useRef(false);
   const [refresh, setRefresh] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyGuard, setHistoryGuard] = useState(null);
@@ -173,9 +175,24 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
     finally { actionLock.current.delete(guard.id); if (mounted.current) setBusyIds((ids) => ids.filter((id) => id !== guard.id)); }
   };
 
+  const deleteAll = async () => {
+    if (!bulkDeletion || bulkDeleteLock.current) return;
+    bulkDeleteLock.current = true;
+    setBulkDeletion(current => ({ ...current, busy: true }));
+    try {
+      const result = await mutate('/api/dynamic-guards/delete-all', 'POST', { confirm: 'delete-records', ids: bulkDeletion.ids });
+      if (!mounted.current) return;
+      const deleted = new Set(result.deletedIds);
+      publish({ ...latestData.current, guards: latestData.current.guards.filter(item => !deleted.has(item.id)) });
+      toast(`已删除 ${result.deletedCount} 项${result.skippedCount ? `，保留 ${result.skippedCount} 项` : ''}`);
+      setBulkDeletion(result.skippedCount ? { ids: [], busy: false, result } : null);
+    } catch (err) { if (mounted.current) { toast(err.message); setBulkDeletion(current => current ? { ...current, busy: false } : null); } }
+    finally { bulkDeleteLock.current = false; }
+  };
+
   return <>
     <div className="ops-content-head dynamic-head"><div><strong>动态 IP 守护</strong><span>多探针检查 · API 自动换 IP · 新 IP 验证</span></div>
-      <div className="ops-content-actions"><button className="ghost" onClick={() => onOpenHistory('dynamicGuardRuns')}>执行记录</button><button className="primary" onClick={() => openEditor(null)}>新增任务</button></div>
+      <div className="ops-content-actions"><button className="ghost danger-text-button" disabled={!loaded || !data.guards.length || Boolean(bulkDeletion?.busy) || busyIds.length > 0 || saving} onClick={() => setBulkDeletion({ ids: data.guards.map(item => item.id), busy: false })}>全部删除</button><button className="ghost" onClick={() => onOpenHistory('dynamicGuardRuns')}>执行记录</button><button className="primary" onClick={() => openEditor(null)}>新增任务</button></div>
     </div>
     {error ? <div className="auth-error dynamic-load-error" role="alert"><span>读取失败：{error}，稍后自动重试</span><button className="ghost" onClick={() => setRefresh((value) => value + 1)}>重试</button></div> : null}
     <div className="ops-list dynamic-list">
@@ -242,6 +259,13 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
     {historyGuard ? <Dialog title={`${historyGuard.name} · 执行记录`} wide className="dynamic-history-dialog" onClose={() => setHistoryGuard(null)}><HistoryRecords key={historyGuard.id} scope="dynamicGuardRuns" guardId={historyGuard.id} api={api} /></Dialog> : null}
     {confirmation ? <Dialog title={confirmation.action === 'delete' ? '删除动态 IP 守护' : '手动换 IP'} onClose={() => setConfirmation(null)} footer={<div className="dialog-actions"><button className="ghost" onClick={() => setConfirmation(null)}>取消</button><button className="primary" onClick={() => { const { guard, action } = confirmation; setConfirmation(null); act(guard, action); }}>确认</button></div>}>
       <p className="confirm-copy">{confirmation.action === 'delete' ? `删除「${confirmation.guard.name}」并停止后续检查及重试。已经提交给服务商的请求无法撤回，执行记录会保留。` : `${confirmation.guard.flow ? '当前换 IP 流程尚未完成；确认后将在原流程中再次提交。' : ''}执行「${confirmation.guard.name}」的换 IP API 命令，会消耗今日一次提交额度，并可能中断目标服务。仍遵守每日上限和冷却时间，已排队的请求不会重复提交。`}</p>
+    </Dialog> : null}
+    {bulkDeletion ? <Dialog title={bulkDeletion.result ? '动态 IP 守护 · 删除结果' : '全部删除动态 IP 守护'} onClose={() => !bulkDeleteLock.current && setBulkDeletion(null)} footer={<div className="dialog-actions">
+      <button className="ghost" disabled={bulkDeletion.busy} onClick={() => setBulkDeletion(null)}>{bulkDeletion.result ? '完成' : '取消'}</button>
+      {!bulkDeletion.result ? <button className="primary danger-action" disabled={bulkDeletion.busy} onClick={deleteAll}>{bulkDeletion.busy ? '删除中...' : '确认全部删除'}</button> : null}
+    </div>}>
+      {bulkDeletion.result ? <div className="confirm-copy"><p>已删除 {bulkDeletion.result.deletedCount} 项，保留 {bulkDeletion.result.skippedCount} 项。</p><ul>{bulkDeletion.result.reasons.map(item => <li key={item.reason}>{item.reason}：{item.count} 项</li>)}</ul></div>
+        : <div className="confirm-copy"><p>确认删除全部 {bulkDeletion.ids.length} 个动态 IP 守护任务？包含搜索未显示的任务，删除后不可恢复。</p><p>停止后续检查和重试，执行历史保留。正在执行或恢复确认中的 API 命令自动跳过。已提交到服务商的请求无法撤回。</p><p>确认期间新建的任务不会删除。</p></div>}
     </Dialog> : null}
   </>;
 }

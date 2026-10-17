@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { bulkDeleteIds, partitionDeletion } from './bulk-delete.js';
 import { Resolver } from 'node:dns/promises';
 import { domainToASCII } from 'node:url';
 import net from 'node:net';
@@ -551,6 +552,21 @@ export function registerDynamicGuardRoutes(app, deps, service) {
     service.tick(next.id);
     res.json({ ok: true, guard: sanitizeDynamicGuard(next) });
   };
+  app.post('/api/dynamic-guards/delete-all', route((req, res) => {
+    const requested = bulkDeleteIds(req.body);
+    let result;
+    update((draft) => {
+      const partition = partitionDeletion(draft.dynamicGuards || [], requested, guard =>
+        service.isExecuting(guard.id) || guard.flow?.commandState === 'executing' ? 'API 命令正在执行或恢复确认中' : '');
+      result = partition.result;
+      const cancelledRuns = new Set((draft.dynamicGuards || []).filter(item => partition.deleted.has(item.id)).map(item => item.flow?.id).filter(Boolean));
+      const finishedAt = iso(Date.now());
+      for (const run of draft.dynamicGuardRuns || []) if (cancelledRuns.has(run.id)) Object.assign(run, { status: 'cancelled', finishedAt, message: '任务已删除，停止后续重试' });
+      draft.dynamicGuards = (draft.dynamicGuards || []).filter(item => !partition.deleted.has(item.id));
+      return draft;
+    }, true);
+    res.json({ ok: true, ...result });
+  }));
   app.post('/api/dynamic-guards', route(save));
   app.put('/api/dynamic-guards/:id', route(save));
   app.post('/api/dynamic-guards/:id/enabled', route((req, res) => {

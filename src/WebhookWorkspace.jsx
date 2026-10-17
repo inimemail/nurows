@@ -18,6 +18,8 @@ export default function WebhookWorkspace({ api, toast, Dialog, cache, search = '
   const [busy, setBusy] = useState(false), [formError, setFormError] = useState('');
   const generation = useRef(0), lock = useRef(false), latest = useRef(data), mounted = useRef(true);
   const editorRequest = useRef(0), [opening, setOpening] = useState('');
+  const bulkSnapshotLock = useRef(false);
+  const [deletionResult, setDeletionResult] = useState(null);
   latest.current = data;
   useEffect(() => { onSearchScopeChange?.({ tab: 'webhooks', section: 'webhooks' }); }, [onSearchScopeChange]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; generation.current++; editorRequest.current++; }; }, []);
@@ -49,7 +51,7 @@ export default function WebhookWorkspace({ api, toast, Dialog, cache, search = '
     try {
       const result = await api(path, { method, body: JSON.stringify(body) });
       if (!mounted.current) return;
-      toast('操作已完成'); return result;
+      toast(result.deletedCount !== undefined ? `已删除 ${result.deletedCount} 项${result.skippedCount ? `，保留 ${result.skippedCount} 项` : ''}` : '操作已完成'); return result;
     } catch (err) { if (mounted.current) { setFormError(err.message); toast(err.message); } throw err; }
     finally { lock.current = false; generation.current++; if (mounted.current) { setBusy(false); setRefresh((n) => n + 1); } }
   }
@@ -63,12 +65,32 @@ export default function WebhookWorkspace({ api, toast, Dialog, cache, search = '
     finally { if (mounted.current && version === editorRequest.current) setOpening(''); }
   }
   const ask = (title, text, action) => setConfirm({ title, text, action });
+  async function requestDeleteAll() {
+    if (bulkSnapshotLock.current || lock.current || opening) return;
+    bulkSnapshotLock.current = true; setOpening('bulk-delete');
+    try {
+      const result = await api('/api/webhooks/choices');
+      if (!mounted.current) return;
+      const ids = result.tasks.map(item => item.id);
+      if (!ids.length) { toast('暂无可删除任务'); return; }
+      ask('全部删除 Webhook 任务', `确认删除全部 ${ids.length} 个任务？包含搜索和分页未显示的任务，删除后不可恢复。运行中或关联动态守护的任务自动保留。历史记录保留，已删除任务的调用链接立即失效。确认期间新建的任务不会删除。`, async () => {
+        const deleted = await mutate('/api/webhooks/delete-all', { confirm: 'delete-records', ids });
+        if (!mounted.current || !deleted) return;
+        // Invalidate the cached page immediately; navigating away before the
+        // next poll must not revive deleted tasks from this cache.
+        cache.current = null; latest.current = null; setData(null); setPage(1);
+        if (deleted.skippedCount) setDeletionResult(deleted);
+      });
+    } catch (err) { if (mounted.current) toast(err.message); }
+    finally { bulkSnapshotLock.current = false; if (mounted.current) setOpening(''); }
+  }
   const patch = (value) => setEditor((old) => ({ ...old, ...value }));
   const tasks = data?.tasks || [];
   return <section className="ops-workspace webhook-workspace">
     <header className="surface ops-header"><div><span className="ops-eyebrow">自动调用 · 后台执行</span><strong>Webhook 任务</strong></div><div className="webhook-summary"><Webhook size={17} /><span>{data ? `${data.total} 个任务 · ${data.active} 个处理中` : '正在读取任务…'}</span></div></header>
     <div className="surface ops-content webhook-content">
       <div className="ops-content-head"><div><strong>任务列表</strong><span>保存命令，通过链接触发，立即返回执行状态</span></div><div className="ops-content-actions webhook-actions">
+        <button className="ghost danger-text-button" disabled={busy || Boolean(opening) || !data?.total} onClick={requestDeleteAll}><Trash2 size={15} />{opening === 'bulk-delete' ? '读取中…' : '全部删除'}</button>
         <button className="ghost icon-button" aria-label="刷新任务" title="刷新" onClick={() => setRefresh((n) => n + 1)}><RefreshCw size={16} /></button>
         <button className="ghost" onClick={() => setHistory({ name: '全部任务' })}><History size={16} />历史记录</button>
         <button className="ghost icon-button" aria-label="Webhook 设置" title="设置" disabled={!data} onClick={() => setSettings({ ...data.settings })}><Settings size={17} /></button>
@@ -109,6 +131,7 @@ export default function WebhookWorkspace({ api, toast, Dialog, cache, search = '
     {history ? <HistoryDialog task={history} api={api} toast={toast} Dialog={Dialog} onClose={() => setHistory(null)} onChange={() => setRefresh((n) => n + 1)} /> : null}
     {settings ? <Dialog title="Webhook 执行设置" className="webhook-dialog" onClose={() => !busy && setSettings(null)} footer={<div className="dialog-actions"><button className="ghost" onClick={() => setSettings(null)} disabled={busy}>取消</button><button className="primary" form="webhook-settings" type="submit" disabled={busy}>保存设置</button></div>}><form id="webhook-settings" className="webhook-form" onSubmit={async (e) => { e.preventDefault(); try { await mutate('/api/webhooks/settings', settings, 'PUT'); setSettings(null); } catch {} }}><label className="ops-field"><span>后台并发任务</span><input type="number" required min={1} max={50} value={settings.concurrency} onChange={(e) => setSettings((s) => ({ ...s, concurrency: e.target.value }))} /></label><label className="ops-field"><span>等待队列上限</span><input type="number" required min={10} max={2000} value={settings.queueLimit} onChange={(e) => setSettings((s) => ({ ...s, queueLimit: e.target.value }))} /></label><p className="webhook-help full">默认 8 个并发，仅作用于 Webhook 任务。执行与调用记录自动保留 7 天；历史记录内可以手动清理。</p>{formError ? <p className="auth-error full">{formError}</p> : null}</form></Dialog> : null}
     {confirm ? <Dialog title={confirm.title} onClose={() => !busy && setConfirm(null)} footer={<div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setConfirm(null)}>取消</button><button className="primary" disabled={busy} onClick={async () => { try { await confirm.action(); if (mounted.current) setConfirm(null); } catch {} }}>{busy ? '处理中…' : '确认'}</button></div>}><p className="confirm-copy">{confirm.text}</p></Dialog> : null}
+    {deletionResult ? <Dialog title="Webhook 任务 · 删除结果" onClose={() => setDeletionResult(null)} footer={<button className="primary" onClick={() => setDeletionResult(null)}>完成</button>}><div className="confirm-copy"><p>已删除 {deletionResult.deletedCount} 项，保留 {deletionResult.skippedCount} 项。</p><ul>{deletionResult.reasons.map(item => <li key={item.reason}>{item.reason}：{item.count} 项</li>)}</ul></div></Dialog> : null}
   </section>;
 }
 

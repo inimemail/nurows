@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { createWebhookStore, WEBHOOK_ACTIVE } from './webhook-store.js';
+import { bulkDeleteIds, partitionDeletion } from './bulk-delete.js';
 
 const fail = (message, statusCode = 400) => { throw Object.assign(new Error(message), { statusCode }); };
 const active = (run) => run && WEBHOOK_ACTIVE.includes(run.status);
@@ -187,6 +188,15 @@ export function createWebhookService(deps) {
       return safeRun(store.run(id));
     },
     remove(id) { task(id); if (store.active(id)) fail('任务仍在执行，请先停止', 409); if (linked(id)) fail('任务已关联动态守护，请先解除关联', 409); store.deleteTask(id); touch(); },
+    removeMany(body) {
+      const requested = bulkDeleteIds(body);
+      const activeIds = new Set(store.activeSummaries().map(item => item.taskId));
+      const linkedIds = new Set(guards().map(item => item.webhookTaskId).filter(Boolean));
+      const { deleted, result } = partitionDeletion(store.taskSummaries(), requested, item =>
+        activeIds.has(item.id) ? '任务正在执行，请先停止' : linkedIds.has(item.id) ? '任务已关联动态守护，请先解除关联' : '');
+      if (deleted.size) { store.deleteTasks(deleted); touch(); }
+      return result;
+    },
     settings(input) { store.saveSettings({ concurrency: integer(input.concurrency, 1, 50), queueLimit: integer(input.queueLimit, 10, 2000) }); touch(); pump(); },
     clear(id) { if (id) task(id); store.clear(id); touch(); }
   };
@@ -222,6 +232,7 @@ export function registerWebhookRoutes(app, service, { publicOnly = false } = {})
   app.put('/api/webhooks/settings', route((req, res) => { service.settings(req.body); res.json({ ok: true }); }));
   app.get('/api/webhooks/history', route((req, res) => res.json(service.store.history(req.query.kind, req.query.taskId, req.query.page))));
   app.post('/api/webhooks/history/clear', route((req, res) => { if (req.body?.confirm !== true) fail('请确认清理记录'); service.clear(req.body.taskId); res.json({ ok: true }); }));
+  app.post('/api/webhooks/delete-all', route((req, res) => res.json({ ok: true, ...service.removeMany(req.body) })));
   app.get('/api/webhooks/runs/:id', route((req, res) => res.json(service.output(req.params.id))));
   app.post('/api/webhooks/runs/:id/stop', route((req, res) => res.json(service.cancel(req.params.id))));
   app.post('/api/webhooks', route((req, res) => res.status(201).json(service.save(req.body))));

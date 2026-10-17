@@ -353,6 +353,8 @@ svg {
   flex-shrink: 0;
   flex-wrap: nowrap;
 }
+.side-head { flex-wrap: wrap; }
+.side-head > .toolbar { max-width: 100%; flex-wrap: wrap; justify-content: flex-end; }
 
 .search-shell {
   position: relative;
@@ -925,8 +927,10 @@ svg {
 .ops-tabs button.active { background: var(--accent-soft); color: var(--text-strong); }
 .ops-tabs em { min-width: 18px; padding: 2px 5px; border-radius: 999px; background: var(--button-ghost-bg); color: var(--text-muted); font-size: 10px; font-style: normal; text-align: center; }
 .ops-content { min-height: 0; flex: 1 1 0; display: flex; flex-direction: column; overflow: hidden; padding: 18px; border-radius: 18px; }
-.ops-content-head { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
-.ops-content-actions { display: flex; align-items: center; gap: 8px; }
+.ops-content-head { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
+.ops-content-head > div:first-child { min-width: 0; }
+.ops-content-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
+.ops-content-actions > button { flex-shrink: 0; white-space: nowrap; }
 .ops-usage-head { flex-wrap: wrap; }
 .ops-usage-head > div:first-child { flex: 1 1 240px; min-width: 0; }
 .ops-usage-filters { flex: 0 1 640px; min-width: 0; margin-left: auto; display: grid; grid-template-columns: minmax(160px, 1fr) 140px auto; align-items: center; gap: 8px; }

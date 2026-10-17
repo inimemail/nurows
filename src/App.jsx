@@ -413,6 +413,8 @@ export default function App() {
   const [historyScope, setHistoryScope] = useState('');
   const [historyRevision, setHistoryRevision] = useState(0);
   const [confirmDialog, setConfirmDialog] = useState({ open: false, title: '', message: '', onConfirm: null });
+  const configBulkDeleting = useRef(false);
+  const [configDeletionResult, setConfigDeletionResult] = useState(null);
   const [accountForm, setAccountForm] = useState({
     username: '',
     currentPassword: '',
@@ -1302,6 +1304,30 @@ export default function App() {
     } catch (error) { toast(error.message); } finally { setActionBusy('automationSave', false); }
   }
 
+  function requestConfigDeleteAll(type) {
+    if (configBulkDeleting.current) return;
+    const [key, resource, label] = { servers: ['servers', 'servers', '服务器'], commands: ['commands', 'commands', '保存的命令'],
+      automation: ['automationTasks', 'automation-tasks', '自动化任务'], proxies: ['proxies', 'proxies', '代理'] }[type];
+    const ids = (state[key] || []).map(item => item.id);
+    if (!ids.length) return;
+    openConfirm({ title: `全部删除${label}`, message: `确认删除全部 ${ids.length} 项${label}？包含搜索未显示的记录，删除后不可恢复。只删除面板配置，历史记录保留；运行中或仍被任务引用的记录自动保留。${type === 'proxies' ? '服务器的对应代理关联会同步解除。' : ''}本次确认后新建的记录不会删除。`, onConfirm: async () => {
+      if (configBulkDeleting.current) return;
+      configBulkDeleting.current = true; setActionBusy('configBulkDelete', true);
+      try {
+        const data = await api(`/api/${resource}/delete-all`, { method: 'POST', body: JSON.stringify({ confirm: 'delete-records', ids }) });
+        setState(data.state);
+        const deleted = new Set(data.deletedIds);
+        if (type === 'commands' && deleted.has(selectedCommandId)) { setSelectedCommandId(''); setCommandText(temporaryCommandText); }
+        if (type === 'automation' && deleted.has(automationTaskId)) { setAutomationTaskId(data.state.automationTasks?.[0]?.id || ''); setAutomationDraft(data.state.automationTasks?.[0] ? { ...EMPTY_AUTOMATION_TASK, ...data.state.automationTasks[0], password: '' } : EMPTY_AUTOMATION_TASK); }
+        if (type === 'servers' && deleted.has(selectedServerId)) setSelectedServerId(data.state.servers[0]?.id || '');
+        if (type === 'proxies' && deleted.has(selectedProxyId)) setSelectedProxyId(data.state.proxies[0]?.id || '');
+        if (data.skippedCount) setConfigDeletionResult(data);
+        toast(`已删除 ${data.deletedCount} 项${data.skippedCount ? `，保留 ${data.skippedCount} 项` : ''}`);
+      } catch (error) { toast(error.message); }
+      finally { configBulkDeleting.current = false; setActionBusy('configBulkDelete', false); }
+    } });
+  }
+
   async function deleteAutomationTask() {
     if (!automationTaskId) return;
     try {
@@ -1662,6 +1688,10 @@ export default function App() {
   }
 
   function confirmSidebarDelete(type) {
+    // The legacy no-selection shortcut must use the same confirmed batch
+    // request and occupation checks as the explicit "全部删除" button.
+    if (type === 'server' && !selectedServerId) { requestConfigDeleteAll('servers'); return; }
+    if (type === 'proxy' && !selectedProxyId) { requestConfigDeleteAll('proxies'); return; }
     if (type === 'server') {
       const targetIds = selectedServerId ? [selectedServerId] : state.servers.map((item) => item.id);
       if (!targetIds.length) {
@@ -2488,6 +2518,7 @@ export default function App() {
                   }}>编辑</button>
                   <button className="primary" onClick={() => resetCreateDraft('server')}>新增</button>
                   <button className="ghost danger-text-button" onClick={() => confirmSidebarDelete('server')}>删除</button>
+                  <button className="ghost danger-text-button" disabled={busy.configBulkDelete || !(state.servers || []).length} onClick={() => requestConfigDeleteAll('servers')}>全部删除</button>
                 </>
               ) : null}
               {tab === 'commands' ? (
@@ -2499,6 +2530,7 @@ export default function App() {
                   }} disabled={!selectedCommand}>编辑</button>
                   <button className="primary" onClick={() => resetCreateDraft('command')}>新增</button>
                   <button className="ghost danger-text-button" disabled={!selectedCommand} onClick={() => confirmSidebarDelete('command')}>删除</button>
+                  <button className="ghost danger-text-button" disabled={busy.configBulkDelete || !(state.commands || []).length} onClick={() => requestConfigDeleteAll('commands')}>全部删除</button>
                 </>
               ) : null}
               {tab === 'automation' ? (
@@ -2506,6 +2538,7 @@ export default function App() {
                   <button className="ghost" onClick={() => editAutomationTask()} disabled={!automationTaskId}>编辑</button>
                   <button className="primary" onClick={() => resetCreateDraft('automation')}>新增</button>
                   <button className="ghost danger-text-button" onClick={() => openConfirm({ title: '删除自动化任务', message: '确认删除当前任务吗？', onConfirm: deleteAutomationTask })} disabled={!automationTaskId}>删除</button>
+                  <button className="ghost danger-text-button" disabled={busy.configBulkDelete || !(state.automationTasks || []).length} onClick={() => requestConfigDeleteAll('automation')}>全部删除</button>
                 </>
               ) : null}
               {tab === 'proxies' ? (
@@ -2517,6 +2550,7 @@ export default function App() {
                   }}>编辑</button>
                   <button className="primary" onClick={() => resetCreateDraft('proxy')}>新增</button>
                   <button className="ghost danger-text-button" onClick={() => confirmSidebarDelete('proxy')}>删除</button>
+                  <button className="ghost danger-text-button" disabled={busy.configBulkDelete || !(state.proxies || []).length} onClick={() => requestConfigDeleteAll('proxies')}>全部删除</button>
                 </>
               ) : null}
             </div>
@@ -3386,6 +3420,8 @@ export default function App() {
       {historyScope ? <Dialog title="历史记录" wide className="history-dialog" onClose={() => setHistoryScope('')}>
         <HistoryBrowser key={historyScope} initialScope={historyScope} api={api} revision={historyRevision} clearing={busy.clearHistory} onClear={requestHistoryCleanup} />
       </Dialog> : null}
+
+      {configDeletionResult ? <Dialog title="批量删除结果" onClose={() => setConfigDeletionResult(null)} footer={<button className="primary" onClick={() => setConfigDeletionResult(null)}>完成</button>}><div className="confirm-copy"><p>已删除 {configDeletionResult.deletedCount} 项，保留 {configDeletionResult.skippedCount} 项。</p><ul>{configDeletionResult.reasons.map(item => <li key={item.reason}>{item.reason}：{item.count} 项</li>)}</ul></div></Dialog> : null}
 
       {confirmDialog.open ? (
         <Dialog

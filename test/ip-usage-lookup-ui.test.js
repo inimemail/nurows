@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import { transformSync } from 'esbuild';
+import * as workspaceSearch from '../shared/workspace-search.js';
 
 const compiled = transformSync(fs.readFileSync(new URL('../src/OrchestrationWorkspace.jsx', import.meta.url), 'utf8') + '\nexport { renderSection, DataView };', { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
 function harness(api = async () => fixture()) {
@@ -19,6 +20,7 @@ function harness(api = async () => fixture()) {
     if (path === 'react') return { useState, useRef: initial => useState({ current: initial })[0], useMemo: fn => fn(), useEffect(fn) { if (!cleanups.length) cleanups.push(fn()); } };
     if (path === 'react/jsx-runtime') return { jsx, jsxs: jsx };
     if (path.endsWith('note-clipboard.js')) return { async copyNoteText(value) { copies.push(value); } };
+    if (path.endsWith('workspace-search.js')) return workspaceSearch;
     return {};
   } });
   const render = () => { cursor = 0; tree = module.exports.IpUsageLookup({ api, Dialog: 'dialog', toast: message => messages.push(message), onClose: () => { closed = true; } }); };
@@ -41,8 +43,9 @@ test('toolbar places batch lookup before history and creation, including an empt
   const section = view.exports.renderSection('guards', { state: {}, visibleRecords: [], search: 'no-match', openIpLookup: () => opened++ });
   const header = view.exports.DataView(section.props);
   const buttons = view.nodes(header).filter(node => node.type === 'button');
-  assert.deepEqual(buttons.map(node => view.text(node)), ['批量查 IP', '检查记录', '新增守护任务']);
-  buttons[0].props.onClick();
+  assert.deepEqual(buttons.map(node => view.text(node)), ['全部删除', '批量查 IP', '检查记录', '新增守护任务']);
+  assert.equal(buttons[0].props.disabled, true);
+  buttons[1].props.onClick();
   assert.equal(opened, 1);
 });
 

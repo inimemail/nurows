@@ -13,6 +13,7 @@ import { createSharedIpHealth } from './shared-ip-health.js';
 import { createRenewalService, registerRenewalRoutes, normalizeRenewalState, renewalSnapshot } from './renewals.js';
 import { createNotesService, registerNotesRoutes } from './notes.js';
 import { createWebhookService, registerWebhookRoutes } from './webhooks.js';
+import { registerConfigBulkDeleteRoutes } from './config-bulk-delete.js';
 import { runLocalWebhook, runSshWebhook } from './webhook-runtime.js';
 import { poolHealthSummary, poolHealthProbeState, poolHealthSchedule, clonePoolHealthPools } from './pool-health-check.js';
 import { parseStoredRecord } from './storage-validation.js';
@@ -537,6 +538,8 @@ app.delete('/api/history', (req, res) => {
 });
 
 registerOrchestrationRoutes(app, orchestrationDeps);
+registerConfigBulkDeleteRoutes(app, { updateState, jobs: () => commandJobs.values(), webhookTasks: () => webhookService.store.taskSummaries(),
+  webhookRuns: () => webhookService.store.activeSummaries(), sanitizeState: sanitizeStateForClient, onTelegramChanged: restartTelegramPolling });
 registerDynamicGuardRoutes(app, { ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus, webhookTasks: () => webhookService.choices(), webhookActive: (id) => webhookService.store.active(id) }, dynamicGuardService);
 registerWebhookRoutes(app, webhookService);
 registerRenewalRoutes(app, renewalDeps, renewalService);

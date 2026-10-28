@@ -54,3 +54,24 @@ test('explicitly empty legacy order pages are accepted without hiding credential
   await assert.rejects(send({ code: -1, msg: '暂无订单' }, 'query'), /商户信息查询失败/);
   await assert.rejects(send({ code: -1, msg: '暂无订单', data: [{ trade_no: 'unexpected' }] }), /订单列表查询失败/);
 });
+
+test('API failures report bounded codes and local reason labels without leaking remote response details', async () => {
+  const send = body => requestEpay({ url: 'https://pay.example.com/', pid: '1001' }, 'secret-key', 'orders', {}, {
+    lookup: async () => [{ address: '8.8.8.8', family: 4 }],
+    request(_url, _options, callback) {
+      callback({ statusCode: 200, on(event, handler) { if (event === 'data') handler(Buffer.from(JSON.stringify(body))); if (event === 'end') handler(); return this; } });
+      return { on() { return this; }, end() {} };
+    }
+  });
+  for (const [message, expected] of [['请求过于频繁', '查询频率'], ['未开启API查询权限', '查询权限'], ['商户密钥错误', '凭证校验'], ['不支持此参数', '不支持当前查询'], ['订单不存在', '订单已不存在'], ['未知错误', '拒绝了本次查询']]) {
+    await assert.rejects(send({ code: -1, msg: `${message} https://pay.example.com/api.php?key=secret-key buyer=private-buyer` }), error => {
+      assert.equal(error.epaySafe, true); assert.equal(error.statusCode, 400);
+      assert.match(error.message, /订单列表查询失败.*返回码 -1/); assert.ok(error.message.includes(expected));
+      assert.doesNotMatch(error.message, /secret-key|private-buyer|https:|api\.php/);
+      return true;
+    });
+  }
+  await assert.rejects(send({ code: 'secret-key', msg: 'private-buyer' }), error => {
+    assert.doesNotMatch(error.message, /secret-key|private-buyer|返回码/); return true;
+  });
+});

@@ -11,13 +11,14 @@ const TABS = [['overview', '收款总览'], ['orders', '订单记录'], ['accoun
 const dateFormatter = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, dateStyle: 'short', timeStyle: 'medium' });
 const date = value => value ? dateFormatter.format(new Date(value)) : '尚未同步';
 const status = item => !item.enabled ? ['paused', '已暂停', CirclePause] : item.syncing ? ['syncing', '同步中', RefreshCw]
-  : item.lastError ? ['error', '同步异常', AlertCircle] : item.initialized ? ['online', '监听中', CheckCircle2] : ['syncing', '等待首次同步', RefreshCw];
+  : item.lastError ? ['error', '同步异常', AlertCircle] : item.catchupWarning ? ['pending', '订单待补齐', AlertCircle] : item.initialized ? ['online', '监听中', CheckCircle2] : ['syncing', '等待首次同步', RefreshCw];
 
 export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearchScopeChange }) {
   const [tab, setTab] = useState('overview'), [data, setData] = useState(null), [error, setError] = useState('');
   const [accountId, setAccountId] = useState(''), [orderStatus, setOrderStatus] = useState(''), [from, setFrom] = useState(''), [to, setTo] = useState('');
   const [query, setQuery] = useState(search), [page, setPage] = useState(1), [refresh, setRefresh] = useState(0);
   const [editor, setEditor] = useState(null), [deletion, setDeletion] = useState(null), [detail, setDetail] = useState(null);
+  const [orderViewer, setOrderViewer] = useState(null), [viewerData, setViewerData] = useState(null), [viewerError, setViewerError] = useState(''), [viewerLoading, setViewerLoading] = useState(false);
   const [busy, setBusy] = useState(false), [testing, setTesting] = useState(false), [formError, setFormError] = useState(''), [testResult, setTestResult] = useState(null), [showKey, setShowKey] = useState(false);
   const lock = useRef(false), generation = useRef(0), mounted = useRef(true), testEpoch = useRef(0), connectionTest = useRef(null);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; testEpoch.current++; connectionTest.current?.abort(); }; }, []);
@@ -30,9 +31,8 @@ export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearc
       stop = startPolling(async signal => {
         if (lock.current) return;
         const version = generation.current;
-        // The account list does not render orders. Tell the server so it can
-        // skip the count and page query instead of scanning a growing ledger
-        // on every 10-second status refresh.
+        // Overview and accounts only need metadata and rollups; orders are
+        // loaded from the local ledger when their tab or dialog is opened.
         const params = new URLSearchParams({ view: tab, accountId, status: tab === 'orders' ? orderStatus : '', from: tab === 'orders' ? from : '', to: tab === 'orders' ? to : '', page: tab === 'orders' ? page : 1, search: tab === 'accounts' ? '' : query });
         try {
           const result = await api(`/api/epay?${params}`, { signal });
@@ -43,6 +43,23 @@ export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearc
     start(); document.addEventListener('visibilitychange', start);
     return () => { cancelled = true; stop?.(); document.removeEventListener('visibilitychange', start); };
   }, [api, accountId, orderStatus, from, to, page, query, tab, refresh]);
+  useEffect(() => {
+    if (!orderViewer) return;
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]);
+    let cancelled = false;
+    setViewerData(null); setViewerError(''); setViewerLoading(true);
+    const params = new URLSearchParams({ view: 'orders', accountId: orderViewer.accountId, status: orderViewer.status, page: orderViewer.page });
+    void (async () => {
+      try {
+        const result = await api(`/api/epay?${params}`, { signal });
+        if (!cancelled && !signal.aborted) setViewerData(result.orders);
+      } catch (error) {
+        if (!cancelled) setViewerError(signal.aborted ? '读取订单超时，请重试' : error.message);
+      } finally { if (!cancelled) setViewerLoading(false); }
+    })();
+    return () => { cancelled = true; controller.abort(); };
+  }, [api, orderViewer]);
   const accounts = data?.accounts || [], selected = accounts.find(item => item.id === accountId);
   const names = useMemo(() => new Map(accounts.map(item => [item.id, item])), [data?.accounts]);
   const accountTotals = useMemo(() => new Map((data?.totals || []).map(item => [item.accountId, item])), [data?.totals]);
@@ -107,6 +124,10 @@ export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearc
     } catch (err) { toast(err.message); }
   }
   const copy = async value => { try { await copyNoteText(value); toast('已复制订单号'); } catch { toast('复制失败，请长按选择复制'); } };
+  const openOrders = item => {
+    setViewerData(null); setViewerError(''); setViewerLoading(true);
+    setOrderViewer({ accountId: item?.id || '', name: item?.name || '全部商户', page: 1, status: '', refresh: 0 });
+  };
   const resetPage = setter => event => { setter(event.target.value); setPage(1); };
   const orderList = records => <div className="epay-orders"><div className="epay-order-head"><span>订单 / 商品</span><span>商户 / 支付方式</span><span>订单金额</span><span>状态 / 时间</span><span /></div>
     {records.map(row => { const account = names.get(row.account_id); return <article className="epay-order" key={`${row.account_id}:${row.trade_no}`}>
@@ -145,11 +166,17 @@ export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearc
               {[['today', '今日收款'], ['yesterday', '昨日收款'], ['month', '本月收款'], ['total', '累计收款']].map(([key, label]) => <div className="epay-metric" key={key}><span>{label}<small>{group.currency}</small></span><strong>{epayMoney(group[key], group.currency)}</strong>{key === 'total' ? <small>{group.paidCount} 笔成功订单</small> : null}</div>)}
             </div>;
           })}
-          <div className="epay-summary-caption">北京时间统计 · 仅统计已同步的成功订单；余额为接口最近查询结果。</div>
+          <div className="epay-summary-caption"><span>北京时间统计 · 仅计入已同步的成功订单</span><span>余额为接口最近查询结果</span></div>
           <div className="epay-section-title"><strong>商户概况</strong><button className="epay-link" onClick={() => setTab('accounts')}>管理账号<ArrowUpRight size={14} /></button></div>
-          <div className="epay-account-cards">{accounts.filter(item => !accountId || item.id === accountId).map(item => { const total = accountTotals.get(item.id), [tone, label, Icon] = status(item); return <button className="epay-account-card" key={item.id} onClick={() => { setAccountId(item.id); setPage(1); }}><div><strong>{item.name}</strong><span className={`epay-badge ${tone}`}><Icon size={12} />{label}</span></div><span className="epay-account-host">{new URL(item.url).host} · 商户 {item.pid}</span><dl><div><dt>当前余额</dt><dd>{epayMoney(item.balance, item.currency)}</dd></div><div><dt>今日收款</dt><dd>{epayMoney(total?.today || 0, item.currency)}</dd></div></dl><small>{item.historyUnsupported ? '接口不支持历史分页 · 仅统计可查询范围' : item.historyComplete ? '历史订单已同步' : '历史订单分批同步中'} · {date(item.lastSyncAt)}</small>{item.lastWarning ? <span className="epay-inline-warning">{item.lastWarning}</span> : null}{item.lastError ? <span className="epay-inline-error">{item.lastError}</span> : null}</button>; })}</div>
-          <div className="epay-section-title"><strong>最近订单</strong><button className="epay-link" onClick={() => setTab('orders')}>查看全部<ArrowUpRight size={14} /></button></div>
-          {orderList(data.orders.records.slice(0, 6))}
+          <div className="epay-overview-merchants">{filtered.filter(item => !accountId || item.id === accountId).map(item => {
+            const total = accountTotals.get(item.id), [tone, label, Icon] = status(item);
+            return <article className="epay-overview-row" key={item.id}>
+              <div className="epay-overview-identity"><div className="epay-merchant-icon"><Wallet size={18} /></div><div><div className="epay-overview-name"><strong>{item.name}</strong><span className={`epay-badge ${tone}`}><Icon size={12} />{label}</span></div><span className="epay-account-host">{new URL(item.url).host} · 商户 {item.pid}</span></div></div>
+              <dl className="epay-overview-amounts"><div><dt>当前余额 <small>{item.currency}</small></dt><dd>{epayMoney(item.balance, item.currency)}</dd></div><div><dt>今日收款</dt><dd>{epayMoney(total?.today || 0, item.currency)}</dd></div><div><dt>累计收款</dt><dd>{epayMoney(total?.total || 0, item.currency)}</dd></div></dl>
+              <button className="ghost epay-view-orders" aria-label={`查看 ${item.name} 的订单`} onClick={() => openOrders(item)}><ReceiptText size={14} />查看订单<ArrowUpRight size={13} /></button>
+              <div className="epay-overview-sync"><small>{item.historyUnsupported ? '接口不支持历史分页 · 保留已同步订单' : item.historyComplete ? '历史订单已同步' : '历史订单分批补齐'} · {date(item.lastSyncAt)}</small>{item.lastWarning ? <span className="epay-inline-warning">{item.lastWarning}</span> : null}{item.lastError ? <span className="epay-inline-error">{item.lastError}</span> : null}</div>
+            </article>;
+          })}{!filtered.some(item => !accountId || item.id === accountId) ? <div className="ops-empty">没有匹配的商户</div> : null}</div>
         </> : tab === 'orders' ? <>{orderList(data.orders.records)}{!data.orders.records.length ? <div className="ops-empty"><ReceiptText size={25} /><strong>暂无匹配订单</strong><span>订单在后台同步，首次读取历史需要一些时间。</span></div> : null}
           <div className="epay-pagination"><span>共 {data.orders.total} 笔 · 第 {data.orders.page}/{data.orders.pages} 页</span><div><button className="ghost icon-button" aria-label="上一页" disabled={data.orders.page <= 1} onClick={() => setPage(value => value - 1)}><ChevronLeft size={16} /></button><button className="ghost icon-button" aria-label="下一页" disabled={data.orders.page >= data.orders.pages} onClick={() => setPage(value => value + 1)}><ChevronRight size={16} /></button></div></div>
         </> : <div className="epay-account-list">{filtered.map(item => { const [tone, label, Icon] = status(item); return <article key={item.id} className="epay-account-row"><div className="epay-merchant-icon"><Wallet size={21} /></div><div className="epay-account-info"><div><strong>{item.name}</strong><span className={`epay-badge ${tone}`}><Icon size={12} />{label}</span></div><span>{item.url} · 商户 {item.pid}</span><small>每 {item.interval} 秒监听 · {item.botIds.length ? `${item.botIds.length} 个通知机器人` : '未开启 TG 通知'} · {date(item.lastSyncAt)}</small>{item.lastWarning ? <span className="epay-inline-warning">{item.lastWarning}</span> : null}{item.lastError ? <span className="epay-inline-error">{item.lastError}</span> : null}{item.note ? <small>{item.note}</small> : null}</div><div className="epay-account-money"><small>最近余额</small><strong>{epayMoney(item.balance, item.currency)}</strong></div><div className="epay-row-actions"><button className="ghost" disabled={busy || !item.enabled || item.syncing} onClick={() => sync(item)}>{item.syncing ? '同步中' : '同步'}</button><button className="ghost" disabled={busy} onClick={() => toggle(item)}>{item.enabled ? '暂停' : '启用'}</button><button className="ghost icon-button" aria-label={`编辑 ${item.name}`} title="编辑" disabled={busy} onClick={() => openEditor(item)}><Pencil size={15} /></button><button className="ghost icon-button danger-text-button" aria-label={`删除 ${item.name}`} title="删除" disabled={busy} onClick={() => setDeletion({ ids: [item.id], name: item.name })}><Trash2 size={15} /></button></div></article>; })}{!filtered.length ? <div className="ops-empty">没有匹配的商户</div> : null}</div>}
@@ -158,6 +185,11 @@ export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearc
       </div>
       <footer className="epay-footnote"><ShieldCheck size={13} /><span>后台独立监听，关闭页面仍会继续。首次导入的历史订单不补发提醒；密钥不返回浏览器，备份随现有数据库保存。</span></footer>
     </div>
+    {orderViewer ? <Dialog title={`${orderViewer.name} · 订单记录`} xwide className="epay-orders-dialog" onClose={() => setOrderViewer(null)} footer={<><span className="epay-dialog-note">读取本地订单，不触发远程同步</span><button className="primary" onClick={() => setOrderViewer(null)}>关闭</button></>}>
+      <div className="epay-viewer-toolbar"><label><span>支付状态</span><select aria-label="弹窗订单状态" value={orderViewer.status} onChange={event => setOrderViewer(current => ({ ...current, status: event.target.value, page: 1 }))}><option value="">全部状态</option>{Object.entries(EPAY_STATUSES).map(([key, value]) => <option key={key} value={key}>{value}</option>)}</select></label><span>{viewerData ? `共 ${viewerData.total} 笔订单` : '已保存的订单记录'}</span><button className="ghost icon-button" aria-label="刷新商户订单" title="刷新商户订单" disabled={viewerLoading} onClick={() => setOrderViewer(current => ({ ...current, refresh: current.refresh + 1 }))}><RefreshCw size={15} /></button></div>
+      {viewerError ? <div className="epay-warning" role="alert"><AlertCircle size={16} /><span>{viewerError}</span><button className="epay-link" onClick={() => setOrderViewer(current => ({ ...current, refresh: current.refresh + 1 }))}>重试</button></div> : null}
+      {viewerLoading ? <div className="ops-empty" role="status"><RefreshCw size={23} /><strong>正在读取订单…</strong></div> : viewerData ? <>{viewerData.records.length ? orderList(viewerData.records) : <div className="ops-empty"><ReceiptText size={24} /><strong>暂无匹配订单</strong></div>}<div className="epay-pagination"><span>第 {viewerData.page}/{viewerData.pages} 页 · 共 {viewerData.total} 笔</span><div><button className="ghost icon-button" aria-label="商户订单上一页" disabled={viewerData.page <= 1} onClick={() => setOrderViewer(current => ({ ...current, page: viewerData.page - 1 }))}><ChevronLeft size={16} /></button><button className="ghost icon-button" aria-label="商户订单下一页" disabled={viewerData.page >= viewerData.pages} onClick={() => setOrderViewer(current => ({ ...current, page: viewerData.page + 1 }))}><ChevronRight size={16} /></button></div></div></> : null}
+    </Dialog> : null}
     {editor ? <Dialog title={editor.id ? '编辑易支付商户' : '添加易支付商户'} wide className="epay-dialog" onClose={closeEditor} footer={<div className="epay-editor-footer"><button className="ghost" disabled={busy || testing} onClick={testConnection}>{testing ? '测试中…' : '测试连接'}</button><div className="dialog-actions"><button className="ghost" disabled={busy} onClick={closeEditor}>取消</button><button className="primary" disabled={busy || testing} onClick={save}>{busy ? '保存中…' : '保存商户'}</button></div></div>}>
       <div className="epay-form-intro"><div><Wallet size={22} /></div><span><strong>连接你的收款账号</strong><small>兼容常见易支付商户查询接口，不修改收款配置。</small></span></div>
       <form className="epay-form" onSubmit={event => { event.preventDefault(); save(); }} autoComplete="off">

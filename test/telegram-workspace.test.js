@@ -58,6 +58,19 @@ test('main menu includes Webhook tasks, granular permissions, and no implicit ma
   assert.equal(h.operations.length, 0);
 });
 
+test('EasyPay recent-order gaps remain visible in Telegram status and the attention filter', async () => {
+  const h = harness({ epayAccounts: [
+    { id: 'gap', name: '部分同步', status: 'incomplete', enabled: true, url: 'https://pay.example.com/', pid: '1001', currency: 'CNY', balance: 100,
+      lastWarning: '最新订单已同步，期间订单尚未补齐，统计和通知可能不完整，将稍后重试。' },
+    { id: 'ok', name: '正常商户', status: 'healthy', enabled: true }
+  ] });
+  await h.send('/epay'); await h.press('仅看异常');
+  assert.ok(h.buttons().some(button => button.text === '部分同步 · 订单待补齐'));
+  assert.equal(h.buttons().some(button => button.text.startsWith('正常商户')), false);
+  await h.press('部分同步 · 订单待补齐');
+  assert.match(h.latest().text, /状态：订单待补齐/); assert.match(h.latest().text, /统计和通知可能不完整/);
+});
+
 test('Webhook Telegram commands keep output private and recheck permission before execution', async () => {
   const h = harness({ webhookTasks: [{ id: 'w1', name: '换 IP API', enabled: true, timeout: 30, location: '面板本机', status: 'success', run: { status: 'success' } }] });
   await h.send('/webhooks'); await h.press('换 IP API · 成功');

@@ -8,7 +8,7 @@ const fail = (message, statusCode = 400) => { throw Object.assign(Error(message)
 const clean = (value, max = 120) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, max);
 const safe = item => { const { keyEnc, ...rest } = item; return { ...rest, configured: Boolean(keyEnc) }; };
 const escape = value => clean(value, 200).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-const snapshotFields = ['lastSyncAt', 'lastAttemptAt', 'balanceAt', 'balance', 'failures', 'nextAt', 'lastError', 'lastWarning', 'historyWarning', 'orderWarning', 'historyRetryAt', 'orderRetryAt', 'initialized', 'historyOffset', 'historyComplete', 'historyUnsupported', 'historySignature', 'pageSize', 'catchupOffset'];
+const snapshotFields = ['lastSyncAt', 'lastAttemptAt', 'balanceAt', 'balance', 'failures', 'nextAt', 'lastError', 'lastWarning', 'historyWarning', 'orderWarning', 'catchupWarning', 'historyRetryAt', 'orderRetryAt', 'catchupRetryAt', 'initialized', 'historyOffset', 'historyComplete', 'historyUnsupported', 'historySignature', 'pageSize', 'catchupOffset'];
 
 export function normalizeEpayOrder(input, pid) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('订单接口返回了无效记录');
@@ -49,6 +49,15 @@ export function epayReceiptMessage(account, order, accounts) {
 export function createEpayService(deps) {
   const store = createEpayStore(deps.db), running = new Map();
   const request = deps.request || requestEpay;
+  // Old versions reported supplemental-query failures as a generic account
+  // error. Revalidate those accounts through the bounded scheduler after an
+  // upgrade instead of keeping the old 15-minute backoff. Keep the error until
+  // an actual successful sync; paused accounts and current failures stay put.
+  for (const item of store.accounts()) {
+    if (item.enabled && item.lastError === '易支付查询失败，请检查商户号、密钥以及商户 API 查询权限' && item.nextAt) {
+      store.saveAccount({ ...item, nextAt: 0 });
+    }
+  }
   let activeTests = 0, sending = false, cursor = 0, lastPrune = 0, accountCache = null;
   const accounts = () => accountCache ||= store.accounts();
   const invalidate = () => { accountCache = null; };
@@ -82,7 +91,7 @@ export function createEpayService(deps) {
       balance: null, balanceAt: '', lastSyncAt: '', lastError: '', failures: 0, pageSize: 50, catchupOffset: 0,
       ...old, ...config, id: old?.id || randomUUID(), version: randomUUID(), createdAt: old?.createdAt || new Date(now).toISOString(),
       updatedAt: new Date(now).toISOString(), nextAt: now };
-    if (input.key) Object.assign(item, { historyRetryAt: 0, orderRetryAt: 0, historyWarning: '', orderWarning: '', lastWarning: '' });
+    if (input.key) Object.assign(item, { historyRetryAt: 0, orderRetryAt: 0, catchupRetryAt: 0, historyWarning: '', orderWarning: '', catchupWarning: '', lastWarning: '' });
     store.saveAccount(item); invalidate(); return safe(item);
   }
   async function test(input, id = '', options = {}) {
@@ -119,6 +128,7 @@ export function createEpayService(deps) {
     const controller = new AbortController(); running.set(id, controller);
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(25000)]), version = item.version;
     const valid = () => !signal.aborted && store.account(id)?.version === version;
+    let stage = '读取商户余额';
     try {
       const key = deps.decrypt(item.keyEnc);
       if (!key) fail('商户密钥无法解密，请重新填写');
@@ -136,6 +146,7 @@ export function createEpayService(deps) {
       };
       const fetchPage = async (offset, history = false) => {
         const size = item.pageSize || 50;
+        stage = history ? '补查历史订单' : offset ? '补查期间订单' : '读取最新订单';
         const result = await request(item, key, 'orders', { limit: size, num: size, page: Math.floor(offset / size) + 1, start: offset }, { signal });
         if (!valid()) throw Error('configuration changed');
         if (!Array.isArray(result.data) || result.data.length > 1000) fail('易支付订单列表格式不兼容');
@@ -151,6 +162,7 @@ export function createEpayService(deps) {
         for (const row of rows) fetched.add(row.trade_no);
         return { rows, ...merged, signature };
       };
+      stage = '读取最新订单';
       const first = await fetchPage(0);
       item.headSignature = first.signature;
       const newHead = first.rows.length - first.known;
@@ -159,10 +171,6 @@ export function createEpayService(deps) {
       } else {
         if (item.catchupOffset) item.catchupOffset += newHead;
         if (!item.catchupOffset && first.rows.length === item.pageSize && first.known < first.rows.length) item.catchupOffset = item.pageSize;
-      }
-      if (item.catchupOffset && !item.historyUnsupported) {
-        const catchup = await fetchPage(item.catchupOffset);
-        item.catchupOffset = catchup.repeated || catchup.known || catchup.rows.length < item.pageSize ? 0 : item.catchupOffset + item.pageSize;
       }
       // The current balance and newest orders are the monitoring path.
       // Supplemental history/detail support varies by site; failures there
@@ -174,11 +182,22 @@ export function createEpayService(deps) {
           item[`${kind}Warning`] = ''; item[`${kind}RetryAt`] = 0;
         } catch (error) {
           if (controller.signal.aborted || store.account(id)?.version !== version || error.epayIntegrity) throw error;
-          item[`${kind}Warning`] = message;
+          item[`${kind}Warning`] = message + (error.epaySafe ? ` ${error.message}` : '');
           item[`${kind}RetryAt`] = Date.now() + Math.max(60000, Math.min(300000, item.interval * 2000));
         }
       };
-      if (!item.historyComplete && !item.historyUnsupported && item.historyOffset) {
+      if (item.catchupOffset && !item.historyUnsupported) {
+        await supplemental('catchup', '最新订单已同步，期间订单尚未补齐，统计和通知可能不完整，将稍后重试。', async () => {
+          const catchup = await fetchPage(item.catchupOffset);
+          item.catchupOffset = catchup.repeated || catchup.known || catchup.rows.length < item.pageSize ? 0 : item.catchupOffset + item.pageSize;
+        });
+        if (item.catchupOffset && !item.catchupWarning) item.catchupWarning = '最新订单已同步，正在补齐期间订单，统计和通知可能暂不完整。';
+      } else {
+        item.catchupWarning = ''; item.catchupRetryAt = 0;
+      }
+      // Prioritize gaps in recent orders over old history, and do not request
+      // an overlapping page twice when the catchup endpoint is failing.
+      if (!item.catchupOffset && !item.historyComplete && !item.historyUnsupported && item.historyOffset) {
         await supplemental('history', '最新订单已同步，历史订单暂未补齐，将稍后重试。', async () => {
           const history = await fetchPage(item.historyOffset, true);
           if (!history.repeated) {
@@ -186,13 +205,14 @@ export function createEpayService(deps) {
             item.historyComplete = history.rows.length < item.pageSize;
           }
         });
-      } else {
+      } else if (item.historyComplete || item.historyUnsupported) {
         item.historyWarning = ''; item.historyRetryAt = 0;
       }
       const pending = store.pending(id).filter(row => !fetched.has(row.trade_no));
       if (pending.length) {
         await supplemental('order', '最新订单已同步，部分旧订单状态暂未核对，将稍后重试。', async () => {
           for (const row of pending) {
+            stage = '核对旧订单状态';
             const result = await request(item, key, 'order', { trade_no: row.trade_no }, { signal });
             if (!valid()) { signal.throwIfAborted(); throw Error('configuration changed'); }
             const order = normalizeEpayOrder(result, item.pid);
@@ -204,13 +224,13 @@ export function createEpayService(deps) {
         item.orderWarning = ''; item.orderRetryAt = 0;
       }
       if (controller.signal.aborted || store.account(id)?.version !== version) return false;
-      item.lastWarning = [item.historyWarning, item.orderWarning].filter(Boolean).join(' ');
+      item.lastWarning = [item.catchupWarning, item.historyWarning, item.orderWarning].filter(Boolean).join(' ');
       item.initialized = true; item.lastSyncAt = new Date(now).toISOString(); item.lastAttemptAt = item.lastSyncAt;
       item.lastError = ''; item.failures = 0; item.nextAt = Date.now() + item.interval * 1000;
     } catch (error) {
       if (controller.signal.aborted || store.account(id)?.version !== version) return false;
       item.failures = Math.min(10, (item.failures || 0) + 1);
-      item.lastError = error.statusCode === 400 ? error.message : signal.aborted ? '同步超时，将自动重试' : '订单同步失败，将自动重试；请检查接口与网络';
+      item.lastError = `${stage}失败：${error.statusCode === 400 || error.epaySafe ? error.message : signal.aborted ? '同步超时，将自动重试' : '接口或网络请求失败，将自动重试'}`;
       item.lastAttemptAt = new Date().toISOString(); item.nextAt = Date.now() + Math.min(900000, item.interval * 1000 * 2 ** item.failures);
     } finally {
       try { patch(id, version, Object.fromEntries([...snapshotFields, 'headSignature'].map(field => [field, item[field]]))); }
@@ -265,10 +285,9 @@ export function createEpayService(deps) {
       if (row) for (const key of ['total', 'today', 'yesterday', 'month', 'paidCount', 'orders']) group[key] += row[key] || 0;
       groups.set(account.currency, group);
     }
-    // Accounts only needs merchant metadata and balances. Avoid COUNT(*) and
-    // the order page read there; this keeps the fast polling path independent
-    // of the size of the local order ledger.
-    const orders = view === 'accounts' ? { records: [], total: 0, page: 1, pages: 1 } : store.orders(query);
+    // Overview and accounts only render rollups. Load orders on demand in the
+    // order tab/dialog instead of counting the ledger on every poll.
+    const orders = view !== 'orders' ? { records: [], total: 0, page: 1, pages: 1 } : store.orders(query);
     return { accounts: all, totals, summary: [...groups.values()], balances: epayBalanceGroups(selected),
       orders, notifications: store.notificationSummary(), serverTime: Date.now(),
       bots: bots().map(({ id, name, enabled, tokenEnc, userIds }) => ({ id, name, enabled, configured: Boolean(tokenEnc), hasRecipients: Boolean(userIds?.length) })) };
@@ -280,7 +299,7 @@ export function createEpayService(deps) {
   }
   return { store, save, test, sync, tick, deliver, snapshot, remove,
     telegramAccounts: () => { const totals = new Map(store.totals().map(row => [row.accountId, row]));
-      return accounts().map(item => ({ ...safe(item), ...totals.get(item.id), status: item.lastError ? 'error' : item.initialized ? 'healthy' : 'queued' })); },
+      return accounts().map(item => ({ ...safe(item), ...totals.get(item.id), status: item.lastError ? 'error' : item.catchupWarning ? 'incomplete' : item.initialized ? 'healthy' : 'queued' })); },
     request(id) {
       const item = requireAccount(id);
       if (!item.enabled) fail('请先启用商户监听');

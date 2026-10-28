@@ -17,13 +17,13 @@ const resources = { guards: 'dns-guards', probes: 'probes', targets: 'probe-targ
 const labels = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', unknown: '未检查',
   queued: '待执行', checking: '检查中', waiting_probe: '等待探针', waiting_ip: '等待可用 IP', waiting_for_ip: '等待备用 IP',
   waiting_new_ip: '等待新 IP', waiting: '等待中', executing: '执行中', observing: '观察中', disabled: '已停用', command_error: '命令异常', resolve_error: '解析异常', cooldown: '冷却中', daily_limit: '达到每日上限',
-  succeeded: '已完成', recovered: '已恢复', replaced: '已补位', degraded: '容量不足', error: '异常', failed: '失败',
+  succeeded: '已完成', recovered: '已恢复', replaced: '已补位', degraded: '容量不足', incomplete: '订单待补齐', error: '异常', failed: '失败',
   pending_approval: '待确认', allocating: '分配中', automating: '执行自动化', dns_updating: '写入 DNS', verifying: '验证中',
   stabilizing: '等待生效', rolling_back: '回滚中', rolled_back: '已回滚', consumed: '已使用', discarded: '已丢弃', returned: '已退回原池',
   done: '已结束', running: '执行中', cancelled: '已取消', processing: '处理中', success: '成功', timeout: '超时', uncertain: '待确认', waiting_guard: '守护处理中', idle: '暂无执行',
   resolving: '正在解析', probe_failed: '检查失败，待重试', capacity: '达到 IP 上限', ready: '检查通过，待写入', synced: '已同步' };
 const finished = new Set(['succeeded', 'recovered', 'rolled_back', 'cancelled', 'done']);
-const bad = new Set(['offline', 'down', 'error', 'failed', 'timeout', 'uncertain', 'degraded', 'waiting_probe', 'waiting_ip', 'waiting_for_ip', 'unhealthy', 'command_error', 'resolve_error', 'daily_limit', 'query_error', 'limit']);
+const bad = new Set(['offline', 'down', 'error', 'failed', 'timeout', 'uncertain', 'degraded', 'incomplete', 'waiting_probe', 'waiting_ip', 'waiting_for_ip', 'unhealthy', 'command_error', 'resolve_error', 'daily_limit', 'query_error', 'limit']);
 const dynamicLabels = { waiting_ip: '等待新 IP', verifying: '验证新 IP', executing: '执行换 IP', query_error: '查询异常', limit: '达到每日上限' };
 const searchSection = (section) => ({ probes: 'nodes', dns: 'bindings' })[section] || section;
 const short = (value, max = 80) => String(value ?? '').replace(/[\r\n]+/g, ' ').slice(0, max);

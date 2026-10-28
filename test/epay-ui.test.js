@@ -121,3 +121,85 @@ test('overview keeps the scope in its toolbar and shows supplemental warnings wi
   assert.equal(view.nodes().some(node => node.props?.className === 'epay-badge error'), false);
   view.close();
 });
+
+test('a gap in recent orders stays visibly incomplete in overview and merchant cards', async () => {
+  const warning = '最新订单已同步，期间订单尚未补齐，统计和通知可能不完整，将稍后重试。';
+  const view = harness(async () => {
+    const data = fixture(); Object.assign(data.accounts[0], { initialized: true, lastError: '', catchupWarning: warning, lastWarning: warning }); return data;
+  });
+  await view.poll(); view.render();
+  for (const tab of ['收款总览', '商户账号']) {
+    view.button(tab).props.onClick(); view.render();
+    assert.ok(view.nodes().some(node => node.props?.className === 'epay-badge pending' && node.props.children?.includes('订单待补齐')));
+    assert.ok(view.nodes().some(node => node.props?.className === 'epay-inline-warning' && node.props.children === warning));
+    assert.equal(view.nodes().some(node => node.props?.className === 'epay-badge online'), false);
+  }
+  view.close();
+});
+
+test('overview renders merchant rows and opens a local paginated order dialog without changing tab filters', async () => {
+  const calls = [];
+  const view = harness(async (path, options = {}) => {
+    calls.push({ path, options });
+    const data = fixture(), q = new URL(path, 'https://panel.example.com/').searchParams;
+    if (q.get('view') === 'orders') data.orders = { records: [{ account_id: 'one', name: '已保存订单', trade_no: 'T1', status: 'paid', cents: 250,
+      channel: 'alipay', created_at: '2026-10-28T02:00:00Z' }], total: 31, page: Number(q.get('page')), pages: 2 };
+    return data;
+  });
+  await view.poll(); view.render();
+  assert.equal(view.nodes().filter(node => node.props?.className === 'epay-overview-row').length, 1);
+  assert.equal(view.nodes().some(node => node.props?.className === 'epay-orders'), false);
+  assert.equal(view.nodes().some(node => node.props?.className === 'epay-account-card'), false);
+  view.button('查看 主站 的订单').props.onClick(); view.render(); await new Promise(resolve => setImmediate(resolve)); view.render();
+  assert.ok(view.nodes().some(node => node.type === 'dialog' && node.props.title === '主站 · 订单记录'));
+  let params = new URL(calls.at(-1).path, 'https://panel.example.com/').searchParams;
+  assert.equal(params.get('accountId'), 'one'); assert.equal(params.get('view'), 'orders'); assert.equal(params.get('page'), '1');
+  assert.equal(view.button('商户订单上一页').props.disabled, true);
+  view.button('商户订单下一页').props.onClick(); view.render(); await new Promise(resolve => setImmediate(resolve)); view.render();
+  params = new URL(calls.at(-1).path, 'https://panel.example.com/').searchParams;
+  assert.equal(params.get('page'), '2'); assert.equal(view.button('商户订单下一页').props.disabled, true);
+  view.nodes().find(node => node.props?.['aria-label'] === '弹窗订单状态').props.onChange({ target: { value: 'paid' } });
+  view.render(); await new Promise(resolve => setImmediate(resolve)); view.render();
+  params = new URL(calls.at(-1).path, 'https://panel.example.com/').searchParams;
+  assert.equal(params.get('page'), '1'); assert.equal(params.get('status'), 'paid');
+  view.button('关闭').props.onClick(); view.render(); await view.poll();
+  params = new URL(calls.at(-1).path, 'https://panel.example.com/').searchParams;
+  assert.equal(params.get('view'), 'overview'); assert.equal(params.get('accountId'), ''); assert.equal(params.get('status'), '');
+  assert.ok(calls.every(call => !call.options.method));
+  view.close();
+});
+
+test('closing the order dialog cancels its request and a late result cannot replace another merchant', async () => {
+  const requests = [];
+  const view = harness((path, options = {}) => {
+    if (new URL(path, 'https://panel.example.com/').searchParams.get('view') !== 'orders') {
+      const data = fixture(); data.accounts.push({ ...data.accounts[0], id: 'two', name: '备用商户' }); return Promise.resolve(data);
+    }
+    return new Promise(resolve => requests.push({ options, resolve }));
+  });
+  await view.poll(); view.render();
+  view.button('查看 主站 的订单').props.onClick(); view.render();
+  view.button('关闭').props.onClick(); view.render(); assert.equal(requests[0].options.signal.aborted, true);
+  view.button('查看 备用商户 的订单').props.onClick(); view.render();
+  requests[0].resolve({ orders: { records: [], total: 999, page: 1, pages: 34 } }); await new Promise(resolve => setImmediate(resolve)); view.render();
+  assert.ok(view.nodes().some(node => node.type === 'dialog' && node.props.title === '备用商户 · 订单记录'));
+  assert.equal(view.nodes().some(node => node.props?.className === 'epay-pagination'), false);
+  requests[1].resolve({ orders: { records: [], total: 0, page: 1, pages: 1 } }); await new Promise(resolve => setImmediate(resolve)); view.render();
+  assert.ok(view.nodes().some(node => node.props?.className === 'epay-pagination'));
+  view.close();
+});
+
+test('order dialog failures are retryable and never issue a remote-sync mutation', async () => {
+  let failure = true; const calls = [];
+  const view = harness(async (path, options = {}) => {
+    calls.push({ path, options });
+    if (new URL(path, 'https://panel.example.com/').searchParams.get('view') === 'orders' && failure) throw Error('订单读取失败');
+    return fixture();
+  });
+  await view.poll(); view.render(); view.button('查看 主站 的订单').props.onClick(); view.render(); await new Promise(resolve => setImmediate(resolve)); view.render();
+  assert.ok(view.nodes().some(node => node.props?.role === 'alert'));
+  failure = false; view.button('重试').props.onClick(); view.render(); await new Promise(resolve => setImmediate(resolve)); view.render();
+  assert.equal(view.nodes().some(node => node.props?.role === 'alert'), false);
+  assert.ok(calls.every(call => !call.options.method));
+  view.close();
+});

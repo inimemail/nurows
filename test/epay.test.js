@@ -110,3 +110,90 @@ test('invalid calendar filters cannot silently roll into a different month', t =
   assert.throws(() => service.snapshot({ from: '2026-02-31' }), /日期无效/);
   assert.doesNotThrow(() => service.snapshot({ from: '2028-02-29' }));
 });
+
+const compatibleRow = (i, status = '0') => ({ pid: '1001', trade_no: `T${i}`, money: '1.00', status,
+  addtime: '2026-10-28 10:00:00', endtime: status === '1' ? '2026-10-28 10:01:00' : '' });
+function customService(t, request) {
+  const db = new Database(':memory:'); t.after(() => db.close());
+  const service = createEpayService({ db, encrypt: value => value, decrypt: value => value, request });
+  const item = service.save({ name: '兼容站点', url: 'https://pay.example.com/', pid: '1001', key: 'secret' });
+  return { service, item };
+}
+
+test('a fixed thirty-order page stays healthy and never repeats detail requests for freshly listed orders', async t => {
+  let details = 0;
+  const { service, item } = customService(t, async (_account, _key, act) => {
+    if (act === 'query') return { code: 1, money: '130.00' };
+    if (act === 'order') { details++; throw Object.assign(Error('detail not supported'), { statusCode: 400 }); }
+    return { code: 1, data: Array.from({ length: 30 }, (_, i) => compatibleRow(i)) };
+  });
+  await service.sync(item.id);
+  service.store.saveAccount({ ...service.store.account(item.id), lastError: '旧版本的辅助查询异常', failures: 2 });
+  await service.sync(item.id);
+  const result = service.snapshot().accounts[0];
+  assert.equal(details, 0); assert.equal(result.lastError, ''); assert.equal(result.initialized, true);
+  assert.equal(result.historyUnsupported, true); assert.ok(result.lastSyncAt); assert.equal(result.failures, 0);
+  assert.equal(service.snapshot().balances[0].stale, 0);
+});
+
+test('history failures do not undo current-order success and back off before retrying', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-28T06:00:00Z') });
+  let historyRequests = 0, historyAvailable = false;
+  const { service, item } = customService(t, async (_account, _key, act, params) => {
+    if (act === 'query') return { code: 1, money: '130.00' };
+    if (params.start) { historyRequests++; if (!historyAvailable) throw Object.assign(Error('history endpoint failed'), { statusCode: 400 }); return { code: 1, data: [] }; }
+    return { code: 1, data: Array.from({ length: 50 }, (_, i) => compatibleRow(i, '1')) };
+  });
+  await service.sync(item.id);
+  let result = service.snapshot().accounts[0];
+  assert.equal(result.lastError, ''); assert.match(result.lastWarning, /历史订单暂未补齐/);
+  assert.equal(result.initialized, true); assert.ok(result.lastSyncAt); assert.equal(service.snapshot().balances[0].stale, 0);
+  await service.sync(item.id); assert.equal(historyRequests, 1);
+  historyAvailable = true; t.mock.timers.tick(60001); await service.sync(item.id);
+  result = service.snapshot().accounts[0];
+  assert.equal(historyRequests, 2); assert.equal(result.historyComplete, true); assert.equal(result.lastWarning, '');
+  assert.equal(service.snapshot().totals[0].total, 5000);
+});
+
+test('old order-detail failures remain visible as warnings without stopping new receipts', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-28T06:00:00Z') });
+  let detailRequests = 0, detailAvailable = false;
+  const { service, item } = customService(t, async (_account, _key, act, params) => {
+    if (act === 'query') return { code: 1, money: '130.00' };
+    if (act === 'orders') return { code: 1, data: params.start ? [] : [compatibleRow('new', '1')] };
+    detailRequests++;
+    if (!detailAvailable) throw Object.assign(Error('detail failed'), { statusCode: 400 });
+    return { code: 1, ...compatibleRow('old', '1') };
+  });
+  service.store.mergeOrders(item, [normalizeEpayOrder(compatibleRow('old'), '1001')], [], () => false, Date.now() - 1000);
+  await service.sync(item.id);
+  let result = service.snapshot().accounts[0];
+  assert.equal(result.lastError, ''); assert.match(result.lastWarning, /旧订单状态暂未核对/); assert.equal(result.initialized, true);
+  await service.sync(item.id); assert.equal(detailRequests, 1);
+  detailAvailable = true; t.mock.timers.tick(60001); await service.sync(item.id);
+  result = service.snapshot().accounts[0]; assert.equal(result.lastWarning, '');
+  assert.equal(service.store.order(item.id, 'Told').status, 'paid');
+});
+
+test('primary order-list rejection remains an error while a successful balance stays fresh', async t => {
+  const { service, item } = customService(t, async (_account, _key, act) => {
+    if (act === 'query') return { code: 1, money: '130.00' };
+    throw Object.assign(Error('订单列表查询失败'), { statusCode: 400 });
+  });
+  await service.sync(item.id);
+  const snapshot = service.snapshot(), result = snapshot.accounts[0];
+  assert.match(result.lastError, /订单列表查询失败/); assert.equal(result.initialized, false);
+  assert.equal(result.lastSyncAt, ''); assert.equal(snapshot.balances[0].stale, 0);
+});
+
+test('supplemental responses from a different merchant are still rejected as integrity errors', async t => {
+  const { service, item } = customService(t, async (_account, _key, act, params) => {
+    if (act === 'query') return { code: 1, money: '130.00' };
+    if (act === 'orders') return { code: 1, data: params.start ? [] : [compatibleRow('new', '1')] };
+    return { code: 1, ...compatibleRow('old', '1'), pid: '1002' };
+  });
+  service.store.mergeOrders(item, [normalizeEpayOrder(compatibleRow('old'), '1001')], [], () => false, Date.now() - 1000);
+  await service.sync(item.id);
+  assert.match(service.snapshot().accounts[0].lastError, /所属商户/);
+  assert.equal(service.store.order(item.id, 'Told').status, 'pending');
+});

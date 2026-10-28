@@ -103,3 +103,21 @@ test('bulk merchant deletion needs confirmation, snapshots its IDs and ignores a
   assert.ok(view.messages.includes('已删除 1 个商户及其本地订单'));
   view.close();
 });
+
+test('overview keeps the scope in its toolbar and shows supplemental warnings without a primary error badge', async () => {
+  const view = harness(async () => {
+    const data = fixture();
+    Object.assign(data.accounts[0], { initialized: true, lastError: '', lastWarning: '最新订单已同步，历史订单暂未补齐，将稍后重试。' });
+    data.summary = [{ currency: 'CNY', total: 13000, today: 13000, yesterday: 20200, month: 100300, paidCount: 30 }];
+    data.balances = [{ currency: 'CNY', balance: 13000, known: 1, total: 1, stale: 0 }];
+    return data;
+  });
+  await view.poll(); view.render();
+  assert.ok(view.nodes().some(node => node.type === 'select' && node.props['aria-label'] === '商户范围'));
+  assert.equal(view.nodes().filter(node => node.props?.className === 'epay-metric' || node.props?.className === 'epay-metric epay-balance-metric').length, 5);
+  assert.equal(view.nodes().some(node => node.props?.className === 'epay-balance-panel'), false);
+  assert.ok(view.nodes().some(node => node.props?.className === 'epay-inline-warning'));
+  assert.ok(view.nodes().some(node => node.props?.className === 'epay-badge online'));
+  assert.equal(view.nodes().some(node => node.props?.className === 'epay-badge error'), false);
+  view.close();
+});

@@ -8,11 +8,11 @@ const fail = (message, statusCode = 400) => { throw Object.assign(Error(message)
 const clean = (value, max = 120) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, max);
 const safe = item => { const { keyEnc, ...rest } = item; return { ...rest, configured: Boolean(keyEnc) }; };
 const escape = value => clean(value, 200).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-const snapshotFields = ['lastSyncAt', 'lastAttemptAt', 'balanceAt', 'balance', 'failures', 'nextAt', 'lastError', 'initialized', 'historyOffset', 'historyComplete', 'historyUnsupported', 'historySignature', 'pageSize', 'catchupOffset'];
+const snapshotFields = ['lastSyncAt', 'lastAttemptAt', 'balanceAt', 'balance', 'failures', 'nextAt', 'lastError', 'lastWarning', 'historyWarning', 'orderWarning', 'historyRetryAt', 'orderRetryAt', 'initialized', 'historyOffset', 'historyComplete', 'historyUnsupported', 'historySignature', 'pageSize', 'catchupOffset'];
 
 export function normalizeEpayOrder(input, pid) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('订单接口返回了无效记录');
-  if (input.pid !== undefined && String(input.pid) !== String(pid)) fail('订单所属商户与配置不符，已停止同步');
+  if (input.pid !== undefined && String(input.pid) !== String(pid)) throw Object.assign(Error('订单所属商户与配置不符，已停止同步'), { statusCode: 400, epayIntegrity: true });
   const trade_no = clean(input.trade_no || input.out_trade_no, 128), cents = epayCents(input.money);
   if (!trade_no || cents === null) fail('订单缺少有效订单号或金额，未计入统计');
   const created_at = epayDate(input.addtime || input.created_at), paid_at = epayDate(input.endtime || input.paid_at);
@@ -28,7 +28,8 @@ export function epayBalanceGroups(accounts, now = Date.now()) {
     group.total++;
     if (Number.isSafeInteger(item.balance)) {
       group.balance += item.balance; group.known++;
-      if (item.lastError || !Number.isFinite(Date.parse(item.balanceAt || '')) || now - Date.parse(item.balanceAt) > Math.max(item.interval * 3000, 120000)) group.stale++;
+      // Order/history failures must not label a freshly read balance as stale.
+      if (!Number.isFinite(Date.parse(item.balanceAt || '')) || now - Date.parse(item.balanceAt) > Math.max(item.interval * 3000, 120000)) group.stale++;
     }
     groups.set(item.currency, group);
   }
@@ -81,6 +82,7 @@ export function createEpayService(deps) {
       balance: null, balanceAt: '', lastSyncAt: '', lastError: '', failures: 0, pageSize: 50, catchupOffset: 0,
       ...old, ...config, id: old?.id || randomUUID(), version: randomUUID(), createdAt: old?.createdAt || new Date(now).toISOString(),
       updatedAt: new Date(now).toISOString(), nextAt: now };
+    if (input.key) Object.assign(item, { historyRetryAt: 0, orderRetryAt: 0, historyWarning: '', orderWarning: '', lastWarning: '' });
     store.saveAccount(item); invalidate(); return safe(item);
   }
   async function test(input, id = '', options = {}) {
@@ -125,7 +127,7 @@ export function createEpayService(deps) {
       const now = Date.now();
       item.balance = epayBalanceCents(info.money ?? info.balance); item.balanceAt = new Date(now).toISOString();
       patch(id, version, { balance: item.balance, balanceAt: item.balanceAt });
-      const notifyRecipients = recipients(item), created = Date.parse(item.createdAt);
+      const notifyRecipients = recipients(item), created = Date.parse(item.createdAt), fetched = new Set();
       const shouldNotify = (row, old) => {
         if (!item.initialized) return false;
         if (row.paid_at && Date.parse(row.paid_at) >= created) return true;
@@ -146,6 +148,7 @@ export function createEpayService(deps) {
           return { rows: [], known: 0, repeated: true, signature };
         }
         const merged = store.mergeOrders(item, rows, notifyRecipients, (row, old) => shouldNotify(row, old) || (!history && item.initialized && !old && !row.paid_at && Date.parse(row.created_at) >= created), now);
+        for (const row of rows) fetched.add(row.trade_no);
         return { rows, ...merged, signature };
       };
       const first = await fetchPage(0);
@@ -161,20 +164,47 @@ export function createEpayService(deps) {
         const catchup = await fetchPage(item.catchupOffset);
         item.catchupOffset = catchup.repeated || catchup.known || catchup.rows.length < item.pageSize ? 0 : item.catchupOffset + item.pageSize;
       }
-      if (!item.historyComplete && !item.historyUnsupported && item.historyOffset) {
-        const history = await fetchPage(item.historyOffset, true);
-        if (!history.repeated) {
-          item.historySignature = history.signature; item.historyOffset += history.rows.length;
-          item.historyComplete = history.rows.length < item.pageSize;
+      // The current balance and newest orders are the monitoring path.
+      // Supplemental history/detail support varies by site; failures there
+      // remain visible but must not undo a successful current-order sync.
+      const supplemental = async (kind, message, task) => {
+        if ((item[`${kind}RetryAt`] || 0) > now) return;
+        try {
+          signal.throwIfAborted(); await task();
+          item[`${kind}Warning`] = ''; item[`${kind}RetryAt`] = 0;
+        } catch (error) {
+          if (controller.signal.aborted || store.account(id)?.version !== version || error.epayIntegrity) throw error;
+          item[`${kind}Warning`] = message;
+          item[`${kind}RetryAt`] = Date.now() + Math.max(60000, Math.min(300000, item.interval * 2000));
         }
+      };
+      if (!item.historyComplete && !item.historyUnsupported && item.historyOffset) {
+        await supplemental('history', '最新订单已同步，历史订单暂未补齐，将稍后重试。', async () => {
+          const history = await fetchPage(item.historyOffset, true);
+          if (!history.repeated) {
+            item.historySignature = history.signature; item.historyOffset += history.rows.length;
+            item.historyComplete = history.rows.length < item.pageSize;
+          }
+        });
+      } else {
+        item.historyWarning = ''; item.historyRetryAt = 0;
       }
-      for (const row of store.pending(id)) {
-        const result = await request(item, key, 'order', { trade_no: row.trade_no }, { signal });
-        if (!valid()) return false;
-        const order = normalizeEpayOrder(result, item.pid);
-        if (order.trade_no !== row.trade_no) fail('订单查询返回了不同订单号，已停止同步');
-        store.mergeOrders(item, [order], notifyRecipients, shouldNotify, now);
+      const pending = store.pending(id).filter(row => !fetched.has(row.trade_no));
+      if (pending.length) {
+        await supplemental('order', '最新订单已同步，部分旧订单状态暂未核对，将稍后重试。', async () => {
+          for (const row of pending) {
+            const result = await request(item, key, 'order', { trade_no: row.trade_no }, { signal });
+            if (!valid()) { signal.throwIfAborted(); throw Error('configuration changed'); }
+            const order = normalizeEpayOrder(result, item.pid);
+            if (order.trade_no !== row.trade_no) throw Object.assign(Error('订单查询返回了不同订单号，已停止同步'), { statusCode: 400, epayIntegrity: true });
+            store.mergeOrders(item, [order], notifyRecipients, shouldNotify, now);
+          }
+        });
+      } else {
+        item.orderWarning = ''; item.orderRetryAt = 0;
       }
+      if (controller.signal.aborted || store.account(id)?.version !== version) return false;
+      item.lastWarning = [item.historyWarning, item.orderWarning].filter(Boolean).join(' ');
       item.initialized = true; item.lastSyncAt = new Date(now).toISOString(); item.lastAttemptAt = item.lastSyncAt;
       item.lastError = ''; item.failures = 0; item.nextAt = Date.now() + item.interval * 1000;
     } catch (error) {

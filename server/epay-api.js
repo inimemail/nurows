@@ -69,6 +69,12 @@ export async function requestEpay(account, key, act, params = {}, options = {}) 
     req.on('error', () => reject(Error(signal.aborted ? '易支付请求超时，请稍后重试' : '易支付连接失败，请检查地址、证书与网络')));
     req.end();
   });
-  if (Number(json.code) !== 1) fail('易支付查询失败，请检查商户号、密钥以及商户 API 查询权限');
+  if (Number(json.code) !== 1) {
+    // A small set of legacy sites use a failure code for an explicitly empty
+    // order page. Do not reinterpret arbitrary errors or authentication errors.
+    const empty = /^(?:暂无订单|没有订单|无订单|未查询到订单|未查到订单|订单记录为空|没有更多订单|查询结果为空)[！!。.\s]*$/.test(String(json.msg || '').trim());
+    if (act === 'orders' && [-1, 0].includes(Number(json.code)) && empty && (!json.data || Array.isArray(json.data) && !json.data.length)) return { code: 1, data: [] };
+    fail(`${{ query: '商户信息', orders: '订单列表', order: '单笔订单' }[act]}查询失败，请检查商户凭证、该接口权限与兼容性`);
+  }
   return json;
 }

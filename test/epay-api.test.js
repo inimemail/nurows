@@ -37,3 +37,20 @@ test('aborted requests do not resolve or connect and mixed private DNS answers f
     lookup: async () => [{ address: '8.8.8.8', family: 4 }, { address: '127.0.0.1', family: 4 }] }), /非公网地址/);
   assert.equal(connections, 0);
 });
+
+test('explicitly empty legacy order pages are accepted without hiding credential or other API errors', async () => {
+  const account = { url: 'https://pay.example.com/', pid: '1001' };
+  const send = (body, act = 'orders') => requestEpay(account, 'secret-key', act, {}, {
+    lookup: async () => [{ address: '8.8.8.8', family: 4 }],
+    request(_url, _options, callback) {
+      callback({ statusCode: 200, on(event, handler) { if (event === 'data') handler(Buffer.from(JSON.stringify(body))); if (event === 'end') handler(); return this; } });
+      return { on() { return this; }, end() {} };
+    }
+  });
+  assert.deepEqual(await send({ code: -1, msg: '暂无订单' }), { code: 1, data: [] });
+  assert.deepEqual(await send({ code: 0, msg: '没有更多订单！', data: [] }), { code: 1, data: [] });
+  await assert.rejects(send({ code: -1, msg: '商户密钥错误' }), /订单列表查询失败/);
+  await assert.rejects(send({ code: -1, msg: '未知错误' }), /订单列表查询失败/);
+  await assert.rejects(send({ code: -1, msg: '暂无订单' }, 'query'), /商户信息查询失败/);
+  await assert.rejects(send({ code: -1, msg: '暂无订单', data: [{ trade_no: 'unexpected' }] }), /订单列表查询失败/);
+});

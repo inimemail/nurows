@@ -146,6 +146,8 @@ export function createTelegramWorkspace(deps) {
       lines.push(`网站：${item.url}`, `商户号：${item.pid}`, `🏦 商户余额：${epayMoney(item.balance, item.currency)}`,
         `💵 今日收款：${epayMoney(item.today || 0, item.currency)}`, `累计成功金额：${epayMoney(item.total || 0, item.currency)}（已同步范围）`,
         `最后同步：${date(item.lastSyncAt)}`);
+      if (item.lastWarning) lines.push(`提示：${short(item.lastWarning, 500)}`);
+      if (item.lastError) lines.push(`异常：${short(item.lastError, 500)}`);
       rows.push([webButton(ctx, section, id)]);
     } else if (section === 'renewals') {
       lines.push(`💰 续费金额：${renewalAmount(item)}`, `📅 到期日期：${item.dueDate || '未知日期'}`);

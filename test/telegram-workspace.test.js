@@ -19,7 +19,7 @@ function harness(extra = {}, options = {}) {
     async call(token, method, body) { const packet = { token, method, ...body, message_id: body.message_id || ++sequence }; packets.push(packet); return packet; },
     async invoke(...args) { operations.push(args); return options.invoke?.(...args); },
     clearFinishedIncidents: (ids) => { operations.push(['clear', ids]); return { removed: ids.length }; },
-    liveJob: options.liveJob, cancelJob: (id) => operations.push(['cancel', id]), webhookTasks: () => state.webhookTasks || []
+    liveJob: options.liveJob, cancelJob: (id) => operations.push(['cancel', id]), webhookTasks: () => state.webhookTasks || [], epayAccounts: () => state.epayAccounts || []
   });
   const latest = () => packets.findLast((packet) => packet.method !== 'answerCallbackQuery');
   const buttons = () => latest()?.reply_markup?.inline_keyboard.flat() || [];
@@ -44,7 +44,7 @@ test('main menu includes Webhook tasks, granular permissions, and no implicit ma
   const h = harness();
   await h.send('/menu');
   assert.deepEqual(h.latest().reply_markup.inline_keyboard.map((row) => row.map((item) => item.text)), [
-    ['系统总览', '故障事件'], ['DNS 守护', '动态 IP 守护'], ['探针与检查', 'IP 资产与备用池'], ['解析管理', '自动化任务'], ['📅 续费管理', 'Webhook 任务']
+    ['系统总览', '故障事件'], ['DNS 守护', '动态 IP 守护'], ['探针与检查', 'IP 资产与备用池'], ['解析管理', '自动化任务'], ['📅 续费管理', 'Webhook 任务'], ['💰 易支付']
   ]);
   h.bot.menuScopes = ['guards'];
   await h.send('/menu');

@@ -13,6 +13,7 @@ import { createSharedIpHealth } from './shared-ip-health.js';
 import { createRenewalService, registerRenewalRoutes, normalizeRenewalState, renewalSnapshot } from './renewals.js';
 import { createNotesService, registerNotesRoutes } from './notes.js';
 import { createWebhookService, registerWebhookRoutes } from './webhooks.js';
+import { createEpayService, registerEpayRoutes } from './epay.js';
 import { registerConfigBulkDeleteRoutes } from './config-bulk-delete.js';
 import { runLocalWebhook, runSshWebhook } from './webhook-runtime.js';
 import { poolHealthSummary, poolHealthProbeState, poolHealthSchedule, clonePoolHealthPools } from './pool-health-check.js';
@@ -198,6 +199,7 @@ const telegramActions = createTelegramActions({ ...orchestrationDeps, renewalDep
 const telegramWorkspace = createTelegramWorkspace({
   readState, readGuardHistoryPage, invoke: telegramActions, call: telegramCall, authorized: telegramAuthorized,
   webhookTasks: () => webhookService.telegramTasks(),
+  epayAccounts: () => epayService.telegramAccounts(),
   clearFinishedIncidents: (ids, actor) => clearFinishedIncidents(orchestrationDeps, ids, actor),
   role: (settings, from, chat) => resolveTelegramRole(null, settings, from, chat),
   liveJob: (id) => commandJobs.get(id), cancelJob: (id) => { const job = commandJobs.get(id); if (job?.type !== 'automation') throw new Error('任务已结束或不存在'); cancelCommandJob(job); },
@@ -321,6 +323,9 @@ webhookService = createWebhookService({
   },
   logError: (error) => console.error('Webhook:', error.message)
 });
+
+const epayService = createEpayService({ db: getSqliteDb(), encrypt: encryptSecret, decrypt: decryptSecret,
+  bots: () => cachedState.telegramBots || [], send: renewalDeps.send });
 
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
@@ -542,6 +547,7 @@ registerConfigBulkDeleteRoutes(app, { updateState, jobs: () => commandJobs.value
   webhookRuns: () => webhookService.store.activeSummaries(), sanitizeState: sanitizeStateForClient, onTelegramChanged: restartTelegramPolling });
 registerDynamicGuardRoutes(app, { ...orchestrationDeps, updateDynamicGuardState, readDynamicGuardHistory, readDynamicGuardStatus, webhookTasks: () => webhookService.choices(), webhookActive: (id) => webhookService.store.active(id) }, dynamicGuardService);
 registerWebhookRoutes(app, webhookService);
+registerEpayRoutes(app, epayService);
 registerRenewalRoutes(app, renewalDeps, renewalService);
 registerNotesRoutes(app, notesService, { dataDir: DATA_DIR });
 
@@ -1271,6 +1277,8 @@ server.listen(PORT, HOST, () => {
   cleanupHistoryRecords();
   restartTelegramPolling();
   renewalService.tick();
+  void epayService.tick().catch(() => {});
+  setInterval(() => { void epayService.tick().catch(() => {}); }, 1000).unref();
   setInterval(() => { try { webhookService.tick(); } catch (error) { console.error('Webhook:', error.message); } }, 1000).unref();
   setInterval(() => renewalService.tick(), 60000).unref();
   checkProbePresence();

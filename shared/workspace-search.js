@@ -1,4 +1,6 @@
 export const WORKSPACE_SEARCH = {
+  epay: { key: 'epayAccounts', placeholder: '搜索订单号、商品名称', fields: ['name', 'url', 'pid'] },
+  epayAccounts: { key: 'epayAccounts', placeholder: '搜索商户名称、网站、商户号', fields: ['name', 'url', 'pid', 'note'] },
   authenticator: { key: 'authenticatorAccounts', placeholder: '搜索服务名称、账号、备注', fields: ['issuer', 'account', 'note'] },
   webhooks: { key: 'webhookTasks', placeholder: '搜索 Webhook 名称、服务器、备注', fields: ['name', 'location', 'note'] },
   notes: { key: 'notes', placeholder: '搜索笔记标题、正文、标签', fields: ['title'] },
@@ -19,6 +21,7 @@ export const WORKSPACE_SEARCH = {
 };
 
 const COMPACT_SEARCH_LABELS = {
+  epay: '搜索订单', epayAccounts: '搜索商户',
   authenticator: '搜索验证器',
   webhooks: '搜索 Webhook 任务',
   notes: '搜索笔记',
@@ -29,7 +32,7 @@ const COMPACT_SEARCH_LABELS = {
 };
 
 export function workspaceSearchPlaceholder(tab, section, compact = false) {
-  const defaults = { authenticator: 'authenticator', webhooks: 'webhooks', probes: 'nodes', pools: 'assets', dns: 'accounts', renewals: 'renewals', telegram: 'bots', notes: 'notes' };
+  const defaults = { epay: 'epay', authenticator: 'authenticator', webhooks: 'webhooks', probes: 'nodes', pools: 'assets', dns: 'accounts', renewals: 'renewals', telegram: 'bots', notes: 'notes' };
   if (compact && COMPACT_SEARCH_LABELS[section || defaults[tab]]) return COMPACT_SEARCH_LABELS[section || defaults[tab]];
   return WORKSPACE_SEARCH[section || defaults[tab]]?.placeholder || ({
     servers: '搜索服务器名称、IP', commands: '搜索命令名称', automation: '搜索自动化任务', proxies: '搜索代理名称、地址'

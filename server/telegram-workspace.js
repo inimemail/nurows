@@ -4,13 +4,14 @@ import { WORKSPACE_SEARCH, filterWorkspaceRecords } from '../shared/workspace-se
 import { parseIpBatch } from './orchestration.js';
 import net from 'node:net';
 import { renewalStatus, renewalAmount, renewalExtension, sortRenewals, RENEWAL_PERIODS } from '../shared/renewals.js';
+import { epayMoney } from '../shared/epay.js';
 
 const sections = {
   guards: ['DNS 守护', 'dnsGuards'], dynamic: ['动态 IP 守护', 'dynamicGuards'],
   probes: ['探针节点', 'probes'], targets: ['检查目标', 'probeTargets'], policies: ['切换策略', 'failoverPolicies'],
   incidents: ['故障事件', 'incidents'], assets: ['IP 资产', 'ipAssets'], pools: ['备用 IP 池', 'ipPools'],
   usage: ['IP 使用记录', 'ipUsageRecords'], dns: ['解析管理', 'dnsBindings'], automation: ['自动化任务', 'automationTasks'],
-  runs: ['自动化执行记录', 'automationRuns'], webhooks: ['Webhook 任务', 'webhookTasks'], renewals: ['续费管理', 'renewals']
+  runs: ['自动化执行记录', 'automationRuns'], webhooks: ['Webhook 任务', 'webhookTasks'], renewals: ['续费管理', 'renewals'], epay: ['易支付', 'epayAccounts']
 };
 const resources = { guards: 'dns-guards', probes: 'probes', targets: 'probe-targets', policies: 'failover-policies', pools: 'ip-pools', assets: 'ip-assets' };
 const labels = { online: '在线', offline: '离线', pending: '待接入', revoked: '已吊销', healthy: '正常', down: '故障', unknown: '未检查',
@@ -68,7 +69,7 @@ export function createTelegramWorkspace(deps) {
   }
   function records(ctx, section) {
     const key = sections[section][1];
-    let items = section === 'webhooks' ? deps.webhookTasks?.() || [] : deps.readState([key])[key] || [];
+    let items = section === 'epay' ? deps.epayAccounts?.() || [] : section === 'webhooks' ? deps.webhookTasks?.() || [] : deps.readState([key])[key] || [];
     if (section === 'automation') items = items.filter((item) => ctx.settings.automationTaskIds?.includes(item.id));
     if (section === 'runs') items = items.filter((item) => ctx.settings.automationTaskIds?.includes(item.taskId));
     return items;
@@ -101,7 +102,7 @@ export function createTelegramWorkspace(deps) {
       [allowed(ctx, 'overview') ? button(ctx, '系统总览', { kind: 'overview', section: 'overview' }) : null, link('incidents', '故障事件')],
       [link('guards', 'DNS 守护'), link('dynamic', '动态 IP 守护')],
       [group('探针与检查', ['probes', 'targets', 'policies']), group('IP 资产与备用池', ['assets', 'pools', 'usage'])],
-      [link('dns', '解析管理'), link('automation', '自动化任务')], [link('renewals', '📅 续费管理'), link('webhooks', 'Webhook 任务')]
+      [link('dns', '解析管理'), link('automation', '自动化任务')], [link('renewals', '📅 续费管理'), link('webhooks', 'Webhook 任务')], [link('epay', '💰 易支付')]
     ].map((row) => row.filter(Boolean));
     return show(ctx, `NuroSSH 操作菜单\n选择模块查看状态或执行操作。${rows.every((row) => !row.length) ? '\n当前机器人未开放管理功能；任务通知仍按各自配置发送。' : ''}`, rows);
   }
@@ -141,7 +142,12 @@ export function createTelegramWorkspace(deps) {
     const action = (text, kind, op) => button(ctx, text, { kind, section, id, op });
     if (item.domain) lines.push(`域名：${short(item.domain, 253)} · ${item.recordType || ''}`);
     if (item.address) lines.push(`地址：${short(item.address, 253)}`);
-    if (section === 'renewals') {
+    if (section === 'epay') {
+      lines.push(`网站：${item.url}`, `商户号：${item.pid}`, `🏦 商户余额：${epayMoney(item.balance, item.currency)}`,
+        `💵 今日收款：${epayMoney(item.today || 0, item.currency)}`, `累计成功金额：${epayMoney(item.total || 0, item.currency)}（已同步范围）`,
+        `最后同步：${date(item.lastSyncAt)}`);
+      rows.push([webButton(ctx, section, id)]);
+    } else if (section === 'renewals') {
       lines.push(`💰 续费金额：${renewalAmount(item)}`, `📅 到期日期：${item.dueDate || '未知日期'}`);
       if (item.note) lines.push(`📝 备注：${short(item.note, 500)}`);
       if (canWrite(ctx)) rows.push([action('📅 快速续费', 'renewalOptions')]);
@@ -338,6 +344,7 @@ export function createTelegramWorkspace(deps) {
     if (kind === 'canceljob') return { kind: 'confirm', section: 'runs', id, op: 'canceljob' };
     const command = text.split(/\s/)[0].split('@')[0];
     if (command === '/renewals' || text === '续费管理') return { kind: 'list', section: 'renewals', page: 0 };
+    if (command === '/epay' || text === '易支付') return { kind: 'list', section: 'epay', page: 0 };
     const commands = { '/webhooks': 'webhooks', '/start': 'root', '/menu': 'root', '菜单': 'root', '/status': 'overview', '总览': 'overview', '/probes': 'probes', '探针管理': 'probes', '/guards': 'guards', 'DNS守护': 'guards', '/dynamic': 'dynamic', '/targets': 'targets', '/policies': 'policies', '/assets': 'assets', '/pools': 'pools', '备用 IP 池': 'pools', '/dns': 'dns', '解析管理': 'dns', '/incidents': 'incidents', '故障事件': 'incidents', '/run': 'automation', '执行自动化': 'automation' };
     if (commands[text]) { const section = commands[text]; return menuAliases[section] || { kind: 'list', section, page: 0 }; }
     const section = commands[command]; return section ? menuAliases[section] || { kind: 'list', section, page: 0 } : null;

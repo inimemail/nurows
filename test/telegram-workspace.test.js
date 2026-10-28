@@ -71,6 +71,14 @@ test('EasyPay recent-order gaps remain visible in Telegram status and the attent
   assert.match(h.latest().text, /状态：订单待补齐/); assert.match(h.latest().text, /统计和通知可能不完整/);
 });
 
+test('EasyPay balance warnings identify the balance update separately from successful order monitoring', async () => {
+  const h = harness({ epayAccounts: [{ id: 'balance', name: '余额超时', status: 'balance_stale', enabled: true, currency: 'CNY', balance: 13000,
+    balanceAt: '2026-10-28T02:00:00Z', lastSyncAt: '2026-10-28T03:00:00Z', lastWarning: '余额刷新失败，保留上次结果；订单监听独立运行。' }] });
+  await h.send('/epay'); await h.press('仅看异常'); await h.press('余额超时 · 余额待刷新');
+  assert.match(h.latest().text, /状态：余额待刷新/); assert.match(h.latest().text, /订单同步：/); assert.match(h.latest().text, /余额更新：/);
+  assert.match(h.latest().text, /订单监听独立运行/);
+});
+
 test('Webhook Telegram commands keep output private and recheck permission before execution', async () => {
   const h = harness({ webhookTasks: [{ id: 'w1', name: '换 IP API', enabled: true, timeout: 30, location: '面板本机', status: 'success', run: { status: 'success' } }] });
   await h.send('/webhooks'); await h.press('换 IP API · 成功');

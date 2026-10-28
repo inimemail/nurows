@@ -132,14 +132,14 @@ test('startup rechecks legacy generic errors without clearing them early or exce
   const items = Array.from({ length: 6 }, (_, i) => old.save({ name: `旧商户 ${i}`, url: 'https://pay.example.com/', pid: String(1000 + i), key: 'secret', enabled: i !== 4 }));
   const nextAt = Date.now() + 900000;
   for (const [i, item] of items.entries()) old.store.saveAccount({ ...old.store.account(item.id), nextAt, failures: 10,
-    lastError: i === 5 ? '订单列表查询失败，请检查商户凭证、该接口权限与兼容性' : legacyQueryError });
+    lastError: i === 5 ? '订单列表查询失败，请检查商户凭证、该接口权限与兼容性' : i === 3 ? '读取商户余额失败：易支付请求超时，请稍后重试' : legacyQueryError });
   old.close();
   const service = createEpayService({ ...options, request: async (_account, _key, act) => {
     if (act === 'query') return new Promise(resolve => releases.push(() => resolve({ code: 1, money: '1.00' })));
     return { code: 1, data: [] };
   } });
   t.after(() => service.close());
-  assert.equal(service.snapshot({ view: 'accounts' }).accounts.filter(item => item.lastError === legacyQueryError).length, 5);
+  assert.equal(service.snapshot({ view: 'accounts' }).accounts.filter(item => item.lastError).length, 6);
   await service.tick(); await service.tick();
   assert.equal(releases.length, 3);
   assert.equal(service.snapshot({ view: 'accounts' }).accounts.filter(item => item.syncing).length, 3);
@@ -166,12 +166,15 @@ test('a legacy error recheck preserves cached orders and a real failure with its
   old.store.saveAccount({ ...old.store.account(item.id), lastError: legacyQueryError, nextAt: Date.now() + 900000 });
   old.close();
   let calls = 0;
-  const request = async () => { calls++; throw Object.assign(Error('商户信息查询失败，请检查商户凭证、该接口权限与兼容性'), { statusCode: 400 }); };
+  const request = async (_account, _key, act) => {
+    if (act === 'query') return { code: 1, money: '1.00' };
+    calls++; throw Object.assign(Error('订单列表查询失败，请检查商户凭证、该接口权限与兼容性'), { statusCode: 400 });
+  };
   const service = createEpayService({ ...options, request });
   await service.tick(); await new Promise(resolve => setImmediate(resolve));
   assert.equal(calls, 1);
   const result = service.snapshot({ view: 'orders' });
-  assert.equal(result.orders.total, 1); assert.match(result.accounts[0].lastError, /商户信息查询失败/);
+  assert.equal(result.orders.total, 1); assert.match(result.accounts[0].lastError, /订单列表查询失败/);
   assert.ok(result.accounts[0].nextAt > Date.now());
   service.close();
   const restarted = createEpayService({ ...options, request });
@@ -372,7 +375,7 @@ test('catchup responses belonging to another merchant remain a hard error', asyn
   assert.match(result.lastError, /所属商户/); assert.equal(service.store.order(item.id, 'T2'), undefined);
 });
 
-test('merchant-info and newest-page errors identify the failing phase and never report success from cached orders', async t => {
+test('balance API rejection is separate from primary order errors and cached orders do not hide a real order failure', async t => {
   let failure = '';
   const { service, item } = customService(t, mockMerchant((act) => {
     if (act === failure) return { code: -1, msg: '没有API查询权限' };
@@ -381,11 +384,96 @@ test('merchant-info and newest-page errors identify the failing phase and never 
   await service.sync(item.id);
   failure = 'query'; await service.sync(item.id);
   let result = service.snapshot({ view: 'orders' });
-  assert.equal(result.orders.total, 1); assert.match(result.accounts[0].lastError, /读取商户余额失败.*返回码 -1.*查询权限/);
+  assert.equal(result.orders.total, 1); assert.equal(result.accounts[0].lastError, '');
+  assert.match(result.accounts[0].balanceWarning, /返回码 -1.*查询权限/); assert.equal(result.balances[0].stale, 1);
   failure = 'orders'; await service.sync(item.id);
   result = service.snapshot({ view: 'orders' });
   assert.equal(result.orders.total, 1); assert.match(result.accounts[0].lastError, /读取最新订单失败.*返回码 -1.*查询权限/);
   failure = ''; await service.sync(item.id); assert.equal(service.snapshot().accounts[0].lastError, '');
+});
+
+test('a slow balance query cannot delay latest-order writes and a timeout preserves the last valid balance', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-28T01:00:00Z') });
+  let balanceFailure, paid = false;
+  const calls = [], sends = [];
+  const { service, item } = customService(t, async (_account, _key, act, params) => {
+    calls.push(act);
+    if (act === 'query') {
+      if (!paid) return { code: 1, money: '130.00' };
+      return new Promise((_resolve, reject) => { balanceFailure = reject; });
+    }
+    return { code: 1, data: params.start ? [] : [compatibleRow('paid', paid ? '1' : '0')] };
+  }, { bots: () => [{ id: 'bot', enabled: true, tokenEnc: 'token', userIds: ['chat'] }], send: async (_bot, _chat, text) => sends.push(text) });
+  service.save({ ...item, key: '', botIds: ['bot'] }, item.id);
+  await service.sync(item.id); const balanceAt = service.store.account(item.id).balanceAt;
+  paid = true; t.mock.timers.tick(30000);
+  const syncing = service.sync(item.id);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(service.store.order(item.id, 'Tpaid').status, 'paid');
+  assert.equal(service.snapshot({ view: 'orders' }).orders.total, 1);
+  balanceFailure(Object.assign(Error('易支付请求超时，请稍后重试'), { epaySafe: true }));
+  await syncing; await service.deliver();
+  const result = service.snapshot().accounts[0];
+  assert.equal(result.lastError, ''); assert.equal(result.failures, 0); assert.equal(result.nextAt, Date.now() + 30000);
+  assert.match(result.balanceWarning, /余额刷新失败.*请求超时/);
+  assert.equal(result.balance, 13000); assert.equal(result.balanceAt, balanceAt);
+  assert.equal(service.snapshot().balances[0].stale, 1);
+  assert.equal(service.telegramAccounts()[0].status, 'balance_stale');
+  assert.equal(sends.length, 1); assert.match(sends[0], /当前商户余额：<b>¥130.00<\/b>（待刷新）/);
+  calls.length = 0; await service.sync(item.id);
+  assert.deepEqual(calls, ['orders']); assert.equal(service.store.account(item.id).balanceAt, balanceAt);
+});
+
+test('failed balance refresh recovers after cooldown without replaying history, including after restart', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-28T01:00:00Z') });
+  let available = false, queries = 0;
+  const request = async (_account, _key, act, params) => {
+    if (act === 'query') { queries++; if (!available) throw Object.assign(Error('易支付请求超时，请稍后重试'), { epaySafe: true }); return { code: 1, money: '140.00' }; }
+    return { code: 1, data: params.start ? [] : [compatibleRow(0, '1')] };
+  };
+  const { service, item, db } = customService(t, request);
+  await service.sync(item.id);
+  let result = service.snapshot().accounts[0];
+  assert.equal(result.lastError, ''); assert.equal(result.initialized, true);
+  assert.equal(result.balance, null); assert.equal(result.balanceAt, ''); assert.match(result.balanceWarning, /余额刷新失败/);
+  service.close();
+  const restarted = createEpayService({ db, encrypt: value => value, decrypt: value => value, request });
+  t.after(() => restarted.close());
+  await restarted.sync(item.id); assert.equal(queries, 1);
+  available = true; t.mock.timers.tick(60001); await restarted.sync(item.id);
+  result = restarted.snapshot().accounts[0];
+  assert.equal(queries, 2); assert.equal(result.balance, 14000); assert.equal(result.balanceWarning, '');
+  assert.equal(result.balanceRetryAt, 0); assert.equal(result.lastWarning, ''); assert.equal(result.lastError, '');
+  assert.equal(result.balanceAt, new Date().toISOString()); assert.equal(restarted.snapshot({ view: 'orders' }).orders.total, 1);
+  assert.equal(restarted.telegramAccounts()[0].status, 'healthy');
+});
+
+test('a successful response with no valid balance never replaces the last valid value or its timestamp', async t => {
+  let money = '130.00';
+  const { service, item } = customService(t, async (_account, _key, act) => act === 'query' ? { code: 1, money } : { code: 1, data: [] });
+  await service.sync(item.id); const balanceAt = service.store.account(item.id).balanceAt;
+  money = 'unavailable'; await service.sync(item.id);
+  const result = service.snapshot().accounts[0];
+  assert.equal(result.balance, 13000); assert.equal(result.balanceAt, balanceAt);
+  assert.match(result.balanceWarning, /未返回有效余额/); assert.equal(result.lastError, '');
+});
+
+test('editing or deleting a merchant during a balance read cancels it and ignores late results', async t => {
+  for (const action of ['edit', 'delete']) {
+    let release, requestSignal;
+    const { service, item } = customService(t, async (_account, _key, act, _params, options) => {
+      if (act === 'query') { requestSignal = options.signal; return new Promise(resolve => { release = resolve; }); }
+      return { code: 1, data: [] };
+    });
+    const syncing = service.sync(item.id); await new Promise(resolve => setImmediate(resolve));
+    if (action === 'edit') service.save({ ...item, key: '', note: 'edited' }, item.id);
+    else service.remove({ ids: [item.id], confirm: 'delete-records' });
+    assert.equal(requestSignal.aborted, true);
+    release({ code: 1, money: '999.00' }); await syncing;
+    const result = service.store.account(item.id);
+    if (action === 'delete') assert.equal(result, null);
+    else { assert.equal(result.note, 'edited'); assert.equal(result.balance, null); assert.equal(result.balanceAt, ''); }
+  }
 });
 
 test('primary order-list rejection remains an error while a successful balance stays fresh', async t => {

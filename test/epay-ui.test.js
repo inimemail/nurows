@@ -203,3 +203,18 @@ test('order dialog failures are retryable and never issue a remote-sync mutation
   assert.ok(calls.every(call => !call.options.method));
   view.close();
 });
+
+test('a balance-only failure shows stale balance separately from the last successful order sync', async () => {
+  const warning = '余额刷新失败，保留上次结果；订单监听独立运行。 易支付请求超时，请稍后重试';
+  const view = harness(async () => {
+    const data = fixture(); Object.assign(data.accounts[0], { initialized: true, lastError: '', balanceWarning: warning, lastWarning: warning,
+      balanceAt: '2026-10-28T02:00:00Z', lastSyncAt: '2026-10-28T03:00:00Z' }); return data;
+  });
+  await view.poll(); view.render();
+  assert.ok(view.nodes().some(node => node.props?.className === 'epay-badge pending' && node.props.children?.includes('余额待刷新')));
+  assert.equal(view.nodes().some(node => node.props?.className === 'epay-badge error'), false);
+  assert.ok(view.nodes().some(node => node.type === 'small' && node.props.children?.includes('订单同步：') && node.props.children?.includes(' · 余额更新：')));
+  view.button('商户账号').props.onClick(); view.render();
+  assert.ok(view.nodes().some(node => node.props?.className === 'epay-badge pending' && node.props.children?.includes('余额待刷新')));
+  view.close();
+});

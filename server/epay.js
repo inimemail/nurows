@@ -8,7 +8,7 @@ const fail = (message, statusCode = 400) => { throw Object.assign(Error(message)
 const clean = (value, max = 120) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, max);
 const safe = item => { const { keyEnc, ...rest } = item; return { ...rest, configured: Boolean(keyEnc) }; };
 const escape = value => clean(value, 200).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-const snapshotFields = ['lastSyncAt', 'lastAttemptAt', 'balanceAt', 'balance', 'failures', 'nextAt', 'lastError', 'lastWarning', 'historyWarning', 'orderWarning', 'catchupWarning', 'historyRetryAt', 'orderRetryAt', 'catchupRetryAt', 'initialized', 'historyOffset', 'historyComplete', 'historyUnsupported', 'historySignature', 'pageSize', 'catchupOffset'];
+const snapshotFields = ['lastSyncAt', 'lastAttemptAt', 'balanceAt', 'balance', 'balanceWarning', 'balanceRetryAt', 'failures', 'nextAt', 'lastError', 'lastWarning', 'historyWarning', 'orderWarning', 'catchupWarning', 'historyRetryAt', 'orderRetryAt', 'catchupRetryAt', 'initialized', 'historyOffset', 'historyComplete', 'historyUnsupported', 'historySignature', 'pageSize', 'catchupOffset'];
 
 export function normalizeEpayOrder(input, pid) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('订单接口返回了无效记录');
@@ -29,7 +29,7 @@ export function epayBalanceGroups(accounts, now = Date.now()) {
     if (Number.isSafeInteger(item.balance)) {
       group.balance += item.balance; group.known++;
       // Order/history failures must not label a freshly read balance as stale.
-      if (!Number.isFinite(Date.parse(item.balanceAt || '')) || now - Date.parse(item.balanceAt) > Math.max(item.interval * 3000, 120000)) group.stale++;
+      if (item.balanceWarning || !Number.isFinite(Date.parse(item.balanceAt || '')) || now - Date.parse(item.balanceAt) > Math.max(item.interval * 3000, 120000)) group.stale++;
     }
     groups.set(item.currency, group);
   }
@@ -41,7 +41,7 @@ export function epayReceiptMessage(account, order, accounts) {
   return ['💰 <b>易支付 · 收款成功</b>', '', `🏷 商户：${escape(account.name)}`,
     `💵 金额：<b>${epayMoney(order.cents, account.currency)}</b> · ${escape(EPAY_CHANNELS[order.channel] || order.channel || '其他方式')}`,
     `📦 商品：${escape(order.name || '未提供')}`, `🧾 订单：<code>${escape(order.trade_no)}</code>`, '',
-    `🏦 当前商户余额：<b>${epayMoney(account.balance, account.currency)}</b>${account.lastError ? '（待刷新）' : ''}`,
+    `🏦 当前商户余额：<b>${epayMoney(account.balance, account.currency)}</b>${epayBalanceGroups([account])[0]?.stale ? '（待刷新）' : ''}`,
     `💎 全部商户总余额：<b>${balance}</b>`, '余额为各接口最近一次查询结果，不是累计收款额。', '',
     `🕒 支付时间：${order.paid_at ? new Date(order.paid_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '接口未提供'}`].join('\n');
 }
@@ -49,12 +49,13 @@ export function epayReceiptMessage(account, order, accounts) {
 export function createEpayService(deps) {
   const store = createEpayStore(deps.db), running = new Map();
   const request = deps.request || requestEpay;
-  // Old versions reported supplemental-query failures as a generic account
-  // error. Revalidate those accounts through the bounded scheduler after an
-  // upgrade instead of keeping the old 15-minute backoff. Keep the error until
-  // an actual successful sync; paused accounts and current failures stay put.
+  // Revalidate legacy generic and balance-only failures through the bounded
+  // scheduler after an upgrade instead of preserving a 15-minute order backoff.
+  // Keep the error until a successful sync; paused accounts and actual order
+  // failures retain their existing retry schedule.
   for (const item of store.accounts()) {
-    if (item.enabled && item.lastError === '易支付查询失败，请检查商户号、密钥以及商户 API 查询权限' && item.nextAt) {
+    const legacyError = item.lastError === '易支付查询失败，请检查商户号、密钥以及商户 API 查询权限' || item.lastError?.startsWith('读取商户余额失败：');
+    if (item.enabled && legacyError && item.nextAt) {
       store.saveAccount({ ...item, nextAt: 0 });
     }
   }
@@ -91,7 +92,7 @@ export function createEpayService(deps) {
       balance: null, balanceAt: '', lastSyncAt: '', lastError: '', failures: 0, pageSize: 50, catchupOffset: 0,
       ...old, ...config, id: old?.id || randomUUID(), version: randomUUID(), createdAt: old?.createdAt || new Date(now).toISOString(),
       updatedAt: new Date(now).toISOString(), nextAt: now };
-    if (input.key) Object.assign(item, { historyRetryAt: 0, orderRetryAt: 0, catchupRetryAt: 0, historyWarning: '', orderWarning: '', catchupWarning: '', lastWarning: '' });
+    if (input.key) Object.assign(item, { balanceRetryAt: 0, balanceWarning: '', historyRetryAt: 0, orderRetryAt: 0, catchupRetryAt: 0, historyWarning: '', orderWarning: '', catchupWarning: '', lastWarning: '' });
     store.saveAccount(item); invalidate(); return safe(item);
   }
   async function test(input, id = '', options = {}) {
@@ -128,15 +129,20 @@ export function createEpayService(deps) {
     const controller = new AbortController(); running.set(id, controller);
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(25000)]), version = item.version;
     const valid = () => !signal.aborted && store.account(id)?.version === version;
-    let stage = '读取商户余额';
+    let stage = '读取最新订单', balanceTask;
+    const balanceController = new AbortController();
     try {
       const key = deps.decrypt(item.keyEnc);
       if (!key) fail('商户密钥无法解密，请重新填写');
-      const info = await request(item, key, 'query', {}, { signal });
-      if (!valid()) return false;
       const now = Date.now();
-      item.balance = epayBalanceCents(info.money ?? info.balance); item.balanceAt = new Date(now).toISOString();
-      patch(id, version, { balance: item.balance, balanceAt: item.balanceAt });
+      if ((item.balanceRetryAt || 0) <= now) {
+        // Balance is independent of the order ledger. Start both requests in
+        // this merchant's existing slot and handle rejection immediately, so a
+        // slow balance endpoint cannot prevent the latest orders being saved.
+        const balanceSignal = AbortSignal.any([signal, balanceController.signal]);
+        balanceTask = Promise.resolve().then(() => request(item, key, 'query', {}, { signal: balanceSignal }))
+          .then(info => ({ info, at: new Date().toISOString(), cancelled: balanceSignal.aborted }), error => ({ error, cancelled: balanceController.signal.aborted || controller.signal.aborted }));
+      }
       const notifyRecipients = recipients(item), created = Date.parse(item.createdAt), fetched = new Set();
       const shouldNotify = (row, old) => {
         if (!item.initialized) return false;
@@ -224,7 +230,6 @@ export function createEpayService(deps) {
         item.orderWarning = ''; item.orderRetryAt = 0;
       }
       if (controller.signal.aborted || store.account(id)?.version !== version) return false;
-      item.lastWarning = [item.catchupWarning, item.historyWarning, item.orderWarning].filter(Boolean).join(' ');
       item.initialized = true; item.lastSyncAt = new Date(now).toISOString(); item.lastAttemptAt = item.lastSyncAt;
       item.lastError = ''; item.failures = 0; item.nextAt = Date.now() + item.interval * 1000;
     } catch (error) {
@@ -233,7 +238,26 @@ export function createEpayService(deps) {
       item.lastError = `${stage}失败：${error.statusCode === 400 || error.epaySafe ? error.message : signal.aborted ? '同步超时，将自动重试' : '接口或网络请求失败，将自动重试'}`;
       item.lastAttemptAt = new Date().toISOString(); item.nextAt = Date.now() + Math.min(900000, item.interval * 1000 * 2 ** item.failures);
     } finally {
-      try { patch(id, version, Object.fromEntries([...snapshotFields, 'headSignature'].map(field => [field, item[field]]))); }
+      try {
+        // Abort an unnecessary balance request after a primary order failure.
+        // Always await it before releasing the slot to keep concurrency bounded.
+        if (item.lastError) balanceController.abort();
+        const result = balanceTask && await balanceTask;
+        if (!controller.signal.aborted && store.account(id)?.version === version) {
+          if (result && !result.cancelled) {
+            const balance = result.info && epayBalanceCents(result.info.money ?? result.info.balance);
+            if (!result.error && Number.isSafeInteger(balance)) {
+              item.balance = balance; item.balanceAt = result.at; item.balanceWarning = ''; item.balanceRetryAt = 0;
+            } else {
+              const reason = result.error?.epaySafe ? ` ${result.error.message}` : result.error ? '' : ' 接口未返回有效余额。';
+              item.balanceWarning = `余额刷新失败，保留上次结果；订单监听独立运行。${reason}`;
+              item.balanceRetryAt = Date.now() + Math.max(60000, Math.min(300000, item.interval * 2000));
+            }
+          }
+          item.lastWarning = [item.balanceWarning, item.catchupWarning, item.historyWarning, item.orderWarning].filter(Boolean).join(' ');
+          patch(id, version, Object.fromEntries([...snapshotFields, 'headSignature'].map(field => [field, item[field]])));
+        }
+      }
       finally { running.delete(id); }
     }
     return true;
@@ -299,7 +323,7 @@ export function createEpayService(deps) {
   }
   return { store, save, test, sync, tick, deliver, snapshot, remove,
     telegramAccounts: () => { const totals = new Map(store.totals().map(row => [row.accountId, row]));
-      return accounts().map(item => ({ ...safe(item), ...totals.get(item.id), status: item.lastError ? 'error' : item.catchupWarning ? 'incomplete' : item.initialized ? 'healthy' : 'queued' })); },
+      return accounts().map(item => ({ ...safe(item), ...totals.get(item.id), status: item.lastError ? 'error' : item.catchupWarning ? 'incomplete' : item.balanceWarning ? 'balance_stale' : item.initialized ? 'healthy' : 'queued' })); },
     request(id) {
       const item = requireAccount(id);
       if (!item.enabled) fail('请先启用商户监听');

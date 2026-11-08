@@ -65,9 +65,10 @@ export function parseAuthenticatorImport(text) {
     // every account and batch below instead of requiring an explicit 1.
     if (version > 2n) throw Error(`暂不支持谷歌迁移格式版本 ${version.toString()}，当前支持版本 0、1、2`);
     const size = Number(single(root, 3, 0, 1n)), index = Number(single(root, 4, 0, 0n));
+    // Proto3 omits zero-valued batch IDs. An absent ID and an explicit zero
+    // identify the same batch; size/index and conflicting-frame checks still apply.
     const id = BigInt.asIntN(32, single(root, 5, 0, 0n)).toString();
     if (!Number.isInteger(size) || size < 1 || size > 100 || !Number.isInteger(index) || index < 0 || index >= size) invalid();
-    if (size > 1 && !root.has(5)) throw Error('多张迁移二维码缺少批次标识，请重新导出完整批次');
     const entries = root.get(1) || [];
     if (!entries.length || entries.length > OTP_MAX_ACCOUNTS) invalid();
     const accounts = [], unsupported = [];

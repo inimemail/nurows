@@ -92,11 +92,35 @@ test('compatible versions retain strict batch validation, rescan detection and c
     assert.equal(state.frames.length, 2); assert.equal(state.accounts.length, 2);
     assert.equal(addAuthenticatorImport(state, frame1), state);
     assert.throws(() => addAuthenticatorImport(state, parseAuthenticatorImport(uri([parameter()], { version, size: 2, index: 0, id: 43 }))), /当前批次/);
-    assert.throws(() => parseAuthenticatorImport(uri([parameter()], { version, size: 2, id: null })), /批次标识/);
+    assert.equal(parseAuthenticatorImport(uri([parameter()], { version, size: 2, id: null })).batch.id, '0');
     assert.throws(() => parseAuthenticatorImport(uri([parameter()], { version, size: 2, index: 2 })), /格式无效/);
   }
   const single = parseAuthenticatorImport(uri([parameter()], { version: null, size: null, index: null, id: null }));
   assert.deepEqual(single.batch, { id: '0', size: 1, index: 0 });
+});
+
+test('multi-frame exports accept omitted batch IDs and normalize explicit zero without losing batch checks', () => {
+  for (const version of [null, 0, 1, 2]) {
+    const frame1 = parseAuthenticatorImport(uri([parameter({ name: 'bob', secret: 'another-secret-value!' })], { version, size: 2, index: 1, id: null }));
+    let state = addAuthenticatorImport(null, frame1);
+    assert.deepEqual(state.batch, { id: '0', size: 2, index: 1 });
+    assert.deepEqual(state.frames, [1]);
+    assert.equal(addAuthenticatorImport(state, frame1), state);
+    const frame0 = parseAuthenticatorImport(uri([parameter()], { version, size: 2, index: 0, id: null }));
+    state = addAuthenticatorImport(state, frame0);
+    assert.deepEqual(state.frames, [1, 0]);
+    assert.deepEqual(state.accounts.map(item => item.account), ['bob', 'alice']);
+    assert.equal(otpCode({ ...state.accounts[1], digits: 8 }, 59000), '94287082');
+    const explicitZero = parseAuthenticatorImport(uri([parameter()], { version, size: 2, index: 0, id: 0 }));
+    assert.deepEqual(explicitZero, frame0);
+    assert.equal(addAuthenticatorImport(state, explicitZero), state);
+    assert.throws(() => addAuthenticatorImport(state, parseAuthenticatorImport(uri([parameter({ secret: 'changed-secret-value!' })], { version, size: 2, index: 0, id: null }))), /同一分片包含不同内容/);
+    assert.throws(() => addAuthenticatorImport(state, parseAuthenticatorImport(uri([parameter()], { version, size: 3, id: null }))), /当前批次/);
+    assert.throws(() => addAuthenticatorImport(state, parseAuthenticatorImport(uri([parameter()], { version, size: 2, id: 42 }))), /当前批次/);
+    for (const metadata of [{ size: 0 }, { size: 101 }, { size: 2, index: 2 }]) {
+      assert.throws(() => parseAuthenticatorImport(uri([parameter()], { version, id: null, ...metadata })), /格式无效/);
+    }
+  }
 });
 
 test('unsupported versions expose only the numeric version and malformed compatible payloads still fail closed', () => {

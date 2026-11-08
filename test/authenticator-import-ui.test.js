@@ -104,3 +104,26 @@ test('image imports accept version-two and omitted-version payloads with default
     h.unmount();
   }
 });
+
+test('Google images without batch IDs require every frame and import all accounts once', async () => {
+  const field = (id, value) => { const data = Buffer.from(value); return Buffer.concat([Buffer.from([id * 8 + 2, data.length]), data]); };
+  const frame = (index, explicitZero = false, changed = false) => {
+    const account = field(1, Buffer.concat([field(1, index ? 'another-secret-value!' : changed ? 'changed-secret-value!' : '12345678901234567890'), field(2, index ? 'bob' : 'alice'), field(3, 'Example')]));
+    const payload = Buffer.concat([account, Buffer.from([16, 1, 24, 2]), index ? Buffer.from([32, index]) : Buffer.alloc(0), explicitZero ? Buffer.from([40, 0]) : Buffer.alloc(0)]);
+    return 'otpauth-migration://offline?data=' + encodeURIComponent(payload.toString('base64'));
+  };
+  const h = harness();
+  await h.files([{ text: frame(1) }]); h.render();
+  assert.equal(h.button('导入 1 个账号').props.disabled, true);
+  await h.button('导入 1 个账号').props.onClick();
+  assert.equal(h.calls.length, 0);
+  await h.files([{ text: frame(0) }, { text: frame(0, true) }, { text: frame(1) }]); h.render();
+  assert.doesNotMatch(h.text(), /未导入|缺少批次标识/);
+  assert.equal(h.button('导入 2 个账号').props.disabled, false);
+  await h.files([{ text: frame(0, false, true) }]); h.render();
+  assert.match(h.text(), /同一分片包含不同内容/);
+  await h.button('导入 2 个账号').props.onClick();
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual(Array.from(h.calls[0][1].accounts, item => item.account).sort(), ['alice', 'bob']);
+  assert.equal(h.imports[0].imported, 2); h.unmount();
+});

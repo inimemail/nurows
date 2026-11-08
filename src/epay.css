@@ -235,3 +235,13 @@
   .epay-editor-footer .dialog-actions button { min-height: 44px; }
   .epay-order-detail dl > div { grid-template-columns: 78px minmax(0,1fr); gap: 10px; }
 }
+.epay-overview-amounts dt { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.epay-refresh-balance.icon-button { display: inline-grid; place-items: center; width: 28px; height: 28px; min-height: 28px; padding: 0; vertical-align: middle; }
+.epay-account-money small { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
+.epay-spinning { animation: epay-spin 1s linear infinite; }
+@keyframes epay-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .epay-spinning { animation: none; } }
+@media (max-width: 760px) {
+  .epay-refresh-balance.icon-button { width: 44px; height: 44px; min-height: 44px; margin-block: -10px; }
+  .epay-account-money small { justify-content: flex-start; }
+}

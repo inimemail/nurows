@@ -132,7 +132,7 @@ export function RenewalExtension({ value, preview, patch, busy }) {
     <div className="renewal-periods" role="group" aria-label="续费时长">{[...RENEWAL_PERIODS.map(([months, label]) => [String(months), label]), ['custom', '自定义']].map(([period, label]) => <button key={period} type="button" className={value.period === period ? 'active' : ''} aria-pressed={value.period === period} disabled={busy} onClick={() => patch({ period })}>{label}</button>)}</div>
     {value.period === 'custom' ? <div className="renewal-extension-custom"><label className="ops-field"><span>续费方式</span><select value={value.mode} disabled={busy} onChange={(event) => patch({ mode: event.target.value })}><option value="months">按月延长</option><option value="date">指定到期日期</option></select></label>{value.mode === 'date' ? <label className="ops-field"><span>新到期日期</span><input type="date" required min={preview.base || beijingDate()} max="2199-12-31" value={value.dueDate} disabled={busy} onChange={(event) => patch({ dueDate: event.target.value })} /></label> : <label className="ops-field"><span>续费月数</span><input type="number" inputMode="numeric" required min="1" max="120" step="1" value={value.months} disabled={busy} onChange={(event) => patch({ months: event.target.value })} /></label>}</div> : null}
     <div className="renewal-extension-preview"><div><span>原到期日</span><time>{value.item.dueDate || '未知日期'}</time></div><div><span>新到期日</span><strong>{preview.dueDate || '请选择有效日期'}</strong></div></div>
-    <p className="renewal-extension-hint">未过期从原到期日延长；已过期或未填日期从今天起算。仅更新续费记录，请先完成实际付款。</p>
+    <p className="renewal-extension-hint">无论是否过期，都从原到期日延长；未填日期时从今天起算。仅更新续费记录，请先完成实际付款。</p>
     {preview.error ? <p className="renewal-field-error" role="alert">{preview.error}</p> : null}
   </div>;
 }

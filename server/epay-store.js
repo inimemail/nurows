@@ -20,6 +20,13 @@ export function createEpayStore(db) {
       UNIQUE(account_id,trade_no,bot_id,chat_id));
     CREATE INDEX IF NOT EXISTS epay_notification_due ON epay_notifications(state,next_at);
     CREATE INDEX IF NOT EXISTS epay_notification_retention ON epay_notifications(created);
+    CREATE TABLE IF NOT EXISTS epay_order_audit (
+      account_id TEXT NOT NULL, trade_no TEXT NOT NULL, generation TEXT NOT NULL,
+      missing_at INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(account_id,trade_no));
+    CREATE INDEX IF NOT EXISTS epay_audit_due ON epay_order_audit(account_id,generation,next_at,trade_no);
+    CREATE TABLE IF NOT EXISTS epay_order_tombstones (
+      account_id TEXT NOT NULL, trade_no TEXT NOT NULL, PRIMARY KEY(account_id,trade_no));
     UPDATE epay_notifications SET state='uncertain' WHERE state='sending';
   `);
   // Build the rollups once for existing installations. Their updates and order
@@ -103,7 +110,7 @@ export function createEpayStore(db) {
           .run(item.id, row.trade_no, row.out_trade_no, row.name, row.channel, row.cents, row.status, row.created_at, row.paid_at, row.paid_day, old?.first_seen || now, now);
         adjustTotals(item.id, row, old);
         changed = true;
-        if (row.status === 'paid' && old?.status !== 'paid' && old?.status !== 'refunded' && shouldNotify(row, old)) {
+        if (row.status === 'paid' && old?.status !== 'paid' && old?.status !== 'refunded' && shouldNotify(row, old) && !sql('SELECT 1 FROM epay_order_tombstones WHERE account_id=? AND trade_no=?').get(item.id, row.trade_no)) {
           for (const recipient of recipients) sql(`INSERT OR IGNORE INTO epay_notifications(account_id,trade_no,bot_id,chat_id,state,next_at,created) VALUES(?,?,?,?,'pending',?,?)`)
             .run(item.id, row.trade_no, recipient.botId, recipient.chatId, now, now);
         }
@@ -127,13 +134,58 @@ export function createEpayStore(db) {
   }
   return {
     account, saveAccount, orders, order, totals, mergeOrders,
+    beginAudit(id) {
+      return sql('SELECT COALESCE(MAX(rowid),0) AS n FROM epay_orders WHERE account_id=?').get(id).n;
+    },
+    prepareAuditCandidates(id, generation, cutoff) {
+      sql(`INSERT INTO epay_order_audit(account_id,trade_no,generation)
+        SELECT o.account_id,o.trade_no,'' FROM epay_orders o LEFT JOIN epay_order_audit a
+        ON a.account_id=o.account_id AND a.trade_no=o.trade_no
+        WHERE o.account_id=? AND o.rowid<=? AND COALESCE(a.generation,'')<>?
+        ON CONFLICT(account_id,trade_no) DO UPDATE SET generation='',missing_at=0,next_at=0`).run(id, cutoff, generation);
+    },
+    auditSeen(id, generation, rows) {
+      let added = 0;
+      db.transaction(() => { for (const row of rows) {
+        added += sql(`INSERT INTO epay_order_audit(account_id,trade_no,generation) VALUES(?,?,?)
+          ON CONFLICT(account_id,trade_no) DO UPDATE SET generation=excluded.generation,missing_at=0,next_at=0 WHERE generation<>excluded.generation`).run(id, row.trade_no, generation).changes;
+      } })();
+      return added;
+    },
+    auditCandidates(id, generation, cutoff, now, limit = 2) {
+      return sql(`SELECT a.trade_no,a.missing_at FROM epay_order_audit a
+        JOIN epay_orders o ON o.account_id=a.account_id AND o.trade_no=a.trade_no
+        WHERE a.account_id=? AND a.generation='' AND a.next_at<=? AND o.rowid<=?
+        ORDER BY a.next_at,a.trade_no LIMIT ?`).all(id, now, cutoff, limit);
+    },
+    auditRemaining(id, generation, cutoff) {
+      return sql(`SELECT 1 FROM epay_order_audit a JOIN epay_orders o ON o.account_id=a.account_id AND o.trade_no=a.trade_no
+        WHERE a.account_id=? AND a.generation='' AND o.rowid<=? LIMIT 1`).get(id, cutoff);
+    },
+    auditMissing(id, tradeNo, now) {
+      sql(`INSERT INTO epay_order_audit(account_id,trade_no,generation,missing_at,next_at) VALUES(?,?,'',?,?)
+        ON CONFLICT(account_id,trade_no) DO UPDATE SET missing_at=CASE WHEN missing_at=0 THEN excluded.missing_at ELSE missing_at END,next_at=excluded.next_at`).run(id, tradeNo, now, now + 60000);
+    },
+    deleteOrder(id, tradeNo) {
+      db.transaction(() => {
+        const old = order(id, tradeNo); if (!old) return;
+        adjustTotals(id, { status: '', cents: 0, paid_day: '' }, old);
+        sql('UPDATE epay_totals SET orders=orders-1 WHERE account_id=?').run(id);
+        sql('INSERT OR IGNORE INTO epay_order_tombstones VALUES(?,?)').run(id, tradeNo);
+        sql("UPDATE epay_notifications SET state='cancelled' WHERE account_id=? AND trade_no=? AND state='pending'").run(id, tradeNo);
+        sql('DELETE FROM epay_orders WHERE account_id=? AND trade_no=?').run(id, tradeNo);
+        if (old.status === 'paid' && old.paid_day) sql('DELETE FROM epay_daily WHERE account_id=? AND paid_day=? AND cents=0').run(id, old.paid_day);
+        sql('DELETE FROM epay_order_audit WHERE account_id=? AND trade_no=?').run(id, tradeNo);
+      })(); invalidate();
+    },
     accounts: () => sql('SELECT body FROM epay_accounts ORDER BY rowid DESC').all().map(row => JSON.parse(row.body)),
-    pending: id => sql("SELECT trade_no FROM epay_orders WHERE account_id=? AND status='pending' ORDER BY checked_at LIMIT 2").all(id),
+    deferPending(id, tradeNo, now) { sql('UPDATE epay_orders SET checked_at=? WHERE account_id=? AND trade_no=?').run(now, id, tradeNo); },
+    pending: id => sql("SELECT o.trade_no FROM epay_orders o LEFT JOIN epay_order_audit a ON a.account_id=o.account_id AND a.trade_no=o.trade_no WHERE o.account_id=? AND o.status='pending' AND COALESCE(a.missing_at,0)=0 ORDER BY o.checked_at LIMIT 2").all(id),
     due: now => sql("SELECT * FROM epay_notifications WHERE state='pending' AND next_at<=? ORDER BY id LIMIT 10").all(now),
     notification(id, state, next = 0) { sql('UPDATE epay_notifications SET state=?,attempts=attempts+1,next_at=? WHERE id=?').run(state, next, id); },
     notificationSummary: () => sql("SELECT state,COUNT(*) AS count FROM epay_notifications WHERE state IN ('pending','uncertain','failed') GROUP BY state").all(),
     remove(ids) { db.transaction(() => { for (const id of ids) {
-      for (const table of ['epay_notifications', 'epay_orders', 'epay_daily', 'epay_totals']) sql(`DELETE FROM ${table} WHERE account_id=?`).run(id);
+      for (const table of ['epay_notifications', 'epay_orders', 'epay_daily', 'epay_totals', 'epay_order_audit', 'epay_order_tombstones']) sql(`DELETE FROM ${table} WHERE account_id=?`).run(id);
       sql('DELETE FROM epay_accounts WHERE id=?').run(id);
     } })(); invalidate(); },
     prune(now) { sql("DELETE FROM epay_notifications WHERE id IN (SELECT id FROM epay_notifications WHERE state IN ('sent','cancelled','failed','uncertain') AND created<? LIMIT 500)").run(now - 7 * 86400000); }

@@ -2,9 +2,10 @@ export const RENEWAL_CURRENCIES = ['CNY', 'USD', 'EUR', 'HKD', 'JPY', 'GBP', 'SG
 export const DEFAULT_RENEWAL_SETTINGS = { days: [7, 3, 1, 0], time: '09:00', botIds: [] };
 export const RENEWAL_PERIODS = [[1, '1 个月'], [3, '3 个月'], [6, '半年'], [12, '1 年']];
 
-// Calendar months, clamped to the last day of the destination month.
+// Extend the recorded due date even when overdue. Only unknown dates use today.
+// Calendar months are clamped to the last day of the destination month.
 export function renewalExtension(dueDate, input, now = Date.now()) {
-  const base = validRenewalDate(dueDate || '') && dueDate > beijingDate(now) ? dueDate : beijingDate(now);
+  const base = validRenewalDate(dueDate || '') ? dueDate : beijingDate(now);
   let next;
   if (input.months !== undefined) {
     if (input.dueDate !== undefined || !Number.isInteger(input.months) || input.months < 1 || input.months > 120) throw new Error('续费月数须为 1–120 的整数');

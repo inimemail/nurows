@@ -204,3 +204,14 @@ test('quick renewal previews presets and custom dates, validates inputs and supp
   release(); await new Promise((resolve) => setImmediate(resolve)); view.render();
   assert.equal(editor(), undefined);
 });
+
+test('expired renewal preview stays anchored to its recorded due date', async () => {
+  const view = harness(async () => ({ ...fixture(), renewals: [{ ...item, dueDate: '2020-01-31' }] }));
+  await view.poll(); view.render(); view.button('续费 香港入口').props.onClick(); view.render();
+  const editor = view.nodes().find(node => node.type === view.exports.RenewalExtension);
+  assert.equal(editor.props.preview.base, '2020-01-31');
+  assert.equal(editor.props.preview.dueDate, '2020-02-29');
+  const content = view.exports.RenewalExtension(editor.props);
+  const hint = view.nodes(content).find(node => node.props.className === 'renewal-extension-hint');
+  assert.match(hint.props.children, /无论是否过期，都从原到期日延长/);
+});

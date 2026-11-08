@@ -402,3 +402,15 @@ test('route adapter propagates web validation and does not serialize full applic
   assert.equal(result.state, undefined);
   assert.equal(state.ipAssets.length, 0);
 });
+
+test('Telegram renewal of an expired server previews and submits an extension from the recorded expiry', async () => {
+  const renewal = { id: 'expired', version: 'v1', name: 'expired server', price: '', currency: 'USD', dueDate: '2020-01-31' };
+  const h = harness({ renewals: [renewal] });
+  await h.click('renewal:expired'); await h.press('续费 1 个月');
+  assert.match(h.latest().text, /起算日：2020-01-31/);
+  assert.match(h.latest().text, /新到期：2020-02-29/);
+  await h.press('确认'); await h.workspace.drain();
+  assert.equal(h.operations.length, 1);
+  assert.equal(h.operations[0][3].months, 1);
+  assert.equal(h.operations[0][3].expectedDueDate, '2020-02-29');
+});

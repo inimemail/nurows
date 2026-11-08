@@ -104,6 +104,19 @@ export function createAuthenticatorStore(db, encrypt, decrypt) {
       ids.splice(ids.indexOf(targetId) + (placement === 'after' ? 1 : 0), 0, id);
       db.transaction(() => ids.forEach((id, i) => updatePosition.run(i, id)))();
     },
+    importBatch(items) {
+      if (!Array.isArray(items) || !items.length || items.length > OTP_MAX_ACCOUNTS) throw Error('导入的验证器数量无效');
+      let imported = 0, skipped = 0;
+      db.transaction(() => {
+        for (const input of items) {
+          const config = normalizeOtpAccount(input);
+          const fingerprint = crypto.createHash('sha256').update(config.secret).digest('hex');
+          if (findFingerprint.get(fingerprint)) { skipped++; continue; }
+          save(config); imported++;
+        }
+      })();
+      return { imported, skipped };
+    },
     import(items) {
       if (!Array.isArray(items) || !items.length || items.length > OTP_MAX_ACCOUNTS) throw Error('导入文件中的验证器数量无效');
       db.transaction(() => { for (const item of items) save(item); })();
@@ -162,6 +175,10 @@ export function registerAuthenticatorRoutes(app, store, verifyPassword, { now = 
   app.post('/api/authenticator', route((req, res) => { requireGrant(req); const id = store.save(req.body); store.audit('create'); res.status(201).json({ ...snapshot(), item: store.account(id) }); }));
   app.put('/api/authenticator/settings', route((req, res) => { requireGrant(req); store.configure(req.body?.idleMinutes); res.json(snapshot()); }));
   app.put('/api/authenticator/order', route((req, res) => { requireGrant(req); store.reorder(req.body?.id, req.body?.targetId, req.body?.placement); res.json(snapshot()); }));
+  app.post('/api/authenticator/import-batch', route((req, res) => {
+    requireGrant(req); const result = store.importBatch(req.body?.accounts); store.audit('import-batch');
+    res.json({ ...snapshot(), accounts: store.secrets(), ...result });
+  }));
   app.post('/api/authenticator/import', route(privateJob(async (req, res) => {
     requireGrant(req);
     const accounts = await decodeAuthenticatorBackup(req.body?.backup, req.body?.passphrase);

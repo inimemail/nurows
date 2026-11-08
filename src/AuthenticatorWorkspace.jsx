@@ -3,12 +3,13 @@ import { ShieldCheck, LockKeyhole, Unlock, Plus, Copy, Pencil, Trash2, QrCode, S
 import { createOtp, parseOtpInput, OTP_DEFAULTS, otpRemaining } from '../shared/authenticator.js';
 import { copyNoteText } from './note-clipboard.js';
 import { readAuthenticatorQr, authenticatorQr } from './authenticator-qr.js';
+import AuthenticatorImportDialog from './AuthenticatorImportDialog.jsx';
 import GuardSortableList from './GuardSortableList.jsx';
 import { authenticatorRequest } from './authenticator-request.js';
 import './authenticator.css';
 
 const BASE = { issuer: '', account: '', note: '', secret: '', ...OTP_DEFAULTS };
-const AUDIT = { unlock: '解锁验证器', create: '添加验证器', edit: '编辑验证器', delete: '删除验证器', reveal: '查看配置二维码', import: '导入加密备份', export: '导出加密备份' };
+const AUDIT = { unlock: '解锁验证器', create: '添加验证器', edit: '编辑验证器', delete: '删除验证器', reveal: '查看配置二维码', import: '导入加密备份', 'import-batch': '批量导入验证器', export: '导出加密备份' };
 
 export default function AuthenticatorWorkspace({ api, toast, Dialog, search = '', onSearchScopeChange }) {
   const [data, setData] = useState(null), [tab, setTab] = useState('saved'), [modal, setModal] = useState(null);
@@ -125,6 +126,7 @@ export default function AuthenticatorWorkspace({ api, toast, Dialog, search = ''
   const newAccount = config => open(unlocked ? { type: 'edit', item: { ...BASE, ...config } } : { type: 'unlock', next: config });
   const close = () => { if (!busy) { setModal(null); setError(''); } };
   async function refresh() { try { await request(unlocked ? '/session' : '', undefined, unlocked ? 'POST' : 'GET', unlocked); toast('已刷新'); } catch {} }
+  const batchDialog = useMemo(() => modal?.type === 'batch' ? <AuthenticatorImportDialog Dialog={Dialog} existing={[...secrets.current.values()]} busy={busy} error={error} request={request} onClose={close} onImported={result => { setModal(null); toast(`已导入 ${result.imported} 个账号${result.skipped ? `，跳过 ${result.skipped} 个重复账号` : ''}`); }} /> : null, [modal, busy, error, data]);
   return <section className="ops-workspace authenticator-workspace">
     <header className="surface ops-header"><div><span className="ops-eyebrow">安全工具</span><strong>2FA 验证器</strong></div><div className={`authenticator-status ${unlocked ? 'unlocked' : ''}`}>{unlocked ? <ShieldCheck size={17} /> : <LockKeyhole size={17} />}<span>{accounts.length} 个验证器 · {unlocked ? '已解锁' : '已锁定'}</span>{unlocked ? <button className="ghost icon-button" title="立即锁定" aria-label="立即锁定" onClick={lock}><LockKeyhole size={17} /></button> : null}</div></header>
     <div className="ops-tabs authenticator-tabs" role="tablist" aria-label="验证器视图">{[['saved', '我的验证器', ShieldCheck], ['temporary', '临时生成', Zap]].map(([key, label, Icon]) => <button key={key} role="tab" aria-selected={tab === key} disabled={busy} className={tab === key ? 'active' : ''} onClick={() => { setTab(key); setModal(null); setError(''); }}><Icon size={16} />{label}</button>)}</div>
@@ -132,7 +134,7 @@ export default function AuthenticatorWorkspace({ api, toast, Dialog, search = ''
       {tab === 'saved' ? <>
         <div className="ops-content-head"><div><strong>我的验证器</strong><span>{unlocked ? `${data?.settings.idleMinutes || 5} 分钟无操作后锁定` : '输入面板密码解锁'}</span></div><div className="ops-content-actions authenticator-toolbar">
           <button className="ghost icon-button" title="刷新" aria-label="刷新验证器" disabled={busy} onClick={refresh}><RefreshCw size={16} /></button>
-          {unlocked ? <><button className="ghost icon-button" title="加密备份" aria-label="加密备份" disabled={busy} onClick={() => open({ type: 'backup' })}><Download size={16} /></button><button className="ghost icon-button" title="设置" aria-label="验证器设置" disabled={busy} onClick={() => open({ type: 'settings', idleMinutes: data.settings.idleMinutes })}><Settings size={17} /></button></> : <button className="ghost" disabled={busy || !data} onClick={() => open({ type: 'unlock' })}><Unlock size={15} />解锁</button>}
+          {unlocked ? <><button className="ghost" disabled={busy} onClick={() => open({ type: 'batch' })}><Upload size={16} />批量导入</button><button className="ghost icon-button" title="加密备份" aria-label="加密备份" disabled={busy} onClick={() => open({ type: 'backup' })}><Download size={16} /></button><button className="ghost icon-button" title="设置" aria-label="验证器设置" disabled={busy} onClick={() => open({ type: 'settings', idleMinutes: data.settings.idleMinutes })}><Settings size={17} /></button></> : <button className="ghost" disabled={busy || !data} onClick={() => open({ type: 'unlock' })}><Unlock size={15} />解锁</button>}
           <button className="primary" disabled={busy || !data} onClick={() => newAccount()}><Plus size={16} />添加</button>
         </div></div>
         {!modal && error ? <p className="auth-error" role="alert">{error}</p> : null}
@@ -156,6 +158,7 @@ export default function AuthenticatorWorkspace({ api, toast, Dialog, search = ''
     {modal?.type === 'delete' ? <Dialog title="删除验证器" className="authenticator-dialog" onClose={close} footer={<div className="dialog-actions"><button className="ghost" disabled={busy} onClick={close}>取消</button><button className="primary danger-action" disabled={busy} onClick={async () => { try { await request(`/${modal.item.id}`, { revision: modal.item.revision }, 'DELETE'); setModal(null); toast('验证器已删除'); } catch {} }}>{busy ? '删除中…' : '确认删除'}</button></div>}><p className="confirm-copy">确认删除「{modal.item.issuer} · {modal.item.account}」？这不会关闭该网站的两步验证，请确保仍有其他验证方式。</p>{error ? <p className="auth-error" role="alert">{error}</p> : null}</Dialog> : null}
     {modal?.type === 'reveal' ? <RevealDialog key={modal.item.id} Dialog={Dialog} item={modal.item} request={request} busy={busy} error={error} onClose={close} /> : null}
     {modal?.type === 'settings' ? <SettingsDialog Dialog={Dialog} initial={modal.idleMinutes} request={request} busy={busy} error={error} onClose={close} onSave={() => { setModal(null); toast('设置已保存'); }} /> : null}
+    {batchDialog}
     {modal?.type === 'backup' ? <BackupDialog Dialog={Dialog} request={request} busy={busy} error={error} onClose={close} onImported={() => { setModal(null); toast('加密备份已导入'); }} /> : null}
   </section>;
 }

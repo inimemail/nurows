@@ -135,3 +135,16 @@ test('encrypted backup rejects tampering and restores only valid accounts', asyn
   await assert.rejects(() => decodeAuthenticatorBackup({ ...backup, data: `${backup.data.slice(0, -2)}AA` }, 'a secure passphrase'), /损坏/);
   await assert.rejects(() => decodeAuthenticatorBackup(backup, 'wrong password'), /错误/);
 });
+
+test('batch import atomically skips duplicate keys without overwriting accounts or leaking secrets', () => {
+  const { db, store } = fixture();
+  try {
+    store.save(config('original'));
+    const b = { ...config('second'), secret: Secret.fromUTF8('another-secret-value!').base32 };
+    assert.deepEqual(store.importBatch([config('renamed'), b, b]), { imported: 1, skipped: 2 });
+    assert.equal(store.list().accounts.length, 2); assert.equal(store.list().accounts[0].account, 'original');
+    assert.equal(store.list().accounts.some(item => 'secret' in item), false);
+    assert.throws(() => store.importBatch([{ ...config('third'), secret: Secret.fromUTF8('third-secret-value!!').base32 }, { ...config(), secret: 'bad' }]));
+    assert.equal(store.list().accounts.length, 2);
+  } finally { db.close(); }
+});

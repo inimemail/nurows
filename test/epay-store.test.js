@@ -92,3 +92,18 @@ test('notification cleanup is bounded and never deletes outstanding delivery or 
   assert.equal(store.order('account', 'one').cents, 250);
   assert.equal(store.totals()[0].total, 250);
 });
+
+test('confirmed deletion is idempotent and a database failure rolls back money and deduplication markers together', t => {
+  const { db, store, merge } = setup(t); merge([row('one'), row('two', 0)]);
+  const totals = store.totals();
+  db.exec("CREATE TRIGGER reject_delete BEFORE DELETE ON epay_orders BEGIN SELECT RAISE(ABORT,'test delete failure'); END;");
+  assert.throws(() => store.deleteOrder('account', 'one'), /test delete failure/);
+  assert.deepEqual(store.totals(), totals);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM epay_order_tombstones').get().n, 0);
+  assert.ok(store.order('account', 'one')); db.exec('DROP TRIGGER reject_delete;');
+  store.deleteOrder('account', 'one'); store.deleteOrder('account', 'one');
+  assert.equal(store.totals()[0].total, 0); assert.equal(store.totals()[0].orders, 1);
+  assert.equal(store.totals()[0].pendingCount, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM epay_order_tombstones').get().n, 1);
+  store.remove(['account']); assert.equal(db.prepare('SELECT COUNT(*) AS n FROM epay_order_tombstones').get().n, 0);
+});

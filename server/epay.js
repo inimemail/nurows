@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { createEpayStore } from './epay-store.js';
 import { normalizeEpayUrl, requestEpay } from './epay-api.js';
+import { EPAY_RECONCILE_INTERVAL, EPAY_RECONCILE_FIELDS, reconcileEpayOrders } from './epay-reconcile.js';
 import { bulkDeleteIds } from './bulk-delete.js';
 import { EPAY_CURRENCIES, EPAY_CHANNELS, EPAY_STATUSES, epayCents, epayBalanceCents, epayDate, epayDay, epayMoney, epayOrderStatus } from '../shared/epay.js';
 
@@ -8,7 +9,7 @@ const fail = (message, statusCode = 400) => { throw Object.assign(Error(message)
 const clean = (value, max = 120) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, max);
 const safe = item => { const { keyEnc, ...rest } = item; return { ...rest, configured: Boolean(keyEnc) }; };
 const escape = value => clean(value, 200).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-const snapshotFields = ['lastSyncAt', 'lastAttemptAt', 'balanceAt', 'balance', 'balanceWarning', 'balanceRetryAt', 'failures', 'nextAt', 'lastError', 'lastWarning', 'historyWarning', 'orderWarning', 'catchupWarning', 'historyRetryAt', 'orderRetryAt', 'catchupRetryAt', 'initialized', 'historyOffset', 'historyComplete', 'historyUnsupported', 'historySignature', 'pageSize', 'catchupOffset'];
+const snapshotFields = [...EPAY_RECONCILE_FIELDS, 'lastSyncAt', 'lastAttemptAt', 'failures', 'nextAt', 'lastError', 'lastWarning', 'historyWarning', 'orderWarning', 'catchupWarning', 'historyRetryAt', 'orderRetryAt', 'catchupRetryAt', 'initialized', 'historyOffset', 'historyComplete', 'historyUnsupported', 'historySignature', 'pageSize', 'catchupOffset'];
 
 export function normalizeEpayOrder(input, pid) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('订单接口返回了无效记录');
@@ -47,16 +48,17 @@ export function epayReceiptMessage(account, order, accounts) {
 }
 
 export function createEpayService(deps) {
-  const store = createEpayStore(deps.db), running = new Map();
+  const store = createEpayStore(deps.db), running = new Map(), balanceJobs = new Map(), balanceQueue = new Set();
   const request = deps.request || requestEpay;
+  const balanceStarted = new Map();
   // Revalidate legacy generic and balance-only failures through the bounded
   // scheduler after an upgrade instead of preserving a 15-minute order backoff.
   // Keep the error until a successful sync; paused accounts and actual order
   // failures retain their existing retry schedule.
   for (const item of store.accounts()) {
     const legacyError = item.lastError === '易支付查询失败，请检查商户号、密钥以及商户 API 查询权限' || item.lastError?.startsWith('读取商户余额失败：');
-    if (item.enabled && legacyError && item.nextAt) {
-      store.saveAccount({ ...item, nextAt: 0 });
+    if (!Number.isFinite(item.reconcileNextAt) || item.enabled && legacyError && item.nextAt) {
+      store.saveAccount({ ...item, reconcileNextAt: Number.isFinite(item.reconcileNextAt) ? item.reconcileNextAt : Date.now() + EPAY_RECONCILE_INTERVAL, ...(item.enabled && legacyError ? { nextAt: 0 } : {}) });
     }
   }
   let activeTests = 0, sending = false, cursor = 0, lastPrune = 0, accountCache = null;
@@ -87,9 +89,9 @@ export function createEpayService(deps) {
     const config = normalize(input, old), all = accounts();
     if (!old && all.length >= 100) fail('最多添加 100 个商户账号');
     if (all.some(item => item.id !== id && (item.name.toLowerCase() === config.name.toLowerCase() || item.url === config.url && item.pid === config.pid))) fail('商户名称或网站与商户号已存在，请勿重复添加', 409);
-    running.get(id)?.abort();
+    running.get(id)?.abort(); balanceJobs.get(id)?.controller.abort(); balanceQueue.delete(id);
     const now = Date.now(), item = { initialized: false, historyOffset: 0, historyComplete: false, historyUnsupported: false,
-      balance: null, balanceAt: '', lastSyncAt: '', lastError: '', failures: 0, pageSize: 50, catchupOffset: 0,
+      reconcileNextAt: now + EPAY_RECONCILE_INTERVAL, balance: null, balanceAt: '', lastSyncAt: '', lastError: '', failures: 0, pageSize: 50, catchupOffset: 0,
       ...old, ...config, id: old?.id || randomUUID(), version: randomUUID(), createdAt: old?.createdAt || new Date(now).toISOString(),
       updatedAt: new Date(now).toISOString(), nextAt: now };
     if (input.key) Object.assign(item, { balanceRetryAt: 0, balanceWarning: '', historyRetryAt: 0, orderRetryAt: 0, catchupRetryAt: 0, historyWarning: '', orderWarning: '', catchupWarning: '', lastWarning: '' });
@@ -122,6 +124,42 @@ export function createEpayService(deps) {
     return bots().filter(bot => item.botIds.includes(bot.id) && bot.enabled !== false && bot.tokenEnc)
       .flatMap(bot => [...new Set(bot.userIds || [])].map(chatId => ({ botId: bot.id, chatId: String(chatId) })));
   }
+  const warnings = item => [item.balanceWarning, item.catchupWarning, item.historyWarning, item.orderWarning, item.reconcileWarning].filter(Boolean).join(' ');
+  function refreshBalance(id, force = false) {
+    if (balanceJobs.has(id)) return balanceJobs.get(id).promise;
+    const item = requireAccount(id), now = Date.now();
+    if (force && now - (balanceStarted.get(id) || 0) < 2000) return Promise.resolve();
+    if (!force && (item.balanceRetryAt || 0) > now) return Promise.resolve();
+    if (balanceJobs.size >= 3) { if (force) balanceQueue.add(id); return Promise.resolve(); }
+    balanceQueue.delete(id);
+    const controller = new AbortController(), version = item.version;
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]);
+    const job = { controller };
+    balanceJobs.set(id, job); balanceStarted.set(id, now);
+    job.promise = Promise.resolve().then(async () => {
+      try {
+        signal.throwIfAborted();
+        const key = deps.decrypt(item.keyEnc); if (!key) fail('商户密钥无法解密，请重新填写');
+        const info = await request(item, key, 'query', {}, { signal });
+        const balance = epayBalanceCents(info.money ?? info.balance);
+        if (!Number.isSafeInteger(balance)) throw Object.assign(Error('接口未返回有效余额。'), { epaySafe: true });
+        signal.throwIfAborted();
+        patch(id, version, { balance, balanceAt: new Date().toISOString(), balanceWarning: '', balanceRetryAt: 0 });
+      } catch (error) {
+        if (!controller.signal.aborted) patch(id, version, {
+          balanceWarning: `余额刷新失败，保留上次结果；订单监听独立运行。${error.epaySafe || error.statusCode === 400 ? ` ${error.message}` : ''}`,
+          balanceRetryAt: Date.now() + Math.max(60000, Math.min(300000, item.interval * 2000))
+        });
+      } finally {
+        if (!controller.signal.aborted) {
+          const current = store.account(id);
+          if (current?.version === version) patch(id, version, { lastWarning: warnings(current) });
+        }
+        if (balanceJobs.get(id) === job) balanceJobs.delete(id);
+      }
+    });
+    return job.promise;
+  }
   async function sync(id) {
     if (running.has(id) || running.size >= 3) return false;
     let item = requireAccount(id);
@@ -130,19 +168,11 @@ export function createEpayService(deps) {
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(25000)]), version = item.version;
     const valid = () => !signal.aborted && store.account(id)?.version === version;
     let stage = '读取最新订单', balanceTask;
-    const balanceController = new AbortController();
     try {
       const key = deps.decrypt(item.keyEnc);
       if (!key) fail('商户密钥无法解密，请重新填写');
       const now = Date.now();
-      if ((item.balanceRetryAt || 0) <= now) {
-        // Balance is independent of the order ledger. Start both requests in
-        // this merchant's existing slot and handle rejection immediately, so a
-        // slow balance endpoint cannot prevent the latest orders being saved.
-        const balanceSignal = AbortSignal.any([signal, balanceController.signal]);
-        balanceTask = Promise.resolve().then(() => request(item, key, 'query', {}, { signal: balanceSignal }))
-          .then(info => ({ info, at: new Date().toISOString(), cancelled: balanceSignal.aborted }), error => ({ error, cancelled: balanceController.signal.aborted || controller.signal.aborted }));
-      }
+      balanceTask = refreshBalance(id);
       const notifyRecipients = recipients(item), created = Date.parse(item.createdAt), fetched = new Set();
       const shouldNotify = (row, old) => {
         if (!item.initialized) return false;
@@ -166,12 +196,16 @@ export function createEpayService(deps) {
         }
         const merged = store.mergeOrders(item, rows, notifyRecipients, (row, old) => shouldNotify(row, old) || (!history && item.initialized && !old && !row.paid_at && Date.parse(row.created_at) >= created), now);
         for (const row of rows) fetched.add(row.trade_no);
+        if (item.reconcileId) store.auditSeen(item.id, item.reconcileId, rows);
         return { rows, ...merged, signature };
       };
       stage = '读取最新订单';
       const first = await fetchPage(0);
       item.headSignature = first.signature;
       const newHead = first.rows.length - first.known;
+      // New receipts shift offset pagination while a deletion audit spans
+      // several polls. Keep its next page behind the already scanned head.
+      if (item.reconcileId && item.reconcilePhase === 'scan' && item.reconcileOffset) item.reconcileOffset += newHead;
       if (!item.initialized) {
         item.historyOffset = first.rows.length; item.historyComplete = first.rows.length < item.pageSize;
       } else {
@@ -219,15 +253,29 @@ export function createEpayService(deps) {
         await supplemental('order', '最新订单已同步，部分旧订单状态暂未核对，将稍后重试。', async () => {
           for (const row of pending) {
             stage = '核对旧订单状态';
-            const result = await request(item, key, 'order', { trade_no: row.trade_no }, { signal });
+            let result;
+            try { result = await request(item, key, 'order', { trade_no: row.trade_no }, { signal }); }
+            catch (error) { if (error.epayOrderMissing && valid()) { store.deferPending(id, row.trade_no, now); continue; } throw error; }
             if (!valid()) { signal.throwIfAborted(); throw Error('configuration changed'); }
             const order = normalizeEpayOrder(result, item.pid);
             if (order.trade_no !== row.trade_no) throw Object.assign(Error('订单查询返回了不同订单号，已停止同步'), { statusCode: 400, epayIntegrity: true });
             store.mergeOrders(item, [order], notifyRecipients, shouldNotify, now);
+            if (item.reconcileId) store.auditSeen(item.id, item.reconcileId, [order]);
           }
         });
       } else {
         item.orderWarning = ''; item.orderRetryAt = 0;
+      }
+      // Reconciliation runs after the current-order path, never a full reimport.
+      if (item.initialized && (item.reconcileNextAt || 0) <= now && !item.catchupOffset && (item.historyComplete || item.historyUnsupported)) {
+        await supplemental('reconcile', '远端删除核对暂未完成，已保留未确认的订单。', () => reconcileEpayOrders({
+          item, store, now, first: first.rows, valid,
+          request: async (act, params) => {
+            const result = await request(item, key, act, params, { signal });
+            return act === 'orders' && Array.isArray(result.data) ? result.data.map(row => normalizeEpayOrder(row, item.pid)) : act === 'orders' ? null : result;
+          }, normalize: row => normalizeEpayOrder(row, item.pid),
+          merge: rows => store.mergeOrders(item, rows, notifyRecipients, shouldNotify, now)
+        }));
       }
       if (controller.signal.aborted || store.account(id)?.version !== version) return false;
       item.initialized = true; item.lastSyncAt = new Date(now).toISOString(); item.lastAttemptAt = item.lastSyncAt;
@@ -239,22 +287,9 @@ export function createEpayService(deps) {
       item.lastAttemptAt = new Date().toISOString(); item.nextAt = Date.now() + Math.min(900000, item.interval * 1000 * 2 ** item.failures);
     } finally {
       try {
-        // Abort an unnecessary balance request after a primary order failure.
-        // Always await it before releasing the slot to keep concurrency bounded.
-        if (item.lastError) balanceController.abort();
-        const result = balanceTask && await balanceTask;
+        await balanceTask;
         if (!controller.signal.aborted && store.account(id)?.version === version) {
-          if (result && !result.cancelled) {
-            const balance = result.info && epayBalanceCents(result.info.money ?? result.info.balance);
-            if (!result.error && Number.isSafeInteger(balance)) {
-              item.balance = balance; item.balanceAt = result.at; item.balanceWarning = ''; item.balanceRetryAt = 0;
-            } else {
-              const reason = result.error?.epaySafe ? ` ${result.error.message}` : result.error ? '' : ' 接口未返回有效余额。';
-              item.balanceWarning = `余额刷新失败，保留上次结果；订单监听独立运行。${reason}`;
-              item.balanceRetryAt = Date.now() + Math.max(60000, Math.min(300000, item.interval * 2000));
-            }
-          }
-          item.lastWarning = [item.balanceWarning, item.catchupWarning, item.historyWarning, item.orderWarning].filter(Boolean).join(' ');
+          item.lastWarning = warnings({ ...item, balanceWarning: store.account(id).balanceWarning });
           patch(id, version, Object.fromEntries([...snapshotFields, 'headSignature'].map(field => [field, item[field]])));
         }
       }
@@ -286,6 +321,11 @@ export function createEpayService(deps) {
   }
   async function tick() {
     const all = accounts(), now = Date.now();
+    for (const id of balanceQueue) {
+      if (balanceJobs.size >= 3) break;
+      if (!store.account(id)) { balanceQueue.delete(id); continue; }
+      void refreshBalance(id, true).catch(() => {});
+    }
     for (let i = 0; i < all.length && running.size < 3; i++) {
       const item = all[(cursor + i) % all.length];
       if (item.enabled && (item.nextAt || 0) <= now && !running.has(item.id)) void sync(item.id).catch(() => {});
@@ -300,7 +340,7 @@ export function createEpayService(deps) {
     if (query.status && !Object.hasOwn(EPAY_STATUSES, query.status)) fail('订单状态无效');
     for (const field of ['from', 'to']) if (query[field] && (!/^\d{4}-\d{2}-\d{2}$/.test(query[field]) || epayDay(`${query[field]}T00:00:00+08:00`) !== query[field])) fail('订单日期无效');
     if (query.from && query.to && query.from > query.to) fail('开始日期不能晚于结束日期');
-    const all = accounts().map(item => ({ ...safe(item), syncing: running.has(item.id) }));
+    const all = accounts().map(item => ({ ...safe(item), syncing: running.has(item.id), balanceRefreshing: balanceJobs.has(item.id) || balanceQueue.has(item.id) }));
     const totals = store.totals(), selected = query.accountId ? all.filter(item => item.id === query.accountId) : all;
     const groups = new Map();
     for (const account of selected) {
@@ -318,10 +358,11 @@ export function createEpayService(deps) {
   }
   function remove(body) {
     const ids = bulkDeleteIds(body), existing = accounts().filter(item => ids.has(item.id));
-    for (const item of existing) running.get(item.id)?.abort();
+    for (const item of existing) { running.get(item.id)?.abort(); balanceJobs.get(item.id)?.controller.abort(); balanceQueue.delete(item.id); balanceStarted.delete(item.id); }
     store.remove(existing.map(item => item.id)); invalidate(); return { deletedCount: existing.length };
   }
-  return { store, save, test, sync, tick, deliver, snapshot, remove,
+  return { store, save, test, sync, tick, deliver, snapshot, remove, refreshBalance,
+    requestBalance(id) { requireAccount(id); void refreshBalance(id, true).catch(() => {}); return { queued: true }; },
     telegramAccounts: () => { const totals = new Map(store.totals().map(row => [row.accountId, row]));
       return accounts().map(item => ({ ...safe(item), ...totals.get(item.id), status: item.lastError ? 'error' : item.catchupWarning ? 'incomplete' : item.balanceWarning ? 'balance_stale' : item.initialized ? 'healthy' : 'queued' })); },
     request(id) {
@@ -330,7 +371,7 @@ export function createEpayService(deps) {
       if (running.has(id)) return { queued: true };
       item.nextAt = 0; store.saveAccount(item); invalidate(); void tick().catch(() => {}); return { queued: true };
     },
-    close() { for (const controller of running.values()) controller.abort(); }
+    close() { for (const controller of running.values()) controller.abort(); for (const job of balanceJobs.values()) job.controller.abort(); balanceQueue.clear(); }
   };
 }
 
@@ -347,5 +388,6 @@ export function registerEpayRoutes(app, service) {
   app.post('/api/epay/accounts', route((req, res) => res.status(201).json({ item: service.save(req.body) })));
   app.put('/api/epay/accounts/:id', route((req, res) => res.json({ item: service.save(req.body, req.params.id) })));
   app.post('/api/epay/accounts/:id/sync', route((req, res) => res.status(202).json(service.request(req.params.id))));
+  app.post('/api/epay/accounts/:id/balance', route((req, res) => res.status(202).json(service.requestBalance(req.params.id))));
   app.post('/api/epay/delete', route((req, res) => res.json(service.remove(req.body))));
 }

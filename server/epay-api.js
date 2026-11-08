@@ -89,6 +89,11 @@ export async function requestEpay(account, key, act, params = {}, options = {}) 
     // order page. Do not reinterpret arbitrary errors or authentication errors.
     const empty = /^(?:暂无订单|没有订单|无订单|未查询到订单|未查到订单|订单记录为空|没有更多订单|查询结果为空)[！!。.\s]*$/.test(String(json.msg || '').trim());
     if (act === 'orders' && [-1, 0].includes(Number(json.code)) && empty && (!json.data || Array.isArray(json.data) && !json.data.length)) return { code: 1, data: [] };
+    // Only an explicit single-order absence can confirm deletion. Never infer
+    // it from a timeout, permissions failure, HTTP 404 or an empty list page.
+    if (act === 'order' && [-1, 0].includes(Number(json.code)) && /^(?:该订单不存在|订单不存在|订单未找到|未找到订单|未查询到该订单)[！!。.\s]*$/.test(String(json.msg || '').trim())) {
+      throw Object.assign(apiError('该订单已不存在'), { statusCode: 400, epayOrderMissing: true });
+    }
     fail(`${{ query: '商户信息', orders: '订单列表', order: '单笔订单' }[act]}查询失败（${rejectionReason(json)}）`);
   }
   return json;

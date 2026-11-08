@@ -498,3 +498,54 @@ test('supplemental responses from a different merchant are still rejected as int
   assert.match(service.snapshot().accounts[0].lastError, /所属商户/);
   assert.equal(service.store.order(item.id, 'Told').status, 'pending');
 });
+
+test('manual balance refresh bypasses failure cooldown, merges repeated clicks and leaves order scheduling alone', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-09T01:00:00Z') });
+  let available = false, release, calls = 0;
+  const { service, item } = customService(t, async (_, _key, act) => {
+    if (act !== 'query') return { data: [] };
+    calls++; if (!available) throw Object.assign(Error('timeout'), { epaySafe: true });
+    return new Promise(resolve => { release = resolve; });
+  });
+  await service.sync(item.id); const previous = service.store.account(item.id);
+  available = true; t.mock.timers.tick(2001);
+  assert.ok(previous.balanceRetryAt > Date.now());
+  service.requestBalance(item.id); service.requestBalance(item.id);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 2); assert.equal(service.snapshot().accounts[0].balanceRefreshing, true);
+  release({ money: '52.30' }); await service.refreshBalance(item.id);
+  const current = service.store.account(item.id);
+  assert.equal(current.balance, 5230); assert.equal(current.balanceWarning, '');
+  assert.equal(current.lastSyncAt, previous.lastSyncAt); assert.equal(current.nextAt, previous.nextAt);
+  service.requestBalance(item.id); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 2); // completed requests are also briefly throttled
+});
+
+test('balance results publish while a slow order response is still pending and cannot be overwritten at sync completion', async t => {
+  let release;
+  const { service, item } = customService(t, async (_, _key, act) => act === 'query' ? { money: '91.00' } : new Promise(resolve => { release = resolve; }));
+  const syncing = service.sync(item.id); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(service.store.account(item.id).balance, 9100);
+  assert.equal(service.snapshot().accounts[0].syncing, true);
+  assert.equal(service.snapshot().accounts[0].balanceRefreshing, false);
+  release({ data: [] }); await syncing;
+  assert.equal(service.store.account(item.id).balance, 9100);
+});
+
+test('manual balance jobs are bounded, queued fairly and can refresh paused merchants without loading orders', async t => {
+  const db = new Database(':memory:'); t.after(() => db.close());
+  const releases = [], calls = [];
+  const service = createEpayService({ db, encrypt: x => x, decrypt: x => x, request: async (item, _key, act) => {
+    calls.push(act); assert.equal(act, 'query');
+    return new Promise(resolve => releases.push(() => resolve({ money: item.pid })));
+  } });
+  t.after(() => service.close());
+  const items = Array.from({ length: 5 }, (_, i) => service.save({ name: `merchant${i}`, url: 'https://pay.example.com', pid: String(i + 1), key: 'key', enabled: false }));
+  items.forEach(item => service.requestBalance(item.id));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length, 3); assert.equal(service.snapshot().accounts.filter(item => item.balanceRefreshing).length, 5);
+  releases.splice(0).forEach(release => release()); await new Promise(resolve => setImmediate(resolve));
+  await service.tick(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length, 5); releases.splice(0).forEach(release => release()); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(service.snapshot().accounts.some(item => item.balanceRefreshing), false);
+});

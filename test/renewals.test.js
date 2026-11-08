@@ -41,9 +41,9 @@ test('renewal dates use Beijing calendar days, strict dates and stable expiratio
 });
 
 test('quick renewal uses calendar months, handles expired and unknown dates, and clamps month end', () => {
-  assert.equal(renewalExtension('2026-01-31', { months: 1 }, NOW).dueDate, '2026-10-21');
+  assert.equal(renewalExtension('2026-01-31', { months: 1 }, NOW).dueDate, '2026-02-28');
   assert.equal(renewalExtension('2026-09-21', { months: 1 }, NOW).dueDate, '2026-10-21');
-  assert.equal(renewalExtension('2026-09-20', { months: 1 }, NOW).dueDate, '2026-10-21');
+  assert.equal(renewalExtension('2026-09-20', { months: 1 }, NOW).dueDate, '2026-10-20');
   assert.equal(renewalExtension('', { months: 1 }, NOW).dueDate, '2026-10-21');
   assert.equal(renewalExtension('2026-01-31', { months: 1 }, Date.parse('2026-01-01T00:00:00Z')).dueDate, '2026-02-28');
   const early = Date.parse('2024-01-01T00:00:00Z');
@@ -378,4 +378,21 @@ test('isolated renewal writes clone no histories and publish only after persiste
   assert.equal(source.match(/setInterval\(\(\) => renewalService.tick\(\), 60000\)/g).length, 1);
   assert.ok(source.indexOf('setInterval(() => renewalService.tick(), 60000)') > source.indexOf('server.listen(PORT'));
   assert.ok(source.indexOf("app.use('/api', authGuard)") < source.indexOf('registerRenewalRoutes(app'));
+});
+
+test('renewal uses the original expiry for every duration, including records still overdue after extending', async () => {
+  for (const [months, expected] of [[1, '2026-10-20'], [3, '2026-12-20'], [6, '2027-03-20'], [12, '2027-09-20'], [2, '2026-11-20']]) {
+    const result = renewalExtension('2026-09-20', { months }, NOW);
+    assert.equal(result.base, '2026-09-20'); assert.equal(result.dueDate, expected);
+  }
+  assert.equal(renewalExtension('2026-10-20', { months: 1 }, NOW).dueDate, '2026-11-20');
+  assert.equal(renewalExtension('2026-01-31', { dueDate: '2026-02-15' }, NOW).dueDate, '2026-02-15');
+  assert.throws(() => renewalExtension('2026-01-31', { dueDate: '2026-01-31' }, NOW));
+  const h = harness([record({ dueDate: '2026-01-31' })]);
+  const handlers = new Map();
+  registerRenewalRoutes(Object.fromEntries(['get', 'put', 'post'].map(method => [method, (path, handler) => handlers.set(`${method} ${path}`, handler)])), h.deps, { tick() {} });
+  let response, error;
+  await handlers.get('post /api/renewals/:id/extend')({ params: { id: h.state.renewals[0].id }, body: { months: 1, version: h.state.renewals[0].version, expectedDueDate: '2026-02-28' } }, { json(value) { response = value; } }, value => { error = value; });
+  assert.equal(error, undefined); assert.equal(response.renewals[0].dueDate, '2026-02-28');
+  assert.equal(renewalStatus(response.renewals[0], undefined, NOW).key, 'expired');
 });

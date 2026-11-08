@@ -20,8 +20,10 @@ export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearc
   const [editor, setEditor] = useState(null), [deletion, setDeletion] = useState(null), [detail, setDetail] = useState(null);
   const [orderViewer, setOrderViewer] = useState(null), [viewerData, setViewerData] = useState(null), [viewerError, setViewerError] = useState(''), [viewerLoading, setViewerLoading] = useState(false);
   const [busy, setBusy] = useState(false), [testing, setTesting] = useState(false), [formError, setFormError] = useState(''), [testResult, setTestResult] = useState(null), [showKey, setShowKey] = useState(false);
+  const balanceRequests = useRef(new Map());
+  const balancing = Boolean(data?.accounts.some(item => item.balanceRefreshing));
   const lock = useRef(false), generation = useRef(0), mounted = useRef(true), testEpoch = useRef(0), connectionTest = useRef(null);
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false; testEpoch.current++; connectionTest.current?.abort(); }; }, []);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; testEpoch.current++; connectionTest.current?.abort(); for (const controller of balanceRequests.current.values()) controller.abort(); balanceRequests.current.clear(); }; }, []);
   useEffect(() => { onSearchScopeChange?.({ tab: 'epay', section: tab === 'accounts' ? 'epayAccounts' : 'epay' }); }, [tab, onSearchScopeChange]);
   useEffect(() => { const timer = setTimeout(() => { setQuery(search); setPage(1); }, 250); return () => clearTimeout(timer); }, [search]);
   useEffect(() => {
@@ -38,11 +40,11 @@ export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearc
           const result = await api(`/api/epay?${params}`, { signal });
           if (!cancelled && version === generation.current && !signal.aborted) { setData(result); setError(''); }
         } catch (err) { if (!cancelled && version === generation.current && (!signal.aborted || signal.reason?.name === 'TimeoutError')) setError(signal.aborted ? '读取超时，请稍后刷新重试' : err.message); }
-      }, 10000);
+      }, balancing ? 2000 : 10000);
     };
     start(); document.addEventListener('visibilitychange', start);
     return () => { cancelled = true; stop?.(); document.removeEventListener('visibilitychange', start); };
-  }, [api, accountId, orderStatus, from, to, page, query, tab, refresh]);
+  }, [api, accountId, orderStatus, from, to, page, query, tab, refresh, balancing]);
   useEffect(() => {
     if (!orderViewer) return;
     const controller = new AbortController();
@@ -105,6 +107,17 @@ export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearc
       if (result) toast('已安排后台同步，不影响页面操作');
     } catch (err) { toast(err.message); }
   }
+  async function refreshBalance(item) {
+    if (balanceRequests.current.has(item.id) || item.balanceRefreshing) return;
+    const controller = new AbortController(); balanceRequests.current.set(item.id, controller);
+    setData(current => current && ({ ...current, accounts: current.accounts.map(account => account.id === item.id ? { ...account, balanceRefreshing: true } : account) }));
+    try {
+      await api(`/api/epay/accounts/${encodeURIComponent(item.id)}/balance`, { method: 'POST', body: '{}', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
+      if (mounted.current) { setRefresh(value => value + 1); toast('已安排刷新余额'); }
+    } catch (err) { if (mounted.current && !controller.signal.aborted) { toast(err.message); setRefresh(value => value + 1); } }
+    finally { balanceRequests.current.delete(item.id); }
+  }
+  const balanceButton = item => <button className="ghost icon-button epay-refresh-balance" aria-label={`刷新 ${item.name} 的余额`} title={item.balanceRefreshing ? '余额刷新中' : '向易支付刷新余额'} disabled={busy || item.balanceRefreshing} onClick={() => refreshBalance(item)}><RefreshCw size={13} className={item.balanceRefreshing ? 'epay-spinning' : ''} /></button>;
   async function toggle(item) {
     if (lock.current) return;
     try {
@@ -171,15 +184,15 @@ export default function EpayWorkspace({ api, toast, Dialog, search = '', onSearc
           <div className="epay-overview-merchants">{filtered.filter(item => !accountId || item.id === accountId).map(item => {
             const total = accountTotals.get(item.id), [tone, label, Icon] = status(item);
             return <article className="epay-overview-row" key={item.id}>
-              <div className="epay-overview-identity"><div className="epay-merchant-icon"><Wallet size={18} /></div><div><div className="epay-overview-name"><strong>{item.name}</strong><span className={`epay-badge ${tone}`}><Icon size={12} />{label}</span></div><span className="epay-account-host">{new URL(item.url).host} · 商户 {item.pid}</span></div></div>
+              <div className="epay-overview-identity"><div className="epay-merchant-icon"><Wallet size={18} /></div><div><div className="epay-overview-name"><strong>{item.name}</strong><span className={`epay-badge ${tone}`}><Icon size={12} />{label}</span>{balanceButton(item)}</div><span className="epay-account-host">{new URL(item.url).host} · 商户 {item.pid}</span></div></div>
               <dl className="epay-overview-amounts"><div><dt>当前余额 <small>{item.currency}</small></dt><dd>{epayMoney(item.balance, item.currency)}</dd></div><div><dt>今日收款</dt><dd>{epayMoney(total?.today || 0, item.currency)}</dd></div><div><dt>累计收款</dt><dd>{epayMoney(total?.total || 0, item.currency)}</dd></div></dl>
               <button className="ghost epay-view-orders" aria-label={`查看 ${item.name} 的订单`} onClick={() => openOrders(item)}><ReceiptText size={14} />查看订单<ArrowUpRight size={13} /></button>
-              <div className="epay-overview-sync"><small>{item.historyUnsupported ? '接口不支持历史分页 · 保留已同步订单' : item.historyComplete ? '历史订单已同步' : '历史订单分批补齐'}</small><small>订单同步：{date(item.lastSyncAt)} · 余额更新：{date(item.balanceAt)}</small>{item.lastWarning ? <span className="epay-inline-warning">{item.lastWarning}</span> : null}{item.lastError ? <span className="epay-inline-error">{item.lastError}</span> : null}</div>
+              <div className="epay-overview-sync"><small>{item.historyUnsupported ? '接口不支持历史分页 · 保留已同步订单' : item.historyComplete ? '历史订单已同步' : '历史订单分批补齐'}</small><small>订单同步：{date(item.lastSyncAt)} · 余额更新：{date(item.balanceAt)}{item.balanceRefreshing ? ' · 刷新中' : ''}</small><small>{item.reconciledAt ? `删除核对：${date(item.reconciledAt)}` : '远端删除每 30 分钟分批核对'}</small>{item.lastWarning ? <span className="epay-inline-warning">{item.lastWarning}</span> : null}{item.lastError ? <span className="epay-inline-error">{item.lastError}</span> : null}</div>
             </article>;
           })}{!filtered.some(item => !accountId || item.id === accountId) ? <div className="ops-empty">没有匹配的商户</div> : null}</div>
         </> : tab === 'orders' ? <>{orderList(data.orders.records)}{!data.orders.records.length ? <div className="ops-empty"><ReceiptText size={25} /><strong>暂无匹配订单</strong><span>订单在后台同步，首次读取历史需要一些时间。</span></div> : null}
           <div className="epay-pagination"><span>共 {data.orders.total} 笔 · 第 {data.orders.page}/{data.orders.pages} 页</span><div><button className="ghost icon-button" aria-label="上一页" disabled={data.orders.page <= 1} onClick={() => setPage(value => value - 1)}><ChevronLeft size={16} /></button><button className="ghost icon-button" aria-label="下一页" disabled={data.orders.page >= data.orders.pages} onClick={() => setPage(value => value + 1)}><ChevronRight size={16} /></button></div></div>
-        </> : <div className="epay-account-list">{filtered.map(item => { const [tone, label, Icon] = status(item); return <article key={item.id} className="epay-account-row"><div className="epay-merchant-icon"><Wallet size={21} /></div><div className="epay-account-info"><div><strong>{item.name}</strong><span className={`epay-badge ${tone}`}><Icon size={12} />{label}</span></div><span>{item.url} · 商户 {item.pid}</span><small>每 {item.interval} 秒监听 · {item.botIds.length ? `${item.botIds.length} 个通知机器人` : '未开启 TG 通知'} · 订单同步：{date(item.lastSyncAt)} · 余额更新：{date(item.balanceAt)}</small>{item.lastWarning ? <span className="epay-inline-warning">{item.lastWarning}</span> : null}{item.lastError ? <span className="epay-inline-error">{item.lastError}</span> : null}{item.note ? <small>{item.note}</small> : null}</div><div className="epay-account-money"><small>最近余额</small><strong>{epayMoney(item.balance, item.currency)}</strong></div><div className="epay-row-actions"><button className="ghost" disabled={busy || !item.enabled || item.syncing} onClick={() => sync(item)}>{item.syncing ? '同步中' : '同步'}</button><button className="ghost" disabled={busy} onClick={() => toggle(item)}>{item.enabled ? '暂停' : '启用'}</button><button className="ghost icon-button" aria-label={`编辑 ${item.name}`} title="编辑" disabled={busy} onClick={() => openEditor(item)}><Pencil size={15} /></button><button className="ghost icon-button danger-text-button" aria-label={`删除 ${item.name}`} title="删除" disabled={busy} onClick={() => setDeletion({ ids: [item.id], name: item.name })}><Trash2 size={15} /></button></div></article>; })}{!filtered.length ? <div className="ops-empty">没有匹配的商户</div> : null}</div>}
+        </> : <div className="epay-account-list">{filtered.map(item => { const [tone, label, Icon] = status(item); return <article key={item.id} className="epay-account-row"><div className="epay-merchant-icon"><Wallet size={21} /></div><div className="epay-account-info"><div><strong>{item.name}</strong><span className={`epay-badge ${tone}`}><Icon size={12} />{label}</span></div><span>{item.url} · 商户 {item.pid}</span><small>每 {item.interval} 秒监听 · {item.botIds.length ? `${item.botIds.length} 个通知机器人` : '未开启 TG 通知'} · 订单同步：{date(item.lastSyncAt)} · 余额更新：{date(item.balanceAt)}{item.balanceRefreshing ? ' · 刷新中' : ''}</small><small>{item.reconciledAt ? `删除核对：${date(item.reconciledAt)}` : '远端删除每 30 分钟分批核对'}</small>{item.lastWarning ? <span className="epay-inline-warning">{item.lastWarning}</span> : null}{item.lastError ? <span className="epay-inline-error">{item.lastError}</span> : null}{item.note ? <small>{item.note}</small> : null}</div><div className="epay-account-money"><small>最近余额{balanceButton(item)}</small><strong>{epayMoney(item.balance, item.currency)}</strong></div><div className="epay-row-actions"><button className="ghost" disabled={busy || !item.enabled || item.syncing} onClick={() => sync(item)}>{item.syncing ? '同步中' : '同步'}</button><button className="ghost" disabled={busy} onClick={() => toggle(item)}>{item.enabled ? '暂停' : '启用'}</button><button className="ghost icon-button" aria-label={`编辑 ${item.name}`} title="编辑" disabled={busy} onClick={() => openEditor(item)}><Pencil size={15} /></button><button className="ghost icon-button danger-text-button" aria-label={`删除 ${item.name}`} title="删除" disabled={busy} onClick={() => setDeletion({ ids: [item.id], name: item.name })}><Trash2 size={15} /></button></div></article>; })}{!filtered.length ? <div className="ops-empty">没有匹配的商户</div> : null}</div>}
         {data.notifications.some(item => ['uncertain', 'failed'].includes(item.state)) ? <div className="epay-warning"><AlertCircle size={16} /><span>部分通知发送失败或结果待确认。为避免重复收款提醒，结果不明确的通知不会自动重发，请以订单记录为准。</span></div> : null}
       </>}
       </div>

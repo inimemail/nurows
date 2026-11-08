@@ -124,3 +124,51 @@
   .authenticator-status { max-width: none; }
   .authenticator-status > span { max-width: none; white-space: nowrap; }
 }
+
+.authenticator-import-dialog { width: min(680px, calc(100vw - 32px)); }
+.authenticator-import-dialog .dialog-body { padding-top: 20px; }
+.authenticator-import-intro { display: flex; gap: 12px; align-items: center; margin-bottom: 18px; }
+.authenticator-import-intro > span { display: grid; place-items: center; flex: 0 0 42px; height: 42px; color: var(--accent-text); background: var(--accent-soft); border-radius: 10px; }
+.authenticator-import-intro strong { color: var(--text-strong); font-size: 14px; }
+.authenticator-import-intro p { margin: 6px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.7; }
+.authenticator-import-tools { display: flex; flex-wrap: wrap; gap: 10px; }
+.authenticator-import-tools button { display: inline-flex; justify-content: center; align-items: center; gap: 7px; min-height: 40px; flex: 1; }
+.authenticator-import-tools .active { color: var(--accent-text); background: var(--accent-soft); }
+.authenticator-import-summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 44px; margin-top: 10px; color: var(--text-soft); font-size: 12px; }
+.authenticator-import-summary > button { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; flex-shrink: 0; }
+.authenticator-import-hint { margin: 0 0 12px; padding: 10px 12px; border-radius: 7px; background: var(--accent-soft); color: var(--accent-text); font-size: 12px; line-height: 1.6; }
+.authenticator-import-select { display: flex; align-items: center; gap: 9px; font-size: 12px; padding: 10px 2px; color: var(--text-soft); }
+.authenticator-import-select > span { margin-left: auto; font-variant-numeric: tabular-nums; }
+.authenticator-import-list { max-height: min(36dvh,320px); overflow: auto; overscroll-behavior: contain; border: 1px solid var(--border-soft); border-radius: 9px; }
+.authenticator-import-row { display: flex; align-items: center; gap: 10px; padding: 12px; border-bottom: 1px solid var(--border-soft); cursor: pointer; }
+.authenticator-import-row:last-child { border-bottom: 0; }
+.authenticator-import-row > span { flex: 1; min-width: 0; }
+.authenticator-import-row strong, .authenticator-import-row small { display: block; overflow-wrap: anywhere; }
+.authenticator-import-row strong { color: var(--text-strong); font-size: 13px; font-weight: 550; }
+.authenticator-import-row small { margin-top: 4px; color: var(--text-muted); font-size: 11px; }
+.authenticator-import-row em { font-style: normal; color: var(--text-muted); font-size: 10px; flex-shrink: 0; }
+.authenticator-import-row.duplicate { background: var(--card-hover); cursor: default; }
+.authenticator-import-dialog input[type=checkbox] { width: 16px; min-width: 16px; height: 16px; min-height: 16px; margin: 0; accent-color: var(--accent-solid); }
+.authenticator-import-empty { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 13px; padding: 32px 12px; border: 1px dashed var(--border-soft); border-radius: 9px; color: var(--text-muted); font-size: 12px; text-align: center; line-height: 1.6; }
+.authenticator-import-unsupported { max-height: 120px; overflow: auto; font-size: 11px; color: #b17622; overflow-wrap: anywhere; }
+.authenticator-import-privacy { display: flex; align-items: flex-start; gap: 6px; margin: 16px 0 0; color: var(--text-muted); font-size: 11px; line-height: 1.7; }
+.authenticator-import-privacy > svg { flex-shrink: 0; margin-top: 2px; }
+.authenticator-import-footer { width: 100%; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.authenticator-import-footer > span { color: var(--text-muted); font-size: 11px; }
+.authenticator-import-camera { position: relative; margin-top: 12px; overflow: hidden; border-radius: 10px; background: #111; }
+.authenticator-import-camera video { display: block; width: 100%; max-height: 260px; object-fit: cover; }
+.authenticator-import-camera > button { position: absolute; top: 8px; right: 8px; background: #fff; }
+.authenticator-import-camera > span { display: block; color: #eee; padding: 8px 12px; font-size: 11px; text-align: center; }
+@media (max-width: 760px) {
+  .authenticator-import-dialog .dialog-body { padding: 16px; }
+  .authenticator-import-tools { gap: 8px; }
+  .authenticator-import-tools button { min-height: 44px; padding-inline: 8px; font-size: 12px; }
+  .authenticator-import-intro { align-items: flex-start; }
+  .authenticator-import-row { min-height: 56px; padding: 10px; gap: 8px; flex-wrap: wrap; }
+  .authenticator-import-row > span { flex-basis: calc(100% - 28px); }
+  .authenticator-import-row em { padding-left: 24px; }
+  .authenticator-import-footer .dialog-actions { width: 100%; margin-left: 0; }
+  .authenticator-import-footer .dialog-actions button { flex: 1; min-height: 44px; }
+  .authenticator-import-summary { font-size: 11px; }
+  .authenticator-toolbar > button:not(.icon-button) { min-height: 44px; }
+}

@@ -218,3 +218,19 @@ test('a balance-only failure shows stale balance separately from the last succes
   assert.ok(view.nodes().some(node => node.props?.className === 'epay-badge pending' && node.props.children?.includes('余额待刷新')));
   view.close();
 });
+
+test('merchant balance refresh calls its independent endpoint once and does not run an order sync', async () => {
+  const calls = []; let release;
+  const view = harness((path, options = {}) => {
+    if (!options.method) return Promise.resolve(fixture());
+    calls.push(path); return new Promise(resolve => { release = resolve; });
+  });
+  await view.poll(); view.render();
+  const button = view.button('刷新 主站 的余额'); assert.ok(button);
+  const action = button.props.onClick(); button.props.onClick(); view.render();
+  assert.equal(calls.length, 1); assert.equal(calls[0], '/api/epay/accounts/one/balance');
+  assert.equal(view.button('刷新 主站 的余额').props.disabled, true);
+  release({ queued: true }); await action; await view.poll(); view.render();
+  assert.ok(!view.button('刷新 主站 的余额').props.disabled);
+  view.close();
+});

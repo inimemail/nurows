@@ -54,3 +54,42 @@ export async function authenticatorQr(config) {
   const { default: QRCode } = await import('qrcode');
   return QRCode.toDataURL(createOtp(config).toString(), { width: 300, margin: 2, errorCorrectionLevel: 'M' });
 }
+
+export async function scanAuthenticatorCamera(video, onText, onError, signal) {
+  if (!globalThis.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw Error('当前浏览器无法使用摄像头，请使用 HTTPS 或导入二维码图片');
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } }, audio: false });
+  if (signal.aborted) { stream.getTracks().forEach(track => track.stop()); return; }
+  let worker, canvas, context, timer, stopped = false, previous = '';
+  const stop = () => {
+    if (stopped) return; stopped = true; clearTimeout(timer); worker?.terminate();
+    stream.getTracks().forEach(track => track.stop()); video.pause(); video.srcObject = null;
+    if (canvas) canvas.width = canvas.height = 0; signal.removeEventListener('abort', stop);
+  };
+  try {
+    worker = new Worker(new URL('./authenticator-qr-worker.js', import.meta.url), { type: 'module' });
+    canvas = document.createElement('canvas'); context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) throw Error();
+  } catch { stop(); throw Error('当前浏览器不支持扫码，请改用二维码图片导入'); }
+  signal.addEventListener('abort', stop, { once: true });
+  video.srcObject = stream;
+  try { await video.play(); } catch { stop(); throw Error('摄像头启动失败，请改用二维码图片导入'); }
+  if (signal.aborted) { stop(); return; }
+  const scan = async () => {
+    if (stopped) return;
+    try {
+      if (video.readyState >= 2 && video.videoWidth) {
+        const ratio = Math.min(1, 960 / Math.max(video.videoWidth, video.videoHeight));
+        canvas.width = Math.max(1, Math.round(video.videoWidth * ratio)); canvas.height = Math.max(1, Math.round(video.videoHeight * ratio));
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+        const result = await workerCall(worker, { pixels: pixels.data, width: canvas.width, height: canvas.height }, [pixels.data.buffer], signal, 5000);
+        if (stopped) return;
+        if (result.text && result.text !== previous) { previous = result.text; onText(result.text); }
+        else if (!result.text) previous = '';
+      }
+    } catch (error) { if (!stopped) { stop(); onError(error); } return; }
+    timer = setTimeout(scan, 250);
+  };
+  void scan();
+  return stop;
+}

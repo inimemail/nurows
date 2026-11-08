@@ -75,3 +75,16 @@ test('API failures report bounded codes and local reason labels without leaking 
     assert.doesNotMatch(error.message, /secret-key|private-buyer|返回码/); return true;
   });
 });
+
+test('only a narrow explicit single-order missing response carries deletion evidence', async () => {
+  const send = (body, act = 'order') => requestEpay({ url: 'https://pay.example.com', pid: '1001' }, 'secret', act, {}, {
+    lookup: async () => [{ address: '8.8.8.8', family: 4 }],
+    request(_url, _options, callback) {
+      callback({ statusCode: 200, on(event, handler) { if (event === 'data') handler(Buffer.from(JSON.stringify(body))); if (event === 'end') handler(); return this; } });
+      return { on() { return this; }, end() {} };
+    }
+  });
+  await assert.rejects(send({ code: -1, msg: '订单不存在！' }), error => error.epayOrderMissing === true);
+  for (const body of [{ code: -1, msg: '订单不存在或无权查询' }, { code: -1, msg: '权限不足' }, { code: -1, msg: '查询超时' }, { code: -1, msg: '订单不存在 secret' }, { code: 500, msg: '订单不存在' }]) await assert.rejects(send(body), error => !error.epayOrderMissing);
+  await assert.rejects(send({ code: -1, msg: '订单不存在' }, 'orders'), error => !error.epayOrderMissing);
+});

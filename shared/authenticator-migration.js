@@ -59,11 +59,15 @@ export function parseAuthenticatorImport(text) {
   try { const raw = atob(encoded); if (btoa(raw).replace(/=+$/, '') !== encoded.replace(/=+$/, '')) invalid(); bytes = Uint8Array.from(raw, char => char.charCodeAt(0)); }
   catch { invalid(); }
   try {
-    const root = fields(bytes), version = Number(single(root, 2, 0, 0n));
-    if (version !== 1) throw Error('暂不支持此版本的谷歌迁移二维码');
+    const root = fields(bytes), version = single(root, 2, 0, 0n);
+    // Compatible offline payloads use the same account schema in versions
+    // 0–2; proto3 may omit the zero-valued version field entirely. Validate
+    // every account and batch below instead of requiring an explicit 1.
+    if (version > 2n) throw Error(`暂不支持谷歌迁移格式版本 ${version.toString()}，当前支持版本 0、1、2`);
     const size = Number(single(root, 3, 0, 1n)), index = Number(single(root, 4, 0, 0n));
     const id = BigInt.asIntN(32, single(root, 5, 0, 0n)).toString();
     if (!Number.isInteger(size) || size < 1 || size > 100 || !Number.isInteger(index) || index < 0 || index >= size) invalid();
+    if (size > 1 && !root.has(5)) throw Error('多张迁移二维码缺少批次标识，请重新导出完整批次');
     const entries = root.get(1) || [];
     if (!entries.length || entries.length > OTP_MAX_ACCOUNTS) invalid();
     const accounts = [], unsupported = [];
@@ -73,9 +77,15 @@ export function parseAuthenticatorImport(text) {
       let account = label(single(row, 2, 2), 200);
       if (issuer && account.startsWith(`${issuer}:`)) account = account.slice(issuer.length + 1).trim();
       const identity = { issuer: issuer || 'Google Authenticator', account: account || '未命名账号' };
-      const type = Number(single(row, 6, 0, 0n)), algorithm = { 1: 'SHA1', 2: 'SHA256', 3: 'SHA512' }[Number(single(row, 4, 0, 0n))];
-      const digits = { 1: 6, 2: 8 }[Number(single(row, 5, 0, 0n))];
-      if (type !== 2 || !algorithm || !digits) { unsupported.push({ ...identity, error: type === 1 ? '暂不支持计数型 HOTP' : '不支持的验证码类型、算法或位数' }); continue; }
+      // Google's unspecified/default enums mean SHA1, six digits and TOTP.
+      // Other explicit values must never silently fall back to those defaults.
+      const type = single(row, 6, 0, 0n), algorithm = { 0: 'SHA1', 1: 'SHA1', 2: 'SHA256', 3: 'SHA512' }[single(row, 4, 0, 0n).toString()];
+      const digits = { 0: 6, 1: 6, 2: 8 }[single(row, 5, 0, 0n).toString()];
+      if (![0n, 2n].includes(type) || !algorithm || !digits) { unsupported.push({ ...identity, error: type === 1n ? '暂不支持计数型 HOTP' : '不支持的验证码类型、算法或位数' }); continue; }
+      // A counter contradicts the time-based configuration, even if the type
+      // enum was omitted. Do not turn a HOTP record into a TOTP record.
+      const counter = single(row, 7, 0, 0n);
+      if (counter !== 0n) { unsupported.push({ ...identity, error: '账号包含计数器，无法作为时间型 TOTP 导入' }); continue; }
       const secret = single(row, 1, 2);
       if (!secret || secret.length < 10 || secret.length > 160) invalid();
       accounts.push(normalizeOtpAccount({ ...identity, secret: Secret.fromHex(Array.from(secret, byte => byte.toString(16).padStart(2, '0')).join('')).base32, algorithm, digits, period: 30 }));

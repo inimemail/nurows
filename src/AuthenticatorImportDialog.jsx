@@ -23,7 +23,7 @@ export default function AuthenticatorImportDialog({ Dialog, existing, busy, erro
     if (!camera) return;
     const controller = new AbortController();
     void scanAuthenticatorCamera(video.current, text => {
-      if (!controller.signal.aborted && !processing.current) try { accept(text); } catch (err) { setError(err.message); }
+      if (!controller.signal.aborted && !processing.current) try { accept(text); } catch (err) { setError(`二维码已识别，但未导入：${err.message}`); }
     }, err => { if (!controller.signal.aborted) { setError(err.message); setCamera(false); } }, controller.signal)
       .catch(() => { if (!controller.signal.aborted) { setError('无法打开摄像头，请允许摄像头权限或选择二维码图片'); setCamera(false); } });
     return () => controller.abort();
@@ -42,12 +42,13 @@ export default function AuthenticatorImportDialog({ Dialog, existing, busy, erro
     try {
       for (let i = 0; i < list.length && !controller.signal.aborted; i++) {
         setProgress(`正在识别 ${i + 1}/${list.length} 张`);
-        try { const text = await readAuthenticatorQr(list[i], controller.signal); if (!controller.signal.aborted) accept(text); }
-        catch (err) { if (!controller.signal.aborted) { failed++; lastFailure = `第 ${i + 1} 张：${err.message}`; setError(lastFailure); } }
+        let decoded = false;
+        try { const text = await readAuthenticatorQr(list[i], controller.signal); decoded = true; if (!controller.signal.aborted) accept(text); }
+        catch (err) { if (!controller.signal.aborted) { failed++; lastFailure = `第 ${i + 1} 张：${decoded ? '二维码已识别，但未导入：' : ''}${err.message}`; setError(lastFailure); } }
       }
     } finally {
       processing.current = false;
-      if (alive.current && !controller.signal.aborted) { setReading(false); if (failed) setError(`${failed} 张未成功识别。${lastFailure}`); setProgress(failed ? `${failed} 张未导入，可重新选择图片` : '图片识别完成'); }
+      if (alive.current && !controller.signal.aborted) { setReading(false); if (failed) setError(`${failed} 张未导入。${lastFailure}`); setProgress(failed ? `${failed} 张未导入，可重新选择图片` : '图片识别完成'); }
     }
   }
   async function save() {

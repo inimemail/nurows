@@ -66,7 +66,7 @@ test('closing camera scanning aborts its stream lifecycle and late callbacks do 
 test('failed images remain visible even when a later image succeeds', async () => {
   const h = harness({ read: async file => { if (file.bad) throw Error('图片模糊'); return file.text; } });
   await h.files([{ bad: true }, { text: uri }]); h.render();
-  assert.match(h.text(), /1 张未成功识别/); assert.equal(h.button('导入 1 个账号').props.disabled, false); h.unmount();
+  assert.match(h.text(), /1 张未导入/); assert.equal(h.button('导入 1 个账号').props.disabled, false); h.unmount();
 });
 
 test('the preview explains account capacity before sending an oversized import', async () => {
@@ -74,4 +74,33 @@ test('the preview explains account capacity before sending an oversized import',
   await h.files([{ text: uri }]); h.render();
   assert.match(h.text(), /还可添加 0 个/); assert.equal(h.button('导入 1 个账号').props.disabled, true);
   await h.button('导入 1 个账号').props.onClick(); assert.equal(h.calls.length, 0); h.unmount();
+});
+
+
+test('decoded migration format errors show the version without calling them image recognition failures', async () => {
+  const payload = Buffer.from([16, 3]);
+  const text = 'otpauth-migration://offline?data=' + encodeURIComponent(payload.toString('base64'));
+  const h = harness(); await h.files([{ text }]); h.render();
+  assert.match(h.text(), /二维码已识别，但未导入：暂不支持谷歌迁移格式版本 3/);
+  assert.doesNotMatch(h.text(), /未成功识别/);
+  assert.equal(h.button('导入 0 个账号').props.disabled, true);
+  assert.equal(h.calls.length, 0); h.unmount();
+});
+
+
+test('image imports accept version-two and omitted-version payloads with default OTP fields', async () => {
+  const field = (id, value) => { const bytes = Buffer.from(value); return Buffer.concat([Buffer.from([id * 8 + 2, bytes.length]), bytes]); };
+  const account = field(1, Buffer.concat([field(1, '12345678901234567890'), field(2, 'Example:alice'), field(3, 'Example')]));
+  for (const version of [null, 0, 1, 2]) {
+    const payload = Buffer.concat([account, version === null ? Buffer.alloc(0) : Buffer.from([16, version])]);
+    const text = 'otpauth-migration://offline?data=' + encodeURIComponent(payload.toString('base64'));
+    const h = harness(); await h.files([{ text }]); h.render();
+    assert.equal(h.button('导入 1 个账号').props.disabled, false);
+    assert.doesNotMatch(h.text(), /未导入|暂不支持/);
+    await h.button('导入 1 个账号').props.onClick();
+    assert.equal(h.calls[0][1].accounts[0].algorithm, 'SHA1');
+    assert.equal(h.calls[0][1].accounts[0].digits, 6);
+    assert.equal(h.calls[0][1].accounts[0].account, 'alice');
+    h.unmount();
+  }
 });

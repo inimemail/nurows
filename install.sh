@@ -651,9 +651,11 @@ PY
 }
 
 run_backup_codec() {
-  local helper="$1" mode="$2" key_file="$3" codec
+  local helper="$1" mode="$2" key_file="$3" codec key_owner
   codec="$(cat "${helper}")"
+  key_owner="$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_uid}:{s.st_gid}")' "${key_file}")"
   docker run --rm -i --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --user "${key_owner}" \
     -v "${key_file}:/run/backup-key:ro" --entrypoint node node:22-alpine \
     -e "${codec}" "${mode}" /run/backup-key
 }

@@ -22,6 +22,19 @@ async function run(file, args) {
   const [code] = await once(p, "exit");
   assert.equal(code, 0, output);
 }
+test('backup codec uses the protected key file owner inside its no-capabilities container', async (t) => {
+  const tmp = await dir(t), key = path.join(tmp, 'master.key'), helper = path.join(tmp, 'codec.cjs');
+  await fs.writeFile(key, 'a'.repeat(64) + '\n', { mode: 0o600 });
+  await fs.chmod(key, 0o600);
+  await fs.writeFile(helper, 'fixture-codec');
+  const script = `source "$1/install.sh"; docker(){ printf '%s\\n' "$@"; }; run_backup_codec "$2" encrypt "$3"`;
+  const output = execFileSync('bash', ['-c', script, '_', root, helper, key], { encoding: 'utf8' }).trim().split('\n');
+  const stat = await fs.stat(key);
+  assert.ok(output.includes('--cap-drop'));
+  assert.ok(output.includes('ALL'));
+  assert.equal(output[output.indexOf('--user') + 1], `${stat.uid}:${stat.gid}`);
+  assert.ok(output.some(argument => argument.endsWith(':/run/backup-key:ro')));
+});
 test("online snapshots recover committed WAL writes, independent notes and attachments", async (t) => {
   const tmp = await dir(t),
     data = path.join(tmp, "data");

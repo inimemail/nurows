@@ -49,6 +49,7 @@ export function noteBody(value) {
     ],
     allowedAttributes: {
       details: ["open"],
+      summary: ["data-note-heading-level"],
       a: ["href", "title", "target", "rel"],
       img: ["src", "alt", "title"],
       code: ["class"],

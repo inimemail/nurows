@@ -136,6 +136,49 @@ test('encrypted backup rejects tampering and restores only valid accounts', asyn
   await assert.rejects(() => decodeAuthenticatorBackup(backup, 'wrong password'), /错误/);
 });
 
+test('routine APIs never return saved keys; page codes are bounded, cached, expire and cannot renew an idle grant', async () => {
+  const { db, store } = fixture(), routes = {};
+  try {
+    const id = store.save(config());
+    const app = Object.fromEntries(['get', 'post', 'put', 'delete'].map(method => [method, (path, handler) => { routes[`${method} ${path}`] = handler; }]));
+    let time = 59000, decryptions = 0;
+    const account = store.account; store.account = id => { decryptions++; return account(id); };
+    registerAuthenticatorRoutes(app, store, async req => { if (req.body.password !== 'correct-password') throw Error('密码错误'); }, { now: () => time });
+    const auth = {}, call = async (method, path, body = {}, token = '', params = {}) => {
+      const res = { code: 200, set() {}, status(code) { this.code = code; return this; }, json(value) { this.data = value; } };
+      await routes[`${method} /api/authenticator${path}`]({ auth, body, params, headers: { 'x-authenticator-unlock': token } }, res);
+      return res;
+    };
+    const unlocked = await call('post', '/unlock', { password: 'correct-password' });
+    const token = unlocked.data.token;
+    assert.equal(decryptions, 0, 'unlock does not decrypt the entire vault');
+    assert.equal(unlocked.data.accounts[0].secret, undefined);
+    assert.match(unlocked.data.accounts[0].fingerprint, /^[a-f0-9]{64}$/);
+    for (const [method, path, body] of [['get', '', {}], ['post', '/session', {}], ['put', '/settings', { idleMinutes: 5 }], ['put', '/order', { id, targetId: id, placement: 'before' }]]) {
+      const response = await call(method, path, body, token);
+      assert.equal(response.code, 200); assert.equal(JSON.stringify(response.data).includes(secret), false);
+    }
+    assert.equal((await call('post', '/codes', { ids: [id] })).code, 423);
+    const first = await call('post', '/codes', { ids: [id] }, token);
+    assert.deepEqual(first.data.codes[0], { id, revision: 1, code: '287082', validFrom: 30000, validUntil: 60000 });
+    assert.equal(JSON.stringify(first.data).includes(secret), false);
+    await call('post', '/codes', { ids: [id] }, token); assert.equal(decryptions, 1, 'same-period codes reuse bounded cache');
+    for (const ids of [null, [id, id], Array(51).fill(id), ['missing']]) assert.equal((await call('post', '/codes', { ids }, token)).code, 400);
+    time = 60000;
+    const next = await call('post', '/codes', { ids: [id] }, token);
+    assert.equal(next.data.codes[0].validFrom, 60000); assert.equal(decryptions, 2);
+    const replacement = { ...config(), revision: 1, secret: 'JBSWY3DPEHPK3PXP' };
+    assert.equal((await call('put', '/:id', replacement, token, { id })).code, 400);
+    assert.equal(store.account(id).secret, secret);
+    const edited = await call('put', '/:id', { ...replacement, password: 'correct-password' }, token, { id });
+    assert.equal(edited.code, 200); assert.equal(edited.data.item.secret, undefined);
+    assert.equal(JSON.stringify(edited.data).includes(replacement.secret), false);
+    const newCode = await call('post', '/codes', { ids: [id] }, token); assert.equal(newCode.data.codes[0].revision, 2);
+    time += 299000; assert.equal((await call('post', '/codes', { ids: [id] }, token)).code, 200);
+    time += 1001; assert.equal((await call('post', '/codes', { ids: [id] }, token)).code, 423, 'code polling must not prolong idle unlock');
+  } finally { db.close(); }
+});
+
 test('batch import atomically skips duplicate keys without overwriting accounts or leaking secrets', () => {
   const { db, store } = fixture();
   try {

@@ -1,14 +1,20 @@
 import { parentPort, workerData } from "node:worker_threads";
-import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { imageSize } from "image-size";
 import { createNotesStore } from "./notes-store.js";
+import { migrateNotesDatabase, openEncryptedNotes, migrateAttachments, decodeAttachment } from './notes-storage.js';
+const key = Buffer.from(workerData.key);
+workerData.key.fill(0);
 const attachmentDir = path.join(
   path.dirname(workerData.filename),
   "note-attachments",
 );
-const store = createNotesStore(new Database(workerData.filename), {attachmentDir});
+await migrateNotesDatabase(workerData.filename, key);
+const db = openEncryptedNotes(workerData.filename, key);
+const store = createNotesStore(db, {attachmentDir});
+const attachmentSize = db.prepare('SELECT size FROM attachments WHERE id=?');
+await migrateAttachments(attachmentDir, key, id => attachmentSize.get(id)?.size);
 const addAttachment = store.attachmentAdd;
 const cleanup = store.cleanup;
 store.cleanup = () => {
@@ -32,9 +38,9 @@ store.cleanup = () => {
 };
 store.attachmentAdd = (args) => {
   if (args.mime.startsWith("image/")) {
-    const dimensions = imageSize(
-      fs.readFileSync(path.join(attachmentDir, args.id)),
-    );
+    const decoded = decodeAttachment(fs.readFileSync(path.join(attachmentDir, args.id)), key);
+    let dimensions;
+    try { dimensions = imageSize(decoded); } finally { decoded.fill(0); }
     if (
       !dimensions.width ||
       !dimensions.height ||
@@ -46,10 +52,21 @@ store.attachmentAdd = (args) => {
   }
   return addAttachment(args);
 };
+store.readAttachment = (args) => {
+  const item = store.attachment(args), filename = path.join(attachmentDir, item.id);
+  if (fs.statSync(filename).size > 10 * 1024 * 1024 + 36) throw Error('附件大小异常');
+  return { item, data: decodeAttachment(fs.readFileSync(filename), key) };
+};
+parentPort.postMessage({ ready: true });
 parentPort.on("message", ({ requestId, method, args }) => {
   try {
     if (!Object.hasOwn(store, method)) throw new Error("未知笔记操作");
-    parentPort.postMessage({ requestId, result: store[method](args || {}) });
+    const result = store[method](args || {});
+    if (method === 'readAttachment') {
+      // Transfer a dedicated buffer, never Node's shared Buffer pool.
+      const data = Uint8Array.from(result.data); result.data.fill(0);
+      parentPort.postMessage({ requestId, result: { ...result, data } }, [data.buffer]);
+    } else parentPort.postMessage({ requestId, result });
   } catch (error) {
     parentPort.postMessage({
       requestId,

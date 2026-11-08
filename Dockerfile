@@ -32,7 +32,7 @@ COPY --from=build /app/shared ./shared
 COPY --from=build /app/probe-agent ./probe-agent
 COPY .env.example ./.env.example
 
-RUN mkdir -p /app/data && chown -R app:app /app
+RUN mkdir -p /app/data /app/secrets && chown -R app:app /app
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0

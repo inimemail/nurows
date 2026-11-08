@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
-import { normalizeOtpAccount, OTP_MAX_ACCOUNTS } from '../shared/authenticator.js';
+import { normalizeOtpAccount, otpCode, OTP_MAX_ACCOUNTS } from '../shared/authenticator.js';
 const scrypt = promisify(crypto.scrypt);
 
 export async function encodeAuthenticatorBackup(accounts, passphrase) {
@@ -43,7 +43,7 @@ export function createAuthenticatorStore(db, encrypt, decrypt) {
     INSERT OR IGNORE INTO authenticator_settings VALUES (1, 5);
     CREATE TABLE IF NOT EXISTS authenticator_audit (id INTEGER PRIMARY KEY, action TEXT NOT NULL, created_at INTEGER NOT NULL);`);
   const all = db.prepare('SELECT * FROM authenticator_accounts ORDER BY position, created_at, id');
-  const metadata = db.prepare('SELECT id,issuer,account,note,algorithm,digits,period,revision FROM authenticator_accounts ORDER BY position,created_at,id');
+  const metadata = db.prepare('SELECT id,issuer,account,note,algorithm,digits,period,revision,fingerprint FROM authenticator_accounts ORDER BY position,created_at,id');
   const orderedIds = db.prepare('SELECT id FROM authenticator_accounts ORDER BY position,created_at,id');
   const count = db.prepare('SELECT COUNT(*) AS n FROM authenticator_accounts');
   const get = db.prepare('SELECT * FROM authenticator_accounts WHERE id=?');
@@ -83,7 +83,7 @@ export function createAuthenticatorStore(db, encrypt, decrypt) {
     return nextId;
   }
   return {
-    list: () => ({ accounts: metadata.all(), settings: settings() }),
+    list: (fingerprints = false) => ({ accounts: metadata.all().map(({ fingerprint, ...item }) => fingerprints ? { ...item, fingerprint } : item), settings: settings() }),
     audit(action) {
       const time = Date.now();
       pruneAudit();
@@ -127,6 +127,7 @@ export function createAuthenticatorStore(db, encrypt, decrypt) {
 export function registerAuthenticatorRoutes(app, store, verifyPassword, { now = Date.now, sessionValid = () => true } = {}) {
   const grants = new Map();
   const pending = new WeakSet();
+  const codeCache = new Map();
   let expensive = 0;
   const privateJob = fn => async (req, res) => {
     // Leave capacity in Node's default worker pool for DNS and file operations.
@@ -135,15 +136,15 @@ export function registerAuthenticatorRoutes(app, store, verifyPassword, { now = 
     try { await fn(req, res); } finally { pending.delete(req.auth); expensive--; }
   };
   const duration = () => store.settings().idleMinutes * 60000;
-  const snapshot = () => ({ ...store.list(), serverTime: now() });
-  const requireGrant = req => {
+  const snapshot = (unlocked = false) => ({ ...store.list(unlocked), serverTime: now() });
+  const requireGrant = (req, touch = true) => {
     const token = req.headers['x-authenticator-unlock'];
     const grant = typeof token === 'string' ? grants.get(token) : null;
     if (!grant || grant.session !== req.auth || !sessionValid(req) || grant.expires <= now() || grant.deadline <= now()) {
       if (grant && (grant.expires <= now() || grant.deadline <= now() || (grant.session === req.auth && !sessionValid(req)))) grants.delete(token);
       const error = Error('验证器已锁定，请重新解锁'); error.statusCode = 423; throw error;
     }
-    grant.expires = Math.min(grant.deadline, now() + duration());
+    if (touch) grant.expires = Math.min(grant.deadline, now() + duration());
     return grant;
   };
   const route = fn => async (req, res) => {
@@ -158,12 +159,11 @@ export function registerAuthenticatorRoutes(app, store, verifyPassword, { now = 
     if (!sessionValid(req)) { const error = Error('登录已失效，请重新登录'); error.statusCode = 401; throw error; }
     for (const [key, grant] of grants) if (grant.expires <= now() || grant.deadline <= now()) grants.delete(key);
     if (grants.size >= 100) { const error = Error('解锁会话过多，请稍后重试'); error.statusCode = 429; throw error; }
-    const accounts = store.secrets();
     const token = crypto.randomBytes(32).toString('hex');
     const grant = { session: req.auth, deadline: now() + 30 * 60000, expires: now() + duration() };
     grants.set(token, grant);
     store.audit('unlock');
-    res.json({ ...snapshot(), accounts, token, expiresAt: grant.expires, deadline: grant.deadline });
+    res.json({ ...snapshot(true), token, expiresAt: grant.expires, deadline: grant.deadline });
   })));
   app.post('/api/authenticator/lock', route((req, res) => {
     const token = req.headers['x-authenticator-unlock'];
@@ -171,18 +171,36 @@ export function registerAuthenticatorRoutes(app, store, verifyPassword, { now = 
     res.json({ ok: true });
   }));
   app.post('/api/authenticator/touch', route((req, res) => { const grant = requireGrant(req); res.json({ expiresAt: grant.expires }); }));
-  app.post('/api/authenticator/session', route((req, res) => { requireGrant(req); res.json({ ...snapshot(), accounts: store.secrets() }); }));
-  app.post('/api/authenticator', route((req, res) => { requireGrant(req); const id = store.save(req.body); store.audit('create'); res.status(201).json({ ...snapshot(), item: store.account(id) }); }));
-  app.put('/api/authenticator/settings', route((req, res) => { requireGrant(req); store.configure(req.body?.idleMinutes); res.json(snapshot()); }));
-  app.put('/api/authenticator/order', route((req, res) => { requireGrant(req); store.reorder(req.body?.id, req.body?.targetId, req.body?.placement); res.json(snapshot()); }));
+  app.post('/api/authenticator/session', route((req, res) => { requireGrant(req); res.json(snapshot(true)); }));
+  app.post('/api/authenticator/codes', route((req, res) => {
+    requireGrant(req, false);
+    const ids = req.body?.ids;
+    if (!Array.isArray(ids) || ids.length > 50 || ids.some(id => typeof id !== 'string' || id.length > 100) || new Set(ids).size !== ids.length) throw Error('一次最多读取当前页 50 个验证码');
+    const time = now(), accounts = new Map(store.list().accounts.map(item => [item.id, item]));
+    for (const [id, value] of codeCache) if (!accounts.has(id) || value.validUntil <= time) codeCache.delete(id);
+    const codes = ids.map(id => {
+      const item = accounts.get(id); if (!item) throw Error('验证器已被修改，请刷新后重试');
+      let value = codeCache.get(id);
+      if (!value || value.revision !== item.revision || value.validFrom > time) {
+        const interval = item.period * 1000, validFrom = Math.floor(time / interval) * interval;
+        value = { id, revision: item.revision, code: otpCode(store.account(id), time), validFrom, validUntil: validFrom + interval };
+        codeCache.set(id, value);
+      }
+      return value;
+    });
+    res.json({ codes, serverTime: time });
+  }));
+  app.post('/api/authenticator', route((req, res) => { requireGrant(req); const id = store.save(req.body); store.audit('create'); res.status(201).json({ ...snapshot(true), item: store.list().accounts.find(item => item.id === id) }); }));
+  app.put('/api/authenticator/settings', route((req, res) => { requireGrant(req); store.configure(req.body?.idleMinutes); res.json(snapshot(true)); }));
+  app.put('/api/authenticator/order', route((req, res) => { requireGrant(req); store.reorder(req.body?.id, req.body?.targetId, req.body?.placement); res.json(snapshot(true)); }));
   app.post('/api/authenticator/import-batch', route((req, res) => {
     requireGrant(req); const result = store.importBatch(req.body?.accounts); store.audit('import-batch');
-    res.json({ ...snapshot(), accounts: store.secrets(), ...result });
+    res.json({ ...snapshot(true), ...result });
   }));
   app.post('/api/authenticator/import', route(privateJob(async (req, res) => {
     requireGrant(req);
     const accounts = await decodeAuthenticatorBackup(req.body?.backup, req.body?.passphrase);
-    requireGrant(req); store.import(accounts); store.audit('import'); res.json({ ...snapshot(), accounts: store.secrets() });
+    requireGrant(req); store.import(accounts); store.audit('import'); res.json(snapshot(true));
   })));
   app.post('/api/authenticator/export', route(privateJob(async (req, res) => {
     requireGrant(req); await verifyPassword(req);
@@ -191,6 +209,11 @@ export function registerAuthenticatorRoutes(app, store, verifyPassword, { now = 
     requireGrant(req); store.audit('export'); res.json({ backup });
   })));
   app.post('/api/authenticator/:id/reveal', route(privateJob(async (req, res) => { requireGrant(req); await verifyPassword(req); requireGrant(req); const item = store.account(req.params.id); store.audit('reveal'); res.json({ item }); })));
-  app.put('/api/authenticator/:id', route((req, res) => { requireGrant(req); const id = store.save(req.body, req.params.id); store.audit('edit'); res.json({ ...snapshot(), item: store.account(id) }); }));
-  app.delete('/api/authenticator/:id', route((req, res) => { requireGrant(req); store.remove(req.params.id, req.body?.revision); store.audit('delete'); res.json(snapshot()); }));
+  app.put('/api/authenticator/:id', route(privateJob(async (req, res) => {
+    requireGrant(req);
+    if (req.body?.secret) { await verifyPassword(req); requireGrant(req); }
+    const id = store.save(req.body, req.params.id); codeCache.delete(id); store.audit('edit');
+    res.json({ ...snapshot(true), item: store.list().accounts.find(item => item.id === id) });
+  })));
+  app.delete('/api/authenticator/:id', route((req, res) => { requireGrant(req); store.remove(req.params.id, req.body?.revision); codeCache.delete(req.params.id); store.audit('delete'); res.json(snapshot(true)); }));
 }

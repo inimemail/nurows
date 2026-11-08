@@ -42,7 +42,7 @@ test('repeated authenticated input requests do not reload storage or migrate eve
     normalizeStateRecord: (value) => value, normalizeAuthRecord: (value) => value, getDefaultAuthRecord: () => ({}),
     getSqliteDb: () => ({ pragma() {}, exec() { schemaChecks += 1; }, transaction: (fn) => fn }),
     dbGetRaw: (id) => id === 'secret' ? key.toString('hex') : JSON.stringify(id === 'auth' ? storedAuth : state),
-    parseStoredRecord, loadStorageKey, process: { env: {} },
+    parseStoredRecord, loadStorageKey, defaultMasterKeyFile: () => '', ROOT_DIR: 'unused', process: { env: {} },
     dbGetJson: (id) => { if (id === 'state') { stateLoads += 1; return structuredClone(state); } return { configured: true }; },
     structuredClone, Buffer,
     crypto: { ...crypto, createDecipheriv(...args) { decryptions += 1; return crypto.createDecipheriv(...args); } },

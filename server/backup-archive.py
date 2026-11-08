@@ -17,7 +17,7 @@ def digest(file):
 
 def prune_backups(root, newest):
     # Only script-generated, completed archives in this deployment's backup folder.
-    pattern = re.compile(r'nurossh_backup_\d{8}_\d{6}(?:_[A-Za-z0-9]+)?\.tar\.gz')
+    pattern = re.compile(r'nurossh_backup_\d{8}_\d{6}(?:_[A-Za-z0-9]+)?\.tar\.gz(?:\.enc)?')
     if root.is_symlink() or not root.is_dir():
         raise ValueError('备份目录无效')
     if not pattern.fullmatch(newest):

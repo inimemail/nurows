@@ -15,7 +15,8 @@ export default function AuthenticatorWorkspace({ api, toast, Dialog, search = ''
   const [data, setData] = useState(null), [tab, setTab] = useState('saved'), [modal, setModal] = useState(null);
   const [unlocked, setUnlocked] = useState(false), [busy, setBusy] = useState(false), [error, setError] = useState('');
   const [now, setNow] = useState(Date.now()), [visible, setVisible] = useState(!document.hidden), [page, setPage] = useState(1), [temporaryEpoch, setTemporaryEpoch] = useState(0);
-  const secrets = useRef(new Map()), session = useRef(null), epoch = useRef(0), pending = useRef(false), mounted = useRef(true);
+  const [codes, setCodes] = useState(new Map());
+  const session = useRef(null), epoch = useRef(0), pending = useRef(false), mounted = useRef(true);
   const activity = useRef(Date.now()), touching = useRef(false), touched = useRef(Date.now()), offset = useRef(0), snapshot = useRef(data);
   const requests = useRef(new Set());
   snapshot.current = data;
@@ -23,24 +24,16 @@ export default function AuthenticatorWorkspace({ api, toast, Dialog, search = ''
     if (result.serverTime) { offset.current = result.serverTime - Date.now(); setNow(result.serverTime); }
     if (result.accounts) {
       const accounts = result.accounts.map(({ secret: _secret, ...metadata }) => metadata);
-      const next = new Map();
-      for (const item of result.accounts) {
-        const previous = secrets.current.get(item.id);
-        const secret = item.secret || (previous?.revision === item.revision ? previous.secret : null);
-        if (secret && session.current) next.set(item.id, { ...item, secret });
-      }
-      if (result.item && session.current) next.set(result.item.id, result.item);
-      secrets.current.clear(); secrets.current = next;
       const value = { accounts, settings: result.settings };
       snapshot.current = value; setData(value);
     }
   }
   function lock() {
     const token = session.current?.token;
-    epoch.current++; session.current = null; secrets.current.clear(); pending.current = false;
+    epoch.current++; session.current = null; pending.current = false;
     for (const controller of requests.current) controller.abort();
     requests.current.clear();
-    if (mounted.current) { setUnlocked(false); setModal(null); setBusy(false); setError(''); setTemporaryEpoch(value => value + 1); }
+    if (mounted.current) { setUnlocked(false); setCodes(new Map()); setModal(null); setBusy(false); setError(''); setTemporaryEpoch(value => value + 1); }
     if (token) void authenticatorRequest(api, '/api/authenticator/lock', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Authenticator-Unlock': token }, body: '{}' }).catch(() => {});
   }
   function ensureCurrent() {
@@ -64,12 +57,6 @@ export default function AuthenticatorWorkspace({ api, toast, Dialog, search = ''
       if (result.token) { session.current = { token: result.token, deadline: result.deadline, expires: result.expiresAt }; activity.current = touched.current = Date.now(); setUnlocked(true); }
       if (needsUnlock && session.current) session.current.expires = Math.min(session.current.deadline, Date.now() + offset.current + (snapshot.current?.settings.idleMinutes || 5) * 60000);
       accept(result);
-      // Do not combine another tab's new configuration with a cached old key.
-      if (needsUnlock && result.accounts && session.current && result.accounts.some(item => !secrets.current.has(item.id))) {
-        const fresh = await authenticatorRequest(api, '/api/authenticator/session', { method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json', 'X-Authenticator-Unlock': token }, body: '{}' });
-        if (!mounted.current || version !== epoch.current || document.hidden) throw new DOMException('Cancelled', 'AbortError');
-        accept(fresh);
-      }
       return result;
     } catch (err) {
       if (mounted.current && epoch.current === version) {
@@ -126,7 +113,37 @@ export default function AuthenticatorWorkspace({ api, toast, Dialog, search = ''
   const newAccount = config => open(unlocked ? { type: 'edit', item: { ...BASE, ...config } } : { type: 'unlock', next: config });
   const close = () => { if (!busy) { setModal(null); setError(''); } };
   async function refresh() { try { await request(unlocked ? '/session' : '', undefined, unlocked ? 'POST' : 'GET', unlocked); toast('已刷新'); } catch {} }
-  const batchDialog = useMemo(() => modal?.type === 'batch' ? <AuthenticatorImportDialog Dialog={Dialog} existing={[...secrets.current.values()]} busy={busy} error={error} request={request} onClose={close} onImported={result => { setModal(null); toast(`已导入 ${result.imported} 个账号${result.skipped ? `，跳过 ${result.skipped} 个重复账号` : ''}`); }} /> : null, [modal, busy, error, data]);
+  const codeScope = tab === 'saved' ? items.map(item => `${item.id}:${item.revision}`).join(',') : '';
+  useEffect(() => {
+    setCodes(new Map());
+    if (!unlocked || tab !== 'saved' || !codeScope) return;
+    const version = epoch.current, token = session.current?.token;
+    const ids = items.map(item => item.id), controller = new AbortController();
+    requests.current.add(controller);
+    let timer, failures = 0;
+    const load = async () => {
+      try {
+        ensureCurrent();
+        const result = await authenticatorRequest(api, '/api/authenticator/codes', { method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json', 'X-Authenticator-Unlock': token }, body: JSON.stringify({ ids }) });
+        if (controller.signal.aborted || !mounted.current || epoch.current !== version || document.hidden) return;
+        offset.current = result.serverTime - Date.now();
+        setNow(result.serverTime);
+        const current = new Map((snapshot.current?.accounts || []).map(item => [item.id, item.revision]));
+        const values = result.codes.filter(item => current.get(item.id) === item.revision);
+        setCodes(new Map(values.map(item => [item.id, item]))); failures = 0;
+        const delay = Math.max(100, Math.min(...values.map(item => item.validUntil - result.serverTime), 120000) + 50);
+        timer = setTimeout(load, delay);
+      } catch (err) {
+        if (controller.signal.aborted || epoch.current !== version || !mounted.current) return;
+        if (err.status === 423 || err.status === 401) { lock(); return; }
+        setError(err.message);
+        timer = setTimeout(load, Math.min(30000, 3000 * 2 ** Math.min(failures++, 4)));
+      }
+    };
+    void load();
+    return () => { controller.abort(); requests.current.delete(controller); clearTimeout(timer); };
+  }, [api, unlocked, tab, codeScope]);
+  const batchDialog = useMemo(() => modal?.type === 'batch' ? <AuthenticatorImportDialog Dialog={Dialog} existing={accounts} busy={busy} error={error} request={request} onClose={close} onImported={result => { setModal(null); toast(`已导入 ${result.imported} 个账号${result.skipped ? `，跳过 ${result.skipped} 个重复账号` : ''}`); }} /> : null, [modal, busy, error, data]);
   return <section className="ops-workspace authenticator-workspace">
     <header className="surface ops-header"><div><span className="ops-eyebrow">安全工具</span><strong>2FA 验证器</strong></div><div className={`authenticator-status ${unlocked ? 'unlocked' : ''}`}>{unlocked ? <ShieldCheck size={17} /> : <LockKeyhole size={17} />}<span>{accounts.length} 个验证器 · {unlocked ? '已解锁' : '已锁定'}</span>{unlocked ? <button className="ghost icon-button" title="立即锁定" aria-label="立即锁定" onClick={lock}><LockKeyhole size={17} /></button> : null}</div></header>
     <div className="ops-tabs authenticator-tabs" role="tablist" aria-label="验证器视图">{[['saved', '我的验证器', ShieldCheck], ['temporary', '临时生成', Zap]].map(([key, label, Icon]) => <button key={key} role="tab" aria-selected={tab === key} disabled={busy} className={tab === key ? 'active' : ''} onClick={() => { setTab(key); setModal(null); setError(''); }}><Icon size={16} />{label}</button>)}</div>
@@ -144,7 +161,7 @@ export default function AuthenticatorWorkspace({ api, toast, Dialog, search = ''
             onSaving={value => { if (value && (pending.current || !session.current)) return false; }}
             onReorder={body => request('/order', body, 'PUT')}>
             {item => <article className="authenticator-row"><div className="authenticator-identity"><span className="authenticator-service-icon"><ShieldCheck size={19} /></span><div><strong>{item.issuer}</strong><span>{item.account}</span>{item.note ? <small>{item.note}</small> : null}</div></div>
-              <CodeDisplay config={unlocked && visible ? secrets.current.get(item.id) : null} now={now} toast={toast} currentTime={() => { ensureCurrent(); return Date.now() + offset.current; }} />
+              <CodeDisplay value={unlocked && visible && codes.get(item.id)?.revision === item.revision ? codes.get(item.id) : null} period={item.period} now={now} toast={toast} currentTime={() => { ensureCurrent(); return Date.now() + offset.current; }} />
               <div className="authenticator-row-actions"><button className="ghost icon-button" disabled={!unlocked || busy} title="编辑" aria-label={`编辑 ${item.issuer}`} onClick={() => open({ type: 'edit', item: { ...item, secret: '' } })}><Pencil size={16} /></button><button className="ghost icon-button" disabled={!unlocked || busy} title="配置二维码" aria-label={`查看 ${item.issuer} 的配置二维码`} onClick={() => open({ type: 'reveal', item })}><QrCode size={17} /></button><button className="ghost icon-button danger-text-button" disabled={!unlocked || busy} title="删除" aria-label={`删除 ${item.issuer}`} onClick={() => open({ type: 'delete', item })}><Trash2 size={16} /></button></div>
             </article>}
           </GuardSortableList>
@@ -163,12 +180,13 @@ export default function AuthenticatorWorkspace({ api, toast, Dialog, search = ''
   </section>;
 }
 
-function CodeDisplay({ config, now, toast, currentTime }) {
+function CodeDisplay({ config, value, period = config?.period || 30, now, toast, currentTime }) {
   const otp = useMemo(() => config ? createOtp(config) : null, [config]);
-  const counter = Math.floor(now / ((config?.period || 30) * 1000));
-  const code = useMemo(() => otp ? otp.generate({ timestamp: counter * otp.period * 1000 }) : '', [otp, counter]);
-  const remaining = otpRemaining(config?.period || 30, now);
-  return <div className={`authenticator-code ${remaining <= 5 ? 'expiring' : ''} ${!otp ? 'locked' : ''}`}><span className="authenticator-digits" aria-label={otp ? `验证码 ${code}` : '验证码已锁定'}>{code ? `${code.slice(0, code.length / 2)} ${code.slice(code.length / 2)}` : '••• •••'}</span><span className="authenticator-countdown" style={{ '--remaining': `${remaining / (config?.period || 30) * 100}%` }} title={otp ? `${remaining} 秒后更新` : '已锁定'}>{otp ? remaining : <LockKeyhole size={12} />}</span><button className="ghost icon-button" disabled={!otp} title="复制验证码" aria-label="复制验证码" onClick={async () => { try { await copyNoteText(otp.generate({ timestamp: currentTime() })); toast('验证码已复制'); } catch (err) { toast(err.message); } }}><Copy size={17} /></button></div>;
+  const counter = Math.floor(now / (period * 1000));
+  const localCode = useMemo(() => otp ? otp.generate({ timestamp: counter * otp.period * 1000 }) : '', [otp, counter]);
+  const code = localCode || (value && now >= value.validFrom && now < value.validUntil ? value.code : '');
+  const remaining = otpRemaining(period, now);
+  return <div className={`authenticator-code ${remaining <= 5 ? 'expiring' : ''} ${!code ? 'locked' : ''}`}><span className="authenticator-digits" aria-label={code ? `验证码 ${code}` : '验证码已锁定'}>{code ? `${code.slice(0, code.length / 2)} ${code.slice(code.length / 2)}` : '••• •••'}</span><span className="authenticator-countdown" style={{ '--remaining': `${remaining / period * 100}%` }} title={code ? `${remaining} 秒后更新` : '已锁定'}>{code ? remaining : <LockKeyhole size={12} />}</span><button className="ghost icon-button" disabled={!code} title="复制验证码" aria-label="复制验证码" onClick={async () => { try { const time = currentTime(); if (!otp && (!value || time < value.validFrom || time >= value.validUntil)) throw Error('验证码正在更新，请稍后复制'); await copyNoteText(otp ? otp.generate({ timestamp: time }) : value.code); toast('验证码已复制'); } catch (err) { toast(err.message); } }}><Copy size={17} /></button></div>;
 }
 
 function SecretInput({ value, onChange, optional = false }) {
@@ -213,7 +231,7 @@ function AccountEditor({ Dialog, initial, busy, error, onClose, onSave }) {
     catch { patch({ secret: value }); }
   };
   return <Dialog title={item.id ? '编辑验证器' : '添加验证器'} className="authenticator-dialog" onClose={onClose} footer={<div className="dialog-actions"><button className="ghost" disabled={busy} onClick={onClose}>取消</button><button className="primary" type="submit" form="authenticator-account" disabled={busy}>{busy ? '保存中…' : '保存'}</button></div>}><form id="authenticator-account" className="authenticator-form" onSubmit={e => { e.preventDefault(); try { if (item.secret) parseOtpInput(item.secret, item); void onSave(item); } catch (err) { setLocalError(err.message); } }}>
-    <SecretInput value={item.secret} onChange={secret} optional={Boolean(item.id)} /><div className="authenticator-name-grid"><label className="ops-field"><span>服务名称 *</span><input required maxLength={120} value={item.issuer} onChange={e => patch({ issuer: e.target.value })} placeholder="例如：Cloudflare" /></label><label className="ops-field"><span>账号名称 *</span><input required maxLength={200} value={item.account} onChange={e => patch({ account: e.target.value })} placeholder="例如：name@example.com" /></label></div><label className="ops-field"><span>备注</span><textarea maxLength={500} rows={2} value={item.note} onChange={e => patch({ note: e.target.value })} /></label><Parameters value={item} onChange={value => { if (/^otpauth:/i.test(item.secret.trim())) { try { patch({ ...parseOtpInput(item.secret), ...value }); } catch { patch(value); } } else patch(value); }} />{localError || error ? <p className="auth-error" role="alert">{localError || error}</p> : null}
+    <SecretInput value={item.secret} onChange={secret} optional={Boolean(item.id)} />{item.id && item.secret ? <label className="ops-field"><span>修改密钥需验证面板密码</span><input required type="password" maxLength={1024} autoComplete="current-password" value={item.password || ''} onChange={e => patch({ password: e.target.value })} /></label> : null}<div className="authenticator-name-grid"><label className="ops-field"><span>服务名称 *</span><input required maxLength={120} value={item.issuer} onChange={e => patch({ issuer: e.target.value })} placeholder="例如：Cloudflare" /></label><label className="ops-field"><span>账号名称 *</span><input required maxLength={200} value={item.account} onChange={e => patch({ account: e.target.value })} placeholder="例如：name@example.com" /></label></div><label className="ops-field"><span>备注</span><textarea maxLength={500} rows={2} value={item.note} onChange={e => patch({ note: e.target.value })} /></label><Parameters value={item} onChange={value => { if (/^otpauth:/i.test(item.secret.trim())) { try { patch({ ...parseOtpInput(item.secret), ...value }); } catch { patch(value); } } else patch(value); }} />{localError || error ? <p className="auth-error" role="alert">{localError || error}</p> : null}
   </form></Dialog>;
 }
 

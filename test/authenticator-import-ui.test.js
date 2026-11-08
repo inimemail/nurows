@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import crypto from 'node:crypto';
 import { transformSync } from 'esbuild';
 import * as authenticator from '../shared/authenticator.js';
 import * as migration from '../shared/authenticator-migration.js';
@@ -19,7 +20,7 @@ function harness({ existing = [], read = async file => file.text, camera = async
     useEffect(fn, deps) { const i = cursor++; if (!slots[i] || deps.some((value, n) => value !== slots[i].deps[n])) { slots[i]?.cleanup?.(); slots[i] = { deps }; effects.push(() => { slots[i].cleanup = fn(); }); } }
   };
   const jsx = (type, props) => ({ type, props }), module = { exports: {} };
-  vm.runInNewContext(compiled, { module, exports: module.exports, AbortController, Set, Error, require(name) {
+  vm.runInNewContext(compiled, { module, exports: module.exports, AbortController, crypto: crypto.webcrypto, TextEncoder, Set, Error, require(name) {
     if (name === 'react') return react;
     if (name === 'react/jsx-runtime') return { jsx, jsxs: jsx };
     if (name === 'lucide-react') return new Proxy({}, { get: (_, name) => name });
@@ -45,7 +46,7 @@ test('batch preview skips already saved keys and repeated files; double submit s
   await Promise.all([submit(), submit()]);
   assert.equal(h.calls.length, 1); assert.equal(h.calls[0][0], '/import-batch'); assert.equal(h.calls[0][1].accounts.length, 1);
   assert.equal(h.imports[0].imported, 1); h.unmount();
-  const duplicate = harness({ existing: [{ secret }] }); await duplicate.files([{ text: uri }]); duplicate.render();
+  const duplicate = harness({ existing: [{ fingerprint: crypto.createHash('sha256').update(secret).digest('hex') }] }); await duplicate.files([{ text: uri }]); duplicate.render();
   assert.equal(duplicate.button('导入 0 个账号').props.disabled, true); assert.match(duplicate.text(), /已存在/); duplicate.unmount();
 });
 
@@ -70,7 +71,7 @@ test('failed images remain visible even when a later image succeeds', async () =
 });
 
 test('the preview explains account capacity before sending an oversized import', async () => {
-  const h = harness({ existing: Array.from({ length: 500 }, (_, i) => ({ secret: `existing-${i}` })) });
+  const h = harness({ existing: Array.from({ length: 500 }, (_, i) => ({ fingerprint: `existing-${i}` })) });
   await h.files([{ text: uri }]); h.render();
   assert.match(h.text(), /还可添加 0 个/); assert.equal(h.button('导入 1 个账号').props.disabled, true);
   await h.button('导入 1 个账号').props.onClick(); assert.equal(h.calls.length, 0); h.unmount();

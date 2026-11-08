@@ -21,6 +21,7 @@
     "@tiptap/starter-kit": "^3.31.3",
     "@xterm/addon-fit": "^0.10.0",
     "better-sqlite3": "^12.9.0",
+    "better-sqlite3-multiple-ciphers": "13.0.3",
     "busboy": "^1.6.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",

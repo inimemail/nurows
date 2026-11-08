@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import crypto from 'node:crypto';
 import express from "express";
 import { createNotesService, registerNotesRoutes } from "../server/notes.js";
 
@@ -10,7 +11,7 @@ test("notes worker routes authenticate uploads/downloads and safely serve active
   const dataDir = await fs.mkdtemp(
     path.join(os.tmpdir(), "nurossh-notes-http-"),
   );
-  const service = createNotesService({ dataDir });
+  const service = createNotesService({ dataDir, key: crypto.randomBytes(32) });
   const app = express();
   app.use(express.json());
   app.use("/api", (req, res, next) =>
@@ -94,4 +95,37 @@ test("notes worker routes authenticate uploads/downloads and safely serve active
   await call(`/api/notes/documents/${doc.id}`,{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({revision:original.revision})});
   await call(`/api/notes/documents/${doc.id}/purge`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({confirm:'delete-permanently'})});
   assert.equal((await call(`/api/notes/attachments/${copyId}`)).status,200);
+});
+
+test('attachment reads queue bounded bursts and retain capacity until decrypted data and response are released', async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'nurossh-notes-capacity-'));
+  const held = [];
+  const app = express();
+  const service = { call: method => method === 'readAttachment' ? new Promise(resolve => held.push(resolve)) : Promise.resolve({}) };
+  const cleanup = registerNotesRoutes(app, service, { dataDir });
+  app.use((error, _req, res, _next) => res.status(error.statusCode || 400).json({ error: error.message }));
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise(resolve => server.once('listening', resolve));
+  t.after(async () => { cleanup(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await fs.rm(dataDir, { recursive: true, force: true }); });
+  const url = `http://127.0.0.1:${server.address().port}/api/notes/attachments/${crypto.randomUUID()}`;
+  const controllers = Array.from({ length: 4 }, () => new AbortController());
+  const jobs = controllers.map(controller => fetch(url, { signal: controller.signal }).then(res => res.text()).catch(() => 'aborted'));
+  for (let i = 0; held.length < 4 && i < 100; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(held.length, 4);
+  const canceledWaiting = new AbortController();
+  const waiting = fetch(url, { signal: canceledWaiting.signal }).then(res => res.text()).catch(() => 'aborted');
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(held.length, 4, 'bursts wait instead of being rejected');
+  canceledWaiting.abort(); assert.equal(await waiting, 'aborted');
+  controllers[0].abort(); await jobs[0];
+  const next = fetch(url).then(res => res.text());
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(held.length, 4, 'cancelled active reads retain their slot during decryption');
+  const result = { item: { mime: 'application/octet-stream', name: 'fixture.txt' }, data: Buffer.from('verified') };
+  held[0](result);
+  for (let i = 0; held.length < 5 && i < 100; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(held.length, 5);
+  for (const finish of held.slice(1)) finish(result);
+  assert.equal(await next, 'verified');
+  assert.deepEqual(await Promise.all(jobs.slice(1)), ['verified', 'verified', 'verified']);
 });

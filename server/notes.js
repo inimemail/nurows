@@ -4,16 +4,20 @@ import path from "node:path";
 import fs from "node:fs";
 import { pipeline } from "node:stream/promises";
 import Busboy from "busboy";
+import { attachmentEncoder } from './notes-storage.js';
 const noteError = (message, statusCode = 400) =>
   Object.assign(new Error(message), { statusCode });
 
-export function createNotesService({ dataDir }) {
-  let worker = null;
+export function createNotesService({ dataDir, key }) {
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw Error('笔记加密密钥不可用');
+  let worker = null, initialized = false, closing = false;
   const pending = new Map();
   let nextId = 0,
     failed = false;
   const fail = (error) => {
+    if (failed) return;
     failed = true;
+    if (!closing) console.error('笔记安全存储不可用：', error.message);
     for (const item of pending.values()) {
       clearTimeout(item.timer);
       item.reject(error);
@@ -22,13 +26,14 @@ export function createNotesService({ dataDir }) {
   };
   function start() {
     worker = new Worker(new URL("./notes-worker.js", import.meta.url), {
-      workerData: { filename: path.join(dataDir, "notes.db") },
+      workerData: { filename: path.join(dataDir, "notes.db"), key },
     });
     worker.on("error", fail);
     worker.on("exit", () =>
       fail(noteError("笔记服务暂不可用，请重启服务", 503)),
     );
     worker.on("message", (message) => {
+      if (message.ready) { initialized = true; return; }
       const item = pending.get(message.requestId);
       if (!item) return;
       pending.delete(message.requestId);
@@ -42,7 +47,11 @@ export function createNotesService({ dataDir }) {
         : item.resolve(message.result);
     });
   }
+  if (fs.existsSync(path.join(dataDir, 'notes.db'))) start();
   return {
+    ready: () => !failed && (!worker || initialized),
+    failed: () => failed,
+    attachmentEncoder: () => attachmentEncoder(key),
     call(method, args = {}) {
       if (failed) return Promise.reject(noteError("笔记服务暂不可用", 503));
       if (
@@ -64,7 +73,7 @@ export function createNotesService({ dataDir }) {
         worker.postMessage({ requestId, method, args });
       });
     },
-    close: () => worker?.terminate(),
+    close: () => { closing = true; return worker?.terminate(); },
   };
 }
 export function registerNotesRoutes(app, service, { dataDir }) {
@@ -144,6 +153,7 @@ export function registerNotesRoutes(app, service, { dataDir }) {
         });
         write = pipeline(
           stream,
+          service.attachmentEncoder(),
           fs.createWriteStream(file, { flags: "wx", mode: 0o600 }),
         );
         write.catch(() => {});
@@ -179,16 +189,58 @@ export function registerNotesRoutes(app, service, { dataDir }) {
       if (!complete) await fs.promises.unlink(file).catch(() => {});
     }
   });
+  let downloads = 0;
+  const waitingDownloads = [];
+  function acquireDownload(res) {
+    return new Promise((resolve, reject) => {
+      let timer;
+      const remove = () => {
+        clearTimeout(timer);
+        res.off('close', cancel);
+        const index = waitingDownloads.indexOf(start);
+        if (index !== -1) waitingDownloads.splice(index, 1);
+      };
+      const cancel = () => { remove(); resolve(null); };
+      const start = () => {
+        remove();
+        if (res.destroyed) { resolve(null); return; }
+        downloads++;
+        let released = false;
+        resolve(() => {
+          if (released) return;
+          released = true;
+          downloads--;
+          while (downloads < 4 && waitingDownloads.length) waitingDownloads[0]();
+        });
+      };
+      if (res.destroyed) { resolve(null); return; }
+      if (downloads < 4) { start(); return; }
+      if (waitingDownloads.length >= 32) { reject(noteError('附件读取繁忙，请稍后重试', 429)); return; }
+      waitingDownloads.push(start);
+      res.once('close', cancel);
+      timer = setTimeout(() => { remove(); reject(noteError('附件读取等待超时，请重试', 503)); }, 30000);
+    });
+  }
   app.get("/api/notes/attachments/:id", async (req, res) => {
     if (!/^[a-f0-9-]{36}$/.test(req.params.id))
       throw noteError("附件不存在", 404);
-    const item = await service.call("attachment", { id: req.params.id });
-    res.set({
-      "Content-Type": item.mime,
-      "Content-Security-Policy": "default-src 'none'; sandbox",
-      "Content-Disposition": `${item.mime.startsWith("image/") ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(item.name).replace(/'/g, "%27")}`,
-    });
-    res.sendFile(path.join(directory, item.id));
+    const releaseSlot = await acquireDownload(res);
+    if (!releaseSlot) return;
+    let released = false, readComplete = false;
+    const release = () => { if (!released && readComplete) { released = true; releaseSlot(); } };
+    res.once('finish', release); res.once('close', release);
+    try {
+      const { item, data } = await service.call("readAttachment", { id: req.params.id });
+      readComplete = true;
+      if (res.destroyed) { release(); return; }
+      res.set({
+        "Content-Type": item.mime,
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "Content-Disposition": `${item.mime.startsWith("image/") ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(item.name).replace(/'/g, "%27")}`,
+      });
+      const buffer = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+      res.status(200).send(buffer);
+    } catch (error) { readComplete = true; release(); throw error; }
   });
   const timer = setInterval(
     () => service.call("cleanup").catch(() => {}),

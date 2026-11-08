@@ -150,10 +150,34 @@ require_compose() {
 }
 
 compose_cmd() {
+  local files=() configured separator candidate
+  if [[ -f docker-compose.storage.yml ]]; then
+    # Explicit -f disables Compose's automatic overrides. Preserve those and
+    # COMPOSE_FILE before appending our independent persistent key mount.
+    configured="${COMPOSE_FILE:-$(read_env_value .env COMPOSE_FILE)}"
+    configured="${configured#\"}"; configured="${configured%\"}"
+    configured="${configured#\'}"; configured="${configured%\'}"
+    if [[ -n "${configured}" ]]; then
+      separator="${COMPOSE_PATH_SEPARATOR:-$(read_env_value .env COMPOSE_PATH_SEPARATOR ':')}"
+      local configured_files=()
+      IFS="${separator}" read -r -a configured_files <<< "${configured}"
+      for candidate in "${configured_files[@]}"; do
+        [[ -z "${candidate}" ]] || files+=(-f "${candidate}")
+      done
+    else
+      for candidate in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+        if [[ -f "${candidate}" ]]; then files+=(-f "${candidate}"); break; fi
+      done
+      for candidate in compose.override.yaml compose.override.yml docker-compose.override.yaml docker-compose.override.yml; do
+        if [[ -f "${candidate}" ]]; then files+=(-f "${candidate}"); break; fi
+      done
+    fi
+    files+=(-f docker-compose.storage.yml)
+  fi
   if command -v docker-compose >/dev/null 2>&1; then
-    docker-compose "$@"
+    docker-compose "${files[@]}" "$@"
   else
-    docker compose "$@"
+    docker compose "${files[@]}" "$@"
   fi
 }
 
@@ -293,6 +317,7 @@ sync_app_bundle() {
     --exclude='./dist' \
     --exclude='./data' \
     --exclude='./backups' \
+    --exclude='./secrets' \
     --exclude='./.env' \
     --exclude='./*.log' \
     --exclude='./local-run.out' \
@@ -322,6 +347,7 @@ services:
       - "${PORT}:${PORT}"
     volumes:
       - ./data:/app/data
+      - ./secrets:/app/secrets
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -373,6 +399,20 @@ ensure_data_permissions() {
   mkdir -p "${install_path}/data" "${install_path}/backups"
   find "${install_path}/data" \( ! -user 10001 -o ! -group 10001 \) -exec chown 10001:10001 {} +
   chmod 700 "${install_path}/data" "${install_path}/backups"
+  mkdir -p "${install_path}/secrets"
+  chown 10001:10001 "${install_path}/secrets"
+  chmod 700 "${install_path}/secrets"
+}
+
+ensure_storage_mount() {
+  local workdir="$1"
+  # Merge a separate persistent key mount without rewriting custom Compose settings.
+  cat > "${workdir}/docker-compose.storage.yml" <<'EOF'
+services:
+  nurossh:
+    volumes:
+      - ./secrets:/app/secrets
+EOF
 }
 
 get_local_ip() {
@@ -441,10 +481,15 @@ deploy_service() {
 }
 
 wait_service_ready() {
-  local attempt
-  for attempt in $(seq 1 20); do
-    if compose_cmd exec -T nurossh node -e 'const http=require("node:http");const host=["0.0.0.0","::",""].includes(process.env.HOST||"")?"127.0.0.1":process.env.HOST;const req=http.get({host,port:process.env.PORT||38471,path:"/api/auth/status",timeout:1500},res=>{let body="";res.on("data",chunk=>body+=chunk);res.on("end",()=>{try{process.exit(res.statusCode===200&&typeof JSON.parse(body).configured==="boolean"?0:1)}catch{process.exit(1)}})});req.on("timeout",()=>req.destroy());req.on("error",()=>process.exit(1));' >/dev/null 2>&1; then
+  local attempt check_status
+  for attempt in $(seq 1 300); do
+    if compose_cmd exec -T nurossh node -e 'const http=require("node:http");const host=["0.0.0.0","::",""].includes(process.env.HOST||"")?"127.0.0.1":process.env.HOST;const req=http.get({host,port:process.env.PORT||38471,path:"/api/auth/status",timeout:1500},res=>{let body="";res.on("data",chunk=>body+=chunk);res.on("end",()=>{try{const result=JSON.parse(body);process.exit(res.statusCode===200&&typeof result.configured==="boolean"?0:result.code==="STORAGE_INITIALIZING"?2:1)}catch{process.exit(1)}})});req.on("timeout",()=>req.destroy());req.on("error",()=>process.exit(1));' >/dev/null 2>&1; then
       return 0
+    else
+      check_status=$?
+      # Large first-time encryption may outlast ordinary startup. Failures keep
+      # the usual timeout; only explicit ongoing migration gets more time.
+      if [[ "${check_status}" -ne 2 && "${attempt}" -ge 20 ]]; then return 1; fi
     fi
     sleep 2
   done
@@ -467,6 +512,7 @@ upgrade_service() {
   [[ -f "${workdir}/docker-compose.yml" ]] || write_compose_file "${workdir}"
   ensure_runtime_env_file "${workdir}"
   ensure_data_permissions "${workdir}"
+  ensure_storage_mount "${workdir}"
   copy_manage_script "${workdir}" "${bundle_dir}"
 
   if ! (
@@ -564,25 +610,75 @@ management_helper() {
   fi
 }
 
+backup_key_file() {
+  local workdir="$1" db_path configured_master
+  db_path="$(read_env_value "${workdir}/.env" SQLITE_DB_PATH /app/data/app.db)"
+  configured_master="$(read_env_value "${workdir}/.env" MASTER_KEY_FILE '')"
+  python3 - "${workdir}" "${db_path}" "${configured_master}" <<'PY'
+import os, secrets, sqlite3, sys
+from pathlib import Path
+root, database, custom = sys.argv[1:]
+database = database.strip().strip('"').strip("'")
+custom = custom.strip().strip('"').strip("'")
+if not database.startswith('/app/data/') or '/../' in database:
+    raise SystemExit('数据库必须位于 /app/data 持久化目录')
+directory = Path(root) / 'secrets'
+file = directory / 'master.key'
+if directory.is_symlink() or file.is_symlink():
+    raise SystemExit('主密钥路径不能是符号链接')
+if not file.exists():
+    dbfile = Path(root) / 'data' / database[len('/app/data/'):]
+    if dbfile.exists() and not custom:
+        with sqlite3.connect(f'file:{dbfile}?mode=ro', uri=True) as db:
+            row = db.execute("SELECT value FROM app_kv WHERE key='secret'").fetchone()
+            if row and row[0].startswith('wrapped-v1:'):
+                raise SystemExit('缺少原 secrets/master.key，禁止生成替代密钥，请先恢复原密钥')
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(file, 'x', opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+        stream.write(secrets.token_hex(32) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    if os.geteuid() == 0:
+        os.chown(directory, 10001, 10001)
+        os.chown(file, 10001, 10001)
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+print(file.resolve())
+PY
+}
+
+run_backup_codec() {
+  local helper="$1" mode="$2" key_file="$3" codec
+  codec="$(cat "${helper}")"
+  docker run --rm -i --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    -v "${key_file}:/run/backup-key:ro" --entrypoint node node:22-alpine \
+    -e "${codec}" "${mode}" /run/backup-key
+}
+
 backup_service() (
   set -euo pipefail
   umask 077
   require_docker
   require_compose
   ensure_host_dependencies backup
-  local workdir helper archive_helper stage snapshot timestamp db_path backup_file
+  local workdir helper archive_helper crypto_helper key_file stage snapshot timestamp db_path backup_file
   workdir="$(get_workdir)"
   [[ -n "${workdir}" ]] || die "未检测到已部署实例。"
   helper="$(management_helper storage-backup.js "${1:-}")"
   archive_helper="$(management_helper backup-archive.py "${1:-}")"
+  crypto_helper="$(management_helper backup-crypto.cjs "${1:-}")"
   mkdir -p "${workdir}/backups"
   exec 9>"${workdir}/backups/.backup.lock"
   flock -n 9 || die "已有备份正在执行，请稍后重试。"
+  key_file="$(backup_key_file "${workdir}")"
   stage="$(mktemp -d "${workdir}/backups/.stage-XXXXXX")"
   snapshot=".backup-${stage##*/}"
   trap "$(printf 'rm -rf -- %q %q' "${stage}" "${workdir}/data/${snapshot}")" EXIT
   timestamp="$(date +%Y%m%d_%H%M%S)"
-  backup_file="${workdir}/backups/${APP_NAME}_backup_${timestamp}_${stage##*-}.tar.gz"
+  backup_file="${workdir}/backups/${APP_NAME}_backup_${timestamp}_${stage##*-}.tar.gz.enc"
   db_path="$(read_env_value "${workdir}/.env" SQLITE_DB_PATH "/app/data/app.db")"
   db_path="${db_path%\"}"; db_path="${db_path#\"}"
   db_path="${db_path%\'}"; db_path="${db_path#\'}"
@@ -598,12 +694,13 @@ backup_service() (
   mv "${workdir}/data/${snapshot}" "${stage}/data"
   cp -p "${workdir}/.env" "${workdir}/docker-compose.yml" "${workdir}/manage.sh" "${stage}/"
   mkdir "${stage}/app"
-  tar --exclude='./node_modules' --exclude='./.git' --exclude='./data' --exclude='./backups' --exclude='./.env' --exclude='./dist' --exclude='__pycache__' -cf - -C "${workdir}/app" . | tar -xf - -C "${stage}/app"
+  tar --exclude='./node_modules' --exclude='./.git' --exclude='./data' --exclude='./backups' --exclude='./secrets' --exclude='./.env' --exclude='./dist' --exclude='__pycache__' -cf - -C "${workdir}/app" . | tar -xf - -C "${stage}/app"
   python3 "${archive_helper}" manifest "${stage}"
   # Fast compression reduces CPU spent on large attachments. Publish only a complete archive.
-  tar -cf - -C "${stage}" . | gzip -1 > "${backup_file}.partial"
+  tar -cf - -C "${stage}" . | gzip -1 | run_backup_codec "${crypto_helper}" encrypt "${key_file}" > "${backup_file}.partial"
   mv "${backup_file}.partial" "${backup_file}"
   info "一致性备份已创建：${backup_file}"
+  info "备份已加密。请将 ${key_file} 单独保管；恢复到其他机器时需要原密钥，密钥不包含在备份中。"
   if ! python3 "${archive_helper}" prune "${workdir}/backups" "${backup_file##*/}"; then
     warn "新备份已保存，但旧备份清理失败，请检查 backups 目录权限。"
   fi
@@ -619,15 +716,35 @@ restore_service() (
   require_docker
   require_compose
   ensure_host_dependencies backup
-  local backup_path target_dir input_path archive_root previous_dir helper confirm_restore
+  local backup_path target_dir input_path archive_root previous_dir helper confirm_restore key_file='' crypto_helper decrypted_archive=''
   read -r -p "备份压缩包路径: " backup_path
   [[ -f "${backup_path}" ]] || die "未找到备份文件。"
   backup_path="$(readlink -f "${backup_path}")"
   helper="$(management_helper backup-archive.py)"
   archive_root="$(mktemp -d)"
-  trap "$(printf 'rm -rf -- %q' "${archive_root}")" EXIT
+  trap 'rm -rf -- "${archive_root}"; [[ -z "${decrypted_archive}" ]] || rm -f -- "${decrypted_archive}"' EXIT
   info "正在校验备份和数据库，校验结束前不会停止现有服务。"
-  python3 "${helper}" extract "${backup_path}" "${archive_root}"
+  if python3 - "${backup_path}" <<'PY'
+import sys
+with open(sys.argv[1], 'rb') as stream:
+    magic = b'NUROSSH-BACKUP-1\n'
+    sys.exit(0 if stream.read(len(magic)) == magic else 1)
+PY
+  then
+    key_file="$(dirname "$(dirname "${backup_path}")")/secrets/master.key"
+    if [[ ! -f "${key_file}" ]]; then
+      read -r -p "加密备份的原主密钥文件路径（secrets/master.key）: " key_file
+    fi
+    [[ -f "${key_file}" ]] || die "未找到原主密钥，未执行恢复。"
+    key_file="$(readlink -f "${key_file}")"
+    crypto_helper="$(management_helper backup-crypto.cjs)"
+    decrypted_archive="$(mktemp)"
+    run_backup_codec "${crypto_helper}" decrypt "${key_file}" < "${backup_path}" > "${decrypted_archive}" || die "备份解密失败，原部署未修改。"
+    python3 "${helper}" extract "${decrypted_archive}" "${archive_root}"
+    rm -f -- "${decrypted_archive}"; decrypted_archive=''
+  else
+    python3 "${helper}" extract "${backup_path}" "${archive_root}"
+  fi
   read -r -p "恢复目标路径 [默认: ${DEFAULT_INSTALL_PATH}]: " input_path
   target_dir="${input_path:-$DEFAULT_INSTALL_PATH}"
   [[ "${target_dir}" == /* && "${target_dir}" != "/" && "${target_dir}" != "/root" && "${target_dir}" != "/home" && "${target_dir}" != "/opt" && ! -L "${target_dir}" ]] || die "请指定独立的绝对部署路径。"
@@ -643,8 +760,18 @@ restore_service() (
   mkdir -p "$(dirname "${target_dir}")"
   prepared="$(mktemp -d "${target_dir}.restore-XXXXXX")"
   cp -a "${archive_root}/." "${prepared}/"
+  if [[ -n "${key_file}" ]]; then
+    mkdir -p "${prepared}/secrets"
+    cp "${key_file}" "${prepared}/secrets/master.key"
+    chmod 600 "${prepared}/secrets/master.key"
+    if [[ "${EUID}" -eq 0 ]]; then chown 10001:10001 "${prepared}/secrets/master.key"; fi
+  elif [[ -f "${target_dir}/secrets/master.key" ]]; then
+    mkdir -p "${prepared}/secrets"
+    cp -p "${target_dir}/secrets/master.key" "${prepared}/secrets/master.key"
+  fi
   ensure_runtime_env_file "${prepared}"
   ensure_data_permissions "${prepared}"
+  ensure_storage_mount "${prepared}"
   if [[ -e "${target_dir}" ]]; then
     (cd "${target_dir}" && compose_cmd stop)
     previous_dir="${target_dir}.before-restore-$(date +%Y%m%d_%H%M%S)"

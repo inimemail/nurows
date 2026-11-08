@@ -9,6 +9,22 @@ if (!source || !destination || !configuredDatabase)
 const root = path.resolve(source),
   target = path.resolve(destination),
   main = path.resolve(configuredDatabase);
+let notesStorage, appKey;
+async function encryptedNotesSnapshot(src, dest) {
+  // Old deployments without encrypted notes never import the new native module.
+  notesStorage ||= await import(path.join(process.cwd(), 'server/notes-storage.js'));
+  if (!appKey) {
+    const db = new Database(main, { readonly: true, fileMustExist: true });
+    let stored;
+    try { stored = db.prepare("SELECT value FROM app_kv WHERE key='secret'").get()?.value; } finally { db.close(); }
+    const { loadStorageKey } = await import(path.join(process.cwd(), 'server/storage-key.js'));
+    const file = process.env.MASTER_KEY_FILE || path.join(process.cwd(), 'secrets', 'master.key');
+    appKey = Buffer.from(loadStorageKey(stored, file).key, 'hex');
+  }
+  const db = notesStorage.openEncryptedNotes(src, appKey, { fileMustExist: true });
+  try { db.prepare('VACUUM INTO ?').run(dest); } finally { db.close(); }
+  const check = notesStorage.openEncryptedNotes(dest, appKey, { readonly: true }); check.close();
+}
 if (
   !target.startsWith(root + path.sep + ".backup-") ||
   !main.startsWith(root + path.sep)
@@ -23,7 +39,7 @@ async function copyDirectory(from, to) {
   const entries = await fs.readdir(from, { withFileTypes: true });
   entries.sort((a, b) => Number(a.isDirectory()) - Number(b.isDirectory()));
   for (const entry of entries) {
-    if (entry.name.startsWith(".backup-") || /-(wal|shm)$/.test(entry.name))
+    if (entry.name.startsWith(".backup-") || /-(wal|shm)$/.test(entry.name) || /\.encrypting(?:-(?:wal|shm|journal))?$/.test(entry.name))
       continue;
     const src = path.join(from, entry.name),
       dest = path.join(to, entry.name);
@@ -53,6 +69,8 @@ async function copyDirectory(from, to) {
       } finally {
         check.close();
       }
+    } else if (src === path.join(root, 'notes.db')) {
+      await encryptedNotesSnapshot(src, dest);
     } else {
       if (src === main)
         throw new Error("Configured database is not a SQLite database");

@@ -36,3 +36,25 @@ export async function copyNoteText(value) {
     }
   }
 }
+
+export function pasteNoteImages(event, editor, upload, toast) {
+  if (!editor?.isEditable || typeof upload !== "function") return false;
+  const clipboard = event.clipboardData;
+  const html = clipboard?.getData("text/html") || "";
+  if (/\/api\/notes\/attachments\/[a-f0-9-]{36}/i.test(html)) return false;
+  const items = clipboard
+    ? Array.from(clipboard.items || [])
+        .filter((item) => item.kind === "file" && /^image\//i.test(item.type))
+        .map((item) => item.getAsFile())
+        .filter(Boolean)
+    : [];
+  const files = items.length
+    ? items
+    : Array.from(clipboard?.files || []).filter((file) => /^image\//i.test(file.type));
+  if (!files.length) return false;
+  event.preventDefault();
+  void (async () => {
+    for (const file of files) await upload(file, editor);
+  })().catch((error) => toast?.(error.message || "图片粘贴失败"));
+  return true;
+}

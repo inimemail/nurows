@@ -8,8 +8,8 @@ import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
 import CodeBlockLowlight from "@tiptap/extension-code-block-lowlight";
 import { common, createLowlight } from "lowlight";
-import { copyNoteText } from "./note-clipboard.js";
-import { NoteDetails, NoteSummary } from "./note-details.js";
+import { copyNoteText, pasteNoteImages } from "./note-clipboard.js";
+import { collectNoteHeadings, NoteDetails, NoteSummary } from "./note-details.js";
 import {
   Bold,
   Italic,
@@ -105,8 +105,8 @@ export default function NoteEditor({
     copyNoteText(text)
       .then(() => toast?.("已复制"))
       .catch((error) => toast?.(error.message));
-  const callbacks = useRef({ onChange, onOutline, onReady });
-  callbacks.current = { onChange, onOutline, onReady };
+  const callbacks = useRef({ onChange, onOutline, onReady, onUpload });
+  callbacks.current = { onChange, onOutline, onReady, onUpload };
   const [slash, setSlash] = useState(null),
     [selection, setSelection] = useState(false),
     [, render] = useState(0);
@@ -145,6 +145,14 @@ export default function NoteEditor({
         if (event.key === "Escape") setSlash(null);
         return false;
       },
+      handlePaste: (view, event) => {
+        return pasteNoteImages(
+          event,
+          { isEditable: editor.isEditable },
+          callbacks.current.onUpload,
+          toast,
+        );
+      },
     },
     onUpdate: ({ editor: e }) => {
       callbacks.current.onChange(e.getHTML());
@@ -153,16 +161,7 @@ export default function NoteEditor({
       setSlash(text === "/" ? from : null);
       clearTimeout(outlineTimer.current);
       outlineTimer.current = setTimeout(() => {
-        const headings = [];
-        e.state.doc.descendants((node, pos) => {
-          if (node.type.name === "heading")
-            headings.push({
-              text: node.textContent,
-              level: node.attrs.level,
-              pos,
-            });
-        });
-        callbacks.current.onOutline(headings);
+        callbacks.current.onOutline(collectNoteHeadings(e.state.doc));
       }, 350);
     },
     onSelectionUpdate: ({ editor: e }) => {
@@ -171,16 +170,7 @@ export default function NoteEditor({
     },
     onCreate: ({ editor: e }) => {
       callbacks.current.onReady(e);
-      const headings = [];
-      e.state.doc.descendants((node, pos) => {
-        if (node.type.name === "heading")
-          headings.push({
-            text: node.textContent,
-            level: node.attrs.level,
-            pos,
-          });
-      });
-      callbacks.current.onOutline(headings);
+      callbacks.current.onOutline(collectNoteHeadings(e.state.doc));
     },
   });
   useEffect(() => {

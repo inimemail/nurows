@@ -20,21 +20,21 @@ function harness(api) {
   const module = { exports: {} };
   let time = Date.now();
   class TestDate extends Date { static now() { return time; } }
-  vm.runInNewContext(compiled, { module, exports: module.exports, document, Date: TestDate, Set, Map, JSON, AbortController, DOMException, setTimeout: fn => { timers.set(++nextTimer, fn); return nextTimer; }, clearTimeout: id => timers.delete(id),
+  vm.runInNewContext(compiled, { module, exports: module.exports, document, Date: TestDate, Set, Map, JSON, AbortController, DOMException, setTimeout: (fn, delay) => { fn.delay = delay; timers.set(++nextTimer, fn); return nextTimer; }, clearTimeout: id => timers.delete(id),
     require: name => name === 'react' ? react : name === './authenticator-request.js' ? { authenticatorRequest } : name === 'react/jsx-runtime' ? { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) } : name === 'lucide-react' ? new Proxy({}, { get: (_, key) => key }) : {} });
   const props = { api, toast() {}, Dialog() {}, search: '', onSearchScopeChange() {} };
   const render = () => { cursor = 0; const tree = module.exports.default(props); effects.splice(0).forEach(fn => fn()); return tree; };
   const find = (node, predicate) => { if (!node || typeof node !== 'object') return null; if (Array.isArray(node)) { for (const value of node) { const result = find(value, predicate); if (result) return result; } return null; } if (predicate(node)) return node; return find(node.props?.children, predicate); };
   const button = (tree, name) => find(tree, node => node.type === 'button' && (node.props['aria-label'] === name || (Array.isArray(node.props.children) && node.props.children.includes(name))));
-  return { render, find, button, document, listeners, timers, advance: ms => { time += ms; }, unmount: () => slots.forEach(slot => slot.cleanup?.()) };
+  return { render, find, button, document, listeners, timers, props, now: () => time, advance: ms => { time += ms; }, unmount: () => slots.forEach(slot => slot.cleanup?.()) };
 }
 const metadata = { accounts: [{ id: 'a', issuer: 'Example', account: 'alice', note: '', revision: 1, algorithm: 'SHA1', digits: 6, period: 30 }], settings: { idleMinutes: 5 }, serverTime: Date.now() };
-const grant = () => ({ ...metadata, accounts: [{ ...metadata.accounts[0], secret: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ' }], token: 'test-token', deadline: Date.now() + 1800000, expiresAt: Date.now() + 300000 });
+const grant = () => ({ ...metadata, token: 'test-token', deadline: Date.now() + 1800000, expiresAt: Date.now() + 300000 });
 const settle = () => new Promise(setImmediate);
 
 test('saved vault locks on hiding the page and ordinary countdown ticks do not poll', async () => {
   const calls = [];
-  const h = harness(async (path, options) => { calls.push([path, options]); return path.endsWith('/unlock') ? grant() : metadata; });
+  const h = harness(async (path, options) => { calls.push([path, options]); return path.endsWith('/unlock') ? grant() : path.endsWith('/codes') ? { codes: [], serverTime: Date.now() } : metadata; });
   h.render(); await settle();
   h.button(h.render(), '解锁').props.onClick();
   const modal = h.find(h.render(), node => node.type?.name === 'PasswordDialog');
@@ -65,7 +65,8 @@ test('unlock completing after leaving the menu never restores plaintext and revo
 test('temporary input is not persisted and mobile list does not depend on undefined parent height', () => {
   assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB|sendBeacon/);
   assert.match(source, /section: 'authenticator'/);
-  assert.match(source, /previous\?\.revision === item\.revision/);
+  assert.doesNotMatch(source, /store\.secrets|secrets\.current/);
+  assert.match(source, /current\.get\(item\.id\) === item\.revision/);
   const css = fs.readFileSync(new URL('../src/authenticator.css', import.meta.url), 'utf8');
   assert.match(css, /@media \(max-width: 760px\)/);
   assert.match(css, /\.authenticator-workspace\.ops-workspace\s*\{[^}]*height: auto/);
@@ -74,7 +75,7 @@ test('temporary input is not persisted and mobile list does not depend on undefi
 
 test('first user action after sleep cannot renew an expired local unlock', async () => {
   const calls = [];
-  const h = harness(async path => { calls.push(path); return path.endsWith('/unlock') ? grant() : metadata; });
+  const h = harness(async path => { calls.push(path); return path.endsWith('/unlock') ? grant() : path.endsWith('/codes') ? { codes: [], serverTime: Date.now() } : metadata; });
   h.render(); await settle(); h.button(h.render(), '解锁').props.onClick();
   await h.find(h.render(), node => node.type?.name === 'PasswordDialog').props.onSubmit('password');
   h.advance(300001);
@@ -110,4 +111,34 @@ test('requests time out with an operation-specific message and forward cancellat
   const request = authenticatorRequest(hang, '/api/authenticator', { signal: controller.signal });
   controller.abort();
   await assert.rejects(request, { name: 'AbortError' });
+});
+
+test('saved codes fetch only the visible page and refresh at expiry without accepting a late hidden-page response', async () => {
+  const accounts = Array.from({ length: 55 }, (_, i) => ({ ...metadata.accounts[0], id: `a${i}` }));
+  const calls = []; let late;
+  const h = harness(async (path, options) => {
+    calls.push([path, options]);
+    if (path.endsWith('/codes')) {
+      if (late === true) return new Promise(resolve => { late = resolve; });
+      return { codes: JSON.parse(options.body).ids.map(id => ({ id, revision: 1, code: '123456', validFrom: h.now() - 1000, validUntil: h.now() + 29000 })), serverTime: h.now() };
+    }
+    return { ...(path.endsWith('/unlock') ? grant() : metadata), accounts };
+  });
+  h.render(); await settle(); h.button(h.render(), '解锁').props.onClick();
+  await h.find(h.render(), node => node.type?.name === 'PasswordDialog').props.onSubmit('password');
+  h.render(); await settle(); h.render();
+  let codeCalls = calls.filter(([path]) => path.endsWith('/codes'));
+  assert.equal(codeCalls.length, 1); assert.equal(JSON.parse(codeCalls[0][1].body).ids.length, 50);
+  const list = h.find(h.render(), node => node.props?.records);
+  assert.equal(h.find(list.props.children(list.props.items[0]), node => node.type?.name === 'CodeDisplay').props.value.code, '123456');
+  assert.ok([...h.timers.values()].some(fn => fn.delay >= 29000 && fn.delay <= 29100));
+  h.button(h.render(), '下一页').props.onClick(); h.render(); await settle();
+  codeCalls = calls.filter(([path]) => path.endsWith('/codes'));
+  assert.deepEqual(JSON.parse(codeCalls.at(-1)[1].body).ids, ['a50', 'a51', 'a52', 'a53', 'a54']);
+  late = true;
+  const timer = [...h.timers.entries()].find(([, fn]) => fn.delay >= 29000); h.timers.delete(timer[0]); timer[1](); await settle();
+  h.document.hidden = true; h.listeners.get('visibilitychange')();
+  late({ codes: [{ id: 'a50', revision: 1, code: '654321', validFrom: h.now(), validUntil: h.now() + 30000 }], serverTime: h.now() }); await settle();
+  assert.equal(h.button(h.render(), '立即锁定'), null);
+  h.unmount(); assert.equal(h.timers.size, 0);
 });

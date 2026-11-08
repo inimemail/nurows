@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import { transformSync } from 'esbuild';
+import { pasteNoteImages } from '../src/note-clipboard.js';
 
 const compiled = transformSync(fs.readFileSync(new URL('../src/note-clipboard.js', import.meta.url), 'utf8'), { format: 'cjs' }).code;
 function clipboardHarness(clipboard, allowed = true) {
@@ -47,4 +48,27 @@ test('denied fallback reports a useful error and still removes temporary input a
   await assert.rejects(view.copy('192.0.2.1'), /手动复制/);
   assert.equal(view.removed.length, 1);
   assert.equal(view.focus.length, 1);
+});
+
+test('image paste uploads clipboard files while internal note images keep their attachment URLs', async () => {
+  const files = [
+    { name: 'one.png', type: 'image/png' },
+    { name: 'two.jpg', type: 'image/jpeg' },
+  ];
+  let prevented = 0;
+  const event = {
+    clipboardData: {
+      items: files.map(file => ({ kind: 'file', type: file.type, getAsFile: () => file })),
+      getData: () => '',
+    },
+    preventDefault: () => prevented++,
+  };
+  const uploaded = [];
+  assert.equal(pasteNoteImages(event, { isEditable: true }, async file => uploaded.push(file), () => {}), true);
+  for (let i = 0; i < 20 && uploaded.length < files.length; i++) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(prevented, 1);
+  assert.deepEqual(uploaded, files);
+
+  const internal = { ...event, clipboardData: { items: event.clipboardData.items, getData: () => '<img src="/api/notes/attachments/12345678-1234-1234-1234-123456789abc">' } };
+  assert.equal(pasteNoteImages(internal, { isEditable: true }, async () => assert.fail('internal images are cloned by the server'), () => {}), false);
 });

@@ -34,6 +34,7 @@ import { createNoteAutosave } from "../shared/note-autosave.js";
 import NoteEditor from "./NoteEditor.jsx";
 import NoteTree from "./NoteTree.jsx";
 import NoteOutline from "./NoteOutline.jsx";
+import { collectNoteHeadings, setHeadingSectionCollapsed } from "./note-details.js";
 import { copyNoteText } from "./note-clipboard.js";
 import Dialog from "./Dialog.jsx";
 import "./notes.css";
@@ -181,7 +182,7 @@ export default function NotesWorkspace({
                 item.id === state.document.id
                   ? {
                       ...item,
-                      title: state.document.title,
+                      title: state.document.title || "未命名文档",
                       favorite: state.document.favorite,
                       updatedAt: state.document.updatedAt,
                     }
@@ -1167,6 +1168,26 @@ export default function NotesWorkspace({
                   key={`${doc.id}:${editorEpoch}`}
                   headings={outline}
                   onClose={() => setOutlineOpen(false)}
+                  onToggle={(heading, collapsed) => {
+                    const instance = editor.current;
+                    if (!instance) return;
+                    const tr = instance.state.tr;
+                    if (setHeadingSectionCollapsed(tr, heading.pos, collapsed)) {
+                      instance.view.dispatch(tr);
+                      setOutline(collectNoteHeadings(instance.state.doc));
+                    }
+                  }}
+                  onToggleAll={(headings, collapsed) => {
+                    const instance = editor.current;
+                    if (!instance) return;
+                    const tr = instance.state.tr;
+                    for (const heading of [...headings].sort((a, b) => b.pos - a.pos))
+                      setHeadingSectionCollapsed(tr, heading.pos, collapsed);
+                    if (tr.docChanged) {
+                      instance.view.dispatch(tr);
+                      setOutline(collectNoteHeadings(instance.state.doc));
+                    }
+                  }}
                   onNavigate={(h) => {
                     const instance = editor.current;
                     if (!instance) return;

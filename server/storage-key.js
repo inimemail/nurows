@@ -1,5 +1,25 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import path from 'node:path';
+
+// This directory must be mounted separately from data and excluded from archives.
+// Never generate a replacement after an encrypted database has been initialized.
+export function defaultMasterKeyFile(stored, root) {
+  const filename = path.join(root, 'secrets', 'master.key');
+  if (fs.existsSync(path.dirname(filename)) && fs.lstatSync(path.dirname(filename)).isSymbolicLink() || fs.existsSync(filename) && fs.lstatSync(filename).isSymbolicLink()) throw Error('独立主密钥路径不能是符号链接');
+  if (!fs.existsSync(filename)) {
+    if (stored?.startsWith('wrapped-v1:')) throw Error('缺少独立主密钥 secrets/master.key，请恢复原密钥，禁止生成替代密钥');
+    fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+    try {
+      const fd = fs.openSync(filename, 'wx', 0o600);
+      try { fs.writeFileSync(fd, crypto.randomBytes(32).toString('hex') + '\n'); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      const directory = fs.openSync(path.dirname(filename), 'r');
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+  }
+  return filename;
+}
 
 // Wrap the existing application key, so enabling this does not re-encrypt or
 // invalidate any saved SSH, cloud or Telegram credential.

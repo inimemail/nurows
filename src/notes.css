@@ -734,6 +734,17 @@ body:has(.notes-fullscreen, .note-dialog) .toast-stack {
 .note-details[data-open="false"] .note-details-content {
   display: none;
 }
+.note-details-label {
+  display: none;
+  min-height: 38px;
+  align-content: center;
+  padding: 8px 14px 8px 43px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.note-details[data-open="false"] .note-details-label {
+  display: block;
+}
 .note-details-toggle {
   float: left;
   width: 30px;
@@ -756,6 +767,12 @@ body:has(.notes-fullscreen, .note-dialog) .toast-stack {
   cursor: pointer;
   font-weight: 600;
 }
+.note-prose summary[data-note-heading-level="1"] { font-size: 2em; }
+.note-prose summary[data-note-heading-level="2"] { font-size: 1.5em; }
+.note-prose summary[data-note-heading-level="3"] { font-size: 1.25em; }
+.note-prose summary[data-note-heading-level="4"] { font-size: 1.1em; }
+.note-prose summary[data-note-heading-level="5"] { font-size: 1em; }
+.note-prose summary[data-note-heading-level="6"] { font-size: 0.9em; }
 .note-prose ul[data-type="taskList"] {
   list-style: none;
   padding: 0;

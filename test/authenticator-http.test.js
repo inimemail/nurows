@@ -64,7 +64,10 @@ test('real 2FA API isolates secrets, persists through restart, and needs new gra
   assert.equal((await call('/api/authenticator/session', {}, 'POST', grant.token)).status, 423);
   const reopened = await (await call('/api/authenticator/unlock', { password })).json();
   assert.equal(reopened.accounts.length, 2);
-  assert.equal(reopened.accounts[0].secret, config.secret);
+  assert.equal(reopened.accounts[0].secret, undefined);
+  const codes = await (await call('/api/authenticator/codes', { ids: [item.id] }, 'POST', reopened.token)).json();
+  assert.match(codes.codes[0].code, /^\d{6}$/);
+  assert.equal(codes.codes[0].secret, undefined);
   assert.equal(reopened.accounts[0].id, item.id);
   assert.equal((await call('/api/workspace', { tab: 'authenticator' })).status, 200);
   assert.equal((await (await call('/api/state', undefined, 'GET')).json()).workspace.tab, 'authenticator');

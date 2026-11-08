@@ -18,7 +18,7 @@ import { registerConfigBulkDeleteRoutes } from './config-bulk-delete.js';
 import { runLocalWebhook, runSshWebhook } from './webhook-runtime.js';
 import { poolHealthSummary, poolHealthProbeState, poolHealthSchedule, clonePoolHealthPools } from './pool-health-check.js';
 import { parseStoredRecord } from './storage-validation.js';
-import { loadStorageKey } from './storage-key.js';
+import { loadStorageKey, defaultMasterKeyFile } from './storage-key.js';
 import { createSessionSocketRegistry, createWebSocketUpgradeHandler, createWebSocketTickets } from './websocket-security.js';
 import { commandJobDelta, workspaceResultPreviews, COMMAND_HISTORY_LIMIT } from '../shared/command-output.js';
 import express from 'express';
@@ -280,7 +280,7 @@ function loadRuntimeEnv() {
 
 ensureStorage();
 cleanupExpiredSessions();
-const notesService = createNotesService({ dataDir: DATA_DIR });
+const notesService = createNotesService({ dataDir: DATA_DIR, key: getAppSecretKey() });
 webhookService = createWebhookService({
   db: getSqliteDb(), encrypt: encryptSecret, decrypt: decryptSecret,
   servers: () => (cachedState.servers || []).map(({ id, name, host }) => ({ id, name, host })),
@@ -384,6 +384,10 @@ registerAuthenticatorRoutes(app, createAuthenticatorStore(getSqliteDb(), encrypt
 }, { sessionValid: req => getSessionFromRequest(req) === req.auth });
 
 app.get('/api/auth/status', (req, res) => {
+  if (!notesService.ready()) {
+    const failed = notesService.failed();
+    res.status(503).json({ error: failed ? '笔记安全存储校验失败，请检查服务日志' : '笔记安全存储正在初始化，请稍后重试', code: failed ? 'STORAGE_FAILED' : 'STORAGE_INITIALIZING' }); return;
+  }
   const auth = readAuth();
   const session = getSessionFromRequest(req);
   res.json({
@@ -1635,7 +1639,9 @@ function getSqliteDb() {
 }
 
 function migrateLegacyStorage() {
-  return getSqliteDb().transaction(() => {
+  const db = getSqliteDb();
+  db.pragma('secure_delete=ON');
+  db.transaction(() => {
     const existingState = dbGetRaw(STORAGE_KEYS.state);
     const existingAuth = dbGetRaw(STORAGE_KEYS.auth);
     if (existingState !== null) parseStoredRecord(existingState, 'state');
@@ -1671,10 +1677,23 @@ function migrateLegacyStorage() {
     cachedState = dbGetJson(STORAGE_KEYS.state, defaultState, normalizeStateRecord);
     cachedAuth = dbGetJson(STORAGE_KEYS.auth, getDefaultAuthRecord(), normalizeAuthRecord);
     const storedKey = dbGetRaw(STORAGE_KEYS.secret);
-    const loadedKey = loadStorageKey(storedKey, process.env.MASTER_KEY_FILE || '');
-    if (loadedKey.stored !== storedKey) dbSetRaw(STORAGE_KEYS.secret, loadedKey.stored);
+    const loadedKey = loadStorageKey(storedKey, process.env.MASTER_KEY_FILE || defaultMasterKeyFile(storedKey, ROOT_DIR));
+    if (loadedKey.stored !== storedKey) {
+      dbSetRaw(STORAGE_KEYS.secret, loadedKey.stored);
+    }
+    if (loadedKey.stored.startsWith('wrapped-v1:') && dbGetRaw('key_hygiene') !== 'done') dbSetRaw('key_hygiene', 'pending');
     cachedSecretHex = loadedKey.key;
   })();
+  if (dbGetRaw('key_hygiene') === 'pending') {
+    // Remove the old unwrapped key from free pages and WAL after the commit.
+    db.exec('VACUUM');
+    if (db.pragma('wal_checkpoint(TRUNCATE)')[0]?.busy) throw Error('应用密钥迁移尚未完成，请停止其他进程后重试');
+    if (fs.existsSync(LEGACY_SECRET_FILE)) {
+      if (fs.readFileSync(LEGACY_SECRET_FILE, 'utf8').trim() === cachedSecretHex) fs.unlinkSync(LEGACY_SECRET_FILE);
+      else console.warn('发现不匹配的旧版 secret.key，已保留原文件；当前数据库继续使用独立主密钥。');
+    }
+    dbSetRaw('key_hygiene', 'done');
+  }
 }
 
 function dbGetRaw(key) {
@@ -1749,7 +1768,8 @@ function deriveEncryptionKey(password, salt) {
 function getAppSecretKey() {
   ensureStorage();
   if (!cachedSecretHex) {
-    cachedSecretHex = loadStorageKey(dbGetRaw(STORAGE_KEYS.secret), process.env.MASTER_KEY_FILE || '').key;
+    const stored = dbGetRaw(STORAGE_KEYS.secret);
+    cachedSecretHex = loadStorageKey(stored, process.env.MASTER_KEY_FILE || defaultMasterKeyFile(stored, ROOT_DIR)).key;
   }
   return Buffer.from(cachedSecretHex, 'hex');
 }

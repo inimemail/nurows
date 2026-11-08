@@ -129,6 +129,7 @@ test("rich text rejects oversized content and removes active HTML and remote ima
   );
   assert.ok(!/script|onclick|javascript:|evil|iframe|svg/.test(result));
   assert.ok(result.includes("/api/notes/attachments/"));
+  assert.match(noteBody('<details><summary data-note-heading-level="2">标题</summary><p>正文</p></details>'), /data-note-heading-level="2"/);
   assert.throws(() => noteBody("x".repeat(1024 * 1024 + 1)), /1 MB/);
 });
 test("damaged persisted auth/state fails closed, never returns empty defaults", () => {
@@ -165,6 +166,19 @@ test("autosave serializes requests and never replaces newer typing with an old r
   await promise;
   assert.equal(manager.get().revision, 3);
   assert.equal(manager.dirty(), false);
+  manager.dispose();
+});
+test("an empty title response does not replace the user's in-progress title with the server fallback", async () => {
+  const manager = createNoteAutosave({
+    save: async (doc) => ({ ...doc, title: doc.title.trim() || "未命名文档", revision: doc.revision + 1 }),
+  });
+  manager.open({ id: "title", title: "现有标题", body: "", revision: 1 });
+  manager.update({ title: "" });
+  await manager.flush();
+  assert.equal(manager.get().title, "");
+  manager.update({ title: "继续输入" });
+  await manager.flush();
+  assert.equal(manager.get().title, "继续输入");
   manager.dispose();
 });
 test("failed saves retain text and block switching until saved or explicitly discarded", async () => {

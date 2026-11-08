@@ -1,8 +1,7 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useMemo } from "react";
 import { ChevronRight, X } from "lucide-react";
 
-export default memo(function NoteOutline({ headings, onClose, onNavigate }) {
-  const [closed, setClosed] = useState(new Set());
+export default memo(function NoteOutline({ headings, onClose, onNavigate, onToggle, onToggleAll }) {
   const rows = useMemo(() => {
     const result = [];
     let hiddenBelow = null;
@@ -12,10 +11,10 @@ export default memo(function NoteOutline({ headings, onClose, onNavigate }) {
       hiddenBelow = null;
       const children = headings[i + 1]?.level > h.level;
       result.push({ ...h, children });
-      if (children && closed.has(h.pos)) hiddenBelow = h.level;
+      if (h.collapsed) hiddenBelow = h.level;
     }
     return result;
-  }, [headings, closed]);
+  }, [headings]);
   return (
     <aside className="note-outline" aria-label="文档大纲">
       <div className="note-outline-head">
@@ -27,12 +26,8 @@ export default memo(function NoteOutline({ headings, onClose, onNavigate }) {
       {headings.length ? (
         <>
           <div className="note-outline-actions">
-            <button onClick={() => setClosed(new Set())}>全部展开</button>
-            <button
-              onClick={() => setClosed(new Set(headings.map((h) => h.pos)))}
-            >
-              全部收起
-            </button>
+            <button onClick={() => onToggleAll?.(headings, false)}>全部展开</button>
+            <button onClick={() => onToggleAll?.(headings, true)}>全部收起</button>
           </div>
           <nav>
             {rows.map((h) => (
@@ -41,18 +36,12 @@ export default memo(function NoteOutline({ headings, onClose, onNavigate }) {
                 key={h.pos}
                 style={{ paddingLeft: (h.level - 1) * 10 }}
               >
-                {h.children ? (
+                {h.children || h.foldable ? (
                   <button
                     className="note-tree-toggle"
-                    aria-label={`${closed.has(h.pos) ? "展开" : "收起"}大纲：${h.text}`}
-                    aria-expanded={!closed.has(h.pos)}
-                    onClick={() =>
-                      setClosed((prior) => {
-                        const next = new Set(prior);
-                        next.has(h.pos) ? next.delete(h.pos) : next.add(h.pos);
-                        return next;
-                      })
-                    }
+                    aria-label={`${h.collapsed ? "展开" : "收起"}标题内容：${h.text}`}
+                    aria-expanded={!h.collapsed}
+                    onClick={() => onToggle?.(h, !h.collapsed)}
                   >
                     <ChevronRight />
                   </button>

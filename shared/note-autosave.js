@@ -33,8 +33,9 @@ export function createNoteAutosave({ save, onChange = () => {} }) {
     running = Promise.resolve()
       .then(() => save(sent))
       .then((result) => {
-        current =
-          edit === version ? result : { ...current, revision: result.revision };
+        current = edit === version
+          ? { ...result, ...(typeof sent.title === "string" && !sent.title.trim() ? { title: sent.title } : {}) }
+          : { ...current, revision: result.revision };
         saved = version;
         error = null;
         return current;

@@ -169,7 +169,7 @@ test("restore rejects traversal and symlink archive members before writing outsi
 });
 test("backup rotation keeps three completed archives and never removes unrelated files", async (t) => {
   const tmp = await dir(t);
-  const names = Array.from({ length: 5 }, (_, i) => `nurossh_backup_2026092${i}_120000${i % 2 ? '_Ab1234' : ''}.tar.gz`);
+  const names = Array.from({ length: 5 }, (_, i) => `nurossh_backup_2026092${i}_120000${i % 2 ? '_Ab1234' : ''}.tar.gz${i % 2 ? '.enc' : ''}`);
   for (const [i, name] of names.entries()) {
     await fs.writeFile(path.join(tmp, name), 'completed archive fixture');
     await fs.utimes(path.join(tmp, name), 100 + i, 100 + i);
@@ -222,14 +222,19 @@ test('management script creates a restorable archive and rolls back a failed res
     ensure_host_dependencies(){ :; }; require_docker(){ :; }; require_compose(){ :; }; require_cmd(){ command -v "$1" >/dev/null || [[ "$1" == flock ]]; }; flock(){ :; }
     get_workdir(){ printf '%s' "$fixture"; }
     compose_cmd(){ if [[ "$1" == ps ]]; then printf 'fixture'; else local dest; dest="$(basename "$8")"; (cd "$repo" && node --input-type=module - "$fixture/data" "$fixture/data/$dest" "$fixture/data/custom.db"); fi; }
-    repo="$1"; fixture="$2"; backup_service "$repo"`;
+    repo="$1"; fixture="$2"; run_backup_codec(){ node "$1" "$2" "$3"; }; backup_service "$repo"`;
   execFileSync('bash',['-c',backupScript,'test',root,deployment],{cwd:root,stdio:'pipe'});
-  const archive=path.join(deployment,'backups',(await fs.readdir(path.join(deployment,'backups'))).find(n=>n.endsWith('.tar.gz')));assert.ok(archive);
+  const archive=path.join(deployment,'backups',(await fs.readdir(path.join(deployment,'backups'))).find(n=>n.endsWith('.tar.gz.enc')));assert.ok(archive);
   await fs.mkdir(path.join(target,'data'),{recursive:true});await fs.writeFile(path.join(target,'docker-compose.yml'),'services: {}');await fs.writeFile(path.join(target,'data/do-not-lose'),'current-data');await fs.writeFile(path.join(target,'data/custom.db-wal'),'stale-wal');
-  const restoreScript=`source "$1/install.sh"; ensure_host_dependencies(){ :; }; require_docker(){ :; }; require_compose(){ :; }; ensure_data_permissions(){ :; }; compose_cmd(){ [[ "$1" != up || "$FAIL_RESTORE" != 1 ]]; }; wait_service_ready(){ :; }; print_access_info(){ :; }; STATE_FILE="$2/state"; restore_service`;
+  const restoreScript=`source "$1/install.sh"; ensure_host_dependencies(){ :; }; require_docker(){ :; }; require_compose(){ :; }; run_backup_codec(){ node "$1" "$2" "$3"; }; ensure_data_permissions(){ :; }; compose_cmd(){ [[ "$1" != up || "$FAIL_RESTORE" != 1 ]]; }; wait_service_ready(){ :; }; print_access_info(){ :; }; STATE_FILE="$2/state"; restore_service`;
+  const external=path.join(tmp,'external');await fs.mkdir(external);const externalArchive=path.join(external,'moved.tar.gz.enc');await fs.copyFile(archive,externalArchive);
+  const wrongKey=path.join(tmp,'wrong.key');await fs.writeFile(wrongKey,'1'.repeat(64),{mode:0o600});
+  assert.throws(()=>execFileSync('bash',['-c',restoreScript,'test',root,tmp],{cwd:root,input:`${externalArchive}\n${wrongKey}\n${target}\ny\n`,env:{...process.env,FAIL_RESTORE:'0'},stdio:['pipe','pipe','pipe']}),/解密失败/);
+  assert.equal(await fs.readFile(path.join(target,'data/do-not-lose'),'utf8'),'current-data');
   assert.throws(()=>execFileSync('bash',['-c',restoreScript,'test',root,tmp],{cwd:root,input:`${archive}\n${target}\ny\n`,env:{...process.env,FAIL_RESTORE:'1'},stdio:['pipe','pipe','pipe']}),/恢复失败/);
   assert.equal(await fs.readFile(path.join(target,'data/do-not-lose'),'utf8'),'current-data');
   execFileSync('bash',['-c',restoreScript,'test',root,tmp],{cwd:root,input:`${archive}\n${target}\ny\n`,env:{...process.env,FAIL_RESTORE:'0'},stdio:['pipe','pipe','pipe']});
+  assert.equal(await fs.readFile(path.join(target,'secrets/master.key'),'utf8'),await fs.readFile(path.join(deployment,'secrets/master.key'),'utf8'));
   assert.match(await fs.readFile(path.join(target,'.env'),'utf8'),/CUSTOM=preserve/);await assert.rejects(fs.stat(path.join(target,'data/custom.db-wal')));
   const restored=new Database(path.join(target,'data/custom.db'),{readonly:true});assert.match(restored.prepare("SELECT value FROM app_kv WHERE key='state'").get().value,/old-server/);restored.close();
   const previous=(await fs.readdir(tmp)).find(n=>n.startsWith('restored.before-restore'));assert.equal(await fs.readFile(path.join(tmp,previous,'data/do-not-lose'),'utf8'),'current-data');

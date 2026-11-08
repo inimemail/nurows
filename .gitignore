@@ -5,6 +5,7 @@ data/
 !data/.gitkeep
 
 .env
+secrets/
 .env.*
 !.env.example
 

@@ -63,7 +63,9 @@
 .tg-form-intro small { display: block; margin-top: 5px; color: var(--text-muted); font-size: 11px; }
 .tg-mode-options { border: 0; padding: 0; margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .tg-mode-options legend { color: var(--text-soft); font-size: 12px; padding: 0 0 9px; }
-.tg-mode-options label { display: flex; align-items: center; gap: 8px; padding: 13px 10px; border: 1px solid var(--border-soft); border-radius: 9px; cursor: pointer; }
+.tg-mode-options label { display: flex; flex-direction: row; justify-content: flex-start; align-items: center; gap: 10px; padding: 12px; border: 1px solid var(--border-soft); border-radius: 9px; cursor: pointer; min-width: 0; }
+.tg-mode-options input[type='radio'] { width: 16px; min-width: 16px; height: 16px; min-height: 16px; flex: 0 0 16px; padding: 0; margin: 0; accent-color: var(--accent-text); }
+.tg-mode-options label>span { min-width: 0; }
 .tg-mode-options label.selected { border-color: var(--accent-text, #538ab8); background: var(--card-hover); }
 .tg-mode-options strong { display: block; font-size: 12px; color: var(--text-soft); }
 .tg-mode-options small { display: block; margin-top: 4px; font-size: 10px; color: var(--text-muted); }
@@ -127,3 +129,37 @@ body:has(.tg-hosting-fullscreen,.tg-viewer-dialog) .toast-stack { z-index: 1600;
 
 .tg-deletion-progress { margin: 12px 16px; padding: 10px 12px; border-radius: 8px; background: var(--accent-soft); color: var(--text-soft); font-size: 12px; overflow-wrap: anywhere; }
 .tg-deletion-progress.failed { color: #bc5353; }
+
+.dialog.tg-edit-dialog { width: min(520px,100%); border-radius: 16px; }
+.tg-edit-dialog .dialog-head { padding: 16px 20px; }
+.tg-edit-dialog .dialog-body { padding: 18px 20px; }
+.tg-edit-dialog .dialog-footer { padding: 14px 20px; }
+.tg-edit-dialog .dialog-actions { justify-content: flex-end; width: 100%; }
+.tg-edit-dialog .tg-form { gap: 16px; }
+.tg-group-picker>label { color: var(--text-soft); font-size: 11px; font-weight: 500; }
+.tg-group-input { position: relative; min-width: 0; }
+.tg-edit-dialog .tg-group-input input { padding-right: 40px; }
+.tg-group-input>button { position: absolute; right: 1px; top: 1px; bottom: 1px; width: 36px; display: grid; place-items: center; color: var(--text-muted); border-radius: 8px; cursor: pointer; }
+.tg-group-input>button:focus-visible { outline: 2px solid var(--accent-text); }
+.tg-group-options { max-height: 168px; overflow-y: auto; overscroll-behavior: contain; padding: 4px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--panel-bg); scrollbar-width: thin; }
+.tg-group-options>button { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; min-height: 36px; padding: 8px; text-align: left; font-size: 12px; border-radius: 6px; cursor: pointer; }
+.tg-group-options>button span { min-width: 0; overflow-wrap: anywhere; }
+.tg-group-options>button svg { flex-shrink: 0; color: var(--accent-text); }
+.tg-group-options>button:hover,.tg-group-options>button.active,.tg-group-options>button:focus-visible { background: var(--card-hover); outline: none; }
+.tg-account-hint { display: flex; align-items: flex-start; gap: 7px; margin: 0; color: var(--text-muted); font-size: 12px; line-height: 1.6; }
+.tg-account-hint svg { flex: 0 0 15px; margin-top: 2px; color: var(--accent-text); }
+.tg-edit-dialog .tg-form .ops-field input { min-height: 40px; padding: 10px 12px; border-radius: 9px; }
+.tg-edit-dialog .tg-form textarea { min-height: 68px; max-height: 160px; padding: 10px 12px; border-radius: 9px; resize: vertical; }
+.tg-edit-dialog .auth-error { margin: 0; padding: 9px 12px; border-radius: 8px; border-color: color-mix(in srgb,#c15151 25%,transparent); color: var(--danger-text,#b44343); background: color-mix(in srgb,#c15151 9%,var(--panel-bg)); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+@media(max-width:600px) {
+  .tg-edit-dialog .dialog-head { min-height: 60px; padding: 12px 14px; }
+  .tg-edit-dialog .dialog-body { padding: 16px 14px; }
+  .tg-edit-dialog .dialog-footer { padding: 12px 14px; }
+  .tg-mode-options { grid-template-columns: 1fr; }
+  .tg-mode-options label { padding: 11px 12px; }
+  .tg-mode-options strong { font-size: 13px; }
+  .tg-mode-options small { font-size: 11px; line-height: 1.5; }
+  .tg-edit-dialog .tg-form .ops-field input { font-size: 16px; }
+  .tg-group-picker>label { font-size: 13px; }
+  .tg-group-options>button { min-height: 44px; font-size: 13px; }
+}

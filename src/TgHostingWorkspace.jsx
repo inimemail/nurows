@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { MessagesSquare, Plus, Settings2, Maximize2, Minimize2, Moon, Play, LockKeyhole, Pencil, Trash2, RefreshCw, ShieldCheck, ClipboardPaste, CornerDownLeft, Expand, Save, Monitor, ChevronLeft, ChevronRight } from 'lucide-react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { MessagesSquare, Plus, Settings2, Maximize2, Minimize2, Moon, Play, LockKeyhole, Pencil, Trash2, RefreshCw, ShieldCheck, ClipboardPaste, CornerDownLeft, Expand, Save, Monitor, ChevronLeft, ChevronRight, ChevronDown, Check } from 'lucide-react';
 import Dialog from './Dialog.jsx';
 import { startPolling } from '../shared/polling.js';
 import { openAuthenticatedWebSocket } from '../shared/websocket-client.js';
@@ -19,9 +19,9 @@ export default function TgHostingWorkspace({ api, toast, search = '', onSearchSc
   const lock = () => {
     const token = session.current?.token; session.current = null; version.current++;
     setUnlock(null); setViewer(null); setPassword(''); setDialog(null); afterUnlock.current = null;
-    if (token) void api('/api/tg-hosting/lock', { method: 'POST', headers: { 'X-TG-Hosting-Unlock': token }, body: '{}' }).catch(() => {});
+    if (token) void api('/api/tg-hosting/lock', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-TG-Hosting-Unlock': token }, body: '{}' }).catch(() => {});
   };
-  useEffect(() => { alive.current = true; return () => { alive.current = false; version.current++; const token = session.current?.token; session.current = null; if (token) void api('/api/tg-hosting/lock', { method: 'POST', headers: { 'X-TG-Hosting-Unlock': token }, body: '{}' }).catch(() => {}); }; }, [api]);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; version.current++; const token = session.current?.token; session.current = null; if (token) void api('/api/tg-hosting/lock', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-TG-Hosting-Unlock': token }, body: '{}' }).catch(() => {}); }; }, [api]);
   useEffect(() => { onSearchScopeChange?.({ tab: 'tgHosting', section: 'tgHosting' }); }, [onSearchScopeChange]);
   useEffect(() => { const timer = setTimeout(() => { setQuery(search); setPage(1); }, 250); return () => clearTimeout(timer); }, [search]);
   useEffect(() => {
@@ -54,7 +54,7 @@ export default function TgHostingWorkspace({ api, toast, search = '', onSearchSc
     if (!session.current || session.current.expiresAt <= Date.now() || session.current.deadline <= Date.now()) { lock(); throw Error('请重新解锁 TG 托管'); }
     mutation.current = true; setBusy(true); setFormError('');
     try {
-      const result = await api(`/api/tg-hosting${endpoint}`, { method, headers: { 'X-TG-Hosting-Unlock': session.current.token }, body: JSON.stringify(value), signal: AbortSignal.timeout(timeout) });
+      const result = await api(`/api/tg-hosting${endpoint}`, { method, headers: { 'Content-Type': 'application/json', 'X-TG-Hosting-Unlock': session.current.token }, body: JSON.stringify(value), signal: AbortSignal.timeout(timeout) });
       if (session.current) session.current.expiresAt = Math.min(session.current.deadline, Date.now() + 10 * 60000);
       return result;
     } catch (err) { if (alive.current) setFormError(err.message); throw err; }
@@ -65,7 +65,7 @@ export default function TgHostingWorkspace({ api, toast, search = '', onSearchSc
     mutation.current = true; setBusy(true); setFormError(''); const epoch = version.current;
     try {
       const result = await api('/api/tg-hosting/unlock', { method: 'POST', body: JSON.stringify({ password }), signal: AbortSignal.timeout(15000) });
-      if (!alive.current || version.current !== epoch) { void api('/api/tg-hosting/lock', { method: 'POST', headers: { 'X-TG-Hosting-Unlock': result.token }, body: '{}' }).catch(() => {}); return; }
+      if (!alive.current || version.current !== epoch) { void api('/api/tg-hosting/lock', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-TG-Hosting-Unlock': result.token }, body: '{}' }).catch(() => {}); return; }
       session.current = result; setUnlock(result); setPassword(''); setDialog(null);
       const action = afterUnlock.current; afterUnlock.current = null; mutation.current = false; action?.();
     } catch (err) { if (alive.current) setFormError(err.message); }
@@ -91,7 +91,7 @@ export default function TgHostingWorkspace({ api, toast, search = '', onSearchSc
   function touch() {
     if (!session.current) return; session.current.expiresAt = Math.min(session.current.deadline, Date.now() + 10 * 60000);
     if (Date.now() - touchAt.current < 20000) return; touchAt.current = Date.now();
-    void api('/api/tg-hosting/touch', { method: 'POST', headers: { 'X-TG-Hosting-Unlock': session.current.token }, body: '{}' }).catch(() => {});
+    void api('/api/tg-hosting/touch', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-TG-Hosting-Unlock': session.current.token }, body: '{}' }).catch(() => {});
   }
   async function save(event) {
     event.preventDefault(); if (mutation.current) return;
@@ -122,7 +122,7 @@ export default function TgHostingWorkspace({ api, toast, search = '', onSearchSc
     </div>
     {dialog?.type === 'migration' ? <Dialog title="接管已恢复的会话" onClose={() => !busy && setDialog(null)} footer={<div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setDialog(null)}>暂不接管</button><button className="primary" disabled={busy || !dialog.acknowledged} onClick={async () => { try { await mutate('/activate-migration', { confirm: 'old-host-stopped' }, 'POST', 40000); setDialog(null); toast('已接管，后台保持账号将按资源顺序启动'); } catch (err) { setFormError(err.message); } }}>{busy ? '接管中…' : '确认接管'}</button></div>}><div className="tg-form"><p className="tg-dialog-description">恢复的登录资料可以继续使用。为避免登录冲突，旧机器上的相同会话必须先停止。接管后按资源限额逐个恢复，不会一次启动所有账号。</p><label className="tg-migration-confirm"><input type="checkbox" checked={dialog.acknowledged} onChange={event => setDialog(value => ({ ...value, acknowledged: event.target.checked }))} /><span>我已停止旧机器上的 TG 托管</span></label>{formError ? <p className="auth-error" role="alert">{formError}</p> : null}</div></Dialog> : null}
     {dialog?.type === 'unlock' ? <Dialog title="解锁 TG 托管" className="tg-edit-dialog" onClose={() => { version.current++; setDialog(null); setPassword(''); }} footer={<div className="dialog-actions"><button className="ghost" onClick={() => { version.current++; setDialog(null); }}>取消</button><button className="primary" form="tg-unlock" type="submit" disabled={busy}>{busy ? '验证中…' : '解锁'}</button></div>}><form id="tg-unlock" className="tg-form" onSubmit={unlockVault}><p className="tg-dialog-description">验证面板密码后，才能打开和操作服务器上的 Telegram 会话。</p><label className="ops-field"><span>面板密码</span><input type="password" value={password} required maxLength={1024} autoComplete="current-password" onChange={e => setPassword(e.target.value)} /></label>{formError ? <p className="auth-error" role="alert">{formError}</p> : null}</form></Dialog> : null}
-    {dialog?.type === 'edit' ? <Dialog title={dialog.item.id ? '编辑托管账号' : '添加托管账号'} className="tg-edit-dialog" onClose={() => !busy && setDialog(null)} footer={<div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setDialog(null)}>取消</button><button className="primary" form="tg-account-edit" type="submit" disabled={busy}>{busy ? '保存中…' : '保存账号'}</button></div>}><form className="tg-form" id="tg-account-edit" onSubmit={save}><div className="tg-form-intro"><MessagesSquare size={23} /><p>一个账号，一份独立会话<small>保存后点击「打开」，在面板内的官方网页完成登录。</small></p></div><label className="ops-field"><span>账号名称 *</span><input required maxLength={100} placeholder="例如：工作账号" value={dialog.item.name} onChange={e => patch({ name: e.target.value })} /></label><div className="tg-form-grid"><label className="ops-field"><span>手机号（选填）</span><input type="tel" maxLength={40} placeholder="仅用于查找和备注" value={dialog.item.phone} onChange={e => patch({ phone: e.target.value })} /></label><label className="ops-field"><span>分组（选填）</span><input maxLength={60} list="tg-groups" value={dialog.item.group} onChange={e => patch({ group: e.target.value })} /><datalist id="tg-groups">{data?.groups.map(value => <option key={value} value={value} />)}</datalist></label></div><fieldset className="tg-mode-options"><legend>关闭窗口后</legend>{[['keep', '后台保持', '继续同步，不退出登录'], ['sleep', '自动休眠', '停止同步，保留登录资料']].map(([mode, title, text]) => <label key={mode} className={dialog.item.mode === mode ? 'selected' : ''}><input type="radio" name="tg-mode" checked={dialog.item.mode === mode} onChange={() => patch({ mode })} /><span><strong>{title}</strong><small>{text}</small></span></label>)}</fieldset><label className="ops-field"><span>备注</span><textarea rows={2} maxLength={500} value={dialog.item.note} onChange={e => patch({ note: e.target.value })} /></label>{formError ? <p className="auth-error" role="alert">{formError}</p> : null}</form></Dialog> : null}
+    {dialog?.type === 'edit' ? <Dialog title={dialog.item.id ? '编辑托管账号' : '添加托管账号'} className="tg-edit-dialog" onClose={() => !busy && setDialog(null)} footer={<div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setDialog(null)}>取消</button><button className="primary" form="tg-account-edit" type="submit" disabled={busy}>{busy ? '保存中…' : '保存账号'}</button></div>}><form className="tg-form" id="tg-account-edit" onSubmit={save}><p className="tg-account-hint"><ShieldCheck size={15} /><span>保存后点「打开」，使用手机 Telegram 扫码登录。</span></p><label className="ops-field"><span>账号名称 *</span><input required maxLength={100} placeholder="例如：工作账号" value={dialog.item.name} onChange={e => patch({ name: e.target.value })} /></label><div className="tg-form-grid"><label className="ops-field"><span>手机号备注（选填）</span><input type="tel" maxLength={40} placeholder="仅用于查找和备注" value={dialog.item.phone} onChange={e => patch({ phone: e.target.value })} /></label><TgGroupPicker value={dialog.item.group} groups={data?.groups || []} onChange={group => patch({ group })} /></div><fieldset className="tg-mode-options"><legend>关闭窗口后</legend>{[['keep', '后台保持', '继续接收消息'], ['sleep', '自动休眠', '释放资源，保留登录']].map(([mode, title, text]) => <label key={mode} className={dialog.item.mode === mode ? 'selected' : ''}><input type="radio" name="tg-mode" value={mode} checked={dialog.item.mode === mode} onChange={() => patch({ mode })} /><span><strong>{title}</strong><small>{text}</small></span></label>)}</fieldset><label className="ops-field"><span>备注</span><textarea rows={2} maxLength={500} value={dialog.item.note} onChange={e => patch({ note: e.target.value })} /></label>{formError ? <p className="auth-error" role="alert">{formError}</p> : null}</form></Dialog> : null}
     {dialog?.type === 'settings' ? <Dialog title="托管运行设置" className="tg-edit-dialog" onClose={() => !busy && setDialog(null)} footer={<div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setDialog(null)}>取消</button><button className="primary" form="tg-settings" type="submit" disabled={busy}>保存设置</button></div>}><form id="tg-settings" className="tg-form" onSubmit={save}><p className="tg-dialog-description">只限制正在运行的账号。名额不足时新账号排队，不会结束现有会话。资源设置在账号下次启动时生效。</p><label className="ops-field"><span>同时运行账号数</span><input required type="number" min={1} max={50} value={dialog.item.maxRunning} onChange={e => patch({ maxRunning: Number(e.target.value) })} /></label><div className="tg-form-grid"><label className="ops-field"><span>单账号内存上限（MB）</span><input required type="number" min={768} max={8192} step={128} value={dialog.item.memoryMb} onChange={e => patch({ memoryMb: Number(e.target.value) })} /></label><label className="ops-field"><span>单账号 CPU 上限（核）</span><input required type="number" min={0.25} max={4} step={0.25} value={dialog.item.cpu} onChange={e => patch({ cpu: Number(e.target.value) })} /></label></div><p className="tg-dialog-description">运行配置需要持久写入受保护的磁盘；会话快照和脚本备份加密。备份时会短暂关闭浏览器生成一致快照，再按原状态恢复。</p>{formError ? <p className="auth-error" role="alert">{formError}</p> : null}</form></Dialog> : null}
     {['delete', 'deleteAll', 'snapshot'].includes(dialog?.type) ? <Dialog title={dialog.type === 'snapshot' ? '保存完整会话快照' : dialog.type === 'deleteAll' ? '确认删除全部托管账号' : '确认删除托管账号'} onClose={() => !busy && setDialog(null)} footer={<div className="dialog-actions"><button className="ghost" disabled={busy} onClick={() => setDialog(null)}>取消</button><button className={`primary ${dialog.type !== 'snapshot' ? 'danger-action' : ''}`} disabled={busy} onClick={async () => {
       try {
@@ -138,6 +138,34 @@ export default function TgHostingWorkspace({ api, toast, search = '', onSearchSc
   </section>;
 }
 
+
+function TgGroupPicker({ value, groups, onChange }) {
+  const id = useId(), input = useRef(null);
+  const [open, setOpen] = useState(false), [active, setActive] = useState(-1), [searching, setSearching] = useState(false);
+  const query = value.trim(), matches = groups.filter(group => !searching || group.toLocaleLowerCase().includes(query.toLocaleLowerCase())).slice(0, 50);
+  const options = [
+    ...(!searching || !query ? [{ value: '', label: '未分组' }] : []),
+    ...matches.map(group => ({ value: group, label: group })),
+    ...(query && !groups.includes(query) ? [{ value: query, label: `新建分组「${query}」` }] : [])
+  ];
+  const choose = group => { onChange(group); setOpen(false); setActive(-1); };
+  const keydown = event => {
+    if (event.nativeEvent.isComposing) return;
+    if (event.key === 'Escape' && open) { event.preventDefault(); event.stopPropagation(); setOpen(false); return; }
+    if (['ArrowDown', 'ArrowUp'].includes(event.key)) {
+      event.preventDefault(); setOpen(true);
+      const next = event.key === 'ArrowDown' ? Math.min(active + 1, options.length - 1) : Math.max(active - 1, 0);
+      setActive(next); document.getElementById(`${id}-option-${next}`)?.scrollIntoView({ block: 'nearest' });
+    }
+    if (event.key === 'Enter' && open) { event.preventDefault(); choose(options[active]?.value ?? query); }
+  };
+  return <div className="ops-field tg-group-picker" onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}>
+    <label htmlFor={id}>分组（选填）</label>
+    <div className="tg-group-input"><input ref={input} id={id} role="combobox" aria-expanded={open} aria-controls={`${id}-options`} aria-autocomplete="list" aria-activedescendant={open && options[active] ? `${id}-option-${active}` : undefined} autoComplete="off" maxLength={60} placeholder="选择或输入新分组" value={value} onFocus={() => { setOpen(true); setSearching(false); setActive(-1); }} onChange={event => { onChange(event.target.value); setOpen(true); setSearching(true); setActive(-1); }} onClick={() => setOpen(true)} onKeyDownCapture={keydown} /><button type="button" aria-label={open ? '收起分组列表' : '选择分组'} aria-expanded={open} onClick={() => { const next = !open; input.current?.focus(); setOpen(next); setActive(-1); }}><ChevronDown size={16} /></button></div>
+    {open ? <div className="tg-group-options" id={`${id}-options`} role="listbox" aria-label="可选分组">{options.map((option, index) => <button key={option.value} type="button" id={`${id}-option-${index}`} role="option" aria-selected={value === option.value} className={index === active ? 'active' : ''} onMouseDown={event => event.preventDefault()} onClick={() => choose(option.value)}><span>{option.label}</span>{value === option.value ? <Check size={14} /> : null}</button>)}</div> : null}
+  </div>;
+}
+
 function TgViewer({ item, api, token, data, onClose, onTouch, toast }) {
   const target = useRef(null), rfb = useRef(null), [expanded, setExpanded] = useState(false), [attempt, setAttempt] = useState(0), [state, setState] = useState('waiting'), [message, setMessage] = useState(''), [text, setText] = useState(''), [clipboard, setClipboard] = useState(''), [showInput, setShowInput] = useState(false), [scale, setScale] = useState(true);
   const [runtime, setRuntime] = useState({ state: 'queued' });
@@ -146,7 +174,7 @@ function TgViewer({ item, api, token, data, onClose, onTouch, toast }) {
   useEffect(() => { const update = () => setVisible(!document.hidden); document.addEventListener('visibilitychange', update); return () => document.removeEventListener('visibilitychange', update); }, []);
   useEffect(() => {
     if (!visible) return;
-    return startPolling(async signal => { const result = await api(`/api/tg-hosting/accounts/${item.id}`, { headers: { 'X-TG-Hosting-Unlock': token }, signal }); if (!signal.aborted) setRuntime(result.runtime); }, 3000, { onError: err => setMessage(err.message) });
+    return startPolling(async signal => { const result = await api(`/api/tg-hosting/accounts/${item.id}`, { headers: { 'Content-Type': 'application/json', 'X-TG-Hosting-Unlock': token }, signal }); if (!signal.aborted) setRuntime(result.runtime); }, 3000, { onError: err => setMessage(err.message) });
   }, [api, item.id, token, visible]);
   useEffect(() => {
     if (!visible) { setState('waiting'); setMessage('页面在后台，画面传输已暂停；账号登录资料保留。'); return; }
@@ -160,7 +188,7 @@ function TgViewer({ item, api, token, data, onClose, onTouch, toast }) {
     setState('connecting'); setMessage('正在建立安全画面连接…');
     void (async () => {
       try {
-        const [module, proof] = await Promise.all([import('@novnc/novnc/lib/rfb.js'), api('/api/tg-hosting/view', { method: 'POST', headers: { 'X-TG-Hosting-Unlock': token }, body: JSON.stringify({ id: item.id }), signal: controller.signal })]);
+        const [module, proof] = await Promise.all([import('@novnc/novnc/lib/rfb.js'), api('/api/tg-hosting/view', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-TG-Hosting-Unlock': token }, body: JSON.stringify({ id: item.id }), signal: controller.signal })]);
         if (disposed) return;
         const socketUrl = new URL(`/ws/tg-hosting?id=${encodeURIComponent(item.id)}`, location.href); socketUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         connection = await openAuthenticatedWebSocket(socketUrl.href, { signal: controller.signal, protocols: [proof.protocol] });
@@ -195,7 +223,7 @@ function TgViewer({ item, api, token, data, onClose, onTouch, toast }) {
     try {
       retryCount.current = 0;
       if (['error', 'stopped'].includes(runtime?.state)) {
-        await api(`/api/tg-hosting/accounts/${item.id}/wake`, { method: 'POST', headers: { 'X-TG-Hosting-Unlock': token }, body: '{}', signal: AbortSignal.timeout(20000) });
+        await api(`/api/tg-hosting/accounts/${item.id}/wake`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-TG-Hosting-Unlock': token }, body: '{}', signal: AbortSignal.timeout(20000) });
         setRuntime({ state: 'queued' });
       }
       onTouch(); setAttempt(value => value + 1);

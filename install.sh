@@ -756,10 +756,40 @@ print(file.resolve())
 PY
 }
 
+prepare_backup_key_file() {
+  python3 - "$1" <<'PY'
+import os, re, stat, sys
+filename = sys.argv[1]
+try:
+    fd = os.open(filename, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+except OSError:
+    raise SystemExit('无法读取原主密钥，请确认路径、文件权限，且不是符号链接')
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 1024:
+        raise SystemExit('备份主密钥文件无效：必须是普通文本文件，内容为 64 位十六进制原密钥')
+    try:
+        text = os.read(fd, 1025).decode('utf-8').strip().strip('\ufeff').strip()
+    except (OSError, UnicodeError):
+        raise SystemExit('备份主密钥格式无效：需要原 master.key 文本文件')
+    if not re.fullmatch(r'[a-fA-F0-9]{64}', text):
+        raise SystemExit('备份主密钥格式无效：内容应为 64 位十六进制原密钥，请重新复制原文件')
+    if info.st_mode & 0o077 or not info.st_mode & 0o400:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            raise SystemExit('无法收紧主密钥权限，请将原文件复制到本机可写目录并执行 chmod 600 后重试')
+        print('[INFO] 原主密钥文件格式有效，权限已收紧为 0600；密钥内容未修改。', file=sys.stderr)
+    print(f'{info.st_uid}:{info.st_gid}')
+finally:
+    os.close(fd)
+PY
+}
+
 run_backup_codec() {
   local helper="$1" mode="$2" key_file="$3" codec key_owner
-  codec="$(cat "${helper}")"
-  key_owner="$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_uid}:{s.st_gid}")' "${key_file}")"
+  key_owner="$(prepare_backup_key_file "${key_file}")" || return 1
+  codec="$(cat "${helper}")" || return 1
   docker run --rm -i --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
     --user "${key_owner}" \
     -v "${key_file}:/run/backup-key:ro" --entrypoint node node:22-alpine \

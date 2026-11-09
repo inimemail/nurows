@@ -6,7 +6,8 @@ const { pipeline } = require('node:stream/promises');
 const MAGIC = Buffer.from('NUROSSH-BACKUP-1\n');
 function keyFile(filename) {
   const stat = fs.statSync(filename);
-  if (!stat.isFile() || stat.size > 1024 || (process.platform !== 'win32' && (stat.mode & 0o077))) throw Error('备份主密钥文件权限或格式无效');
+  if (!stat.isFile() || stat.size > 1024) throw Error('备份主密钥文件无效：需要原 master.key 文本文件');
+  if (process.platform !== 'win32' && (stat.mode & 0o077)) throw Error('备份主密钥权限过宽：请将原密钥文件权限设为 0600 或 0400 后重试');
   const text = fs.readFileSync(filename, 'utf8').trim();
   if (!/^[a-f0-9]{64}$/i.test(text)) throw Error('备份主密钥格式无效');
   return Buffer.from(text, 'hex');

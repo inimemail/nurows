@@ -3,13 +3,29 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { encoder, decoder } from '../server/backup-crypto.cjs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { encoder, decoder, keyFile } from '../server/backup-crypto.cjs';
 
 async function transform(chunks, codec) {
   const parts = [];
   await pipeline(Readable.from(chunks), codec, async stream => { for await (const chunk of stream) parts.push(chunk); });
   return Buffer.concat(parts);
 }
+test('standalone codec distinguishes broad permissions from invalid key files and contents', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'backup-key-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const file = path.join(root, 'master.key');
+  await fs.writeFile(file, 'a'.repeat(64)); await fs.chmod(file, 0o644);
+  assert.throws(() => keyFile(file), /权限过宽/);
+  await fs.chmod(file, 0o600);
+  assert.equal(keyFile(file).length, 32);
+  await fs.writeFile(file, 'invalid');
+  assert.throws(() => keyFile(file), /格式无效/);
+  await fs.writeFile(file, 'a'.repeat(1025));
+  assert.throws(() => keyFile(file), /文件无效/);
+});
 test('deployment archives encrypt with bounded streams and reject wrong keys, altered headers, truncation and tampering', async () => {
   const key = crypto.randomBytes(32), data = Buffer.concat([Buffer.from('private-notes-and-credentials'), crypto.randomBytes(1024 * 1024)]);
   const encrypted = await transform([data.subarray(0, 1), data.subarray(1)], encoder(key));

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import Database from "better-sqlite3";
 import { createNotesStore } from "../server/notes-store.js";
@@ -34,6 +34,46 @@ test('backup codec uses the protected key file owner inside its no-capabilities 
   assert.ok(output.includes('ALL'));
   assert.equal(output[output.indexOf('--user') + 1], `${stat.uid}:${stat.gid}`);
   assert.ok(output.some(argument => argument.endsWith(':/run/backup-key:ro')));
+});
+test('migrated valid keys have broad permissions tightened before Docker while content and ownership stay intact', async t => {
+  const tmp = await dir(t), key = path.join(tmp, 'master.key'), helper = path.join(tmp, 'codec.cjs');
+  const value = 'A1'.repeat(32) + '\n';
+  await fs.writeFile(key, value); await fs.writeFile(helper, 'fixture-codec');
+  const script = 'source "$1/install.sh"; docker(){ printf "%s\\n" "$@"; }; run_backup_codec "$2" decrypt "$3"';
+  for (const mode of [0o644, 0o640, 0o444, 0o600, 0o400]) {
+    await fs.chmod(key, mode);
+    const before = await fs.stat(key);
+    const result = spawnSync('bash', ['-c', script, '_', root, helper, key], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    const after = await fs.stat(key);
+    assert.equal(after.mode & 0o777, mode & 0o077 ? 0o600 : mode);
+    assert.equal(after.uid, before.uid); assert.equal(after.gid, before.gid);
+    assert.equal(await fs.readFile(key, 'utf8'), value);
+    assert.equal(result.stdout.includes(value.trim()), false);
+    assert.equal(result.stderr.includes(value.trim()), false);
+    assert.ok(result.stdout.includes(`${after.uid}:${after.gid}`));
+    assert.equal(result.stderr.includes('权限已收紧'), Boolean(mode & 0o077));
+  }
+});
+test('invalid key files fail before Docker even inside a guarded restore command and are never modified', async t => {
+  const tmp = await dir(t), key = path.join(tmp, 'master.key'), helper = path.join(tmp, 'codec.cjs');
+  await fs.writeFile(helper, 'fixture-codec');
+  const script = 'source "$1/install.sh"; docker(){ printf "DOCKER_INVOKED"; }; run_backup_codec "$2" decrypt "$3" || exit 77';
+  for (const content of ['', 'not-a-master-key', '<html>download failed</html>', 'a'.repeat(1025)]) {
+    await fs.writeFile(key, content); await fs.chmod(key, 0o644);
+    const result = spawnSync('bash', ['-c', script, '_', root, helper, key], { encoding: 'utf8' });
+    assert.equal(result.status, 77);
+    assert.match(result.stderr, /密钥.*无效/);
+    assert.equal(result.stdout, '');
+    assert.equal(await fs.readFile(key, 'utf8'), content);
+    assert.equal((await fs.stat(key)).mode & 0o777, 0o644);
+  }
+  await fs.writeFile(key, 'a'.repeat(64)); await fs.chmod(key, 0o600);
+  const link = path.join(tmp, 'link'); await fs.symlink(key, link);
+  for (const file of [tmp, link, path.join(tmp, 'missing')]) {
+    const result = spawnSync('bash', ['-c', script, '_', root, helper, file], { encoding: 'utf8' });
+    assert.equal(result.status, 77); assert.equal(result.stdout, '');
+  }
 });
 test("online snapshots recover committed WAL writes, independent notes and attachments", async (t) => {
   const tmp = await dir(t),

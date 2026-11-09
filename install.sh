@@ -438,6 +438,61 @@ stop_tg_browsers() {
   [[ -z "$(compose_cmd ps -q --status running tg-runner)" ]] || compose_cmd exec -T tg-runner node --input-type=module -e 'import http from "node:http";const req=http.request({socketPath:"/control/runner.sock",path:"/shutdown",method:"POST",timeout:300000},res=>{res.resume();res.on("end",()=>process.exit(res.statusCode===200?0:1))});req.on("error",()=>process.exit(1));req.on("timeout",()=>req.destroy());req.end();'
 }
 
+wait_tg_runner_transport() {
+  local attempt
+  # An unconfigured runner returns 503. Its socket must still accept requests
+  # before the backup helper can perform /configure and acquire its lease.
+  for attempt in $(seq 1 20); do
+    if compose_cmd exec -T tg-runner node --input-type=module -e 'import http from "node:http";const req=http.get({socketPath:"/control/runner.sock",path:"/status",timeout:2000},res=>{res.resume();res.on("end",()=>process.exit([200,503].includes(res.statusCode)?0:1));res.on("error",()=>process.exit(1))});req.on("error",()=>process.exit(1));req.on("timeout",()=>req.destroy());' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+prepare_tg_upgrade_backup() (
+  set -euo pipefail
+  local bundle="${1:-}" minimum container stage image_ref previous_image running
+  [[ -n "${bundle}" && -f docker-compose.tg.yml ]] || return 0
+  container="$(compose_cmd ps -a -q tg-runner)"
+  [[ -n "${container}" ]] || return 0
+  minimum="$(docker version --format '{{.Server.MinAPIVersion}}')"
+  # Only the known old-client/new-engine incompatibility needs a bootstrap.
+  if ! python3 - "${minimum}" <<'PY'
+import re, sys
+value = sys.argv[1]
+sys.exit(0 if re.fullmatch(r'1\.\d+', value) and int(value.split('.')[1]) > 41 else 1)
+PY
+  then
+    return 0
+  fi
+  stage="$(mktemp -d)"
+  trap 'rm -rf -- "${stage}"' EXIT
+  docker cp "${container}:/runtime/runner.mjs" "${stage}/runner.mjs"
+  grep -Fq '/v1.41${endpoint}' "${stage}/runner.mjs" || return 0
+  [[ -f "${bundle}/shared/tg-docker.js" && -f "${bundle}/tg-hosting/Dockerfile" ]] && grep -Fq createTgDockerClient "${bundle}/tg-hosting/runner.mjs" || die "新版源码缺少 Docker API 兼容修复，未继续升级；请使用包含修复的完整源码。"
+  image_ref="$(docker inspect --format '{{.Config.Image}}' "${container}")"
+  previous_image="$(docker inspect --format '{{.Image}}' "${container}")"
+  running="$(docker inspect --format '{{.State.Running}}' "${container}")"
+  [[ -n "${image_ref}" && "${image_ref}" != *@* && "${image_ref}" != sha256:* && -n "${previous_image}" ]] || die "无法确认托管组件镜像标签，未继续升级；原组件和数据未修改。"
+  info "检测到旧托管组件 API v1.41 与 Docker 最低版本 ${minimum} 不兼容；先更新独立组件，再进行完整备份。"
+  # Build first, while existing browsers and the panel keep running. Replacing
+  # the runner does not stop/delete account containers or their profile mounts.
+  docker build --target runner --file "${bundle}/tg-hosting/Dockerfile" --tag "${image_ref}" "${bundle}" || die "兼容组件构建失败，原组件仍保留，未继续升级。"
+  # A stopped deployment stays cold. backup_service starts a temporary runner
+  # with desired=false, so an offline backup cannot activate restored sessions.
+  if [[ "${running}" != true && -z "$(compose_cmd ps -q --status running nurossh)" ]]; then
+    return 0
+  fi
+  if ! { compose_cmd up -d --no-deps --no-build tg-runner && wait_tg_runner_transport; }; then
+    warn "兼容组件启动失败，正在恢复原组件镜像；本次升级已取消。"
+    docker image tag "${previous_image}" "${image_ref}"
+    compose_cmd up -d --no-deps --no-build tg-runner || true
+    die "托管组件未就绪，未跳过备份，也未更新面板和数据。"
+  fi
+)
+
 wait_tg_hosting_ready() {
   local attempt
   # Probe as the panel user, through its own socket mount. A running container
@@ -726,6 +781,9 @@ backup_service() (
   mkdir -p "${workdir}/backups"
   exec 9>"${workdir}/backups/.backup.lock"
   flock -n 9 || die "已有备份正在执行，请稍后重试。"
+  # The old runner may be the very component this upgrade fixes. Repair only
+  # that compatibility deadlock, under the same lock, before asking it to back up.
+  (cd "${workdir}" && prepare_tg_upgrade_backup "${1:-}")
   key_file="$(backup_key_file "${workdir}")"
   stage="$(mktemp -d "${workdir}/backups/.stage-XXXXXX")"
   snapshot=".backup-${stage##*/}"
@@ -746,6 +804,7 @@ backup_service() (
         compose_cmd up -d --no-deps tg-runner
         backup_runner_started=1
         trap 'compose_cmd stop tg-runner >/dev/null 2>&1 || true' EXIT
+        wait_tg_runner_transport || die "临时托管组件未就绪，未继续备份。"
       fi
       compose_cmd run --rm --no-deps -T -e "TG_HOSTING_BACKUP_COLD=${backup_runner_started}" nurossh node --input-type=module - /app/data "/app/data/${snapshot}" "${db_path}" < "${helper}"
     fi

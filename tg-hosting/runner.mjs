@@ -9,7 +9,7 @@ import { pipeline } from 'node:stream/promises';
 import { WebSocketServer } from 'ws';
 import { encoder, decoder } from './backup-crypto.cjs';
 import { TG_ACCOUNT_ID, tgHostingSettings, tgDiskReserve, tgResourceBlock, tgRetryDelay, tgRuntimeAccount, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from './shared/tg-hosting.js';
-import { requestTgJson } from './shared/tg-http.js';
+import { createTgDockerClient } from './shared/tg-docker.js';
 
 const socket = process.env.TG_HOSTING_SOCKET || '/control/runner.sock';
 const dockerSocket = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
@@ -21,6 +21,7 @@ let settings = tgHostingSettings(), key = null, hostProfiles, namespace, backupL
 let resourceCache = null, resourceCacheAt = 0, resourceReading = null;
 let dockerCapacity = null, capacityAt = 0;
 let migrationHold = false;
+let configured = false;
 const fail = (message, statusCode = 400) => { throw Object.assign(Error(message), { statusCode }); };
 const idCheck = id => { if (!TG_ACCOUNT_ID.test(id)) fail('账号标识无效'); return id; };
 const label = () => ({ 'nurossh.tg.owner': namespace });
@@ -36,11 +37,7 @@ async function markProfileActive(id) {
   const directory = await fsp.open(profiles, 'r'); try { await directory.sync(); } finally { await directory.close(); }
 }
 
-async function docker(method, endpoint, body, timeout = 30000) {
-  const response = await requestTgJson({ socketPath: dockerSocket, path: `/v1.41${endpoint}`, method, data: body, timeout });
-  if (response.statusCode >= 300) throw Object.assign(Error(`Docker 操作失败（${response.statusCode}），请检查托管组件和浏览器镜像`), { dockerStatus: response.statusCode });
-  return response.data;
-}
+const docker = createTgDockerClient(dockerSocket);
 const ownedContainers = () => docker('GET', `/containers/json?all=1&filters=${encodeURIComponent(JSON.stringify({ label: [`nurossh.tg.owner=${namespace}`] }))}`);
 async function inspect(id) {
   try {
@@ -269,7 +266,7 @@ async function startBudget() {
 }
 let processing = false;
 async function tick() {
-  if (processing || mutating || backupLease || !key || closed || migrationHold) return;
+  if (processing || mutating || backupLease || !configured || closed || migrationHold) return;
   processing = true;
   try { await exclusive(async () => {
     if (backupLease || closed) return;
@@ -344,6 +341,7 @@ async function tick() {
 let operation = Promise.resolve();
 function exclusive(fn) { const result = operation.then(async () => { mutating = true; try { return await fn(); } finally { mutating = false; } }); operation = result.catch(() => {}); return result; }
 async function configure(data) {
+  configured = false;
   if (!/^[a-f0-9]{64}$/.test(data.key || '')) fail('配置密钥无效');
   if (key && !key.equals(Buffer.from(data.key, 'hex'))) fail('托管组件密钥发生变化，请先重启组件', 409);
   if (!Array.isArray(data.accounts) || data.accounts.length > 10000 || data.accounts.some(item => !TG_ACCOUNT_ID.test(item.id) || typeof item.desired !== 'boolean')) fail('账号配置无效');
@@ -377,6 +375,7 @@ async function configure(data) {
       else await ownedNetwork(item.id);
     }
   }
+  configured = true;
   return { ok: true };
 }
 async function readBody(req) {
@@ -386,7 +385,7 @@ async function readBody(req) {
 async function handle(req) {
   const url = new URL(req.url, 'http://localhost');
   if (req.method === 'POST' && url.pathname === '/configure') return exclusive(() => { if (backupLease) fail('正在备份，请稍后重试', 409); return configureBody(req); });
-  if (!key) fail('托管组件正在初始化', 503);
+  if (!configured) fail('托管组件尚未完成初始化，请查看面板连接错误或重新启用组件', 503);
   if (req.method === 'GET' && url.pathname === '/status') {
     // Docker may be stalled. Reading status must not queue behind its I/O or a
     // large archive; only admission decisions require a fresh resource sample.

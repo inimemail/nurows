@@ -37,6 +37,11 @@ test('optional deployment preserves Compose overrides and isolates the Docker so
  assert.equal(config.services.nurossh.environment.FIXTURE,'kept');assert.ok(config.services['tg-runner'].volumes.some(v=>v.target==='/var/run/docker.sock'));assert.ok(!config.services.nurossh.volumes.some(v=>v.target==='/var/run/docker.sock'));assert.equal(config.services['tg-runner'].build.context,await fs.realpath(path.join(root,'app')));assert.equal(config.services['tg-runner'].ports,undefined);
  const merged=JSON.parse(execFileSync('bash',['-c','source "$1/install.sh"; compose_cmd config --format json','_',repo],{cwd:root,encoding:'utf8'}));assert.equal(merged.services.nurossh.environment.FIXTURE,'kept');assert.ok(merged.services['tg-runner']);
 });
+test('component readiness waits for the panel socket and fails instead of claiming success when disconnected',()=>{
+ const command='source "$1/install.sh"; attempts=0; fixture_min=$2; sleep(){ :; }; compose_cmd(){ attempts=$((attempts+1)); [[ "$*" == *TG_HOSTING_SOCKET* ]] || exit 9; (( attempts >= fixture_min )); }; wait_tg_hosting_ready; result=$?; printf "%s %s" "$result" "$attempts"';
+ const success=execFileSync('bash',['-c',command,'_',repo,'3'],{encoding:'utf8'});assert.equal(success,'0 3');
+ const failure=execFileSync('bash',['-c',command.replace('wait_tg_hosting_ready; result=$?','set +e; wait_tg_hosting_ready; result=$?'),'_',repo,'99'],{encoding:'utf8'});assert.equal(failure,'1 30');
+});
 test('restoring hosted sessions writes a fresh private takeover marker, including repeated restores',async t=>{
  const root=await temporary(t),data=path.join(root,'data');await fs.mkdir(data);await fs.writeFile(path.join(root,'.env'),'SQLITE_DB_PATH=/app/data/app.db\nTG_HOSTING_ENABLED=1\n');
  const db=new Database(path.join(data,'app.db'));db.exec('CREATE TABLE tg_hosting_accounts(id TEXT PRIMARY KEY,name TEXT,value TEXT)');

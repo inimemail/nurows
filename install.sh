@@ -438,6 +438,19 @@ stop_tg_browsers() {
   [[ -z "$(compose_cmd ps -q --status running tg-runner)" ]] || compose_cmd exec -T tg-runner node --input-type=module -e 'import http from "node:http";const req=http.request({socketPath:"/control/runner.sock",path:"/shutdown",method:"POST",timeout:300000},res=>{res.resume();res.on("end",()=>process.exit(res.statusCode===200?0:1))});req.on("error",()=>process.exit(1));req.on("timeout",()=>req.destroy());req.end();'
 }
 
+wait_tg_hosting_ready() {
+  local attempt
+  # Probe as the panel user, through its own socket mount. A running container
+  # alone does not prove the panel can connect or initialize the component.
+  for attempt in $(seq 1 30); do
+    if compose_cmd exec -T nurossh node --input-type=module -e 'import http from "node:http";const socketPath=process.env.TG_HOSTING_SOCKET;if(!socketPath)process.exit(1);const req=http.get({socketPath,path:"/status",timeout:2000},res=>{let body="";res.on("data",chunk=>{body+=chunk;if(body.length>8*1024*1024)req.destroy()});res.on("end",()=>{try{const data=JSON.parse(body);process.exit(res.statusCode===200&&Array.isArray(data.accounts)?0:1)}catch{process.exit(1)}});res.on("error",()=>process.exit(1))});req.on("error",()=>process.exit(1));req.on("timeout",()=>req.destroy());' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
 enable_tg_hosting() {
   require_docker; require_compose
   local workdir
@@ -448,8 +461,8 @@ enable_tg_hosting() {
   info "默认最多运行 2 个账号，每个账号上限 1 GB 内存；无空闲资源时排队。首次下载浏览器镜像较大。"
   grep -q '^TG_HOSTING_ENABLED=' "${workdir}/.env" && sed -i 's/^TG_HOSTING_ENABLED=.*/TG_HOSTING_ENABLED=1/' "${workdir}/.env" || printf '\nTG_HOSTING_ENABLED=1\n' >> "${workdir}/.env"
   ensure_storage_mount "${workdir}"
-  (cd "${workdir}" && build_tg_browser && compose_cmd up -d --build && wait_service_ready) || die "托管组件安装未完成，请检查构建日志；账号资料未清除。"
-  info "TG 托管组件已启用，进入面板最后的 TG 托管菜单添加账号。"
+  (cd "${workdir}" && build_tg_browser && compose_cmd up -d --build && wait_service_ready && wait_tg_hosting_ready) || die "托管组件尚未就绪，请查看 docker compose -f docker-compose.yml -f docker-compose.storage.yml -f docker-compose.tg.yml logs --tail=80 tg-runner；账号资料未清除。"
+  info "TG 托管组件已连接。刷新面板，点击已创建账号的「打开」即可扫码登录，无需重新添加账号。"
 }
 
 get_local_ip() {

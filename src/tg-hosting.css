@@ -18,6 +18,13 @@
 .tg-component-notice strong { color: var(--text-soft); font-size: 13px; }
 .tg-component-notice p { margin: 4px 0 0; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .tg-component-notice>div { min-width: 0; }
+.tg-setup-notice>div { flex: 1; }
+.tg-setup-notice>button { flex-shrink: 0; border: 1px solid var(--border-soft); font-size: 12px; }
+.tg-setup-guide ol { margin: 0; padding-left: 20px; color: var(--text-soft); font-size: 13px; line-height: 1.8; }
+.tg-setup-guide li+li { margin-top: 7px; }
+.tg-setup-command { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--card-hover); }
+.tg-setup-command code { font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; user-select: text; }
+.tg-setup-command button { justify-self: end; border: 1px solid var(--border-soft); }
 .tg-migration-notice { border-color: #b68d3a50; background: #b68d3a0b; }
 .tg-migration-notice button { margin-top: 9px; border: 1px solid var(--border-soft); font-size: 12px; }
 .tg-resource-status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 14px; padding: 10px 22px; color: var(--text-muted); font-size: 11px; }
@@ -99,6 +106,9 @@
   .tg-toolbar-buttons { width: 100%; justify-content: flex-end; gap: 6px; } .tg-toolbar-buttons button { font-size: 12px; }
   .tg-filter-row { padding: 0 14px 12px; } .tg-filter-row select { min-width: 0; max-width: 105px; font-size: 11px; padding: 7px; } .tg-filter-row>button { font-size: 11px; white-space: nowrap; }
   .tg-component-notice { margin: 12px 14px; padding: 12px; }
+  .tg-setup-notice { flex-wrap: wrap; }
+  .tg-setup-notice>div { flex-basis: calc(100% - 36px); }
+  .tg-setup-notice>button { margin-left: 32px; }
   .tg-resource-status { padding: 10px 14px; font-size: 10px; }
   .tg-account-row { grid-template-columns: minmax(0,1fr) auto; gap: 12px 10px; padding: 15px 14px; } .tg-account-identity { grid-column: 1/-1; gap: 9px; } .tg-avatar { width: 34px; height: 34px; border-radius: 10px; }
   .tg-account-status { grid-row: 2; grid-column: 1; display: grid; gap: 5px; padding-left: 0; } .tg-account-status small { font-size: 10px; line-height: 1.6; }

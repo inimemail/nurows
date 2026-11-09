@@ -5,6 +5,7 @@ RUN npm ci --omit=dev
 COPY tg-hosting/runner.mjs ./runner.mjs
 COPY shared/tg-hosting.js ./shared/tg-hosting.js
 COPY shared/tg-http.js ./shared/tg-http.js
+COPY shared/tg-docker.js ./shared/tg-docker.js
 COPY server/backup-crypto.cjs ./backup-crypto.cjs
 CMD ["node", "runner.mjs"]
 

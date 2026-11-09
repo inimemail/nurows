@@ -1,0 +1,44 @@
+# Optional: enabled by install.sh menu 11. No VNC or Docker API ports are published.
+services:
+  nurossh:
+    environment:
+      TG_HOSTING_SOCKET: /run/tg-hosting/runner.sock
+    volumes:
+      - tg-control:/run/tg-hosting
+  tg-runner:
+    build:
+      context: .
+      dockerfile: tg-hosting/Dockerfile
+      target: runner
+    container_name: nurossh-tg-runner
+    restart: unless-stopped
+    init: true
+    environment:
+      TG_RUNNER_CONTAINER: nurossh-tg-runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - tg-control:/control
+      - ./tg-browser-data:/profiles
+      - ./data/tg-hosted-snapshots:/snapshots
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: 1
+    cpu_shares: 128
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+  tg-browser:
+    profiles: [tg-image]
+    image: nurossh-tg-browser:local
+    build:
+      context: .
+      dockerfile: tg-hosting/Dockerfile
+      target: browser
+    entrypoint: ["/bin/true"]
+    restart: "no"
+    network_mode: none
+volumes:
+  tg-control:

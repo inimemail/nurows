@@ -14,6 +14,7 @@ import { createRenewalService, registerRenewalRoutes, normalizeRenewalState, ren
 import { createNotesService, registerNotesRoutes } from './notes.js';
 import { createWebhookService, registerWebhookRoutes } from './webhooks.js';
 import { createEpayService, registerEpayRoutes } from './epay.js';
+import { createTgHostingService, registerTgHostingRoutes } from './tg-hosting.js';
 import { registerConfigBulkDeleteRoutes } from './config-bulk-delete.js';
 import { runLocalWebhook, runSshWebhook } from './webhook-runtime.js';
 import { poolHealthSummary, poolHealthProbeState, poolHealthSchedule, clonePoolHealthPools } from './pool-health-check.js';
@@ -326,6 +327,7 @@ webhookService = createWebhookService({
 
 const epayService = createEpayService({ db: getSqliteDb(), encrypt: encryptSecret, decrypt: decryptSecret,
   bots: () => cachedState.telegramBots || [], send: renewalDeps.send });
+const tgHostingService = createTgHostingService({ db: getSqliteDb(), key: getAppSecretKey(), restoreMarker: path.join(DATA_DIR, '.tg-hosting-restored.json') });
 
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
@@ -363,8 +365,8 @@ registerProbePublicRoutes(app, {
 });
 app.use('/api', authGuard);
 
-registerAuthenticatorRoutes(app, createAuthenticatorStore(getSqliteDb(), encryptSecret, decryptSecret), async req => {
-  enforceAuthRateLimit(req, 'authenticator');
+async function verifyPrivatePassword(req, scope = 'authenticator') {
+  enforceAuthRateLimit(req, scope);
   const auth = readAuth();
   const password = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
   const hash = password.length <= 1024 && auth.configured
@@ -373,15 +375,17 @@ registerAuthenticatorRoutes(app, createAuthenticatorStore(getSqliteDb(), encrypt
   const valid = hash && hash.length === expected.length && crypto.timingSafeEqual(hash, expected);
   hash?.fill(0);
   if (!valid) {
-    registerAuthFailure(req, 'authenticator');
+    registerAuthFailure(req, scope);
     const error = new Error('密码错误'); error.statusCode = 403; throw error;
   }
   const currentAuth = readAuth();
   if (getSessionFromRequest(req) !== req.auth || req.auth.username !== currentAuth.username || auth.hash !== currentAuth.hash) {
     const error = new Error('登录已失效，请重新登录'); error.statusCode = 401; throw error;
   }
-  clearAuthRateLimit(req, 'authenticator');
-}, { sessionValid: req => getSessionFromRequest(req) === req.auth });
+  clearAuthRateLimit(req, scope);
+}
+registerAuthenticatorRoutes(app, createAuthenticatorStore(getSqliteDb(), encryptSecret, decryptSecret), verifyPrivatePassword, { sessionValid: req => getSessionFromRequest(req) === req.auth });
+const tgHostingRoutes = registerTgHostingRoutes(app, tgHostingService, req => verifyPrivatePassword(req, 'tg-hosting'), { sessionValid: req => getSessionFromRequest(req) === req.auth });
 
 app.get('/api/auth/status', (req, res) => {
   if (!notesService.ready()) {
@@ -1144,6 +1148,11 @@ wss.on('connection', (ws, req) => {
   attachWebSocketHeartbeat(ws);
 
   const url = new URL(req.url || '', 'http://localhost');
+  if (url.pathname === '/ws/tg-hosting') {
+    req.auth = getSessionFromRequest(req);
+    tgHostingRoutes.connect(ws, req, sessionSockets);
+    return;
+  }
   if (url.pathname === '/ws/command-job') {
     handleCommandJobConnection(ws, req);
     return;
@@ -1282,6 +1291,7 @@ server.listen(PORT, HOST, () => {
   restartTelegramPolling();
   renewalService.tick();
   void epayService.tick().catch(() => {});
+  void tgHostingService.runtime(true).catch(() => {});
   setInterval(() => { void epayService.tick().catch(() => {}); }, 1000).unref();
   setInterval(() => { try { webhookService.tick(); } catch (error) { console.error('Webhook:', error.message); } }, 1000).unref();
   setInterval(() => renewalService.tick(), 60000).unref();
@@ -2404,7 +2414,7 @@ function getWorkspaceForUser(state, auth = null) {
     };
   }
   return {
-    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator'].includes(source.tab) ? source.tab : 'servers',
+    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay', 'tgHosting'].includes(source.tab) ? source.tab : 'servers',
     search: typeof source.search === 'string' ? source.search : '',
     selectedServerId: typeof source.selectedServerId === 'string' ? source.selectedServerId : '',
     selectedCommandId: typeof source.selectedCommandId === 'string' ? source.selectedCommandId : '',
@@ -2465,7 +2475,7 @@ function getWorkspaceForUser(state, auth = null) {
 
 function normalizeWorkspaceInput(input = {}) {
   return {
-    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator'].includes(input.tab) ? input.tab : 'servers',
+    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay', 'tgHosting'].includes(input.tab) ? input.tab : 'servers',
     search: typeof input.search === 'string' ? input.search : '',
     selectedServerId: typeof input.selectedServerId === 'string' ? input.selectedServerId : '',
     selectedCommandId: typeof input.selectedCommandId === 'string' ? input.selectedCommandId : '',

@@ -174,6 +174,7 @@ compose_cmd() {
     fi
     files+=(-f docker-compose.storage.yml)
   fi
+  [[ ! -f docker-compose.tg.yml ]] || files+=(-f docker-compose.tg.yml)
   if command -v docker-compose >/dev/null 2>&1; then
     docker-compose "${files[@]}" "$@"
   else
@@ -318,6 +319,7 @@ sync_app_bundle() {
     --exclude='./data' \
     --exclude='./backups' \
     --exclude='./secrets' \
+    --exclude='./tg-browser-data' \
     --exclude='./.env' \
     --exclude='./*.log' \
     --exclude='./local-run.out' \
@@ -413,6 +415,41 @@ services:
     volumes:
       - ./secrets:/app/secrets
 EOF
+  ensure_tg_hosting_mount "${workdir}"
+}
+
+ensure_tg_hosting_mount() {
+  local workdir="$1"
+  [[ "$(read_env_value "${workdir}/.env" TG_HOSTING_ENABLED)" == 1 ]] || return 0
+  [[ -f "${workdir}/app/docker-compose.tg.yml" ]] || die "缺少 TG 托管组件部署模板，请先升级服务。"
+  sed 's|context: \.$|context: ./app|' "${workdir}/app/docker-compose.tg.yml" > "${workdir}/docker-compose.tg.yml"
+  mkdir -p "${workdir}/tg-browser-data" "${workdir}/data/tg-hosted-snapshots"
+  chmod 700 "${workdir}/tg-browser-data" "${workdir}/data/tg-hosted-snapshots"
+  chown 10001:10001 "${workdir}/tg-browser-data"
+  chown 10001:10001 "${workdir}/data/tg-hosted-snapshots"
+}
+
+build_tg_browser() {
+  [[ ! -f docker-compose.tg.yml ]] || compose_cmd --profile tg-image build tg-browser
+}
+
+stop_tg_browsers() {
+  [[ -f docker-compose.tg.yml ]] || return 0
+  [[ -z "$(compose_cmd ps -q --status running tg-runner)" ]] || compose_cmd exec -T tg-runner node --input-type=module -e 'import http from "node:http";const req=http.request({socketPath:"/control/runner.sock",path:"/shutdown",method:"POST",timeout:300000},res=>{res.resume();res.on("end",()=>process.exit(res.statusCode===200?0:1))});req.on("error",()=>process.exit(1));req.on("timeout",()=>req.destroy());req.end();'
+}
+
+enable_tg_hosting() {
+  require_docker; require_compose
+  local workdir
+  workdir="$(get_workdir)"
+  [[ -n "${workdir}" ]] || die "请先部署面板。"
+  [[ -f "${workdir}/app/docker-compose.tg.yml" ]] || die "请先使用菜单 2 升级服务。"
+  info "将安装独立浏览器组件：组件需要 Docker 管理权限，面板本身不挂载 Docker socket。"
+  info "默认最多运行 2 个账号，每个账号上限 1 GB 内存；无空闲资源时排队。首次下载浏览器镜像较大。"
+  grep -q '^TG_HOSTING_ENABLED=' "${workdir}/.env" && sed -i 's/^TG_HOSTING_ENABLED=.*/TG_HOSTING_ENABLED=1/' "${workdir}/.env" || printf '\nTG_HOSTING_ENABLED=1\n' >> "${workdir}/.env"
+  ensure_storage_mount "${workdir}"
+  (cd "${workdir}" && build_tg_browser && compose_cmd up -d --build && wait_service_ready) || die "托管组件安装未完成，请检查构建日志；账号资料未清除。"
+  info "TG 托管组件已启用，进入面板最后的 TG 托管菜单添加账号。"
 }
 
 get_local_ip() {
@@ -468,13 +505,14 @@ deploy_service() {
     write_runtime_env "${install_path}/.env" "${port}" "0.0.0.0"
   fi
   ensure_data_permissions "${install_path}"
+  ensure_storage_mount "${install_path}"
   copy_manage_script "${install_path}" "${bundle_dir}"
 
   echo "${install_path}" > "${STATE_FILE}"
 
   (
     cd "${install_path}" || exit 1
-    compose_cmd up -d --build
+    build_tg_browser && compose_cmd up -d --build
   )
 
   print_access_info "${install_path}/.env"
@@ -517,7 +555,7 @@ upgrade_service() {
 
   if ! (
     cd "${workdir}" || exit 1
-    compose_cmd up -d --build && wait_service_ready
+    build_tg_browser && compose_cmd up -d --build && wait_service_ready
   ); then
     die "新版服务未通过就绪检查。升级前备份保存在 ${workdir}/backups，原数据目录未清空，请查看日志或恢复该备份。"
   fi
@@ -535,7 +573,7 @@ stop_service() {
 
   (
     cd "${workdir}" || exit 1
-    compose_cmd stop
+    stop_tg_browsers && compose_cmd stop
   )
 
   info "服务已停止。"
@@ -690,13 +728,19 @@ backup_service() (
     if [[ -n "$(compose_cmd ps -q --status running nurossh)" ]]; then
       compose_cmd exec -T nurossh node --input-type=module - /app/data "/app/data/${snapshot}" "${db_path}" < "${helper}"
     else
-      compose_cmd run --rm --no-deps -T nurossh node --input-type=module - /app/data "/app/data/${snapshot}" "${db_path}" < "${helper}"
+      local backup_runner_started=0
+      if [[ -f docker-compose.tg.yml && -z "$(compose_cmd ps -q --status running tg-runner)" ]]; then
+        compose_cmd up -d --no-deps tg-runner
+        backup_runner_started=1
+        trap 'compose_cmd stop tg-runner >/dev/null 2>&1 || true' EXIT
+      fi
+      compose_cmd run --rm --no-deps -T -e "TG_HOSTING_BACKUP_COLD=${backup_runner_started}" nurossh node --input-type=module - /app/data "/app/data/${snapshot}" "${db_path}" < "${helper}"
     fi
   )
   mv "${workdir}/data/${snapshot}" "${stage}/data"
   cp -p "${workdir}/.env" "${workdir}/docker-compose.yml" "${workdir}/manage.sh" "${stage}/"
   mkdir "${stage}/app"
-  tar --exclude='./node_modules' --exclude='./.git' --exclude='./data' --exclude='./backups' --exclude='./secrets' --exclude='./.env' --exclude='./dist' --exclude='__pycache__' -cf - -C "${workdir}/app" . | tar -xf - -C "${stage}/app"
+  tar --exclude='./node_modules' --exclude='./.git' --exclude='./data' --exclude='./backups' --exclude='./secrets' --exclude='./tg-browser-data' --exclude='./.env' --exclude='./dist' --exclude='__pycache__' -cf - -C "${workdir}/app" . | tar -xf - -C "${stage}/app"
   python3 "${archive_helper}" manifest "${stage}"
   # Fast compression reduces CPU spent on large attachments. Publish only a complete archive.
   tar -cf - -C "${stage}" . | gzip -1 | run_backup_codec "${crypto_helper}" encrypt "${key_file}" > "${backup_file}.partial"
@@ -772,17 +816,18 @@ PY
     cp -p "${target_dir}/secrets/master.key" "${prepared}/secrets/master.key"
   fi
   ensure_runtime_env_file "${prepared}"
+  mark_tg_hosting_restore "${prepared}"
   ensure_data_permissions "${prepared}"
   ensure_storage_mount "${prepared}"
   if [[ -e "${target_dir}" ]]; then
-    (cd "${target_dir}" && compose_cmd stop)
+    (cd "${target_dir}" && stop_tg_browsers && compose_cmd stop)
     previous_dir="${target_dir}.before-restore-$(date +%Y%m%d_%H%M%S)"
     [[ ! -e "${previous_dir}" ]] || die "回退目录已存在，请稍后重试。"
     mv "${target_dir}" "${previous_dir}"
     info "原部署已保留：${previous_dir}"
   fi
   mv "${prepared}" "${target_dir}"
-  if ! (cd "${target_dir}" && compose_cmd up -d --build --force-recreate && wait_service_ready); then
+  if ! (cd "${target_dir}" && build_tg_browser && compose_cmd up -d --build --force-recreate && wait_service_ready); then
     warn "恢复版本启动失败，新目录已保留。"
     if [[ -n "${previous_dir:-}" ]]; then
       (cd "${target_dir}" && compose_cmd down) || true
@@ -795,6 +840,32 @@ PY
   echo "${target_dir}" > "${STATE_FILE}"
   print_access_info "${target_dir}/.env"
 )
+mark_tg_hosting_restore() {
+  local workdir="$1" db_path
+  db_path="$(read_env_value "${workdir}/.env" SQLITE_DB_PATH /app/data/app.db)"
+  python3 - "${workdir}" "${db_path}" <<'PY'
+import json, os, sqlite3, sys, uuid
+from pathlib import Path
+from datetime import datetime, timezone
+root = Path(sys.argv[1])
+database = sys.argv[2].strip().strip('"').strip("'")
+if not database.startswith('/app/data/') or '/../' in database:
+    raise SystemExit('TG 托管恢复要求数据库位于持久化目录')
+file = root / 'data' / database[len('/app/data/'):]
+if not file.exists():
+    sys.exit(0)
+with sqlite3.connect(f'file:{file}?mode=ro', uri=True) as db:
+    table = db.execute("SELECT 1 FROM sqlite_master WHERE name='tg_hosting_accounts'").fetchone()
+    accounts = table and db.execute('SELECT 1 FROM tg_hosting_accounts LIMIT 1').fetchone()
+if accounts:
+    marker = root / 'data' / '.tg-hosting-restored.json'
+    marker.unlink(missing_ok=True)
+    with open(marker, 'x', opener=lambda name, flags: os.open(name, flags, 0o600)) as stream:
+        json.dump({'id': str(uuid.uuid4()), 'restoredAt': datetime.now(timezone.utc).isoformat()}, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+PY
+}
 restore_backup() {
   restore_service
 }
@@ -906,8 +977,9 @@ uninstall_service() {
 
   (
     cd "${workdir}" || exit 1
+    stop_tg_browsers || die "浏览器停止失败，已取消卸载，避免删除使用中的登录资料。"
     compose_cmd down -v || true
-  )
+  ) || die "停止或移除容器失败，已取消卸载。"
 
   rm -rf "${workdir}"
   rm -f "${STATE_FILE}"
@@ -947,11 +1019,12 @@ main_menu() {
   echo " 8) 完全卸载"
   echo " 9) 📁 FTP/SFTP 备份工具"
   echo "10) 📂 S3 备份工具"
+  echo "11) 💬 TG 托管组件"
   echo " 0) 退出"
   echo "=================================================="
 
   local choice
-  read -r -p "请选择操作 [0-10]: " choice
+  read -r -p "请选择操作 [0-11]: " choice
   case "${choice}" in
     1) deploy_service ;;
     2) upgrade_service ;;
@@ -963,6 +1036,7 @@ main_menu() {
     8) uninstall_service ;;
     9) install_ftp ;;
     10) install_s3 ;;
+    11) enable_tg_hosting ;;
     0) info "再见"; exit 0 ;;
     *) warn "无效选项。" ;;
   esac
@@ -978,6 +1052,7 @@ dispatch_command() {
     backup) do_backup ;;
     restore) restore_backup ;;
     cron) setup_auto_backup ;;
+    tg-hosting) enable_tg_hosting ;;
     uninstall) uninstall_service ;;
     "")
       while true; do
@@ -988,7 +1063,7 @@ dispatch_command() {
       ;;
     *)
       err "不支持的命令: ${1}"
-      echo "可用命令: install | upgrade | stop | restart | backup | restore | cron | uninstall | run-backup"
+      echo "可用命令: install | upgrade | stop | restart | backup | restore | cron | uninstall | run-backup | tg-hosting"
       exit 1
       ;;
   esac

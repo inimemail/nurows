@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 
-const socketPaths = new Set(['/ws/terminal', '/ws/command-job']);
+const socketPaths = new Set(['/ws/terminal', '/ws/command-job', '/ws/tg-hosting']);
 
 export function isAllowedWebSocketOrigin(req, { allowedOrigins = [], production = true, devPort = '5173' } = {}) {
   try {

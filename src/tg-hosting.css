@@ -1,0 +1,129 @@
+.tg-hosting-workspace { min-width: 0; }
+.tg-hosting-workspace.tg-hosting-fullscreen { position: fixed; inset: 0; z-index: 600; height: 100dvh; overflow: hidden; padding: 20px; background: var(--page-bg, #f4f6f9); }
+.tg-heading-tools,.tg-toolbar-buttons,.tg-row-actions,.tg-pagination>div { display: flex; align-items: center; gap: 8px; }
+.tg-lock-state { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 12px; }
+.tg-lock-state.open { color: #358369; }
+.tg-account-panel { display: flex; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; }
+.tg-account-panel>div:not(.tg-account-list),.tg-account-panel>footer { flex-shrink: 0; }
+.tg-account-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 22px 15px; }
+.tg-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 22px; }
+.tg-summary span { display: flex; align-items: baseline; gap: 6px; color: var(--text-muted); font-size: 12px; }
+.tg-summary b { font-size: 22px; font-weight: 650; color: var(--text-strong, var(--text-main)); }
+.tg-summary .running b { color: #358369; }
+.tg-filter-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 0 22px 14px; border-bottom: 1px solid var(--border-soft); }
+.tg-filter-row>div { display: flex; gap: 8px; min-width: 0; }
+.tg-filter-row select { max-width: 180px; min-width: 105px; border: 1px solid var(--border-soft); border-radius: 8px; padding: 7px 10px; color: var(--text-soft); background: var(--card-bg); font-size: 12px; }
+.tg-component-notice { display: flex; align-items: flex-start; gap: 12px; margin: 16px 22px; padding: 13px 15px; border: 1px solid var(--border-soft); background: var(--card-hover); border-radius: 10px; color: var(--text-muted); }
+.tg-component-notice>svg { flex-shrink: 0; margin-top: 2px; }
+.tg-component-notice strong { color: var(--text-soft); font-size: 13px; }
+.tg-component-notice p { margin: 4px 0 0; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.tg-component-notice>div { min-width: 0; }
+.tg-migration-notice { border-color: #b68d3a50; background: #b68d3a0b; }
+.tg-migration-notice button { margin-top: 9px; border: 1px solid var(--border-soft); font-size: 12px; }
+.tg-resource-status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 14px; padding: 10px 22px; color: var(--text-muted); font-size: 11px; }
+.tg-migration-confirm { display: flex; align-items: flex-start; gap: 9px; padding: 13px; border: 1px solid var(--border-soft); border-radius: 9px; font-size: 13px; color: var(--text-soft); line-height: 1.6; cursor: pointer; }
+.tg-migration-confirm input { flex-shrink: 0; margin-top: 3px; }
+.tg-account-list { flex: 1; min-height: 100px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.tg-account-list:has(details[open]) { padding-bottom: 150px; }
+.tg-account-row { display: grid; grid-template-columns: minmax(170px,1.4fr) minmax(130px,1fr) minmax(140px,.9fr) auto; gap: 18px; padding: 17px 22px; align-items: center; border-bottom: 1px solid var(--border-soft); }
+.tg-account-row:hover { background: var(--card-hover); }
+.tg-account-identity { display: flex; gap: 12px; align-items: center; min-width: 0; }
+.tg-avatar { width: 40px; height: 40px; display: grid; place-items: center; flex-shrink: 0; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--card-hover); color: var(--accent-text, #4888ba); }
+.tg-account-identity>div { display: grid; gap: 4px; min-width: 0; }
+.tg-account-identity strong { color: var(--text-strong, var(--text-main)); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tg-account-identity span:not(.tg-avatar),.tg-account-identity small { color: var(--text-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tg-account-status { display: grid; justify-items: start; gap: 6px; min-width: 0; }
+.tg-state { display: inline-flex; padding: 4px 8px; border-radius: 6px; color: var(--text-muted); background: var(--card-hover); font-size: 11px; white-space: nowrap; }
+.tg-state.running { color: #287356; background: #439a7916; }
+.tg-state.queued,.tg-state.starting { color: #a6742b; background: #bd933819; }
+.tg-state.error { color: #c15151; background: #c1515112; }
+.tg-account-status small,.tg-account-time { color: var(--text-muted); font-size: 11px; }
+.tg-account-status em { font-style: normal; color: #bc5353; font-size: 11px; overflow-wrap: anywhere; }
+.tg-account-time { display: grid; gap: 7px; }
+.tg-open-account { color: var(--accent-text); border: 1px solid var(--border-soft); }
+.tg-row-more { position: relative; }
+.tg-row-more summary { list-style: none; cursor: pointer; padding: 8px; color: var(--text-muted); }
+.tg-row-more summary::-webkit-details-marker { display: none; }
+.tg-row-more>div { position: absolute; z-index: 10; top: 34px; right: 0; width: 165px; padding: 6px; border: 1px solid var(--border-soft); border-radius: 10px; box-shadow: 0 8px 28px #0002; background: var(--card-bg, #fff); }
+.tg-row-more button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 10px 8px; text-align: left; font-size: 12px; border-radius: 6px; cursor: pointer; }
+.tg-row-more button:hover { background: var(--card-hover); }
+.tg-footnote { display: flex; align-items: start; gap: 7px; margin-top: auto; padding: 16px 22px; color: var(--text-muted); font-size: 11px; line-height: 1.7; }
+.tg-footnote svg { flex: 0 0 13px; margin-top: 3px; }
+.tg-pagination { display: flex; justify-content: space-between; align-items: center; padding: 13px 22px; color: var(--text-muted); font-size: 12px; }
+.tg-empty { display: grid; justify-items: center; gap: 12px; padding: 54px 20px; text-align: center; color: var(--text-muted); }
+.tg-empty>span { width: 65px; height: 65px; display: grid; place-items: center; border-radius: 20px; background: var(--card-hover); color: var(--accent-text); }
+.tg-empty h3 { margin: 5px 0 0; font-size: 18px; color: var(--text-strong, var(--text-main)); }
+.tg-empty p { margin: 0 0 8px; font-size: 12px; line-height: 1.8; }
+.tg-form { display: grid; gap: 18px; }
+.tg-form .ops-field input,.tg-form .ops-field textarea { min-width: 0; width: 100%; }
+.tg-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.tg-dialog-description { font-size: 12px; color: var(--text-muted); line-height: 1.8; margin: 0; }
+.tg-form-intro { display: flex; gap: 12px; align-items: center; color: var(--accent-text); padding: 13px; border-radius: 10px; background: var(--card-hover); }
+.tg-form-intro p { margin: 0; font-size: 13px; color: var(--text-soft); }
+.tg-form-intro small { display: block; margin-top: 5px; color: var(--text-muted); font-size: 11px; }
+.tg-mode-options { border: 0; padding: 0; margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.tg-mode-options legend { color: var(--text-soft); font-size: 12px; padding: 0 0 9px; }
+.tg-mode-options label { display: flex; align-items: center; gap: 8px; padding: 13px 10px; border: 1px solid var(--border-soft); border-radius: 9px; cursor: pointer; }
+.tg-mode-options label.selected { border-color: var(--accent-text, #538ab8); background: var(--card-hover); }
+.tg-mode-options strong { display: block; font-size: 12px; color: var(--text-soft); }
+.tg-mode-options small { display: block; margin-top: 4px; font-size: 10px; color: var(--text-muted); }
+.dialog.xwide.tg-viewer-dialog { width: min(1440px,96vw); max-width: none; height: min(92dvh,1000px); max-height: 96dvh; display: flex; flex-direction: column; }
+.tg-viewer-dialog .dialog-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 0; }
+.tg-viewer-dialog .dialog-head { padding: 14px 18px; flex: 0 0 auto; }
+.tg-viewer-dialog .dialog-footer { padding: 10px 16px; }
+.dialog.xwide.tg-viewer-fullscreen { width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; }
+.dialog-backdrop:has(>.tg-viewer-fullscreen) { padding: 0; }
+.tg-viewer-tools { flex-shrink: 0; display: flex; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border-soft); }
+.tg-viewer-tools>div { display: flex; gap: 6px; }
+.tg-viewer-tools button { font-size: 11px; padding: 7px; }
+.tg-remote-screen { position: relative; flex: 1; min-height: 0; overflow: auto; background: #1a1e26; }
+.tg-vnc-target { position: absolute; inset: 0; overflow: auto; }
+.tg-viewer-cover { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 15px; color: #abb6c6; background: #1a1e26; padding: 25px; text-align: center; }
+.tg-viewer-cover strong { color: #e8eef4; font-size: 16px; }
+.tg-viewer-cover p { font-size: 12px; max-width: 450px; line-height: 1.8; }
+.tg-viewer-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; font-size: 11px; color: var(--text-muted); }
+.tg-viewer-footer i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #939dac; margin-right: 5px; }
+.tg-viewer-footer i.connected { background: #38926c; }
+.tg-remote-input { display: grid; gap: 8px; padding: 10px 12px; flex: 0 0 auto; border-top: 1px solid var(--border-soft); }
+.tg-remote-input textarea { width: 100%; resize: vertical; min-height: 58px; max-height: 130px; border: 1px solid var(--border-soft); border-radius: 7px; padding: 10px; background: var(--card-bg); color: var(--text-soft); font-size: 14px; }
+.tg-remote-input>div { display: flex; gap: 6px; align-items: center; }
+.tg-remote-input>div>span { flex: 1; }
+.tg-remote-input button { font-size: 11px; }
+@media(max-width:1000px) { .tg-account-row { grid-template-columns: minmax(140px,1.4fr) minmax(110px,1fr) auto; gap: 12px; } .tg-account-time { display: none; } .tg-account-toolbar { align-items: flex-start; flex-direction: column; } .tg-toolbar-buttons { align-self: flex-end; } }
+@media(max-width:600px) {
+  .tg-hosting-workspace.tg-hosting-fullscreen { padding: max(10px,env(safe-area-inset-top)) 10px max(10px,env(safe-area-inset-bottom)); }
+  .tg-lock-state { font-size: 10px; } .tg-heading-tools { gap: 4px; }
+  .tg-account-toolbar { padding: 16px 14px 12px; gap: 14px; } .tg-summary { gap: 18px; } .tg-summary b { font-size: 20px; } .tg-summary span { font-size: 11px; }
+  .tg-toolbar-buttons { width: 100%; justify-content: flex-end; gap: 6px; } .tg-toolbar-buttons button { font-size: 12px; }
+  .tg-filter-row { padding: 0 14px 12px; } .tg-filter-row select { min-width: 0; max-width: 105px; font-size: 11px; padding: 7px; } .tg-filter-row>button { font-size: 11px; white-space: nowrap; }
+  .tg-component-notice { margin: 12px 14px; padding: 12px; }
+  .tg-resource-status { padding: 10px 14px; font-size: 10px; }
+  .tg-account-row { grid-template-columns: minmax(0,1fr) auto; gap: 12px 10px; padding: 15px 14px; } .tg-account-identity { grid-column: 1/-1; gap: 9px; } .tg-avatar { width: 34px; height: 34px; border-radius: 10px; }
+  .tg-account-status { grid-row: 2; grid-column: 1; display: grid; gap: 5px; padding-left: 0; } .tg-account-status small { font-size: 10px; line-height: 1.6; }
+  .tg-row-actions { grid-row: 2; grid-column: 2; gap: 1px; } .tg-open-account { padding: 7px 9px; font-size: 11px; } .tg-footnote { padding: 14px; font-size: 10px; }
+  .tg-form-grid { grid-template-columns: 1fr; } .tg-mode-options { gap: 8px; } .tg-mode-options label { padding: 11px 8px; } .tg-mode-options small { font-size: 9px; }
+  .dialog-backdrop:has(>.tg-viewer-dialog) { padding: 0; }
+  .dialog.xwide.tg-viewer-dialog { width: 100%; height: 100%; max-height: 100%; border-radius: 0; margin: 0; }
+  .tg-viewer-dialog .dialog-body { overflow-y: auto; scrollbar-gutter: auto; }
+  .tg-viewer-dialog .tg-remote-screen { min-height: 120px; }
+  .tg-viewer-dialog .dialog-head { padding: max(12px,env(safe-area-inset-top)) 12px 12px; } .tg-viewer-dialog .dialog-footer { padding: 9px 10px max(9px,env(safe-area-inset-bottom)); }
+  .tg-viewer-tools { padding: 6px; gap: 4px; flex-wrap: wrap; } .tg-viewer-tools>div { gap: 3px; } .tg-viewer-tools button { font-size: 10px; padding: 6px; }
+  .tg-viewer-footer { align-items: flex-start; font-size: 10px; } .tg-viewer-footer>button { flex-shrink: 0; font-size: 10px; }
+  .tg-remote-input textarea,.tg-form input,.tg-form textarea { font-size: 16px; } .tg-remote-input button { font-size: 10px; padding: 7px; }
+}
+body:has(.tg-hosting-fullscreen,.tg-viewer-dialog) .dialog-backdrop { z-index: 1500; }
+body:has(.tg-hosting-fullscreen,.tg-viewer-dialog) .toast-stack { z-index: 1600; }
+
+.tg-hosting-workspace .ops-eyebrow { letter-spacing: 0; }
+@media(max-width:600px) { .tg-hosting-workspace .ops-header { min-height: 70px; padding: 12px 14px; gap: 8px; } .tg-hosting-workspace .ops-header strong { font-size: 18px; } .tg-hosting-workspace .ops-eyebrow { font-size: 9px; } }
+
+.tg-hosting-workspace .tg-account-panel { border-radius: 14px; }
+@media(max-width:600px) {
+  .tg-hosting-workspace .ops-header { flex-direction: row; align-items: center; }
+  .tg-account-identity strong { font-size: 13px; }
+  .tg-hosting-workspace .tg-heading-tools .icon-button { width: 34px; min-width: 34px; min-height: 34px; }
+  .tg-row-actions .icon-button { width: 32px; min-width: 32px; min-height: 36px; }
+}
+
+.tg-deletion-progress { margin: 12px 16px; padding: 10px 12px; border-radius: 8px; background: var(--accent-soft); color: var(--text-soft); font-size: 12px; overflow-wrap: anywhere; }
+.tg-deletion-progress.failed { color: #bc5353; }

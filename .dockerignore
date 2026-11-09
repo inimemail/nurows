@@ -12,3 +12,5 @@ local-run.out
 local-run.err
 __pycache__
 *.pyc
+
+tg-browser-data/

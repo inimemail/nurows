@@ -8,7 +8,7 @@ import { filterPickerServers } from '../shared/server-picker-search.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
 import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
 import RenewalWorkspace from './RenewalWorkspace.jsx';
-import { BookOpen, CalendarClock, Webhook, ShieldCheck, Wallet } from 'lucide-react';
+import { BookOpen, CalendarClock, Webhook, ShieldCheck, Wallet, MessagesSquare } from 'lucide-react';
 import { HISTORY_LABELS } from './HistoryRecords.jsx';
 import Dialog from './Dialog.jsx';
 import { copyNoteText } from './note-clipboard.js';
@@ -19,6 +19,7 @@ const NotesWorkspace = lazy(() => import('./NotesWorkspace.jsx'));
 const WebhookWorkspace = lazy(() => import('./WebhookWorkspace.jsx'));
 const AuthenticatorWorkspace = lazy(() => import('./AuthenticatorWorkspace.jsx'));
 const EpayWorkspace = lazy(() => import('./EpayWorkspace.jsx'));
+const TgHostingWorkspace = lazy(() => import('./TgHostingWorkspace.jsx'));
 
 const EMPTY_SERVER = {
   id: '',
@@ -95,7 +96,8 @@ const TABS = [
   { key: 'telegram', label: 'Telegram', icon: TelegramIcon },
   { key: 'notes', label: '笔记', icon: BookOpen },
   { key: 'authenticator', label: '2FA 验证器', icon: ShieldCheck },
-  { key: 'epay', label: '易支付', icon: Wallet }
+  { key: 'epay', label: '易支付', icon: Wallet },
+  { key: 'tgHosting', label: 'TG 托管', icon: MessagesSquare }
 ];
 
 const TERMINAL_SESSIONS_STORAGE_KEY = 'nurossh-terminal-sessions';
@@ -352,7 +354,7 @@ function readStoredActiveTerminalId() {
 
 function normalizeWorkspacePayload(workspace = {}) {
   return {
-    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay'].includes(workspace.tab) ? workspace.tab : 'servers',
+    tab: ['commands', 'webhooks', 'automation', 'proxies', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay', 'tgHosting'].includes(workspace.tab) ? workspace.tab : 'servers',
     search: typeof workspace.search === 'string' ? workspace.search : '',
     selectedServerId: typeof workspace.selectedServerId === 'string' ? workspace.selectedServerId : '',
     selectedCommandId: typeof workspace.selectedCommandId === 'string' ? workspace.selectedCommandId : '',
@@ -2470,7 +2472,7 @@ export default function App() {
           >
             <ThemeIcon theme={theme} />
           </button>
-          {!['webhooks', 'authenticator', 'epay'].includes(tab) ? <button className="ghost mobile-only" onClick={() => setAssetDrawerOpen((value) => !value)}>列表</button> : null}
+          {!['webhooks', 'authenticator', 'epay', 'tgHosting'].includes(tab) ? <button className="ghost mobile-only" onClick={() => setAssetDrawerOpen((value) => !value)}>列表</button> : null}
           {tab === 'servers' ? <button className="ghost" onClick={() => setImportDialog((current) => ({ ...current, open: true }))}>导入</button> : null}
           <button className="ghost user-pill" onClick={() => setSettingsDialogOpen(true)}>
             <GearIcon />
@@ -2479,7 +2481,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay'].includes(tab) ? ' orchestration-layout' : '')}>
+      <div className={'console-body ' + (workspaceFullscreenActive ? 'console-body-terminal-fullscreen' : '') + (tab === 'automation' ? ' automation-layout' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay', 'tgHosting'].includes(tab) ? ' orchestration-layout' : '')}>
         {!workspaceFullscreenActive ? (
           <button
             className={'mobile-drawer-scrim ' + (assetDrawerOpen ? 'open' : '')}
@@ -2488,7 +2490,7 @@ export default function App() {
             onClick={() => setAssetDrawerOpen(false)}
           />
         ) : null}
-        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay'].includes(tab) ? ' orchestration-aside' : '')}>
+        <aside className={'surface side-panel ' + (assetDrawerOpen ? 'open' : '') + ' ' + (workspaceFullscreenActive ? 'side-panel-hidden' : '') + (tab === 'automation' ? ' automation-aside' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay', 'tgHosting'].includes(tab) ? ' orchestration-aside' : '')}>
             <div className="side-head">
             <div>
               <strong>{tab === 'servers' ? '资产树' : tab === 'commands' ? '命令模板' : tab === 'automation' ? '自动化任务' : tab === 'webhooks' ? 'Webhook 任务' : tab === 'probes' ? '探针管理' : tab === 'pools' ? '备用 IP 池' : tab === 'dns' ? '解析管理' : tab === 'epay' ? '易支付' : '代理列表'}</strong>
@@ -2696,13 +2698,14 @@ export default function App() {
           ) : null}
         </aside>
 
-          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay'].includes(tab) ? ' orchestration-main' : '')}>
+          <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay', 'tgHosting'].includes(tab) ? ' orchestration-main' : '')}>
           {tab === 'webhooks' ? <Suspense fallback={<div className="ops-empty">正在加载 Webhook 任务…</div>}><WebhookWorkspace api={api} toast={toast} Dialog={Dialog} cache={webhookCache} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
           {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} stateReady={stateLoaded} dynamicGuardCache={dynamicGuardCache} search={search} onSearchChange={setSearch} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
           {tab === 'renewals' ? <RenewalWorkspace state={state} search={search} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
           {tab === 'notes' ? <Suspense fallback={<div className="surface workspace-panel">正在加载笔记...</div>}><NotesWorkspace api={api} toast={toast} search={search} onSearchScopeChange={setWorkspaceSearchScope} onBeforeLeave={handler => { notesBeforeLeave.current = handler; }} /></Suspense> : null}
           {tab === 'authenticator' ? <Suspense fallback={<div className="ops-empty">正在加载验证器…</div>}><AuthenticatorWorkspace api={api} toast={toast} Dialog={Dialog} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
           {tab === 'epay' ? <Suspense fallback={<div className="ops-empty">正在加载易支付…</div>}><EpayWorkspace api={api} toast={toast} Dialog={Dialog} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
+          {tab === 'tgHosting' ? <Suspense fallback={<div className="ops-empty">正在加载 TG 托管…</div>}><TgHostingWorkspace api={api} toast={toast} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
           {tab === 'automation' ? (
             <section className="automation-board">
               <div className="automation-page-head surface">

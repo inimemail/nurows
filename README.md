@@ -220,3 +220,7 @@ Nginx 仍需正常转发 WebSocket Upgrade 和浏览器的 Origin、Sec-WebSocke
 
 - `npm run build`
 - `npm start`
+
+### TG 托管（可选组件）
+
+易支付后新增 TG 托管，可在面板内打开服务器上的多个独立 Telegram 官方网页会话，支持后台保持、休眠、全屏和手机输入。升级面板后，通过管理脚本 **11）TG 托管组件** 按需安装；未启用时不运行浏览器。组件需要 Linux Docker、允许 Chromium sandbox 的用户命名空间，以及足够的内存。会话快照随原加密备份保存，运行配置本身仍需宿主机磁盘保护。使用、资源限制和恢复说明见 [TG 托管说明](tg-hosting/README.md)。

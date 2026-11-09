@@ -1,4 +1,4 @@
-export async function openAuthenticatedWebSocket(url, { signal, fetchImpl = fetch, Socket = WebSocket } = {}) {
+export async function openAuthenticatedWebSocket(url, { signal, fetchImpl = fetch, Socket = WebSocket, protocols = [] } = {}) {
   const controller = new AbortController();
   const cancel = () => controller.abort(signal.reason);
   if (signal?.aborted) cancel();
@@ -18,7 +18,7 @@ export async function openAuthenticatedWebSocket(url, { signal, fetchImpl = fetc
     if (!response.ok) throw new Error(data.error || '无法获取终端连接凭证，请刷新页面重试');
     if (!/^[a-f0-9]{64}$/.test(data.ticket || '')) throw new Error('终端连接凭证无效，请确认前后端已同时更新');
     // Keep the short-lived, single-use proof out of URLs and access logs.
-    return new Socket(url, ['nurossh-v1', `nurossh-ticket.${data.ticket}`]);
+    return new Socket(url, ['nurossh-v1', `nurossh-ticket.${data.ticket}`, ...protocols]);
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener('abort', cancel);

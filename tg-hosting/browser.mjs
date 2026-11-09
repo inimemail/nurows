@@ -23,7 +23,7 @@ function stop(code = 0) {
     for (const process of children) if (process !== chromium) process.kill('SIGTERM');
   };
   if (chromium && children.has(chromium)) {
-    chromium.once('exit', stopDisplay); chromium.kill('SIGTERM');
+    chromium.once('exit', (exitCode, signal) => { if (exitCode !== 0 || signal) forcedStop = true; stopDisplay(); }); chromium.kill('SIGTERM');
     setTimeout(() => { if (children.has(chromium)) { forcedStop = true; chromium.kill('SIGKILL'); } stopDisplay(); }, 12000).unref();
   } else stopDisplay();
   const poll = setInterval(() => { if (!children.size) { clearInterval(poll); process.exit(forcedStop ? 75 : code); } }, 100);
@@ -31,7 +31,7 @@ function stop(code = 0) {
 }
 process.on('SIGTERM', () => stop()); process.on('SIGINT', () => stop());
 fs.mkdirSync('/profile', { recursive: true, mode: 0o700 });
-launch('Xtigervnc', [':99', '-geometry', '1024x768', '-depth', '24', '-SecurityTypes', 'None', '-AlwaysShared', '-localhost', 'no', '-rfbport', '5900', '-MaxCutText', '32768', '-nolisten', 'tcp', '-ac']);
+launch('Xtigervnc', [':99', '-geometry', '1024x768', '-depth', '24', '-SecurityTypes', 'None', '-AlwaysShared', '-localhost', 'no', '-rfbport', '5900', '-FrameRate', '30', '-MaxCutText', '32768', '-nolisten', 'tcp', '-ac']);
 for (let i = 0; i < 100 && !fs.existsSync('/tmp/.X11-unix/X99'); i++) await new Promise(resolve => setTimeout(resolve, 50));
 
 launch('openbox', ['--config-file', '/opt/openbox.xml', '--sm-disable']);

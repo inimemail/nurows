@@ -6,6 +6,8 @@ COPY tg-hosting/runner.mjs ./runner.mjs
 COPY shared/tg-hosting.js ./shared/tg-hosting.js
 COPY shared/tg-http.js ./shared/tg-http.js
 COPY shared/tg-docker.js ./shared/tg-docker.js
+COPY shared/tg-frame-relay.js ./shared/tg-frame-relay.js
+COPY shared/tg-profile-storage.js ./shared/tg-profile-storage.js
 COPY server/backup-crypto.cjs ./backup-crypto.cjs
 CMD ["node", "runner.mjs"]
 

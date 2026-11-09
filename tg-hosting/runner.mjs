@@ -8,8 +8,10 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { WebSocketServer } from 'ws';
 import { encoder, decoder } from './backup-crypto.cjs';
-import { TG_ACCOUNT_ID, tgHostingSettings, tgDiskReserve, tgMemoryBudget, tgBrowserGrowthMb, tgRetryDelay, tgRuntimeAccount, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from './shared/tg-hosting.js';
+import { TG_ACCOUNT_ID, TG_PROFILE_MAX_BYTES, tgHostingSettings, tgDiskReserve, tgMemoryBudget, tgBrowserGrowthMb, tgRetryDelay, tgRuntimeAccount, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from './shared/tg-hosting.js';
 import { createTgDockerClient } from './shared/tg-docker.js';
+import { relayTgFrame } from './shared/tg-frame-relay.js';
+import { createProfileStorage, scanProfile } from './shared/tg-profile-storage.js';
 
 const socket = process.env.TG_HOSTING_SOCKET || '/control/runner.sock';
 const dockerSocket = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
@@ -28,6 +30,26 @@ const idCheck = id => { if (!TG_ACCOUNT_ID.test(id)) fail('账号标识无效');
 const label = () => ({ 'nurossh.tg.owner': namespace });
 const name = id => `nurossh-tg-${namespace}-${id}`;
 const activeMarker = id => path.join(profiles, `.active-${id}`);
+const profileMarker = id => path.join(snapshots, `${id}.profile-known`);
+async function markProfileKnown(id) {
+  const row = rows.get(id);
+  if (!fs.existsSync(profileMarker(id))) {
+    const stage = `${profileMarker(id)}.partial`;
+    await fsp.rm(stage, { force: true });
+    try {
+      const handle = await fsp.open(stage, 'wx', 0o600);
+      try { await handle.writeFile('profile-created\n'); await fsp.chown(stage, 10001, 10001); await handle.sync(); } finally { await handle.close(); }
+      await fsp.rename(stage, profileMarker(id));
+    } finally { await fsp.rm(stage, { force: true }); }
+    const directory = await fsp.open(snapshots, 'r'); try { await directory.sync(); } finally { await directory.close(); }
+  }
+  if (row) row.profileExpected = true;
+}
+function requireSavedProfile(id) {
+  if (rows.get(id)?.profileExpected || fs.existsSync(profileMarker(id)) || fs.existsSync(activeMarker(id))) {
+    fail('已有账号的登录目录和快照均缺失，已停止启动或备份；请恢复原资料，不会创建空白会话', 503);
+  }
+}
 const active = () => [...rows.values()].filter(row => ['starting', 'running', 'stopping', 'saving'].includes(row.state));
 function retryResourceWaiters() {
   for (const row of rows.values()) if (row.state === 'queued' && row.resourceAttempts) { row.retryAt = 0; row.resourceAttempts = 0; }
@@ -66,7 +88,8 @@ async function restoreProfile(id) {
   const directory = path.join(profiles, id), archive = path.join(snapshots, `${id}.tar.gz.enc`);
   await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
   await fsp.chown(directory, 10001, 10001);
-  if ((await fsp.readdir(directory)).length || !fs.existsSync(archive)) return;
+  if ((await fsp.readdir(directory)).length) { await markProfileKnown(id); return; }
+  if (!fs.existsSync(archive)) { requireSavedProfile(id); return; }
   // Authenticate the entire archive before extraction. The temporary archive is
   // private, removed on failure, and never part of a deployment backup.
   const temporary = path.join(profiles, `.restore-${id}.tar.gz`);
@@ -78,7 +101,7 @@ async function restoreProfile(id) {
     const resources = await readResources(true), archiveSize = (await fsp.stat(archive)).size;
     if (resources.error || archiveSize > resources.diskHeadroomBytes) fail('恢复空间不足，原加密会话未修改，请清理磁盘后重试', 503);
     let size = 0;
-    const bounded = new Transform({ transform(chunk, _enc, callback) { size += chunk.length; callback(size > 2 * 1024 ** 3 ? Error('账号配置超过 2 GB') : null, chunk); } });
+    const bounded = new Transform({ transform(chunk, _enc, callback) { size += chunk.length; callback(size > TG_PROFILE_MAX_BYTES + 256 * 1024 ** 2 ? Error('账号备份超过安全上限，原加密快照已保留') : null, chunk); } });
     await pipeline(fs.createReadStream(archive), decoder(key), bounded, fs.createWriteStream(temporary, { mode: 0o600 }));
     await fsp.chown(temporary, 10001, 10001);
     await fsp.rm(staging, { recursive: true, force: true });
@@ -86,32 +109,26 @@ async function restoreProfile(id) {
     await helper(stagingName, ['node', '/opt/profile-archive.cjs', 'extract', '/archive/profile.tar.gz'], { archive: temporary });
     await fsp.rmdir(directory); // Must still be empty; never replace a live profile.
     await fsp.rename(staging, directory);
+    await markProfileKnown(id);
   } finally { await fsp.rm(temporary, { force: true }); await fsp.rm(staging, { recursive: true, force: true }); }
 }
-async function profileUsage(id, limitBytes = 2 * 1024 ** 3, limitFiles = 100000) {
-  const root = path.join(profiles, id); let bytes = 0, files = 0;
-  async function walk(directory) {
-    for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
-      if (['SingletonLock', 'SingletonCookie', 'SingletonSocket'].includes(entry.name)) continue;
-      if (++files > limitFiles) fail('账号浏览器配置文件过多，已暂停启动以保护磁盘');
-      if (entry.isSymbolicLink()) fail('账号配置包含不允许的符号链接');
-      const current = path.join(directory, entry.name);
-      if (entry.isDirectory()) await walk(current);
-      else if (entry.isFile()) {
-        const stat = await fsp.stat(current); bytes += stat.size;
-        if (bytes > limitBytes || files > limitFiles) fail('账号浏览器配置过大，已暂停启动以保护磁盘');
-      } else fail('账号配置包含不支持的文件类型');
-    }
-  }
-  await walk(root); return { bytes, files };
+async function profileUsage(id) {
+  const usage = await scanProfile(path.join(profiles, id), { excludeCaches: true });
+  if (usage.filesExceeded || usage.bytes > TG_PROFILE_MAX_BYTES) fail('账号配置超过备份安全上限（20 GB / 10 万文件），原快照和登录资料已保留');
+  return usage;
 }
+const storage = createProfileStorage({ rows, profiles, snapshots,
+  getLimit: () => settings.storageGb * 1024 ** 3,
+  exclusive, blocked: () => !configured || backupLease || closed || migrationHold,
+  stop, canClean: row => !row.uncleanStop && !fs.existsSync(activeMarker(row.id)),
+});
 async function helper(id, command, { archive } = {}) {
   const binds = [`${hostProfiles}/${id}:/profile`];
   if (archive) binds.push(`${hostProfiles}/${path.basename(archive)}:/archive/profile.tar.gz:ro`);
-  const created = await docker('POST', '/containers/create', { Image: image, User: '10001:10001', Entrypoint: command, Cmd: [], Healthcheck: { Test: ['NONE'] }, Labels: { ...label(), 'nurossh.tg.helper': '1' }, HostConfig: { Binds: binds, NetworkMode: 'none', ReadonlyRootfs: true, CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges:true'], Memory: 384 * 1024 ** 2, MemorySwap: 384 * 1024 ** 2, NanoCpus: 5e8, CpuShares: 64, LogConfig: { Type: 'none' }, PidsLimit: 64 } });
+  const created = await docker('POST', '/containers/create', { Image: image, User: '10001:10001', Env: [`TG_PROFILE_LIMIT_BYTES=${TG_PROFILE_MAX_BYTES}`], Entrypoint: command, Cmd: [], Healthcheck: { Test: ['NONE'] }, Labels: { ...label(), 'nurossh.tg.helper': '1' }, HostConfig: { Binds: binds, NetworkMode: 'none', ReadonlyRootfs: true, CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges:true'], Memory: 384 * 1024 ** 2, MemorySwap: 384 * 1024 ** 2, NanoCpus: 5e8, CpuShares: 64, LogConfig: { Type: 'none' }, PidsLimit: 64 } });
   try {
     await docker('POST', `/containers/${created.Id}/start`);
-    const result = await docker('POST', `/containers/${created.Id}/wait`, undefined, 180000);
+    const result = await docker('POST', `/containers/${created.Id}/wait`, undefined, 900000);
     if (result.StatusCode !== 0) fail('账号配置归档或恢复失败，原快照未替换', 503);
   } finally { await docker('DELETE', `/containers/${created.Id}?force=true`).catch(() => {}); }
 }
@@ -123,6 +140,7 @@ async function stop(id) {
   const container = await inspect(id);
   if (container?.State.Running) await docker('POST', `/containers/${container.Id}/stop?t=25`, undefined, 35000);
   const stopped = container?.State.Running ? await inspect(id) : container;
+  if (stopped?.State.Running) fail('无法确认浏览器已经停止，已保留登录资料和活动标记', 503);
   if (stopped && Date.parse(stopped.State.StartedAt) > 0) {
     row.uncleanStop = Boolean(stopped.State.OOMKilled || stopped.State.ExitCode !== 0);
     if (!row.uncleanStop) {
@@ -153,7 +171,7 @@ async function checkpoint(id) {
   const file = path.join(snapshots, `${id}.tar.gz.enc`);
   // A verified snapshot of a browser that has not restarted is immutable.
   // UI intents may already say "saving"/"stopping"; state alone cannot test this.
-  if (!row.dirty && fs.existsSync(file)) { row.state = resume ? 'queued' : 'stopped'; return; }
+  if (!row.dirty && fs.existsSync(file)) { row.state = resume ? (row.storageBlocked ? 'error' : 'queued') : 'stopped'; return; }
   // Clean interrupted temporary archives without ever deleting browser data.
   const directory = path.join(profiles, id);
   await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -161,8 +179,9 @@ async function checkpoint(id) {
   // A restored, unopened account has a snapshot and no live profile yet.
   // Never replace its only session copy with an empty archive.
   if (!(await fsp.readdir(directory)).length && (fs.existsSync(file) || row.containerPresent === false)) {
+    if (!fs.existsSync(file)) requireSavedProfile(id);
     if (row.containerPresent !== false) await stop(id);
-    row.dirty = false; row.state = resume ? 'queued' : 'stopped'; return;
+    row.dirty = false; row.state = resume ? (row.storageBlocked ? 'error' : 'queued') : 'stopped'; return;
   }
   if (row.containerPresent !== false) await stop(id);
   else row.state = 'stopped';
@@ -172,7 +191,19 @@ async function checkpoint(id) {
   const archive = path.join(profiles, id, `.tg-snapshot-${crypto.randomUUID()}.tar.gz`);
   try {
     if ((row.uncleanStop || fs.existsSync(activeMarker(id))) && fs.existsSync(file)) fail('浏览器未正常退出，已保留上次完整快照和当前登录目录；请重新打开后再保存快照', 503);
+    // Cleaning is optional for a rescue backup: cache failures must not stop
+    // us saving session databases. The archive independently excludes caches.
+    let cachesCleaned = false;
+    if (!row.uncleanStop && !fs.existsSync(activeMarker(id))) {
+      try { await storage.cleanStopped(row); cachesCleaned = true; }
+      catch { row.storageError = '备份前缓存未完全清理；备份仍排除缓存，登录资料保留'; }
+    }
     const usage = await profileUsage(id), resources = await readResources(true);
+    if (!usage.bytes) fail('未发现可备份的账号数据，已保留原快照和当前目录；不会用空资料覆盖登录会话', 503);
+    if (cachesCleaned) {
+      row.storageBytes = usage.bytes; row.storageCheckedAt = Date.now(); row.storageSample = (row.storageSample || 0) + 1;
+      row.storageScanAfter = Date.now() + 30 * 60000;
+    }
     if (resources.error || resources.diskHeadroomBytes < usage.bytes * 2) fail('磁盘空间不足，未覆盖原快照；完整登录资料仍保留在服务器', 503);
     await helper(id, ['node', '/opt/profile-archive.cjs', 'pack', `/profile/${path.basename(archive)}`]);
     const encrypted = encoder(key), writer = fs.createWriteStream(stage, { flags: 'w', mode: 0o600 });
@@ -181,14 +212,18 @@ async function checkpoint(id) {
     await fsp.chown(stage, 10001, 10001); await fsp.rename(stage, file);
     const directory = await fsp.open(snapshots, 'r'); try { await directory.sync(); } finally { await directory.close(); }
     row.dirty = false; row.snapshotAt = new Date().toISOString(); row.snapshotError = '';
+    row.snapshotBytes = (await fsp.stat(file)).size;
+    await markProfileKnown(id);
   } catch (error) { row.snapshotError = error.message; throw error;
-  } finally { await fsp.rm(archive, { force: true }); await fsp.rm(stage, { force: true }); if (resume) row.state = 'queued'; }
+  } finally { await fsp.rm(archive, { force: true }); await fsp.rm(stage, { force: true }); if (resume) row.state = row.storageBlocked ? 'error' : 'queued'; }
 }
 async function start(id, cpu = settings.cpu, memoryMb = settings.memoryMb) {
   const row = rows.get(id); if (!row || !row.desired) return;
   row.state = 'starting'; row.error = ''; row.dirty = true; row.healthySince = null;
   try {
-    await assertImage(); await restoreProfile(id); await profileUsage(id);
+    await assertImage(); await restoreProfile(id);
+    const previous = await inspect(id);
+    await storage.prepare(row, { cleanAllowed: !previous?.State.Running && !row.uncleanStop && !fs.existsSync(activeMarker(id)) });
     const directory = path.join(profiles, id);
     await fsp.chown(directory, 10001, 10001); await fsp.chmod(directory, 0o700);
     const network = await ownedNetwork(id);
@@ -217,12 +252,23 @@ async function start(id, cpu = settings.cpu, memoryMb = settings.memoryMb) {
     for (let i = 0; i < 60; i++) {
       const current = await inspect(id);
       if (!current?.State.Running) throw Error('浏览器未能启动；请检查服务器是否允许 Chromium 用户命名空间 sandbox，以及内存预算');
-      if (Date.now() - new Date(current.State.StartedAt).getTime() >= 3000 && await probeVnc(row.ip)) { row.memoryMb = container.HostConfig.Memory / 1024 ** 2; row.cpu = container.HostConfig.NanoCpus / 1e9; row.state = 'running'; row.startedAt = new Date().toISOString(); row.retryAt = 0; row.resourceAttempts = 0; row.startAttempts = 0; return; }
+      if (Date.now() - new Date(current.State.StartedAt).getTime() >= 3000 && await probeVnc(row.ip)) { await markProfileKnown(id); row.memoryMb = container.HostConfig.Memory / 1024 ** 2; row.cpu = container.HostConfig.NanoCpus / 1e9; row.state = 'running'; row.startedAt = new Date().toISOString(); row.retryAt = 0; row.resourceAttempts = 0; row.startAttempts = 0; return; }
       await new Promise(resolve => setTimeout(resolve, 500));
     }
     throw Error('浏览器启动超时，请检查服务器资源和 sandbox 支持');
   } catch (error) {
-    await stop(id).catch(() => {}); row.error = error.message;
+    let stopped = true;
+    try { await stop(id); } catch { stopped = false; }
+    row.error = error.message;
+    if (!stopped) {
+      // Do not release a potentially live browser's memory/CPU reservation
+      // after any startup failure if Docker cannot confirm it has stopped.
+      row.storageBlocked = Boolean(error.storageBlocked); row.state = 'running'; row.storageScanAfter = Date.now() + 60000;
+      row.memoryMb ||= memoryMb; row.cpu ||= cpu;
+      row.error = `${error.storageBlocked ? '存储超限' : '启动未完成'}，暂时无法确认浏览器已停止；已保留资源名额和登录资料，稍后重试`;
+      return;
+    }
+    if (error.storageBlocked) { row.storageBlocked = true; row.state = 'error'; row.retryAt = 0; return; }
     row.startAttempts = (row.startAttempts || 0) + 1;
     const delay = tgRetryDelay(row.startAttempts);
     row.state = row.desired && delay !== null ? 'queued' : 'error'; row.retryAt = delay === null ? 0 : Date.now() + delay;
@@ -359,7 +405,7 @@ async function tick() {
       }
     }
     if (active().length < settings.maxRunning) {
-      const next = [...rows.values()].find(row => row.state === 'queued' && row.desired && (!row.retryAt || row.retryAt <= Date.now()));
+      const next = [...rows.values()].find(row => row.state === 'queued' && row.desired && !row.storageBlocked && !row.storageMaintaining && (!row.retryAt || row.retryAt <= Date.now()));
       if (next && !next.pending) {
         const budget = await startBudget();
         if (budget.message) { next.error = budget.message; next.resourceAttempts = (next.resourceAttempts || 0) + 1; next.retryAt = Date.now() + Math.min(120000, 5000 * 2 ** Math.min(next.resourceAttempts - 1, 4)); }
@@ -374,7 +420,7 @@ async function configure(data) {
   configured = false;
   if (!/^[a-f0-9]{64}$/.test(data.key || '')) fail('配置密钥无效');
   if (key && !key.equals(Buffer.from(data.key, 'hex'))) fail('托管组件密钥发生变化，请先重启组件', 409);
-  if (!Array.isArray(data.accounts) || data.accounts.length > 10000 || data.accounts.some(item => !TG_ACCOUNT_ID.test(item.id) || typeof item.desired !== 'boolean')) fail('账号配置无效');
+  if (!Array.isArray(data.accounts) || data.accounts.length > 10000 || data.accounts.some(item => !TG_ACCOUNT_ID.test(item.id) || typeof item.desired !== 'boolean' || item.profileExpected !== undefined && typeof item.profileExpected !== 'boolean')) fail('账号配置无效');
   settings = tgHostingSettings(data.settings);
   const wasHeld = migrationHold;
   migrationHold = Boolean(data.migrationHold);
@@ -382,6 +428,9 @@ async function configure(data) {
   const self = await docker('GET', `/containers/${runtimeName}/json`);
   hostProfiles = self.Mounts.find(mount => mount.Destination === profiles)?.Source;
   if (!hostProfiles || !hostProfiles.startsWith('/')) fail('浏览器持久目录未挂载', 503);
+  // Non-secret ownership metadata lets full uninstall find empty orphan
+  // networks even after Docker/the runner lost all container endpoints.
+  await fsp.writeFile(path.join(profiles, '.tg-owner'), namespace + '\n', { mode: 0o600 });
   // A runner crash must not leave a previous archive/extraction helper writing
   // while a new browser opens the same account.
   const existing = await ownedContainers();
@@ -392,13 +441,14 @@ async function configure(data) {
   }
   for (const item of data.accounts) {
     if (rows.has(item.id)) {
+      if (item.profileExpected) rows.get(item.id).profileExpected = true;
       if (migrationHold) { const row = rows.get(item.id); row.desired = false; if (existingIds.has(item.id)) await stop(item.id); else { row.state = 'stopped'; row.containerPresent = false; } }
       else if (wasHeld) { const row = rows.get(item.id); row.desired = item.desired; if (row.desired && row.state === 'stopped') row.state = 'queued'; }
       continue;
     }
     const container = existingIds.has(item.id) ? await inspect(item.id) : null, running = Boolean(container?.State.Running);
     const network = `${name(item.id)}-net`;
-    rows.set(item.id, { dirty: true, containerPresent: Boolean(container), memoryMb: container?.HostConfig?.Memory / 1024 ** 2, cpu: container?.HostConfig?.NanoCpus / 1e9, id: item.id, desired: item.desired, state: running ? 'running' : item.desired ? 'queued' : 'stopped', ip: running ? container.NetworkSettings.Networks[network]?.IPAddress : '', error: '', viewers: 0, retryAt: 0, startAttempts: 0, resourceAttempts: 0 });
+    rows.set(item.id, { dirty: true, profileExpected: Boolean(item.profileExpected || running), containerPresent: Boolean(container), memoryMb: container?.HostConfig?.Memory / 1024 ** 2, cpu: container?.HostConfig?.NanoCpus / 1e9, id: item.id, desired: item.desired, state: running ? 'running' : item.desired ? 'queued' : 'stopped', ip: running ? container.NetworkSettings.Networks[network]?.IPAddress : '', error: '', viewers: 0, retryAt: 0, startAttempts: 0, resourceAttempts: 0 });
     if (migrationHold) { const row = rows.get(item.id); row.desired = false; if (container) await stop(item.id); else row.state = 'stopped'; }
     else if (running) {
       if (!item.desired) await stop(item.id);
@@ -470,7 +520,9 @@ async function handle(req) {
     return exclusive(() => {
       if (backupLease) fail('正在备份，请稍后重试', 409);
       if (input.maxRunning < active().length) fail('当前运行账号多于新上限，请先休眠部分账号', 409);
+      const storageChanged = settings.storageGb !== input.storageGb;
       settings = input;
+      if (storageChanged) for (const row of rows.values()) row.storageScanAfter = 0;
       retryResourceWaiters();
       return { ok: true };
     });
@@ -486,21 +538,23 @@ async function handle(req) {
     await removeNetwork(id);
     await fsp.rm(path.join(profiles, id), { recursive: true, force: true });
     await fsp.rm(path.join(snapshots, `${id}.tar.gz.enc`), { force: true });
+    await fsp.rm(profileMarker(id), { force: true });
     await fsp.rm(activeMarker(id), { force: true });
+    await storage.forget(id);
     rows.delete(id); return { ok: true };
   });
   if (req.method !== 'POST' || !action) fail('操作不存在', 404);
   if (!rows.has(id)) rows.set(id, { id, state: 'stopped', desired: false, containerPresent: false, viewers: 0, error: '' });
   const row = rows.get(id);
-  if (row.pending) fail('该账号正在处理上一个操作，请稍后重试', 409);
+  if (row.pending || row.storageMaintaining) fail('该账号正在保存资料或清理缓存，请稍后重试', 409);
   // Acknowledge promptly; heavy profile work stays outside panel HTTP requests.
   if (action === 'wake') {
     if (migrationHold) fail('请先确认旧机器已停止并完成迁移接管', 409);
     await assertImage();
-    if (row.pending) fail('该账号正在处理上一个操作，请稍后重试', 409);
+    if (row.pending || row.storageMaintaining) fail('该账号正在保存资料或清理缓存，请稍后重试', 409);
     if (backupLease) fail('正在保存备份，请稍后操作', 409);
     row.desired = true;
-    row.retryAt = 0; row.startAttempts = 0; row.crashAttempts = 0; row.resourceAttempts = 0; row.error = '';
+    row.retryAt = 0; row.startAttempts = 0; row.crashAttempts = 0; row.resourceAttempts = 0; row.error = ''; row.storageBlocked = false;
     if (!['running', 'starting'].includes(row.state)) row.state = 'queued';
   } else {
     if (action === 'sleep') row.desired = false;
@@ -528,9 +582,9 @@ server.on('upgrade', (req, transport, head) => {
   if (!row || row.state !== 'running' || !row.ip || attached.has(row.id) || backupLease || migrationHold) { transport.destroy(); return; }
   wss.handleUpgrade(req, transport, head, ws => {
     attached.add(row.id); row.viewers = 1;
-    const vnc = net.connect({ host: row.ip, port: 5900 });
+    const vnc = net.connect({ host: row.ip, port: 5900, noDelay: true });
     vnc.setTimeout(30000);
-    vnc.on('data', chunk => { if (ws.bufferedAmount > 4 * 1024 * 1024) { ws.close(1013); return; } if (ws.readyState === 1) ws.send(chunk); });
+    vnc.on('data', chunk => relayTgFrame(vnc, ws, chunk));
     ws.on('message', data => { if (!vnc.write(data)) ws._socket.pause(); });
     vnc.on('drain', () => ws._socket.resume());
     let finished = false;
@@ -540,5 +594,6 @@ server.on('upgrade', (req, transport, head) => {
   });
 });
 server.listen(socket, async () => { await fsp.chmod(socket, 0o600); await fsp.chown(socket, 10001, 10001); });
+const storageTimer = setInterval(() => { if (!mutating) void storage.tick().catch(() => {}); }, 1000); storageTimer.unref();
 const timer = setInterval(() => { if (backupLease?.expires < Date.now()) backupLease = null; void tick().catch(() => {}); }, 5000); timer.unref();
-process.on('SIGTERM', () => { closed = true; server.close(); for (const client of wss.clients) client.close(); setTimeout(() => process.exit(0), 100).unref(); });
+process.on('SIGTERM', () => { closed = true; clearInterval(storageTimer); server.close(); for (const client of wss.clients) client.close(); setTimeout(() => process.exit(0), 100).unref(); });

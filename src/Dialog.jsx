@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef } from 'react';
 import { createPortal } from 'react-dom';
 
-export default function Dialog({ title, onClose, footer, children, wide = false, xwide = false, className = '', restoreFocusRef }) {
+export default function Dialog({ title, onClose, headerActions, footer, children, wide = false, xwide = false, className = '', restoreFocusRef }) {
   const titleId = useId();
   const dialog = useRef(null);
   const close = useRef(onClose);
@@ -36,7 +36,7 @@ export default function Dialog({ title, onClose, footer, children, wide = false,
     <div className="dialog-backdrop" onClick={onClose}>
       <div ref={dialog} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}
         className={`dialog ${wide ? 'wide' : ''} ${xwide ? 'xwide' : ''} ${className}`} onClick={(event) => event.stopPropagation()}>
-        <div className="dialog-head"><strong id={titleId}>{title}</strong><button className="icon-button" type="button" aria-label="关闭" onClick={onClose}>
+        <div className="dialog-head"><strong id={titleId}>{title}</strong>{headerActions}<button className="icon-button" type="button" aria-label="关闭" onClick={onClose}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
         </button></div>
         <div className="dialog-body">{children}</div>

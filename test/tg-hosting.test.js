@@ -18,8 +18,8 @@ function fixture(t, custom = {}, options = {}) {
   return { service, runner, calls };
 }
 test('hosting validates resource bounds and preserves safe defaults', () => {
-  assert.deepEqual(tgHostingSettings(), { maxRunning: 2, memoryMb: 1024, cpu: 1 });
-  for (const input of [{maxRunning:0},{memoryMb:384},{memoryMb:1000},{cpu:0},{cpu:0.3}]) assert.throws(() => tgHostingSettings(input));
+  assert.deepEqual(tgHostingSettings(), { maxRunning: 2, memoryMb: 1024, cpu: 1, storageGb: 5 });
+  for (const input of [{maxRunning:0},{memoryMb:384},{memoryMb:1000},{cpu:0},{cpu:0.3},{storageGb:0},{storageGb:21},{storageGb:1.5}]) assert.throws(() => tgHostingSettings(input));
   assert.equal(tgHostingSettings({ memoryMb: 512 }).memoryMb, 512);
   assert.equal(tgHostingAccount({ name: ' A ' }).mode, 'keep');
   assert.throws(() => tgHostingAccount({ name: '' }));
@@ -193,7 +193,7 @@ test('restored desired accounts resume in recent-running order and takeover surv
  const row=JSON.parse(db.prepare('SELECT value FROM tg_hosting_accounts WHERE id=?').get(a.id).value);row.lastRunningAt='2026-11-01T00:00:00Z';db.prepare('UPDATE tg_hosting_accounts SET value=? WHERE id=?').run(JSON.stringify(row),a.id);
  service.close();service=createTgHostingService({db,key:Buffer.alloc(32,7),runner,restoreMarker:marker});
  t.after(()=>{service.close();db.close();});
- await service.runtime(true);const held=calls.at(-2);assert.equal(held.url,'/configure');assert.equal(held.body.accounts.every(row=>!row.desired),true);
+ await service.runtime(true);const held=calls.at(-2);assert.equal(held.url,'/configure');assert.equal(held.body.accounts.every(row=>!row.desired),true);assert.equal(held.body.accounts.find(row=>row.id===a.id).profileExpected,true);
  await assert.rejects(service.activateMigration('old-host-stopped'),/lost response/);assert.equal(service.migrationHeld(),false);
  await service.runtime(true);assert.equal(calls.at(-2).body.migrationHold,false);assert.equal(calls.at(-2).body.accounts.every(row=>row.desired),true);
  assert.deepEqual(tgResumeOrder([{id:'b',createdAt:'2026-01-01'},{id:'a',lastRunningAt:'2026-02-01'}]).map(row=>row.id),['a','b']);
@@ -265,4 +265,16 @@ test('one rejected account does not block other account commands or lose their k
  assert.equal(results[0].status,'rejected');assert.equal(service.requireAccount(accounts[0].id).desired,false);
  for(let i=1;i<accounts.length;i++){assert.equal(results[i].status,'fulfilled');assert.equal(service.requireAccount(accounts[i].id).desired,true);}
  assert.equal(service.records().length,4);
+});
+
+test('old settings inherit the 5 GB default and partial updates preserve a chosen storage limit', async t => {
+  const db = new Database(':memory:');
+  const runner = { enabled: false }, service = createTgHostingService({ db, key: Buffer.alloc(32, 7), runner });
+  t.after(() => { service.close(); db.close(); });
+  db.prepare('INSERT INTO tg_hosting_settings VALUES(1,?)').run(JSON.stringify({maxRunning:2,memoryMb:1024,cpu:1}));
+  assert.equal(service.settings().storageGb,5);
+  await service.configure({storageGb:8}); await service.configure({cpu:.5});
+  assert.equal(service.settings().storageGb,8); assert.equal(service.settings().cpu,.5);
+  const restarted=createTgHostingService({db,key:Buffer.alloc(32,7),runner});
+  assert.equal(restarted.settings().storageGb,8); restarted.close();
 });

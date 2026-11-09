@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { relayTgFrame } from '../shared/tg-frame-relay.js';
 import { createTgRunnerClient } from './tg-hosting-runner.js';
-import { TG_ACCOUNT_ID, TG_HOSTING_DEFAULTS, hostingError, tgHostingAccount, tgHostingSettings, tgResumeOrder } from '../shared/tg-hosting.js';
+import { TG_ACCOUNT_ID, hostingError, tgHostingAccount, tgHostingSettings, tgResumeOrder } from '../shared/tg-hosting.js';
 
 export function createTgHostingService({ db, key, runner = createTgRunnerClient(), now = Date.now, restoreMarker = '' }) {
   db.exec(`CREATE TABLE IF NOT EXISTS tg_hosting_accounts(id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, value TEXT NOT NULL);
@@ -25,7 +26,7 @@ export function createTgHostingService({ db, key, runner = createTgRunnerClient(
   let recordsCache;
   const records = () => recordsCache ||= list.all().map(row => JSON.parse(row.value));
   const requireAccount = id => { const row = get.get(id); if (!row) throw hostingError('托管账号不存在', 404); return JSON.parse(row.value); };
-  const settings = () => settingGet.get() ? JSON.parse(settingGet.get().value) : { ...TG_HOSTING_DEFAULTS };
+  const settings = () => tgHostingSettings(settingGet.get() ? JSON.parse(settingGet.get().value) : {});
   const saveRow = item => { put.run(item.id, item.name, JSON.stringify(item)); recordsCache = null; };
   let initialized = false, initializing, lastRuntime = { accounts: [], connected: false }, lastPoll = 0, polling, deletion = null;
   const recordedStarts = new Map();
@@ -33,7 +34,7 @@ export function createTgHostingService({ db, key, runner = createTgRunnerClient(
   async function initialize() {
     if (!runner.enabled) return false;
     if (initialized) return true;
-    if (!initializing) initializing = runner.request('POST', '/configure', { key: snapshotsKey, settings: settings(), migrationHold: migrationHeld(), accounts: tgResumeOrder(records()).map(({ id, desired }) => ({ id, desired: migrationHeld() ? false : desired })) }, 30000)
+    if (!initializing) initializing = runner.request('POST', '/configure', { key: snapshotsKey, settings: settings(), migrationHold: migrationHeld(), accounts: tgResumeOrder(records()).map(({ id, desired, lastRunningAt }) => ({ id, desired: migrationHeld() ? false : desired, profileExpected: Boolean(lastRunningAt) })) }, 30000)
       .then(() => { initialized = true; return true; }).finally(() => { initializing = null; });
     return initializing;
   }
@@ -106,7 +107,7 @@ export function createTgHostingService({ db, key, runner = createTgRunnerClient(
       saveRow(item); return item;
     },
     async configure(input) {
-      const value = tgHostingSettings(input);
+      const value = tgHostingSettings({ ...settings(), ...input });
       if (runner.enabled) { await initialize(); await runner.request('PUT', '/settings', value); }
       settingPut.run(JSON.stringify(value)); return value;
     },
@@ -219,8 +220,8 @@ export function registerTgHostingRoutes(app, service, verifyPassword, { sessionV
       let live = false;
       const valid = () => sessionSockets.authorized(ws) && grants.get(token) === grant && grant.expires > now() && grant.deadline > now();
       upstream.on('open', () => { if (!valid()) { upstream.close(); return; } live = true; });
-      upstream.on('message', (data, binary) => { if (!valid()) { upstream.close(); return; } if (ws.bufferedAmount > 4 * 1024 * 1024) { ws.close(1013, '画面连接过慢，请重连'); return; } if (ws.readyState === 1) ws.send(data, { binary }); });
-      ws.on('message', (data, binary) => { if (!valid() || !live) return; if (upstream.bufferedAmount > 1024 * 1024) { ws.close(1013); return; } upstream.send(data, { binary }); });
+      upstream.on('message', (data, binary) => { if (!valid()) { upstream.close(); return; } relayTgFrame(upstream, ws, data, { binary }); });
+      ws.on('message', (data, binary) => { if (!valid() || !live) return; relayTgFrame(ws, upstream, data, { binary, limit: 1024 * 1024 }); });
       let finished = false;
       const finish = () => {
         if (finished) return; finished = true; viewers.delete(ws); try { upstream.close(); } catch {}

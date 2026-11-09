@@ -7,6 +7,7 @@ import http from 'node:http';
 import {once} from 'node:events';
 import {spawn,execFileSync} from 'node:child_process';
 import Database from 'better-sqlite3';
+import { PROFILE_CACHE_PATHS } from '../shared/tg-profile-storage.js';
 const repo=path.resolve(import.meta.dirname,'..');
 async function temporary(t){const root=await fs.mkdtemp(path.join(os.tmpdir(),'nurossh-tg-backup-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));return root;}
 async function execute(args,env={}){const child=spawn(process.execPath,args,{cwd:repo,env:{...process.env,...env},stdio:['ignore','pipe','pipe']});let error='';child.stderr.on('data',d=>error+=d);const [code]=await once(child,'exit');return {code,error};}
@@ -28,6 +29,20 @@ test('profile archive preserves binary data, excludes temporary archives and rej
   const unsafe=path.join(root,kind+'.tar.gz');execFileSync('python3',['-c',`import tarfile,io,sys\nt=tarfile.open(sys.argv[1],'w:gz')\ni=tarfile.TarInfo('../escaped' if sys.argv[2]=='traversal' else 'linked')\ni.type=tarfile.SYMTYPE if sys.argv[2]=='symlink' else tarfile.REGTYPE\ni.linkname='/etc/passwd'\nt.addfile(i)\nt.close()`,unsafe,kind]);
   assert.throws(()=>execFileSync('python3',[script,'extract',unsafe],{stdio:'pipe'}));assert.deepEqual(await fs.readFile(path.join(profile,'session')),original);
  }
+});
+test('profile backup excludes only exact disposable paths and preserves all session stores including names resembling caches',async t=>{
+ const root=await temporary(t),profile=path.join(root,'profile');await fs.mkdir(profile);
+ const source=(await fs.readFile(path.join(repo,'tg-hosting/profile-archive.py'),'utf8')).replace("root = Path('/profile')",`root = Path(${JSON.stringify(profile)})`);
+ const script=path.join(root,'archive.py');await fs.writeFile(script,source);
+ const kept=['Local State','Default/IndexedDB/Cache/session','Default/IndexedDB/https_web.telegram.org_0.indexeddb.leveldb/data','Default/Local Storage/leveldb/data','Default/Network/Cookies','Default/Cookies','Default/Sessions/tab','Default/Service Worker/CacheStorage/session','Default/IndexedDB/SingletonCookie','Default/IndexedDB/.tg-snapshot-session.tar.gz'];
+ for(const name of kept){await fs.mkdir(path.dirname(path.join(profile,name)),{recursive:true});await fs.writeFile(path.join(profile,name),Buffer.from(name+'\0session'));}
+ for(const name of PROFILE_CACHE_PATHS){await fs.mkdir(path.join(profile,name),{recursive:true});await fs.writeFile(path.join(profile,name,'temporary'),'rebuildable');}
+ const packed=path.join(profile,'.tg-snapshot-test.tar.gz'),copy=path.join(root,'copy.tar.gz');
+ execFileSync('python3',[script,'pack',packed]);await fs.copyFile(packed,copy);await fs.rm(profile,{recursive:true});await fs.mkdir(profile);execFileSync('python3',[script,'extract',copy]);
+ for(const name of kept)assert.deepEqual(await fs.readFile(path.join(profile,name)),Buffer.from(name+'\0session'));
+ for(const name of PROFILE_CACHE_PATHS)await assert.rejects(fs.stat(path.join(profile,name)),{code:'ENOENT'});
+ await fs.symlink('/tmp/unknown-session',path.join(profile,'session-link'));
+ assert.throws(()=>execFileSync('python3',[script,'pack',packed],{stdio:'pipe'}),error=>error.stderr.toString().includes('unsupported profile file'));
 });
 test('optional deployment preserves Compose overrides and isolates the Docker socket from the panel',async t=>{
  try { execFileSync('docker',['compose','version'],{stdio:'pipe'}); } catch { t.skip('Docker Compose is not installed'); return; }
@@ -66,4 +81,68 @@ test('restoring an expanded profile refuses low disk before touching any existin
  source=source.replace('disk = os.statvfs(root)','disk = type("Disk", (), {"f_blocks": 1024**3, "f_frsize": 1, "f_bavail": 0})()');await fs.writeFile(script,source);
  assert.throws(()=>execFileSync('python3',[script,'extract',packed],{stdio:'pipe'}),error=>error.stderr.toString().includes('insufficient restore space'));
  assert.deepEqual(await fs.readFile(path.join(profile,'session')),session);assert.deepEqual(await fs.readFile(packed),saved);
+});
+
+test('streamed profile archives restore multiple blocks, long UTF-8 names and hardlinked files without references',async t=>{
+ const root=await temporary(t),profile=path.join(root,'profile');await fs.mkdir(profile);
+ const script=path.join(root,'archive.py'),source=(await fs.readFile(path.join(repo,'tg-hosting/profile-archive.py'),'utf8')).replace("root = Path('/profile')",`root = Path(${JSON.stringify(profile)})`);await fs.writeFile(script,source);
+ const content=Buffer.from(Array.from({length:256*1024},(_,i)=>(i*17)%251));
+ const long='会话数据'.repeat(24)+'/登录数据库';await fs.mkdir(path.dirname(path.join(profile,long)),{recursive:true});await fs.writeFile(path.join(profile,long),content);
+ await fs.link(path.join(profile,long),path.join(profile,'linked-session'));
+ const packed=path.join(profile,'.tg-snapshot-test.tar.gz'),copy=path.join(root,'copy.tar.gz');execFileSync('python3',[script,'pack',packed]);await fs.copyFile(packed,copy);
+ execFileSync('python3',['-c',"import sys,tarfile\nwith tarfile.open(sys.argv[1],'r:gz') as t:\n assert all(m.isfile() for m in t)",copy]);
+ await fs.rm(profile,{recursive:true});await fs.mkdir(profile);execFileSync('python3',[script,'extract',copy]);
+ assert.deepEqual(await fs.readFile(path.join(profile,long)),content);assert.deepEqual(await fs.readFile(path.join(profile,'linked-session')),content);
+});
+
+test('actual runner checkpoint cleans only after clean stop and can still rescue sessions if disposable cache removal fails',async t=>{
+ const {default:vm}=await import('node:vm'),{default:syncFs}=await import('node:fs');
+ const {encoder,decoder}=await import('../server/backup-crypto.cjs'),{pipeline}=await import('node:stream/promises');
+ const {default:crypto}=await import('node:crypto');
+ const source=await fs.readFile(path.join(repo,'tg-hosting/runner.mjs'),'utf8');
+ const body=source.slice(source.indexOf('async function checkpoint('),source.indexOf('\nasync function start('));
+ for(const scenario of ['clean','cleanup-failed','unclean','reuse','empty-profile','pack-failed']){
+  const root=await temporary(t),profiles=path.join(root,'profiles'),snapshots=path.join(root,'snapshots'),id='account',directory=path.join(profiles,id);
+  await fs.mkdir(directory,{recursive:true});await fs.mkdir(snapshots);await fs.writeFile(path.join(directory,'session'),'session-proof');
+  const snapshot=path.join(snapshots,id+'.tar.gz.enc');await fs.writeFile(snapshot,'previous-encrypted-snapshot');
+  const row={id,dirty:scenario!=='reuse',desired:true,containerPresent:scenario!=='reuse'},rows=new Map([[id,row]]),actions=[];
+  const key=Buffer.alloc(32,3);
+  const helpers=source.slice(source.indexOf('async function markProfileKnown('),source.indexOf('const active ='));
+  const checkpoint=vm.runInNewContext(`${helpers}\n(${body})`,{rows,profiles,snapshots,path,fs:syncFs,fsp:{...fs,chown:async()=>{}},crypto,key,encoder,pipeline,
+   profileMarker:id=>path.join(snapshots,id+'.profile-known'),
+   activeMarker:id=>path.join(profiles,'.active-'+id),fail:message=>{throw Error(message);},
+   stop:async()=>{actions.push('stop');row.containerPresent=false;row.uncleanStop=scenario==='unclean';},
+   storage:{cleanStopped:async()=>{actions.push('clean');assert.equal(row.containerPresent,false);assert.equal(row.uncleanStop,false);if(scenario==='cleanup-failed')throw Error('EACCES');}},
+   profileUsage:async()=>{actions.push('scan');return {bytes:scenario==='empty-profile'?0:13};},readResources:async()=>({diskHeadroomBytes:10**9}),
+   helper:async(_id,args)=>{actions.push('pack');if(scenario==='pack-failed')throw Error('helper-failed');await fs.writeFile(path.join(directory,path.basename(args.at(-1))),'session-proof');},
+  });
+  if(scenario==='unclean'){
+   await assert.rejects(checkpoint(id),/未正常退出/);assert.deepEqual(actions,['stop']);
+   assert.equal(await fs.readFile(snapshot,'utf8'),'previous-encrypted-snapshot');
+  }else if(scenario==='reuse'){
+   await checkpoint(id);assert.deepEqual(actions,[]);assert.equal(await fs.readFile(snapshot,'utf8'),'previous-encrypted-snapshot');
+  }else if(['empty-profile','pack-failed'].includes(scenario)){
+   await assert.rejects(checkpoint(id),scenario==='empty-profile'?/不会用空资料覆盖/:/helper-failed/);
+   assert.equal(await fs.readFile(snapshot,'utf8'),'previous-encrypted-snapshot');
+   assert.ok(!(await fs.readdir(directory)).some(name=>name.startsWith('.tg-snapshot-')));
+  }else{
+   await checkpoint(id);assert.deepEqual(actions,['stop','clean','scan','pack']);
+   let restored='';const {Writable}=await import('node:stream');await pipeline(syncFs.createReadStream(snapshot),decoder(key),new Writable({write(chunk,_enc,cb){restored+=chunk;cb();}}));assert.equal(restored,'session-proof');
+   if(scenario==='cleanup-failed')assert.match(row.storageError,/缓存未完全清理/);else assert.equal(row.storageBytes,13);
+  }
+  assert.equal(await fs.readFile(path.join(directory,'session'),'utf8'),'session-proof');
+ }
+});
+
+test('empty profile archives cannot replace a session and extraction never clears a pre-existing destination',async t=>{
+ const root=await temporary(t),profile=path.join(root,'profile');await fs.mkdir(profile);
+ const script=path.join(root,'archive.py');await fs.writeFile(script,(await fs.readFile(path.join(repo,'tg-hosting/profile-archive.py'),'utf8')).replace("root = Path('/profile')",`root = Path(${JSON.stringify(profile)})`));
+ const empty=path.join(root,'empty.tar.gz');execFileSync('python3',['-c',"import tarfile,sys\nwith tarfile.open(sys.argv[1],'w:gz'): pass",empty]);
+ assert.throws(()=>execFileSync('python3',[script,'extract',empty],{stdio:'pipe'}),error=>error.stderr.toString().includes('empty profile archive'));
+ assert.throws(()=>execFileSync('python3',[script,'pack',path.join(profile,'.tg-snapshot-empty.tar.gz')],{stdio:'pipe'}),error=>error.stderr.toString().includes('empty profile'));
+ await fs.rm(path.join(profile,'.tg-snapshot-empty.tar.gz'));
+ await fs.writeFile(path.join(profile,'session'),'only-login-copy');
+ const valid=path.join(root,'valid.tar.gz');execFileSync('python3',['-c',"import tarfile,sys,io\nwith tarfile.open(sys.argv[1],'w:gz') as t:\n m=tarfile.TarInfo('session');m.size=3;t.addfile(m,io.BytesIO(b'new'))",valid]);
+ assert.throws(()=>execFileSync('python3',[script,'extract',valid],{stdio:'pipe'}),error=>error.stderr.toString().includes('existing session retained'));
+ assert.equal(await fs.readFile(path.join(profile,'session'),'utf8'),'only-login-copy');assert.deepEqual(await fs.readdir(profile),['session']);
 });

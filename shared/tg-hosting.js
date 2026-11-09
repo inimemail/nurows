@@ -1,5 +1,14 @@
-export const TG_HOSTING_DEFAULTS = Object.freeze({ maxRunning: 2, memoryMb: 1024, cpu: 1 });
+export const TG_HOSTING_DEFAULTS = Object.freeze({ maxRunning: 2, memoryMb: 1024, cpu: 1, storageGb: 5 });
+export const TG_PROFILE_MAX_BYTES = 20 * 1024 ** 3;
+export const TG_PROFILE_MAX_FILES = 100000;
 export const TG_BROWSER_MIN_MEMORY_MB = 512;
+// Keep desktop rendering bounded even when the viewer fills a 4K monitor.
+// noVNC scales the resulting framebuffer and translates pointer coordinates.
+export function tgViewerSize(width, height) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1) return null;
+  const ratio = Math.min(1, 1440 / width, 900 / height);
+  return { width: Math.max(1, Math.floor(width * ratio)), height: Math.max(1, Math.floor(height * ratio)) };
+}
 export const TG_HOSTING_STATES = Object.freeze({ stopped: '休眠', queued: '等待启动', starting: '启动中', running: '后台保持', stopping: '正在休眠', saving: '保存快照中', error: '运行异常', unavailable: '组件未连接' });
 export const TG_ACCOUNT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 export function hostingError(message, statusCode = 400) { return Object.assign(Error(message), { statusCode }); }
@@ -21,6 +30,13 @@ export function tgViewRetryDelay(attempt) {
 export function tgRuntimeAccount(row) {
   const value = { id: row.id, state: row.state };
   for (const field of ['pending', 'snapshotAt', 'startedAt', 'retryAt', 'memoryMb', 'cpu', 'viewers']) if (row[field]) value[field] = row[field];
+  for (const field of ['storageBytes', 'snapshotBytes']) if (Number.isFinite(row[field]) && row[field] >= 0) value[field] = row[field];
+  if (row.storageCheckedAt) value.storageCheckedAt = row.storageCheckedAt;
+  if (row.storageBlocked) value.storageBlocked = true;
+  if (row.storageMaintaining) value.storageMaintaining = true;
+  // The UI displays one error. Avoid duplicating long errors across thousands
+  // of accounts in the runner's bounded status response.
+  if (row.storageError && !row.error && !row.healthError && !row.snapshotError) value.storageError = String(row.storageError).slice(0, 160);
   if (row.error || row.healthError) value.error = String(row.error || row.healthError).slice(0, 160);
   else if (row.snapshotError) value.snapshotError = String(row.snapshotError).slice(0, 160);
   return value;
@@ -83,7 +99,8 @@ export function tgHostingSettings(input = {}) {
   if (!Number.isInteger(value.maxRunning) || value.maxRunning < 1 || value.maxRunning > 50) throw hostingError('同时运行数量应为 1–50');
   if (!Number.isInteger(value.memoryMb) || value.memoryMb < TG_BROWSER_MIN_MEMORY_MB || value.memoryMb > 8192 || value.memoryMb % 128) throw hostingError('单账号内存应为 512–8192 MB，按 128 MB 调整');
   if (!Number.isFinite(value.cpu) || value.cpu < 0.25 || value.cpu > 4 || value.cpu * 4 % 1) throw hostingError('单账号 CPU 应为 0.25–4 核，按 0.25 核调整');
-  return { maxRunning: value.maxRunning, memoryMb: value.memoryMb, cpu: value.cpu };
+  if (!Number.isInteger(value.storageGb) || value.storageGb < 1 || value.storageGb > 20) throw hostingError('单账号存储上限应为 1–20 GB');
+  return { maxRunning: value.maxRunning, memoryMb: value.memoryMb, cpu: value.cpu, storageGb: value.storageGb };
 }
 export function tgHostingAccount(input, old = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw hostingError('账号信息格式无效');

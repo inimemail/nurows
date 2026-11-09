@@ -1061,6 +1061,86 @@ EOF
   info "已设置定时备份: ${cron_spec}"
 }
 
+# Full uninstall must also remove independent browsers left by a crashed runner.
+# Identify them by BOTH the instance's bind mount and its owner label; never
+# prune globally or infer ownership from a container-name prefix.
+remove_tg_uninstall_resources() {
+  python3 - "$1" <<'PYTG'
+import json, pathlib, re, subprocess, sys
+root = pathlib.Path(sys.argv[1], 'tg-browser-data').resolve()
+owner_key = 'nurossh.tg.owner'
+def docker(*args):
+    return subprocess.check_output(['docker', *args], text=True, timeout=90).strip()
+def inspect(ids, kind='container'):
+    result = []
+    for offset in range(0, len(ids), 100):
+        result.extend(json.loads(docker(kind, 'inspect', *ids[offset:offset + 100])))
+    return result
+try:
+    tagged = docker('ps', '-aq', '--filter', 'label=' + owner_key).split()
+    runners = docker('ps', '-aq', '--filter', 'label=com.docker.compose.service=tg-runner').split()
+    containers = inspect(sorted(set(tagged + runners)))
+    owners, ours, runner_ids, runner_networks = set(), [], set(), set()
+    marker = root / '.tg-owner'
+    if marker.is_symlink():
+        raise ValueError('托管归属标记无效，取消清理')
+    if marker.exists():
+        owner = marker.read_text().strip()
+        if not re.fullmatch('[a-f0-9]{12}', owner):
+            raise ValueError('托管归属标记无效，取消清理')
+        owners.add(owner)
+    for item in containers:
+        labels = item.get('Config', {}).get('Labels') or {}
+        mounts = item.get('Mounts', [])
+        if labels.get('com.docker.compose.service') == 'tg-runner' and any(m.get('Type') == 'bind' and m.get('Destination') == '/profiles' and pathlib.Path(m['Source']).resolve() == root for m in mounts):
+            if item.get('State', {}).get('Running'):
+                raise ValueError('托管组件尚未停止，取消清理')
+            runner_ids.add(item['Id'])
+            runner_networks.update(n['NetworkID'] for n in item.get('NetworkSettings', {}).get('Networks', {}).values())
+        owner = labels.get(owner_key, '')
+        if re.fullmatch('[a-f0-9]{12}', owner) and any(m.get('Type') == 'bind' and m.get('Destination') == '/profile' and pathlib.Path(m['Source']).resolve().parent == root for m in mounts):
+            owners.add(owner)
+            ours.append(item)
+    networks = inspect(docker('network', 'ls', '-q', '--filter', 'label=' + owner_key).split(), 'network')
+    # Older runners may have left a network with only their own endpoint.
+    for network in networks:
+        owner = (network.get('Labels') or {}).get(owner_key, '')
+        if network['Id'] in runner_networks and re.fullmatch('[a-f0-9]{12}', owner):
+            owners.add(owner)
+    ids = {item['Id'] for item in ours}
+    if any((item.get('Config', {}).get('Labels') or {}).get(owner_key) in owners and item['Id'] not in ids for item in containers):
+        raise ValueError('同一会话标识还被其他部署使用，取消清理')
+    networks = [n for n in networks if (n.get('Labels') or {}).get(owner_key) in owners]
+    if any(set((n.get('Containers') or {})) - ids - runner_ids for n in networks):
+        raise ValueError('托管网络还连接其他容器，取消清理')
+    # Preflight every resource before the first deletion. A failure leaves the
+    # deployment directory intact and is propagated back to the shell.
+    for item in ours:
+        if item.get('State', {}).get('Running'):
+            docker('stop', '--time', '25', item['Id'])
+        docker('rm', item['Id'])
+    for network in networks:
+        for endpoint in set(network.get('Containers') or {}) & runner_ids:
+            docker('network', 'disconnect', network['Id'], endpoint)
+        docker('network', 'rm', network['Id'])
+except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+    print('TG 托管资源清理失败，数据目录已保留：' + str(error), file=sys.stderr)
+    sys.exit(1)
+PYTG
+}
+
+protect_tg_profiles_from_uninstall() {
+  local workdir="$1" profile
+  # Full uninstall must not be an implicit account deletion. Check again after
+  # stopping Compose so an account created during confirmation is protected.
+  for profile in "${workdir}"/tg-browser-data/* "${workdir}"/tg-browser-data/.active-* \
+    "${workdir}"/data/tg-hosted-snapshots/*.tar.gz.enc "${workdir}"/data/tg-hosted-snapshots/*.profile-known; do
+    if [[ -e "${profile}" || -L "${profile}" ]]; then
+      die "仍有 TG 托管登录资料，已阻止卸载；只有主动删除对应托管账号后才允许删除这些资料。原目录未删除。"
+    fi
+  done
+}
+
 uninstall_service() {
   require_docker
   require_compose
@@ -1068,8 +1148,9 @@ uninstall_service() {
   local workdir
   workdir="$(get_workdir)"
   [[ -n "${workdir}" ]] || die "未检测到已部署实例。"
+  protect_tg_profiles_from_uninstall "${workdir}"
 
-  warn "该操作会删除容器以及 ${workdir} 下的全部数据。"
+  warn "该操作会删除面板、TG 托管组件、残留容器/网络，以及 ${workdir} 下的其他业务数据、密钥和备份；存在托管账号登录资料时禁止卸载。Docker 本身与共享镜像缓存保留。"
   local confirm
   read -r -p "确认卸载？(y/N): " confirm
   if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
@@ -1077,11 +1158,15 @@ uninstall_service() {
     return
   fi
 
+  ensure_host_dependencies backup
   (
     cd "${workdir}" || exit 1
-    stop_tg_browsers || die "浏览器停止失败，已取消卸载，避免删除使用中的登录资料。"
-    compose_cmd down -v || true
-  ) || die "停止或移除容器失败，已取消卸载。"
+    # Stop the controller first so it cannot recreate an account during cleanup.
+    compose_cmd stop || exit 1
+    protect_tg_profiles_from_uninstall "${workdir}"
+    remove_tg_uninstall_resources "${workdir}" || exit 1
+    compose_cmd down -v || exit 1
+  ) || die "停止或移除容器失败，已取消卸载；数据目录仍保留。"
 
   rm -rf "${workdir}"
   rm -f "${STATE_FILE}"

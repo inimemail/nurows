@@ -28,8 +28,9 @@
 .tg-migration-notice { border-color: #b68d3a50; background: #b68d3a0b; }
 .tg-migration-notice button { margin-top: 9px; border: 1px solid var(--border-soft); font-size: 12px; }
 .tg-resource-status { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 14px; padding: 10px 22px; color: var(--text-muted); font-size: 11px; }
-.tg-migration-confirm { display: flex; align-items: flex-start; gap: 9px; padding: 13px; border: 1px solid var(--border-soft); border-radius: 9px; font-size: 13px; color: var(--text-soft); line-height: 1.6; cursor: pointer; }
-.tg-migration-confirm input { flex-shrink: 0; margin-top: 3px; }
+.tg-migration-confirm { display: flex; flex-direction: row; align-items: flex-start; justify-content: flex-start; gap: 10px; padding: 13px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--card-hover); font-size: 13px; color: var(--text-soft); line-height: 1.7; cursor: pointer; }
+.tg-migration-confirm input[type='checkbox'] { width: 16px; min-width: 16px; height: 16px; min-height: 16px; flex: 0 0 16px; padding: 0; margin: 3px 0 0; accent-color: var(--accent-text); }
+.tg-migration-confirm>span { min-width: 0; flex: 1; }
 .tg-account-list { flex: 1; min-height: 100px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 .tg-account-list:has(details[open]) { padding-bottom: 150px; }
 .tg-account-row { display: grid; grid-template-columns: minmax(170px,1.4fr) minmax(130px,1fr) minmax(140px,.9fr) auto; gap: 18px; padding: 17px 22px; align-items: center; border-bottom: 1px solid var(--border-soft); }
@@ -45,6 +46,11 @@
 .tg-state.queued,.tg-state.starting { color: #a6742b; background: #bd933819; }
 .tg-state.error { color: #c15151; background: #c1515112; }
 .tg-account-status small,.tg-account-time { color: var(--text-muted); font-size: 11px; }
+.tg-account-storage { display: flex; flex-wrap: wrap; gap: 3px 10px; color: var(--text-muted); font-size: 11px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+.tg-account-storage b { color: var(--text-soft); font-weight: 500; }
+.tg-account-storage.near b { color: #a6742c; }
+.tg-account-storage.full b { color: #bc5353; }
+.tg-account-storage>span { min-width: 0; overflow-wrap: anywhere; }
 .tg-account-status em { font-style: normal; color: #bc5353; font-size: 11px; overflow-wrap: anywhere; }
 .tg-account-time { display: grid; gap: 7px; }
 .tg-open-account { color: var(--accent-text); border: 1px solid var(--border-soft); }
@@ -76,21 +82,27 @@
 .tg-mode-options label.selected { border-color: var(--accent-text, #538ab8); background: var(--card-hover); }
 .tg-mode-options strong { display: block; font-size: 12px; color: var(--text-soft); }
 .tg-mode-options small { display: block; margin-top: 4px; font-size: 10px; color: var(--text-muted); }
-.dialog.xwide.tg-viewer-dialog { width: min(1440px,96vw); max-width: none; height: min(92dvh,1000px); max-height: 96dvh; display: flex; flex-direction: column; }
+.dialog-backdrop:has(>.tg-viewer-dialog) { padding: 12px; backdrop-filter: none; background: #020617b3; }
+.dialog.xwide.tg-viewer-dialog { width: 100%; max-width: none; height: 100%; max-height: 100%; border-radius: 14px; display: flex; flex-direction: column; background: #080f1c; }
+:root[data-theme='hbx-light'] .dialog.xwide.tg-viewer-dialog { background: #fcfdf9; }
 .tg-viewer-dialog .dialog-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 0; }
-.tg-viewer-dialog .dialog-head { padding: 14px 18px; flex: 0 0 auto; }
-.tg-viewer-dialog .dialog-footer { padding: 10px 16px; }
+.tg-viewer-dialog .dialog-head { min-height: 50px; padding: 7px 12px; flex: 0 0 auto; gap: 12px; }
+.tg-viewer-dialog .dialog-head>strong { min-width: 0; max-width: min(240px,25vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.tg-viewer-dialog .dialog-head>.icon-button { flex: 0 0 32px; width: 32px; min-width: 32px; height: 32px; min-height: 32px; border-radius: 8px; }
+.tg-viewer-dialog .dialog-footer { padding: 6px 12px; }
 .dialog.xwide.tg-viewer-fullscreen { width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; }
 .dialog-backdrop:has(>.tg-viewer-fullscreen) { padding: 0; }
-.tg-viewer-tools { flex-shrink: 0; display: flex; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border-soft); }
-.tg-viewer-tools>div { display: flex; gap: 6px; }
-.tg-viewer-tools button { font-size: 11px; padding: 7px; }
+.tg-viewer-tools { min-width: 0; flex: 1; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tg-viewer-tools>div { display: flex; align-items: center; gap: 6px; }
+.tg-viewer-tools button { font-size: 12px; padding: 7px 9px; white-space: nowrap; border-radius: 8px; }
+.tg-viewer-tools .icon-button { min-width: 32px; width: 32px; min-height: 32px; height: 32px; padding: 7px; }
 .tg-remote-screen { position: relative; flex: 1; min-height: 0; overflow: auto; background: #1a1e26; }
 .tg-vnc-target { position: absolute; inset: 0; overflow: auto; }
 .tg-viewer-cover { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 15px; color: #abb6c6; background: #1a1e26; padding: 25px; text-align: center; }
 .tg-viewer-cover strong { color: #e8eef4; font-size: 16px; }
 .tg-viewer-cover p { font-size: 12px; max-width: 450px; line-height: 1.8; }
 .tg-viewer-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; font-size: 11px; color: var(--text-muted); }
+.tg-viewer-footer>button { min-height: 30px; padding: 5px 9px; border-radius: 8px; font-size: 11px; }
 .tg-viewer-footer i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #939dac; margin-right: 5px; }
 .tg-viewer-footer i.connected { background: #38926c; }
 .tg-remote-input { display: grid; gap: 8px; padding: 10px 12px; flex: 0 0 auto; border-top: 1px solid var(--border-soft); }
@@ -118,8 +130,15 @@
   .dialog.xwide.tg-viewer-dialog { width: 100%; height: 100%; max-height: 100%; border-radius: 0; margin: 0; }
   .tg-viewer-dialog .dialog-body { overflow-y: auto; scrollbar-gutter: auto; }
   .tg-viewer-dialog .tg-remote-screen { min-height: 120px; }
-  .tg-viewer-dialog .dialog-head { padding: max(12px,env(safe-area-inset-top)) 12px 12px; } .tg-viewer-dialog .dialog-footer { padding: 9px 10px max(9px,env(safe-area-inset-bottom)); }
-  .tg-viewer-tools { padding: 6px; gap: 4px; flex-wrap: wrap; } .tg-viewer-tools>div { gap: 3px; } .tg-viewer-tools button { font-size: 10px; padding: 6px; }
+  .tg-viewer-dialog .dialog-head { flex-wrap: wrap; min-height: 0; gap: 4px 6px; padding: max(6px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) 6px max(8px,env(safe-area-inset-left)); }
+  .tg-viewer-dialog .dialog-head>strong { max-width: 100px; font-size: 12px; }
+  .tg-viewer-dialog .dialog-head>.icon-button { order: 2; flex-basis: 36px; min-width: 36px; width: 36px; height: 36px; min-height: 36px; }
+  .tg-viewer-dialog .dialog-footer { padding: 5px 8px max(5px,env(safe-area-inset-bottom)); }
+  .tg-viewer-tools { display: contents; }
+  .tg-viewer-tools>div { gap: 3px; }
+  .tg-viewer-tools>div:first-child { flex: 1; }
+  .tg-viewer-tools>div:last-child { order: 3; flex: 1 0 100%; justify-content: flex-end; }
+  .tg-viewer-tools button { font-size: 11px; padding: 7px 6px; min-height: 34px; }
   .tg-viewer-footer { align-items: flex-start; font-size: 10px; } .tg-viewer-footer>button { flex-shrink: 0; font-size: 10px; }
   .tg-remote-input textarea,.tg-form input,.tg-form textarea { font-size: 16px; } .tg-remote-input button { font-size: 10px; padding: 7px; }
 }

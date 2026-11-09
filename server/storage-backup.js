@@ -43,7 +43,7 @@ async function freezeHostedProfiles() {
   const crypto = await import('node:crypto');
   const runner = createTgRunnerClient();
   const key = Buffer.from(crypto.hkdfSync('sha256', await applicationKey(), Buffer.alloc(0), 'nurossh-tg-profile-backups-v1', 32)).toString('hex');
-  await runner.request('POST', '/configure', { key, settings, migrationHold, accounts: accounts.map(({ id, desired }) => ({ id, desired: migrationHold || process.env.TG_HOSTING_BACKUP_COLD === '1' ? false : desired })) }, 60000);
+  await runner.request('POST', '/configure', { key, settings, migrationHold, accounts: accounts.map(({ id, desired, lastRunningAt }) => ({ id, desired: migrationHold || process.env.TG_HOSTING_BACKUP_COLD === '1' ? false : desired, profileExpected: Boolean(lastRunningAt) })) }, 60000);
   const lease = await runner.request('POST', '/backup/start', {}, 30 * 60000);
   let renewing = null, leaseError = null;
   const timer = setInterval(() => {

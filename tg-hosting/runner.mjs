@@ -8,7 +8,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { WebSocketServer } from 'ws';
 import { encoder, decoder } from './backup-crypto.cjs';
-import { TG_ACCOUNT_ID, tgHostingSettings, tgDiskReserve, tgResourceBlock, tgRetryDelay, tgRuntimeAccount, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from './shared/tg-hosting.js';
+import { TG_ACCOUNT_ID, tgHostingSettings, tgDiskReserve, tgMemoryBudget, tgBrowserGrowthMb, tgRetryDelay, tgRuntimeAccount, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from './shared/tg-hosting.js';
 import { createTgDockerClient } from './shared/tg-docker.js';
 
 const socket = process.env.TG_HOSTING_SOCKET || '/control/runner.sock';
@@ -17,6 +17,7 @@ const image = process.env.TG_BROWSER_IMAGE || 'nurossh-tg-browser:local';
 const runtimeName = process.env.TG_RUNNER_CONTAINER || 'nurossh-tg-runner';
 const profiles = '/profiles', snapshots = '/snapshots';
 const rows = new Map(), attached = new Set();
+const memorySamples = new Map();
 let settings = tgHostingSettings(), key = null, hostProfiles, namespace, backupLease = null, closed = false, mutating = false;
 let resourceCache = null, resourceCacheAt = 0, resourceReading = null;
 let dockerCapacity = null, capacityAt = 0;
@@ -28,6 +29,9 @@ const label = () => ({ 'nurossh.tg.owner': namespace });
 const name = id => `nurossh-tg-${namespace}-${id}`;
 const activeMarker = id => path.join(profiles, `.active-${id}`);
 const active = () => [...rows.values()].filter(row => ['starting', 'running', 'stopping', 'saving'].includes(row.state));
+function retryResourceWaiters() {
+  for (const row of rows.values()) if (row.state === 'queued' && row.resourceAttempts) { row.retryAt = 0; row.resourceAttempts = 0; }
+}
 
 async function markProfileActive(id) {
   // Persist before Chromium can write. This survives both worker and Docker
@@ -114,6 +118,7 @@ async function helper(id, command, { archive } = {}) {
 
 async function stop(id) {
   const row = rows.get(id); if (!row) return;
+  memorySamples.delete(id);
   row.state = 'stopping';
   const container = await inspect(id);
   if (container?.State.Running) await docker('POST', `/containers/${container.Id}/stop?t=25`, undefined, 35000);
@@ -129,6 +134,7 @@ async function stop(id) {
   await removeNetwork(id);
   row.containerPresent = false;
   row.state = 'stopped'; row.ip = ''; row.viewers = 0;
+  retryResourceWaiters();
 }
 async function removeNetwork(id) {
   const networkName = `${name(id)}-net`;
@@ -178,7 +184,7 @@ async function checkpoint(id) {
   } catch (error) { row.snapshotError = error.message; throw error;
   } finally { await fsp.rm(archive, { force: true }); await fsp.rm(stage, { force: true }); if (resume) row.state = 'queued'; }
 }
-async function start(id, cpu = settings.cpu) {
+async function start(id, cpu = settings.cpu, memoryMb = settings.memoryMb) {
   const row = rows.get(id); if (!row || !row.desired) return;
   row.state = 'starting'; row.error = ''; row.dirty = true; row.healthySince = null;
   try {
@@ -197,12 +203,12 @@ async function start(id, cpu = settings.cpu) {
           // namespace syscalls Docker's default seccomp policy denies.
           SecurityOpt: ['no-new-privileges:true', 'seccomp=unconfined'],
           Tmpfs: { '/tmp': 'rw,nosuid,nodev,size=256m,mode=1777', '/home/browser': 'rw,nosuid,nodev,size=16m,uid=10001,gid=10001' },
-          Memory: settings.memoryMb * 1024 ** 2, MemorySwap: settings.memoryMb * 1024 ** 2, NanoCpus: Math.floor(cpu * 1e9), CpuShares: 128, PidsLimit: 256, ShmSize: 128 * 1024 ** 2,
+          Memory: memoryMb * 1024 ** 2, MemorySwap: memoryMb * 1024 ** 2, NanoCpus: Math.floor(cpu * 1e9), CpuShares: 128, PidsLimit: 256, ShmSize: 128 * 1024 ** 2,
           RestartPolicy: { Name: 'no' }, LogConfig: { Type: 'none' } }
       });
       row.containerPresent = true;
       container = await inspect(id);
-      const limitError = tgBrowserLimitError(container?.HostConfig, settings.memoryMb, cpu);
+      const limitError = tgBrowserLimitError(container?.HostConfig, memoryMb, cpu);
       if (limitError) fail(limitError, 503);
       await markProfileActive(id);
       await docker('POST', `/containers/${result.Id}/start`); container = await inspect(id);
@@ -258,11 +264,35 @@ async function readResources(force = false) {
   })();
   return resourceReading;
 }
+async function growthReserve() {
+  const running = active(), deadline = Date.now() + 2000;
+  let cursor = 0, growthMb = 0;
+  // Only sample when admitting a new browser; list polling never starts N
+  // Docker stats streams. Bound concurrency, cache briefly, and fail closed.
+  await Promise.all(Array.from({ length: Math.min(4, running.length) }, async () => {
+    while (cursor < running.length) {
+      const row = running[cursor++], limitMb = row.memoryMb || settings.memoryMb;
+      let sample = memorySamples.get(row.id);
+      if (!sample || sample.limitMb !== limitMb || Date.now() - sample.at >= 5000) {
+        let reserved = limitMb;
+        if (row.state === 'running' && Date.now() < deadline) {
+          try { reserved = tgBrowserGrowthMb(await docker('GET', `/containers/${name(row.id)}/stats?stream=false&one-shot=true`, undefined, Math.max(1, Math.min(1000, deadline - Date.now()))), limitMb); } catch {}
+        }
+        sample = { at: Date.now(), limitMb, growthMb: reserved };
+        memorySamples.set(row.id, sample);
+      }
+      growthMb += sample.growthMb;
+    }
+  }));
+  return growthMb;
+}
 async function startBudget() {
-  const resources = await readResources();
+  const growthMb = await growthReserve();
+  const resources = { ...await readResources(true), growthMb };
+  const memory = tgMemoryBudget(resources, settings.memoryMb);
   const cpu = Math.min(settings.cpu, resources.totalCpus * .75 - resources.reservedCpus);
-  const message = tgResourceBlock(resources, settings.memoryMb) || (!Number.isFinite(cpu) || cpu < .25 ? 'CPU 预算不足，已排队保护面板；请休眠其他账号或降低单账号 CPU 上限' : '');
-  return { resources, cpu, message };
+  const message = memory.reason || (!Number.isFinite(cpu) || cpu < .25 ? 'CPU 预算不足，已排队保护面板；请休眠其他账号或降低单账号 CPU 上限' : '');
+  return { resources, cpu, memoryMb: memory.memoryMb, message };
 }
 let processing = false;
 async function tick() {
@@ -333,7 +363,7 @@ async function tick() {
       if (next && !next.pending) {
         const budget = await startBudget();
         if (budget.message) { next.error = budget.message; next.resourceAttempts = (next.resourceAttempts || 0) + 1; next.retryAt = Date.now() + Math.min(120000, 5000 * 2 ** Math.min(next.resourceAttempts - 1, 4)); }
-        else await start(next.id, budget.cpu);
+        else await start(next.id, budget.cpu, budget.memoryMb);
       }
     }
   }); } finally { processing = false; }
@@ -440,7 +470,9 @@ async function handle(req) {
     return exclusive(() => {
       if (backupLease) fail('正在备份，请稍后重试', 409);
       if (input.maxRunning < active().length) fail('当前运行账号多于新上限，请先休眠部分账号', 409);
-      settings = input; return { ok: true };
+      settings = input;
+      retryResourceWaiters();
+      return { ok: true };
     });
   }
   const match = url.pathname.match(/^\/accounts\/([^/]+)(?:\/(wake|sleep|snapshot))?$/);

@@ -513,7 +513,7 @@ enable_tg_hosting() {
   [[ -n "${workdir}" ]] || die "请先部署面板。"
   [[ -f "${workdir}/app/docker-compose.tg.yml" ]] || die "请先使用菜单 2 升级服务。"
   info "将安装独立浏览器组件：组件需要 Docker 管理权限，面板本身不挂载 Docker socket。"
-  info "默认最多运行 2 个账号，每个账号上限 1 GB 内存；无空闲资源时排队。首次下载浏览器镜像较大。"
+  info "默认最多运行 2 个账号，每个账号内存按余量从 512 MB 起分配、最高 1 GB；资源不足时排队。首次下载浏览器镜像较大。"
   grep -q '^TG_HOSTING_ENABLED=' "${workdir}/.env" && sed -i 's/^TG_HOSTING_ENABLED=.*/TG_HOSTING_ENABLED=1/' "${workdir}/.env" || printf '\nTG_HOSTING_ENABLED=1\n' >> "${workdir}/.env"
   ensure_storage_mount "${workdir}"
   (cd "${workdir}" && build_tg_browser && compose_cmd up -d --build && wait_service_ready && wait_tg_hosting_ready) || die "托管组件尚未就绪，请查看 docker compose -f docker-compose.yml -f docker-compose.storage.yml -f docker-compose.tg.yml logs --tail=80 tg-runner；账号资料未清除。"

@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createTgHostingService, registerTgHostingRoutes } from '../server/tg-hosting.js';
-import { tgHostingSettings, tgHostingAccount, tgResumeOrder, tgResourceBlock, tgRetryDelay, tgViewRetryDelay, tgDiskReserve, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from '../shared/tg-hosting.js';
+import { tgHostingSettings, tgHostingAccount, tgResumeOrder, tgResourceBlock, tgMemoryBudget, tgBrowserGrowthMb, tgRetryDelay, tgViewRetryDelay, tgDiskReserve, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from '../shared/tg-hosting.js';
 
 function fixture(t, custom = {}, options = {}) {
   const calls = [], db = new Database(':memory:');
@@ -19,7 +19,8 @@ function fixture(t, custom = {}, options = {}) {
 }
 test('hosting validates resource bounds and preserves safe defaults', () => {
   assert.deepEqual(tgHostingSettings(), { maxRunning: 2, memoryMb: 1024, cpu: 1 });
-  for (const input of [{maxRunning:0},{memoryMb:512},{memoryMb:1000},{cpu:0},{cpu:0.3}]) assert.throws(() => tgHostingSettings(input));
+  for (const input of [{maxRunning:0},{memoryMb:384},{memoryMb:1000},{cpu:0},{cpu:0.3}]) assert.throws(() => tgHostingSettings(input));
+  assert.equal(tgHostingSettings({ memoryMb: 512 }).memoryMb, 512);
   assert.equal(tgHostingAccount({ name: ' A ' }).mode, 'keep');
   assert.throws(() => tgHostingAccount({ name: '' }));
   assert.throws(() => tgHostingAccount({ name: 'a', mode: 'invalid' }));
@@ -138,6 +139,37 @@ test('resource checks fail closed, reserve disk space and retry with bounded bac
   assert.match(tgResourceBlock({...good,availableMb:1200},1024),/内存/);
   assert.equal(tgRetryDelay(1),60000); assert.equal(tgRetryDelay(1,true),300000); assert.equal(tgRetryDelay(4),null);
   assert.equal(tgDiskReserve(10*1024**3),1024**3); assert.equal(tgDiskReserve(1000*1024**3),4*1024**3);
+});
+test('small hosts allocate a real lower hard limit while preserving system headroom', () => {
+  const small = { totalMb: 1986, availableMb: 980, reservedMb: 0, diskLow: false };
+  const budget = tgMemoryBudget(small, 1024);
+  assert.equal(budget.memoryMb, 512);
+  assert.equal(budget.reason, '');
+  assert.ok(small.availableMb - budget.memoryMb >= budget.reserveMb);
+  assert.equal(tgMemoryBudget({ ...small, availableMb: 1300 }, 1024).memoryMb, 896);
+  assert.equal(tgMemoryBudget({ ...small, availableMb: 1800 }, 1024).memoryMb, 1024);
+  assert.equal(tgMemoryBudget({ ...small, availableMb: 1800 }, 512).memoryMb, 512);
+  assert.match(tgResourceBlock({ ...small, availableMb: 850 }, 1024), /内存预算不足/);
+});
+test('admission reserves future browser growth instead of oversubscribing a lightly used host', () => {
+  const second = { totalMb: 1986, availableMb: 1100, reservedMb: 768, growthMb: 468, diskLow: false };
+  // The existing account currently uses 300 MB but can still grow to 768 MB.
+  assert.match(tgResourceBlock(second, 1024), /内存预算不足/);
+  assert.match(tgResourceBlock({ ...second, growthMb: undefined }, 1024), /内存预算不足/);
+  const large = { totalMb: 8192, availableMb: 6000, reservedMb: 1024, growthMb: 600, diskLow: false };
+  assert.equal(tgMemoryBudget(large, 1024).memoryMb, 1024);
+  const full = tgMemoryBudget({ ...large, reservedMb: 6500, growthMb: 0 }, 1024);
+  assert.equal(full.memoryMb, 0);
+  assert.match(full.reason, /已有账号限额合计/);
+  for (const value of [NaN, -1, 1025]) assert.equal(tgMemoryBudget({ ...large, growthMb: value }, 1024).memoryMb, 0);
+});
+test('memory growth uses the Docker working set, supports both cgroups and fails conservatively', () => {
+  const bytes = 1024 ** 2;
+  for (const field of ['inactive_file', 'total_inactive_file']) {
+    const stats = { memory_stats: { usage: 600 * bytes, limit: 1024 * bytes, stats: { [field]: 200 * bytes } } };
+    assert.equal(tgBrowserGrowthMb(stats, 1024), 624);
+  }
+  for (const stats of [null, {}, { memory_stats: { usage: 1, limit: bytes, stats: {} } }, { memory_stats: { usage: 1, limit: 1024 * bytes, stats: { inactive_file: 2 } } }]) assert.equal(tgBrowserGrowthMb(stats, 1024), 1024);
 });
 test('migration hold survives long inactivity and resumes only after explicit old-host confirmation', async t => {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'nurossh-tg-migration-')); t.after(()=>fs.rmSync(root,{recursive:true,force:true}));

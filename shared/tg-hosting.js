@@ -1,4 +1,5 @@
 export const TG_HOSTING_DEFAULTS = Object.freeze({ maxRunning: 2, memoryMb: 1024, cpu: 1 });
+export const TG_BROWSER_MIN_MEMORY_MB = 512;
 export const TG_HOSTING_STATES = Object.freeze({ stopped: '休眠', queued: '等待启动', starting: '启动中', running: '后台保持', stopping: '正在休眠', saving: '保存快照中', error: '运行异常', unavailable: '组件未连接' });
 export const TG_ACCOUNT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 export function hostingError(message, statusCode = 400) { return Object.assign(Error(message), { statusCode }); }
@@ -45,13 +46,34 @@ export function tgContainerHealth(container) {
   if (status.includes('healthy')) return 'healthy';
   return 'unknown';
 }
+export function tgMemoryBudget(resources, maximumMb) {
+  const blocked = reason => ({ memoryMb: 0, reason });
+  if (!resources || resources.error || !Number.isFinite(resources.totalMb) || resources.totalMb <= 0 || !Number.isFinite(resources.availableMb) || resources.availableMb < 0 || !Number.isFinite(resources.reservedMb) || resources.reservedMb < 0 || !Number.isFinite(maximumMb) || maximumMb < TG_BROWSER_MIN_MEMORY_MB) return blocked('暂时无法读取服务器资源，已暂停新账号启动');
+  if (resources.isolationError) return blocked(resources.isolationError);
+  if (resources.diskLow) return blocked('磁盘空间不足，已暂停启动并保留登录资料，请清理宿主机磁盘');
+  // A setting is an upper bound, not a requirement to allocate a full GiB.
+  // Keep host headroom AND the unused portion of existing browser hard limits.
+  // Without a valid usage sample, reserve every byte of those limits.
+  const growthMb = resources.growthMb ?? resources.reservedMb;
+  if (!Number.isFinite(growthMb) || growthMb < 0 || growthMb > resources.reservedMb) return blocked('暂时无法确认账号内存预算，已暂停新账号启动');
+  const reserveMb = Math.max(384, resources.totalMb * .2);
+  const totalHeadroom = resources.totalMb - resources.reservedMb - reserveMb;
+  if (totalHeadroom < TG_BROWSER_MIN_MEMORY_MB) return blocked(`内存预算不足：已有账号限额合计 ${Math.ceil(resources.reservedMb)} MB，需保留 ${Math.ceil(reserveMb)} MB 系统余量；已排队等待`);
+  const available = Math.min(totalHeadroom, resources.availableMb - growthMb - Math.min(reserveMb, 1024));
+  const memoryMb = Math.floor(Math.min(maximumMb, available) / 128) * 128;
+  if (memoryMb < TG_BROWSER_MIN_MEMORY_MB) return blocked(`内存预算不足：可用 ${Math.floor(resources.availableMb)} MB，需至少 ${Math.ceil(growthMb + Math.min(reserveMb, 1024) + TG_BROWSER_MIN_MEMORY_MB)} MB；已排队，空闲后自动重试`);
+  return { memoryMb, reserveMb, reason: '' };
+}
 export function tgResourceBlock(resources, memoryMb) {
-  if (!resources || resources.error || !Number.isFinite(resources.totalMb) || resources.totalMb <= 0 || !Number.isFinite(resources.availableMb) || !Number.isFinite(resources.reservedMb)) return '暂时无法读取服务器资源，已暂停新账号启动';
-  if (resources.isolationError) return resources.isolationError;
-  if (resources.diskLow) return '磁盘空间不足，已暂停启动并保留登录资料，请清理宿主机磁盘';
-  const reserve = Math.max(768, resources.totalMb * .2);
-  if (resources.totalMb - resources.reservedMb - memoryMb < reserve || resources.availableMb - memoryMb < Math.min(reserve, 1024)) return '内存预算不足，已排队保护面板；请休眠其他账号或增加服务器内存';
-  return '';
+  return tgMemoryBudget(resources, memoryMb).reason;
+}
+export function tgBrowserGrowthMb(stats, limitMb) {
+  const memory = stats?.memory_stats, values = memory?.stats;
+  const usage = memory?.usage, inactive = values?.total_inactive_file ?? values?.inactive_file;
+  if (!Number.isFinite(usage) || usage < 0 || !Number.isFinite(inactive) || inactive < 0 || inactive > usage || memory.limit !== limitMb * 1024 ** 2) return limitMb;
+  // Match Docker's working-set calculation: reclaimable cache cannot pay for
+  // both MemAvailable and a browser's future growth at the same time.
+  return Math.max(0, limitMb - (usage - inactive) / 1024 ** 2);
 }
 export function tgDiskNeedsParking(resources) {
   return Boolean(resources && !resources.error && resources.diskLow && Number.isFinite(resources.diskHeadroomBytes) && resources.diskHeadroomBytes < 0);
@@ -59,7 +81,7 @@ export function tgDiskNeedsParking(resources) {
 export function tgHostingSettings(input = {}) {
   const value = { ...TG_HOSTING_DEFAULTS, ...input };
   if (!Number.isInteger(value.maxRunning) || value.maxRunning < 1 || value.maxRunning > 50) throw hostingError('同时运行数量应为 1–50');
-  if (!Number.isInteger(value.memoryMb) || value.memoryMb < 768 || value.memoryMb > 8192 || value.memoryMb % 128) throw hostingError('单账号内存应为 768–8192 MB，按 128 MB 调整');
+  if (!Number.isInteger(value.memoryMb) || value.memoryMb < TG_BROWSER_MIN_MEMORY_MB || value.memoryMb > 8192 || value.memoryMb % 128) throw hostingError('单账号内存应为 512–8192 MB，按 128 MB 调整');
   if (!Number.isFinite(value.cpu) || value.cpu < 0.25 || value.cpu > 4 || value.cpu * 4 % 1) throw hostingError('单账号 CPU 应为 0.25–4 核，按 0.25 核调整');
   return { maxRunning: value.maxRunning, memoryMb: value.memoryMb, cpu: value.cpu };
 }

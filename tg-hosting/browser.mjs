@@ -31,11 +31,13 @@ function stop(code = 0) {
 }
 process.on('SIGTERM', () => stop()); process.on('SIGINT', () => stop());
 fs.mkdirSync('/profile', { recursive: true, mode: 0o700 });
-launch('Xtigervnc', [':99', '-geometry', '1280x800', '-depth', '24', '-SecurityTypes', 'None', '-AlwaysShared', '-localhost', 'no', '-rfbport', '5900', '-MaxCutText', '32768', '-nolisten', 'tcp', '-ac']);
+launch('Xtigervnc', [':99', '-geometry', '1024x768', '-depth', '24', '-SecurityTypes', 'None', '-AlwaysShared', '-localhost', 'no', '-rfbport', '5900', '-MaxCutText', '32768', '-nolisten', 'tcp', '-ac']);
 for (let i = 0; i < 100 && !fs.existsSync('/tmp/.X11-unix/X99'); i++) await new Promise(resolve => setTimeout(resolve, 50));
 
 launch('openbox', ['--config-file', '/opt/openbox.xml', '--sm-disable']);
-chromium = launch('chromium', ['--user-data-dir=/profile', '--no-first-run', '--no-default-browser-check', '--disable-dev-shm-usage', '--disable-breakpad', '--disable-session-crashed-bubble', '--disable-extensions', '--disk-cache-size=33554432', '--media-cache-size=16777216', '--window-size=1280,800', '--start-maximized', '--app=https://web.telegram.org/a/']);
+// VPS sessions use a single app window. Avoid GPU acceleration and optional
+// Chrome services; keep the sandbox, Telegram workers and persistent storage.
+chromium = launch('chromium', ['--user-data-dir=/profile', '--no-first-run', '--no-default-browser-check', '--disable-dev-shm-usage', '--disable-breakpad', '--disable-session-crashed-bubble', '--disable-extensions', '--disable-gpu', '--renderer-process-limit=2', '--disable-background-networking', '--disable-features=MediaRouter,OptimizationHints,AutofillServerCommunication', '--disk-cache-size=16777216', '--media-cache-size=8388608', '--window-size=1024,768', '--start-maximized', '--app=https://web.telegram.org/a/']);
 
 await new Promise(resolve => setTimeout(resolve, 2000));
 if (!stopping) launch('tigervncconfig', ['-nowin']);

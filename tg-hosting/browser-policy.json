@@ -2,6 +2,7 @@
   "URLBlocklist": ["*"],
   "URLAllowlist": ["https://.web.telegram.org", "https://.telegram.org", "https://.t.me"],
   "DeveloperToolsAvailability": 2,
+  "DeveloperToolsAvailabilityAllowlist": ["https://.web.telegram.org/a/"],
   "DownloadRestrictions": 3,
   "BrowserSignin": 0,
   "SyncDisabled": true,

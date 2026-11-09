@@ -3,6 +3,8 @@ WORKDIR /runtime
 COPY tg-hosting/package*.json ./
 RUN npm ci --omit=dev
 COPY tg-hosting/runner.mjs ./runner.mjs
+COPY tg-hosting/profile-archive.py ./
+COPY shared/tg-login-state.js shared/tg-login-monitor.js ./shared/
 COPY shared/tg-hosting.js ./shared/tg-hosting.js
 COPY shared/tg-cpu-group.js ./shared/tg-cpu-group.js
 COPY shared/tg-http.js ./shared/tg-http.js
@@ -18,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends chromium openbo
   && groupadd -g 10001 browser && useradd -m -u 10001 -g 10001 browser
 COPY tg-hosting/browser-policy.json /etc/chromium/policies/managed/nurossh.json
 COPY tg-hosting/browser.mjs /opt/browser.mjs
+COPY tg-hosting/browser-version.mjs /opt/
+COPY shared/tg-login-state.js shared/tg-login-monitor.js /opt/shared/
 COPY tg-hosting/openbox.xml /opt/openbox.xml
 COPY tg-hosting/profile-archive.cjs tg-hosting/profile-archive.py /opt/
 USER 10001:10001

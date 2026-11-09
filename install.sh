@@ -430,7 +430,70 @@ ensure_tg_hosting_mount() {
 }
 
 build_tg_browser() {
-  [[ ! -f docker-compose.tg.yml ]] || compose_cmd --profile tg-image build tg-browser
+  [[ -f docker-compose.tg.yml ]] || return 0
+  # Panel updates must not silently migrate Chromium's login databases.
+  if docker image inspect nurossh-tg-browser:local >/dev/null 2>&1; then
+    info "复用现有 TG 浏览器镜像；浏览器单独升级，不随面板自动更换。"
+  else
+    compose_cmd --profile tg-image build tg-browser
+  fi
+}
+
+upgrade_tg_browser() (
+  set -euo pipefail
+  require_docker; require_compose; ensure_host_dependencies backup
+  local workdir candidate previous smoke='' old_image attempt ready=0
+  workdir="$(get_workdir)"
+  [[ -n "${workdir}" && -f "${workdir}/docker-compose.tg.yml" && -f "${workdir}/app/tg-hosting/Dockerfile" ]] || die "请先升级面板并安装 TG 托管组件。"
+  cd "${workdir}"
+  exec 8>"${workdir}/.tg-browser-upgrade.lock"
+  flock -n 8 || die "另一个浏览器升级正在进行。"
+  old_image="$(docker image inspect --format '{{.Id}}' nurossh-tg-browser:local)" || die "当前浏览器镜像不存在，请先安装组件。"
+  candidate="nurossh-tg-browser:candidate-$(date +%Y%m%d%H%M%S)-$$"
+  previous="nurossh-tg-browser:previous-$(date +%Y%m%d%H%M%S)-$$"
+  cleanup_tg_candidate() {
+    if [[ -n "${smoke}" ]]; then docker rm -f "${smoke}" >/dev/null 2>&1 || true; fi
+    docker image rm "${candidate}" >/dev/null 2>&1 || true
+  }
+  trap cleanup_tg_candidate EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  info "构建候选浏览器；现有账号保持运行，不更换当前镜像。"
+  docker build --pull --no-cache --target browser --file app/tg-hosting/Dockerfile --tag "${candidate}" app || die "候选镜像构建失败，原浏览器和登录资料未修改。"
+  # Smoke-test in a disposable tmpfs profile, with no network, host data or ports.
+  smoke="$(docker run -d --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --security-opt seccomp=unconfined --memory 512m --memory-swap 512m --cpus 1 --pids-limit 256 --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777 --tmpfs /home/browser:rw,nosuid,nodev,size=16m,uid=10001,gid=10001 --tmpfs /profile:rw,nosuid,nodev,size=128m,uid=10001,gid=10001 --health-interval 2s --health-start-period 5s --health-timeout 3s --health-retries 3 "${candidate}")" || die "候选浏览器无法启动，原镜像未替换。"
+  for attempt in $(seq 1 45); do
+    if [[ "$(docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "${smoke}")" == 'true healthy' ]] && (( attempt >= 6 )); then
+      if docker exec "${smoke}" node -e 'const f=require("fs");if(!f.existsSync("/profile/Default")||!f.existsSync("/profile/.nurossh-browser-version"))process.exit(1)'; then ready=1; break; fi
+    fi
+    [[ "$(docker inspect --format '{{.State.Running}}' "${smoke}")" == true ]] || break
+    sleep 2
+  done
+  (( ready )) || die "候选浏览器未通过沙箱、画面或配置检查，原镜像及账号未修改。"
+  docker stop -t 25 "${smoke}" >/dev/null || die "候选浏览器未能正常停止，原镜像未替换。"
+  [[ "$(docker inspect --format '{{.State.ExitCode}}' "${smoke}")" == 0 ]] || die "候选浏览器未正常退出，原镜像未替换。"
+  info "候选检查通过，先创建完整加密备份；备份失败则取消升级。"
+  backup_service
+  # Only move tags after the backup succeeds. Already-running browsers keep
+  # their immutable image IDs; no automatic profile downgrade on later failure.
+  [[ "$(docker image inspect --format '{{.Id}}' nurossh-tg-browser:local)" == "${old_image}" ]] || die "浏览器镜像在升级期间发生变化，已取消替换。"
+  docker image tag "${old_image}" "${previous}"
+  docker image tag "${candidate}" nurossh-tg-browser:local
+  info "浏览器已更新。现有账号继续运行，下次正常休眠并打开时生效；旧镜像保留为 ${previous}，不要用旧版本打开新版登录资料。"
+)
+
+tg_hosting_menu() {
+  local choice
+  echo "1) 安装或修复托管组件（保留现有浏览器版本）"
+  echo "2) 单独升级浏览器（候选检查、完整备份后生效）"
+  echo "0) 返回"
+  read -r -p "请选择 [0-2]: " choice
+  case "${choice}" in
+    1) enable_tg_hosting ;;
+    2) upgrade_tg_browser ;;
+    0) return ;;
+    *) warn "无效选项。" ;;
+  esac
 }
 
 stop_tg_browsers() {
@@ -1226,7 +1289,7 @@ main_menu() {
     8) uninstall_service ;;
     9) install_ftp ;;
     10) install_s3 ;;
-    11) enable_tg_hosting ;;
+    11) tg_hosting_menu ;;
     0) info "再见"; exit 0 ;;
     *) warn "无效选项。" ;;
   esac
@@ -1243,6 +1306,7 @@ dispatch_command() {
     restore) restore_backup ;;
     cron) setup_auto_backup ;;
     tg-hosting) enable_tg_hosting ;;
+    tg-browser-upgrade) upgrade_tg_browser ;;
     uninstall) uninstall_service ;;
     "")
       while true; do
@@ -1253,7 +1317,7 @@ dispatch_command() {
       ;;
     *)
       err "不支持的命令: ${1}"
-      echo "可用命令: install | upgrade | stop | restart | backup | restore | cron | uninstall | run-backup | tg-hosting"
+      echo "可用命令: install | upgrade | stop | restart | backup | restore | cron | uninstall | run-backup | tg-hosting | tg-browser-upgrade"
       exit 1
       ;;
   esac

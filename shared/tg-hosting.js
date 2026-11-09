@@ -2,6 +2,12 @@ export const TG_HOSTING_DEFAULTS = Object.freeze({ maxRunning: 2, memoryMb: 1024
 export const TG_PROFILE_MAX_BYTES = 20 * 1024 ** 3;
 export const TG_PROFILE_MAX_FILES = 100000;
 export const TG_BROWSER_MIN_MEMORY_MB = 512;
+// Session protection/status metadata is backed up, but cannot by itself prove
+// that any Chromium login data remains. Keep in sync with profile-archive.py.
+export function tgProfileDataName(name) {
+  return !/^\.nurossh-(?:login\.json|browser-version|browser-error\.json)(?:\.[a-f0-9]{12}\.partial)?$/.test(name) &&
+    !['SingletonLock', 'SingletonCookie', 'SingletonSocket'].includes(name) && !/^\.tg-snapshot-.*\.tar\.gz$/.test(name);
+}
 // Keep desktop rendering bounded even when the viewer fills a 4K monitor.
 // noVNC scales the resulting framebuffer and translates pointer coordinates.
 export function tgViewerSize(width, height) {
@@ -29,6 +35,10 @@ export function tgViewRetryDelay(attempt) {
 }
 export function tgRuntimeAccount(row) {
   const value = { id: row.id, state: row.state };
+  if (row.state === 'running' && ['authenticated', 'attention', 'login', 'unknown'].includes(row.loginState) && Number.isFinite(row.loginCheckedAt)) {
+    value.loginState = Date.now() - row.loginCheckedAt > 12 * 60000 ? 'unknown' : row.loginState;
+    value.loginCheckedAt = row.loginCheckedAt;
+  }
   for (const field of ['pending', 'snapshotAt', 'startedAt', 'retryAt', 'memoryMb', 'cpu', 'viewers']) if (row[field]) value[field] = row[field];
   for (const field of ['storageBytes', 'snapshotBytes']) if (Number.isFinite(row[field]) && row[field] >= 0) value[field] = row[field];
   if (row.storageCheckedAt) value.storageCheckedAt = row.storageCheckedAt;

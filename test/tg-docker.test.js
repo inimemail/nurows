@@ -90,7 +90,8 @@ test('runner readiness remains unavailable after Docker configuration fails, and
   const repo = path.resolve(import.meta.dirname, '..');
   let source = await fs.readFile(path.join(repo, 'tg-hosting/runner.mjs'), 'utf8');
   const imports = { ws: import.meta.resolve('ws'), './backup-crypto.cjs': pathToFileURL(path.join(repo, 'server/backup-crypto.cjs')).href };
-  for (const file of ['tg-hosting.js', 'tg-docker.js', 'tg-cpu-group.js', 'tg-frame-relay.js', 'tg-profile-storage.js']) imports[`./shared/${file}`] = pathToFileURL(path.join(repo, 'shared', file)).href;
+  for (const file of ['tg-hosting.js', 'tg-docker.js', 'tg-cpu-group.js', 'tg-frame-relay.js', 'tg-profile-storage.js', 'tg-login-state.js', 'tg-login-monitor.js']) imports[`./shared/${file}`] = pathToFileURL(path.join(repo, 'shared', file)).href;
+  await fs.copyFile(path.join(repo, 'tg-hosting/profile-archive.py'), path.join(root, 'profile-archive.py'));
   for (const [from, to] of Object.entries(imports)) source = source.replace(`from '${from}'`, `from ${JSON.stringify(to)}`);
   source = source.replace("const profiles = '/profiles', snapshots = '/snapshots';", `const profiles = ${JSON.stringify(path.join(root, 'profiles'))}, snapshots = ${JSON.stringify(path.join(root, 'snapshots'))};`);
   // Only ownership changes are stubbed for unprivileged macOS/Linux test users.

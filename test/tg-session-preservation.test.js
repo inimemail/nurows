@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { encoder, decoder } from '../server/backup-crypto.cjs';
-import { TG_PROFILE_MAX_BYTES } from '../shared/tg-hosting.js';
+import { TG_PROFILE_MAX_BYTES, tgProfileDataName } from '../shared/tg-hosting.js';
 
 const source=await fs.readFile(new URL('../tg-hosting/runner.mjs',import.meta.url),'utf8');
 const markerHelpers=source.slice(source.indexOf('async function markProfileKnown('),source.indexOf('const active ='));
@@ -19,7 +19,7 @@ async function fixture(t, overrides={}) {
   const profiles=path.join(root,'profiles'),snapshots=path.join(root,'snapshots'),id='account';
   await fs.mkdir(profiles);await fs.mkdir(snapshots);
   const row={id,desired:true,containerPresent:false},rows=new Map([[id,row]]),calls=[];
-  const context={rows,profiles,snapshots,path,fs:syncFs,fsp:{...fs,chown:async()=>{}},key:Buffer.alloc(32,7),TG_PROFILE_MAX_BYTES,
+  const context={rows,profiles,snapshots,path,fs:syncFs,fsp:{...fs,chown:async()=>{}},key:Buffer.alloc(32,7),TG_PROFILE_MAX_BYTES,tgProfileDataName,
     pipeline,encoder,decoder,Transform,
     profileMarker:id=>path.join(snapshots,id+'.profile-known'),activeMarker:id=>path.join(profiles,'.active-'+id),
     fail:message=>{throw Error(message);},readResources:async()=>({diskHeadroomBytes:10**10}),
@@ -80,4 +80,20 @@ test('interrupted guard writes leave no half-written permanent marker and never 
   await assert.rejects(h.markProfileKnown(h.id),/permission failure/);
   assert.deepEqual(await fs.readdir(h.snapshots),[]);assert.equal(await fs.readFile(path.join(directory,'session'),'utf8'),'login-proof');
   assert.equal(h.row.profileExpected,undefined);
+});
+
+test('status/version metadata alone never conceals a missing known login profile or silently rolls it back', async t => {
+  for (const kind of ['new', 'known', 'snapshot']) {
+    const h = await fixture(t), directory = path.join(h.profiles, h.id);
+    await fs.mkdir(directory);
+    for (const name of ['.nurossh-login.json', '.nurossh-browser-version', '.nurossh-browser-error.json', '.nurossh-login.json.abcdef123456.partial']) await fs.writeFile(path.join(directory, name), 'status-only');
+    if (kind === 'known') await h.markProfileKnown(h.id);
+    const snapshot = path.join(h.snapshots, h.id + '.tar.gz.enc');
+    if (kind === 'snapshot') await fs.writeFile(snapshot, 'retained-snapshot');
+    if (kind === 'new') { await h.restoreProfile(h.id); assert.equal(h.row.profileExpected, undefined); }
+    else await assert.rejects(h.restoreProfile(h.id), /不会创建空白会话/);
+    assert.equal((await fs.readdir(directory)).length, 4);
+    assert.deepEqual(h.calls, []);
+    if (kind === 'snapshot') assert.equal(await fs.readFile(snapshot, 'utf8'), 'retained-snapshot');
+  }
 });

@@ -109,3 +109,59 @@ test('failed startup or readiness restores the old image and stops the upgrade',
     assert.equal(result.calls[rollback + 1], 'compose up -d --no-deps --no-build tg-runner');
   }
 });
+
+test('panel upgrades reuse the installed browser image and fresh machines build it once', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-browser-reuse-')); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.writeFile(path.join(root, 'docker-compose.tg.yml'), 'services: {}');
+  const script = 'source "$1/install.sh"; cd "$2"; docker(){ [[ "$TG_IMAGE_PRESENT" == yes ]]; }; compose_cmd(){ printf "BUILD %s\\n" "$*"; }; build_tg_browser';
+  for (const present of ['yes', 'no']) {
+    const result = spawnSync('bash', ['-c', script, '_', repo, root], { encoding: 'utf8', env: { ...process.env, TG_IMAGE_PRESENT: present } });
+    assert.equal(result.status, 0, result.stderr); assert.equal(result.stdout.includes('BUILD'), present === 'no');
+    if (present === 'no') assert.match(result.stdout, /--profile tg-image build tg-browser/);
+  }
+  await fs.rm(path.join(root, 'docker-compose.tg.yml'));
+  const disabled = spawnSync('bash', ['-c', script, '_', repo, root], { encoding: 'utf8' }); assert.equal(disabled.status, 0); assert.equal(disabled.stdout, '');
+});
+
+test('explicit browser upgrade requires candidate startup, clean stop and complete backup before changing tags', async t => {
+  for (const failure of ['', 'build', 'run', 'health', 'flush', 'backup', 'changed']) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'tg-browser-upgrade-')); t.after(() => fs.rm(root, { recursive: true, force: true }));
+    await fs.mkdir(path.join(root, 'app/tg-hosting'), { recursive: true });
+    await fs.writeFile(path.join(root, 'docker-compose.tg.yml'), 'services: {}'); await fs.writeFile(path.join(root, 'app/tg-hosting/Dockerfile'), 'FROM fixture');
+    await fs.mkdir(path.join(root, 'tg-browser-data/account'), { recursive: true }); await fs.writeFile(path.join(root, 'tg-browser-data/account/session'), 'retained');
+    const log = path.join(root, 'calls'); await fs.writeFile(log, '');
+    const script = `source "$1/install.sh"
+get_workdir(){ printf '%s' "$TG_UPGRADE_ROOT"; }
+require_docker(){ :; }; require_compose(){ :; }; ensure_host_dependencies(){ :; }; sleep(){ :; }; flock(){ :; }
+backup_service(){ printf 'BACKUP\\n' >> "$TG_FIXTURE_LOG"; [[ "$TG_FAILURE" != backup ]] || return 1; touch "$TG_FIXTURE_LOG.backed-up"; }
+docker(){
+ printf '%s\\n' "$*" >> "$TG_FIXTURE_LOG"
+ case "$1" in
+  image) case "$2" in
+   inspect) if [[ "$TG_FAILURE" == changed && -e "$TG_FIXTURE_LOG.backed-up" ]]; then printf 'sha256:other'; else printf 'sha256:old'; fi ;;
+   *) : ;;
+   esac ;;
+  build) [[ "$TG_FAILURE" != build ]] ;;
+  run) [[ "$TG_FAILURE" != run ]] || return 1; printf 'disposable-smoke' ;;
+  inspect) case "$3" in
+   *ExitCode*) [[ "$TG_FAILURE" != flush ]] && printf 0 || printf 75 ;;
+   *Health*) [[ "$TG_FAILURE" != health ]] && printf 'true healthy' || printf 'true unhealthy' ;;
+   *) printf true ;;
+   esac ;;
+  exec|stop|rm) : ;;
+  *) return 99 ;;
+ esac
+}
+upgrade_tg_browser`;
+    const result = spawnSync('bash', ['-c', script, '_', repo], { encoding: 'utf8', env: { ...process.env, TG_FAILURE: failure, TG_UPGRADE_ROOT: root, TG_FIXTURE_LOG: log } });
+    const calls = (await fs.readFile(log, 'utf8')).split('\n');
+    assert.equal(result.status === 0, !failure, `${failure}: ${result.stderr}`);
+    const swap = calls.findIndex(call => /^image tag nurossh-tg-browser:candidate-.* nurossh-tg-browser:local$/.test(call));
+    if (!failure) {
+      assert.ok(swap > calls.indexOf('BACKUP')); assert.ok(calls.indexOf('BACKUP') > calls.findIndex(call => call === 'stop -t 25 disposable-smoke'));
+      assert.ok(calls.some(call => /^image tag sha256:old nurossh-tg-browser:previous-/.test(call)));
+    } else assert.equal(swap, -1, failure);
+    assert.ok(!calls.some(call => /force-recreate|prune|rm .*account/.test(call)));
+    assert.equal(await fs.readFile(path.join(root, 'tg-browser-data/account/session'), 'utf8'), 'retained');
+  }
+});

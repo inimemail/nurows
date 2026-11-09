@@ -4,21 +4,26 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { Transform } from 'node:stream';
+import { Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { WebSocketServer } from 'ws';
 import { encoder, decoder } from './backup-crypto.cjs';
-import { TG_ACCOUNT_ID, TG_PROFILE_MAX_BYTES, tgHostingSettings, tgDiskReserve, tgMemoryBudget, tgCpuTotal, tgBrowserGrowthMb, tgRetryDelay, tgRuntimeAccount, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from './shared/tg-hosting.js';
+import { TG_ACCOUNT_ID, TG_PROFILE_MAX_BYTES, tgProfileDataName, tgHostingSettings, tgDiskReserve, tgMemoryBudget, tgCpuTotal, tgBrowserGrowthMb, tgRetryDelay, tgRuntimeAccount, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from './shared/tg-hosting.js';
 import { createTgDockerClient } from './shared/tg-docker.js';
 import { createTgCpuGroup } from './shared/tg-cpu-group.js';
 import { relayTgFrame } from './shared/tg-frame-relay.js';
 import { createProfileStorage, scanProfile } from './shared/tg-profile-storage.js';
+import { tgLoginStatus } from './shared/tg-login-state.js';
+import { readLoginFile } from './shared/tg-login-monitor.js';
 
 const socket = process.env.TG_HOSTING_SOCKET || '/control/runner.sock';
 const dockerSocket = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const image = process.env.TG_BROWSER_IMAGE || 'nurossh-tg-browser:local';
 const runtimeName = process.env.TG_RUNNER_CONTAINER || 'nurossh-tg-runner';
 const profiles = '/profiles', snapshots = '/snapshots';
+// Use this release's validator even when the installed Chromium image is pinned.
+const archiveSource = fs.readFileSync(new URL('./profile-archive.py', import.meta.url), 'utf8');
+const verifiedSnapshots = new Map();
 const rows = new Map(), attached = new Set();
 const memorySamples = new Map();
 let settings = tgHostingSettings(), key = null, hostProfiles, namespace, backupLease = null, closed = false, mutating = false;
@@ -85,13 +90,22 @@ async function ownedNetwork(id) {
   catch (error) { if (error.dockerStatus !== 403 && error.dockerStatus !== 409) throw error; }
   return networkName;
 }
-async function assertImage() { try { await docker('GET', `/images/${encodeURIComponent(image)}/json`); } catch { fail('浏览器镜像尚未构建，请先完成 TG 托管组件安装', 503); } }
+async function assertImage() { try { return (await docker('GET', `/images/${encodeURIComponent(image)}/json`)).Id; } catch { fail('浏览器镜像尚未构建，请先完成 TG 托管组件安装', 503); } }
 
 async function restoreProfile(id) {
   const directory = path.join(profiles, id), archive = path.join(snapshots, `${id}.tar.gz.enc`);
   await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
   await fsp.chown(directory, 10001, 10001);
-  if ((await fsp.readdir(directory)).length) { await markProfileKnown(id); return; }
+  const entries = await fsp.readdir(directory);
+  if (entries.length) {
+    if (entries.some(tgProfileDataName)) { await markProfileKnown(id); return; }
+    // Never let monitor/version files hide the loss of an existing profile.
+    // Retain the directory and backup for an explicit restore; do not silently
+    // open a new login or roll back an account's current files.
+    if (fs.existsSync(archive)) fail('登录目录仅剩状态标记，已保留原目录和加密快照；请恢复备份，不会创建空白会话', 503);
+    requireSavedProfile(id);
+    return; // A never-started account may retry initialization without deletion.
+  }
   if (!fs.existsSync(archive)) { requireSavedProfile(id); return; }
   // Authenticate the entire archive before extraction. The temporary archive is
   // private, removed on failure, and never part of a deployment backup.
@@ -126,6 +140,7 @@ const storage = createProfileStorage({ rows, profiles, snapshots,
   stop, canClean: row => !row.uncleanStop && !fs.existsSync(activeMarker(row.id)),
 });
 async function helper(id, command, { archive } = {}) {
+  if (command[0] === 'node' && command[1] === '/opt/profile-archive.cjs') command = ['python3', '-c', archiveSource, ...command.slice(2)];
   const binds = [`${hostProfiles}/${id}:/profile`];
   if (archive) binds.push(`${hostProfiles}/${path.basename(archive)}:/archive/profile.tar.gz:ro`);
   const created = await docker('POST', '/containers/create', { Image: image, User: '10001:10001', Env: [`TG_PROFILE_LIMIT_BYTES=${TG_PROFILE_MAX_BYTES}`], Entrypoint: command, Cmd: [], Healthcheck: { Test: ['NONE'] }, Labels: { ...label(), 'nurossh.tg.helper': '1' }, HostConfig: { Binds: binds, NetworkMode: 'none', ReadonlyRootfs: true, CapDrop: ['ALL'], SecurityOpt: ['no-new-privileges:true'], Memory: 384 * 1024 ** 2, MemorySwap: 384 * 1024 ** 2, NanoCpus: 5e8, CpuShares: 64, LogConfig: { Type: 'none' }, PidsLimit: 64 } });
@@ -168,13 +183,38 @@ async function removeNetwork(id) {
   }
   await docker('DELETE', `/networks/${networkName}`);
 }
+async function verifySnapshot(file, expected) {
+  const before = await fsp.lstat(file, { bigint: true });
+  if (!before.isFile() || before.size > TG_PROFILE_MAX_BYTES + 256 * 1024 ** 2) fail('账号快照格式或大小异常，原文件和登录目录已保留', 503);
+  const signature = stat => `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  if (!expected && verifiedSnapshots.get(file) === signature(before)) return;
+  verifiedSnapshots.delete(file);
+  const hash = crypto.createHash('sha256'); let bytes = 0;
+  const sink = new Writable({ write(chunk, _encoding, done) {
+    bytes += chunk.length;
+    if (bytes > TG_PROFILE_MAX_BYTES + 256 * 1024 ** 2) return done(Error('账号快照超过安全上限'));
+    hash.update(chunk); done();
+  } });
+  try {
+    await pipeline(fs.createReadStream(file, { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK }), decoder(key), sink, { signal: AbortSignal.timeout(900000) });
+    const digest = hash.digest('hex');
+    if (!bytes || expected && (expected.bytes !== bytes || expected.digest !== digest)) throw Error('snapshot mismatch');
+    const after = await fsp.lstat(file, { bigint: true });
+    if (signature(before) !== signature(after)) throw Error('snapshot changed');
+    verifiedSnapshots.set(file, signature(after));
+  } catch { fail('账号快照完整性校验失败，原快照和当前登录目录已保留，请重新保存快照或恢复备份', 503); }
+}
+async function reuseSnapshot(row, file) {
+  try { await verifySnapshot(file); row.snapshotError = ''; }
+  catch (error) { row.snapshotError = error.message; throw error; }
+}
 async function checkpoint(id) {
   const row = rows.get(id); if (!row) fail('账号不存在', 404);
   const resume = row.desired;
   const file = path.join(snapshots, `${id}.tar.gz.enc`);
   // A verified snapshot of a browser that has not restarted is immutable.
   // UI intents may already say "saving"/"stopping"; state alone cannot test this.
-  if (!row.dirty && fs.existsSync(file)) { row.state = resume ? (row.storageBlocked ? 'error' : 'queued') : 'stopped'; return; }
+  if (!row.dirty && fs.existsSync(file)) { await reuseSnapshot(row, file); row.state = resume ? (row.storageBlocked ? 'error' : 'queued') : 'stopped'; return; }
   // Clean interrupted temporary archives without ever deleting browser data.
   const directory = path.join(profiles, id);
   await fsp.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -183,6 +223,7 @@ async function checkpoint(id) {
   // Never replace its only session copy with an empty archive.
   if (!(await fsp.readdir(directory)).length && (fs.existsSync(file) || row.containerPresent === false)) {
     if (!fs.existsSync(file)) requireSavedProfile(id);
+    else await reuseSnapshot(row, file);
     if (row.containerPresent !== false) await stop(id);
     row.dirty = false; row.state = resume ? (row.storageBlocked ? 'error' : 'queued') : 'stopped'; return;
   }
@@ -209,22 +250,29 @@ async function checkpoint(id) {
     }
     if (resources.error || resources.diskHeadroomBytes < usage.bytes * 2) fail('磁盘空间不足，未覆盖原快照；完整登录资料仍保留在服务器', 503);
     await helper(id, ['node', '/opt/profile-archive.cjs', 'pack', `/profile/${path.basename(archive)}`]);
-    const encrypted = encoder(key), writer = fs.createWriteStream(stage, { flags: 'w', mode: 0o600 });
-    await pipeline(fs.createReadStream(archive), encrypted, writer);
+    await fsp.rm(stage, { force: true });
+    const hash = crypto.createHash('sha256'); let bytes = 0;
+    const hashing = new Transform({ transform(chunk, _encoding, done) { bytes += chunk.length; if (bytes > TG_PROFILE_MAX_BYTES + 256 * 1024 ** 2) return done(Error('账号归档超过安全上限，原快照已保留')); hash.update(chunk); done(null, chunk); } });
+    const encrypted = encoder(key), writer = fs.createWriteStream(stage, { flags: 'wx', mode: 0o600 });
+    await pipeline(fs.createReadStream(archive), hashing, encrypted, writer);
     const fd = await fsp.open(stage, 'r'); try { await fd.sync(); } finally { await fd.close(); }
+    // Read the entire encrypted result back, authenticate GCM and compare the
+    // compressed bytes. The last good snapshot is untouched until this passes.
+    await verifySnapshot(stage, { bytes, digest: hash.digest('hex') });
     await fsp.chown(stage, 10001, 10001); await fsp.rename(stage, file);
+    verifiedSnapshots.delete(stage); verifiedSnapshots.delete(file);
     const directory = await fsp.open(snapshots, 'r'); try { await directory.sync(); } finally { await directory.close(); }
     row.dirty = false; row.snapshotAt = new Date().toISOString(); row.snapshotError = '';
     row.snapshotBytes = (await fsp.stat(file)).size;
     await markProfileKnown(id);
   } catch (error) { row.snapshotError = error.message; throw error;
-  } finally { await fsp.rm(archive, { force: true }); await fsp.rm(stage, { force: true }); if (resume) row.state = row.storageBlocked ? 'error' : 'queued'; }
+  } finally { verifiedSnapshots.delete(stage); await fsp.rm(archive, { force: true }); await fsp.rm(stage, { force: true }); if (resume) row.state = row.storageBlocked ? 'error' : 'queued'; }
 }
 async function start(id, cpu = settings.cpu, memoryMb = settings.memoryMb) {
   const row = rows.get(id); if (!row || !row.desired) return;
   row.state = 'starting'; row.error = ''; row.dirty = true; row.healthySince = null;
   try {
-    await assertImage(); await restoreProfile(id);
+    const browserImage = await assertImage(); await restoreProfile(id);
     const previous = await inspect(id);
     await storage.prepare(row, { cleanAllowed: !previous?.State.Running && !row.uncleanStop && !fs.existsSync(activeMarker(id)) });
     const directory = path.join(profiles, id);
@@ -234,12 +282,13 @@ async function start(id, cpu = settings.cpu, memoryMb = settings.memoryMb) {
     if (!container?.State.Running) for (const file of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) await fsp.rm(path.join(directory, file), { force: true });
     if (container && !container.State.Running) { await docker('DELETE', `/containers/${container.Id}`); container = null; }
     if (!container) {
+      row.monitorToken = crypto.randomBytes(16).toString('hex'); row.loginState = 'unknown'; row.loginReadAt = 0;
       // Restoration may take minutes. Reconfirm the parent immediately before
       // launch rather than trust an old cached quota after Docker disruption.
       const group = await cpuGroup.ensure(await readResources(), settings, true);
       if (!group.ready) fail(group.error, 503);
       const result = await docker('POST', `/containers/create?name=${name(id)}`, {
-        Image: image, User: '10001:10001', Labels: { ...label(), 'nurossh.tg.account': id },
+        Image: browserImage, User: '10001:10001', Env: [`TG_MONITOR_TOKEN=${row.monitorToken}`], Labels: { ...label(), 'nurossh.tg.account': id },
         HostConfig: { CgroupParent: cpuGroup.parent(), Binds: [`${hostProfiles}/${id}:/profile`], ReadonlyRootfs: true, NetworkMode: network, CapDrop: ['ALL'],
           // Chromium's user-namespace sandbox remains enabled. It needs the
           // namespace syscalls Docker's default seccomp policy denies.
@@ -267,6 +316,8 @@ async function start(id, cpu = settings.cpu, memoryMb = settings.memoryMb) {
     }
     throw Error('浏览器启动超时，请检查服务器资源和 sandbox 支持');
   } catch (error) {
+    const versionError = row.monitorToken ? await readLoginFile(path.join(profiles, id, '.nurossh-browser-error.json')) : null;
+    if (row.monitorToken && versionError?.token === row.monitorToken) error = Object.assign(Error(versionError.code === 'browser-downgrade' ? '浏览器版本低于该账号已用版本，已阻止降级并保留登录资料；请升级浏览器组件' : '无法安全确认浏览器版本，已保留登录资料；请检查浏览器组件'), { browserBlocked: true });
     let stopped = true;
     try { await stop(id); } catch { stopped = false; }
     row.error = error.message;
@@ -279,6 +330,7 @@ async function start(id, cpu = settings.cpu, memoryMb = settings.memoryMb) {
       return;
     }
     if (error.storageBlocked) { row.storageBlocked = true; row.state = 'error'; row.retryAt = 0; return; }
+    if (error.browserBlocked) { row.state = 'error'; row.retryAt = 0; return; }
     row.startAttempts = (row.startAttempts || 0) + 1;
     const delay = tgRetryDelay(row.startAttempts);
     row.state = row.desired && delay !== null ? 'queued' : 'error'; row.retryAt = delay === null ? 0 : Date.now() + delay;
@@ -503,7 +555,7 @@ async function configure(data) {
     }
     const container = existingIds.has(item.id) ? await inspect(item.id) : null, running = Boolean(container?.State.Running);
     const network = `${name(item.id)}-net`;
-    rows.set(item.id, { dirty: true, profileExpected: Boolean(item.profileExpected || running), containerPresent: Boolean(container), memoryMb: container?.HostConfig?.Memory / 1024 ** 2, cpu: container?.HostConfig?.NanoCpus / 1e9, cpuGrouped: cpuGroup.includes(container?.HostConfig?.CgroupParent), id: item.id, desired: item.desired, state: running ? 'running' : item.desired ? 'queued' : 'stopped', ip: running ? container.NetworkSettings.Networks[network]?.IPAddress : '', error: '', viewers: 0, retryAt: 0, startAttempts: 0, resourceAttempts: 0 });
+    rows.set(item.id, { monitorToken: container?.Config?.Env?.find(value => value.startsWith('TG_MONITOR_TOKEN='))?.slice(17), loginState: 'unknown', dirty: true, profileExpected: Boolean(item.profileExpected || running), containerPresent: Boolean(container), memoryMb: container?.HostConfig?.Memory / 1024 ** 2, cpu: container?.HostConfig?.NanoCpus / 1e9, cpuGrouped: cpuGroup.includes(container?.HostConfig?.CgroupParent), id: item.id, desired: item.desired, state: running ? 'running' : item.desired ? 'queued' : 'stopped', ip: running ? container.NetworkSettings.Networks[network]?.IPAddress : '', error: '', viewers: 0, retryAt: 0, startAttempts: 0, resourceAttempts: 0 });
     if (migrationHold) { const row = rows.get(item.id); row.desired = false; if (container) await stop(item.id); else row.state = 'stopped'; }
     else if (running) {
       if (!item.desired) await stop(item.id);
@@ -594,6 +646,7 @@ async function handle(req) {
     await removeNetwork(id);
     await fsp.rm(path.join(profiles, id), { recursive: true, force: true });
     await fsp.rm(path.join(snapshots, `${id}.tar.gz.enc`), { force: true });
+    verifiedSnapshots.delete(path.join(snapshots, `${id}.tar.gz.enc`));
     await fsp.rm(profileMarker(id), { force: true });
     await fsp.rm(activeMarker(id), { force: true });
     await storage.forget(id);
@@ -650,6 +703,24 @@ server.on('upgrade', (req, transport, head) => {
   });
 });
 server.listen(socket, async () => { await fsp.chmod(socket, 0o600); await fsp.chown(socket, 10001, 10001); });
+let loginReading = false;
+async function readLoginStates() {
+  if (loginReading || mutating || backupLease || closed || migrationHold || !configured) return;
+  let row; const now = Date.now();
+  // Pick the oldest due account. With 50 accounts and one read every 2s,
+  // choosing the first due row would permanently starve accounts after #30.
+  for (const item of rows.values()) if (item.state === 'running' && item.monitorToken && !item.pending && now >= (item.loginReadAt || 0) &&
+      (!row || (item.loginReadAt || 0) < (row.loginReadAt || 0))) row = item;
+  if (!row) return;
+  loginReading = true; row.loginReadAt = Date.now() + 60000;
+  const token = row.monitorToken;
+  try {
+    const status = tgLoginStatus(await readLoginFile(path.join(profiles, row.id, '.nurossh-login.json')), token);
+    if (rows.get(row.id) === row && row.state === 'running' && row.monitorToken === token) Object.assign(row, status);
+  } catch { row.loginState = 'unknown'; }
+  finally { loginReading = false; }
+}
+const loginTimer = setInterval(() => { void readLoginStates(); }, 2000); loginTimer.unref();
 const storageTimer = setInterval(() => { if (!mutating) void storage.tick().catch(() => {}); }, 1000); storageTimer.unref();
 const timer = setInterval(() => { if (backupLease?.expires < Date.now()) backupLease = null; void tick().catch(() => {}); }, 5000); timer.unref();
 process.on('SIGTERM', () => { closed = true; clearInterval(storageTimer); server.close(); for (const client of wss.clients) client.close(); setTimeout(() => process.exit(0), 100).unref(); });

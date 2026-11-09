@@ -98,17 +98,20 @@ test('streamed profile archives restore multiple blocks, long UTF-8 names and ha
 test('actual runner checkpoint cleans only after clean stop and can still rescue sessions if disposable cache removal fails',async t=>{
  const {default:vm}=await import('node:vm'),{default:syncFs}=await import('node:fs');
  const {encoder,decoder}=await import('../server/backup-crypto.cjs'),{pipeline}=await import('node:stream/promises');
+ const {Transform, Writable, Readable}=await import('node:stream');
  const {default:crypto}=await import('node:crypto');
  const source=await fs.readFile(path.join(repo,'tg-hosting/runner.mjs'),'utf8');
- const body=source.slice(source.indexOf('async function checkpoint('),source.indexOf('\nasync function start('));
- for(const scenario of ['clean','cleanup-failed','unclean','reuse','empty-profile','pack-failed']){
+ const body=source.slice(source.indexOf('async function verifySnapshot('),source.indexOf('\nasync function start('));
+ for(const scenario of ['clean','cleanup-failed','unclean','reuse','empty-profile','pack-failed','readback-failed']){
   const root=await temporary(t),profiles=path.join(root,'profiles'),snapshots=path.join(root,'snapshots'),id='account',directory=path.join(profiles,id);
   await fs.mkdir(directory,{recursive:true});await fs.mkdir(snapshots);await fs.writeFile(path.join(directory,'session'),'session-proof');
-  const snapshot=path.join(snapshots,id+'.tar.gz.enc');await fs.writeFile(snapshot,'previous-encrypted-snapshot');
+  const snapshot=path.join(snapshots,id+'.tar.gz.enc');
+  await pipeline(Readable.from([Buffer.from('previous-snapshot')]),encoder(Buffer.alloc(32,3)),syncFs.createWriteStream(snapshot));
+  const originalSnapshot=await fs.readFile(snapshot);
   const row={id,dirty:scenario!=='reuse',desired:true,containerPresent:scenario!=='reuse'},rows=new Map([[id,row]]),actions=[];
   const key=Buffer.alloc(32,3);
   const helpers=source.slice(source.indexOf('async function markProfileKnown('),source.indexOf('const active ='));
-  const checkpoint=vm.runInNewContext(`${helpers}\n(${body})`,{rows,profiles,snapshots,path,fs:syncFs,fsp:{...fs,chown:async()=>{}},crypto,key,encoder,pipeline,
+  const checkpoint=vm.runInNewContext(`${helpers}\n${body}\ncheckpoint`,{rows,profiles,snapshots,path,fs:{...syncFs,createReadStream:(file,...args)=>scenario==='readback-failed'&&file.endsWith('.partial')?Readable.from([Buffer.from('corrupt-readback')]):syncFs.createReadStream(file,...args)},fsp:{...fs,chown:async()=>{}},crypto,key,encoder,decoder,pipeline,Transform,Writable,AbortSignal,verifiedSnapshots:new Map(),TG_PROFILE_MAX_BYTES:20*1024**3,
    profileMarker:id=>path.join(snapshots,id+'.profile-known'),
    activeMarker:id=>path.join(profiles,'.active-'+id),fail:message=>{throw Error(message);},
    stop:async()=>{actions.push('stop');row.containerPresent=false;row.uncleanStop=scenario==='unclean';},
@@ -118,12 +121,12 @@ test('actual runner checkpoint cleans only after clean stop and can still rescue
   });
   if(scenario==='unclean'){
    await assert.rejects(checkpoint(id),/未正常退出/);assert.deepEqual(actions,['stop']);
-   assert.equal(await fs.readFile(snapshot,'utf8'),'previous-encrypted-snapshot');
+   assert.deepEqual(await fs.readFile(snapshot),originalSnapshot);
   }else if(scenario==='reuse'){
-   await checkpoint(id);assert.deepEqual(actions,[]);assert.equal(await fs.readFile(snapshot,'utf8'),'previous-encrypted-snapshot');
-  }else if(['empty-profile','pack-failed'].includes(scenario)){
-   await assert.rejects(checkpoint(id),scenario==='empty-profile'?/不会用空资料覆盖/:/helper-failed/);
-   assert.equal(await fs.readFile(snapshot,'utf8'),'previous-encrypted-snapshot');
+   await checkpoint(id);assert.deepEqual(actions,[]);assert.deepEqual(await fs.readFile(snapshot),originalSnapshot);
+  }else if(['empty-profile','pack-failed','readback-failed'].includes(scenario)){
+   await assert.rejects(checkpoint(id),scenario==='empty-profile'?/不会用空资料覆盖/:scenario==='readback-failed'?/完整性/:/helper-failed/);
+   assert.deepEqual(await fs.readFile(snapshot),originalSnapshot);
    assert.ok(!(await fs.readdir(directory)).some(name=>name.startsWith('.tg-snapshot-')));
   }else{
    await checkpoint(id);assert.deepEqual(actions,['stop','clean','scan','pack']);

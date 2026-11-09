@@ -42,6 +42,10 @@
 .tg-account-identity strong { color: var(--text-strong, var(--text-main)); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tg-account-identity span:not(.tg-avatar),.tg-account-identity small { color: var(--text-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tg-account-status { display: grid; justify-items: start; gap: 6px; min-width: 0; }
+.tg-account-state-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.tg-login-state { color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.tg-login-state.authenticated { color: #287356; }
+.tg-login-state.attention,.tg-login-state.login { color: #b67724; }
 .tg-state { display: inline-flex; padding: 4px 8px; border-radius: 6px; color: var(--text-muted); background: var(--card-hover); font-size: 11px; white-space: nowrap; }
 .tg-state.running { color: #287356; background: #439a7916; }
 .tg-state.queued,.tg-state.starting { color: #a6742b; background: #bd933819; }

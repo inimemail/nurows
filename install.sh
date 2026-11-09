@@ -1101,6 +1101,9 @@ try:
         if re.fullmatch('[a-f0-9]{12}', owner) and any(m.get('Type') == 'bind' and m.get('Destination') == '/profile' and pathlib.Path(m['Source']).resolve().parent == root for m in mounts):
             owners.add(owner)
             ours.append(item)
+        elif re.fullmatch('[a-f0-9]{12}', owner) and labels.get('nurossh.tg.cpu-group') == '1' and any(m.get('Type') == 'bind' and m.get('Destination') == '/ownership' and m.get('RW') is False and pathlib.Path(m['Source']).resolve() == root for m in mounts):
+            owners.add(owner)
+            ours.append(item)
     networks = inspect(docker('network', 'ls', '-q', '--filter', 'label=' + owner_key).split(), 'network')
     # Older runners may have left a network with only their own endpoint.
     for network in networks:

@@ -83,14 +83,14 @@ test('runner readiness remains unavailable after Docker configuration fails, and
     if (req.url === '/version') return { data: { ApiVersion: '1.52', MinAPIVersion: '1.44' } };
     if (req.url === '/v1.44/containers/fixture-runner/json') return broken
       ? { status: 400, data: { message: 'fixture Docker configuration rejected' } }
-      : { data: { Mounts: [{ Destination: path.join(root, 'profiles'), Source: '/fixture/profiles' }] } };
+      : { data: { Config: { Image: 'fixture:runner' }, Mounts: [{ Destination: path.join(root, 'profiles'), Source: '/fixture/profiles' }] } };
     if (req.url.startsWith('/v1.44/containers/json')) return { data: [] };
     return { status: 500, data: { message: `unexpected request ${req.url}` } };
   });
   const repo = path.resolve(import.meta.dirname, '..');
   let source = await fs.readFile(path.join(repo, 'tg-hosting/runner.mjs'), 'utf8');
   const imports = { ws: import.meta.resolve('ws'), './backup-crypto.cjs': pathToFileURL(path.join(repo, 'server/backup-crypto.cjs')).href };
-  for (const file of ['tg-hosting.js', 'tg-docker.js', 'tg-frame-relay.js', 'tg-profile-storage.js']) imports[`./shared/${file}`] = pathToFileURL(path.join(repo, 'shared', file)).href;
+  for (const file of ['tg-hosting.js', 'tg-docker.js', 'tg-cpu-group.js', 'tg-frame-relay.js', 'tg-profile-storage.js']) imports[`./shared/${file}`] = pathToFileURL(path.join(repo, 'shared', file)).href;
   for (const [from, to] of Object.entries(imports)) source = source.replace(`from '${from}'`, `from ${JSON.stringify(to)}`);
   source = source.replace("const profiles = '/profiles', snapshots = '/snapshots';", `const profiles = ${JSON.stringify(path.join(root, 'profiles'))}, snapshots = ${JSON.stringify(path.join(root, 'snapshots'))};`);
   // Only ownership changes are stubbed for unprivileged macOS/Linux test users.

@@ -8,8 +8,9 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { WebSocketServer } from 'ws';
 import { encoder, decoder } from './backup-crypto.cjs';
-import { TG_ACCOUNT_ID, TG_PROFILE_MAX_BYTES, tgHostingSettings, tgDiskReserve, tgMemoryBudget, tgBrowserGrowthMb, tgRetryDelay, tgRuntimeAccount, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from './shared/tg-hosting.js';
+import { TG_ACCOUNT_ID, TG_PROFILE_MAX_BYTES, tgHostingSettings, tgDiskReserve, tgMemoryBudget, tgCpuTotal, tgBrowserGrowthMb, tgRetryDelay, tgRuntimeAccount, tgDiskNeedsParking, tgHostIsolationBlock, tgBrowserLimitError, tgContainerHealth, tgCrashAttempts } from './shared/tg-hosting.js';
 import { createTgDockerClient } from './shared/tg-docker.js';
+import { createTgCpuGroup } from './shared/tg-cpu-group.js';
 import { relayTgFrame } from './shared/tg-frame-relay.js';
 import { createProfileStorage, scanProfile } from './shared/tg-profile-storage.js';
 
@@ -64,10 +65,12 @@ async function markProfileActive(id) {
 }
 
 const docker = createTgDockerClient(dockerSocket);
+const cpuGroup = createTgCpuGroup({ docker });
+let cpuSyncRetryAt = 0;
 const ownedContainers = () => docker('GET', `/containers/json?all=1&filters=${encodeURIComponent(JSON.stringify({ label: [`nurossh.tg.owner=${namespace}`] }))}`);
-async function inspect(id) {
+async function inspect(id, timeout) {
   try {
-    const container = await docker('GET', `/containers/${name(id)}/json`);
+    const container = await docker('GET', `/containers/${name(id)}/json`, undefined, timeout);
     if (container.Config?.Labels?.['nurossh.tg.owner'] !== namespace) fail('容器归属校验失败');
     return container;
   } catch (error) { if (error.dockerStatus === 404) return null; throw error; }
@@ -231,9 +234,13 @@ async function start(id, cpu = settings.cpu, memoryMb = settings.memoryMb) {
     if (!container?.State.Running) for (const file of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) await fsp.rm(path.join(directory, file), { force: true });
     if (container && !container.State.Running) { await docker('DELETE', `/containers/${container.Id}`); container = null; }
     if (!container) {
+      // Restoration may take minutes. Reconfirm the parent immediately before
+      // launch rather than trust an old cached quota after Docker disruption.
+      const group = await cpuGroup.ensure(await readResources(), settings, true);
+      if (!group.ready) fail(group.error, 503);
       const result = await docker('POST', `/containers/create?name=${name(id)}`, {
         Image: image, User: '10001:10001', Labels: { ...label(), 'nurossh.tg.account': id },
-        HostConfig: { Binds: [`${hostProfiles}/${id}:/profile`], ReadonlyRootfs: true, NetworkMode: network, CapDrop: ['ALL'],
+        HostConfig: { CgroupParent: cpuGroup.parent(), Binds: [`${hostProfiles}/${id}:/profile`], ReadonlyRootfs: true, NetworkMode: network, CapDrop: ['ALL'],
           // Chromium's user-namespace sandbox remains enabled. It needs the
           // namespace syscalls Docker's default seccomp policy denies.
           SecurityOpt: ['no-new-privileges:true', 'seccomp=unconfined'],
@@ -245,14 +252,17 @@ async function start(id, cpu = settings.cpu, memoryMb = settings.memoryMb) {
       container = await inspect(id);
       const limitError = tgBrowserLimitError(container?.HostConfig, memoryMb, cpu);
       if (limitError) fail(limitError, 503);
+      if (!cpuGroup.parent() || container.HostConfig.CgroupParent !== cpuGroup.parent()) fail('共享 CPU 分组校验失败，未启动账号；登录资料已保留', 503);
       await markProfileActive(id);
       await docker('POST', `/containers/${result.Id}/start`); container = await inspect(id);
+      const applied = await cpuGroup.ensure(await readResources(), settings, true);
+      if (!applied.ready) fail(applied.error, 503);
     }
     row.ip = container.NetworkSettings.Networks[network]?.IPAddress;
     for (let i = 0; i < 60; i++) {
       const current = await inspect(id);
       if (!current?.State.Running) throw Error('浏览器未能启动；请检查服务器是否允许 Chromium 用户命名空间 sandbox，以及内存预算');
-      if (Date.now() - new Date(current.State.StartedAt).getTime() >= 3000 && await probeVnc(row.ip)) { await markProfileKnown(id); row.memoryMb = container.HostConfig.Memory / 1024 ** 2; row.cpu = container.HostConfig.NanoCpus / 1e9; row.state = 'running'; row.startedAt = new Date().toISOString(); row.retryAt = 0; row.resourceAttempts = 0; row.startAttempts = 0; return; }
+      if (Date.now() - new Date(current.State.StartedAt).getTime() >= 3000 && await probeVnc(row.ip)) { await markProfileKnown(id); row.memoryMb = container.HostConfig.Memory / 1024 ** 2; row.cpu = container.HostConfig.NanoCpus / 1e9; row.cpuGrouped = container.HostConfig.CgroupParent === cpuGroup.parent(); row.state = 'running'; row.startedAt = new Date().toISOString(); row.retryAt = 0; row.resourceAttempts = 0; row.startAttempts = 0; return; }
       await new Promise(resolve => setTimeout(resolve, 500));
     }
     throw Error('浏览器启动超时，请检查服务器资源和 sandbox 支持');
@@ -297,7 +307,7 @@ async function readResources(force = false) {
       const reserveBytes = tgDiskReserve(diskTotal);
       const resources = {
         totalMb, availableMb, reservedMb, totalCpus: Number(info.NCPU), reservedCpus: active().reduce((sum, row) => sum + (row.cpu || settings.cpu), 0),
-        isolationError: tgHostIsolationBlock(info),
+        isolationError: tgHostIsolationBlock(info), cgroupDriver: info.CgroupDriver, cgroupVersion: String(info.CgroupVersion || '1'),
         diskTotalBytes: diskTotal, diskAvailableBytes: diskAvailable,
         diskReserveBytes: reserveBytes, diskHeadroomBytes, diskLow: diskHeadroomBytes < 0,
       };
@@ -332,13 +342,56 @@ async function growthReserve() {
   }));
   return growthMb;
 }
+async function cpuBudget(resources) {
+  let cpu;
+  try { cpu = Math.min(settings.cpu, tgCpuTotal(resources.totalCpus, settings.cpuTotal)); }
+  catch (error) { return { cpu: 0, message: error.message }; }
+  if (Date.now() < cpuSyncRetryAt && active().some(row => row.cpuUnconfirmed || row.cpu !== cpu)) return { cpu: 0, message: '单账号 CPU 上限待确认，稍后自动重试；已有账号继续运行' };
+  async function syncLimits(decreasesOnly = false) {
+    const changes = active().filter(row => decreasesOnly ? row.cpuGrouped && (row.cpuUnconfirmed || row.cpu > cpu) : row.cpuUnconfirmed || row.cpu !== cpu);
+    if (!changes.length) return;
+    const deadline = Date.now() + 10000;
+    const remaining = () => {
+      const time = deadline - Date.now();
+      if (time <= 0) throw Error('CPU 调整超时');
+      return Math.min(2000, time);
+    };
+    for (const row of changes) {
+      if (row.state !== 'running' || row.pending || row.storageMaintaining || row.healthError) throw Error('账号正在处理');
+      const container = await inspect(row.id, remaining());
+      if (!container?.State.Running || !(container.HostConfig?.NanoCpus > 0)) throw Error('CPU 状态待确认');
+      row.cpu = container.HostConfig.NanoCpus / 1e9;
+      row.cpuUnconfirmed = true;
+      // The account maximum is bounded by the overall maximum, never divided
+      // by account count. cgroup v1 requires each child quota <= parent quota.
+      if (row.cpu !== cpu) await docker('POST', `/containers/${name(row.id)}/update`, { NanoCpus: Math.floor(cpu * 1e9) }, remaining());
+      const updated = await inspect(row.id, remaining());
+      if (!updated?.State.Running || updated.HostConfig?.NanoCpus !== Math.floor(cpu * 1e9)) throw Error('CPU 更新待确认');
+      row.cpu = cpu; row.cpuUnconfirmed = false;
+    }
+    cpuSyncRetryAt = 0;
+  }
+  try {
+    // v1 rejects reducing a parent's quota below an existing child's quota.
+    // Lower only those child caps first; an increase always changes parent first.
+    if (resources.cgroupVersion === '1') await syncLimits(true);
+    const group = await cpuGroup.ensure(resources, settings);
+    if (!group.ready) return { cpu: 0, message: group.error };
+    await syncLimits();
+    return { cpu, message: '' };
+  } catch {
+    cpuSyncRetryAt = Date.now() + 30000;
+    return { cpu: 0, message: '单账号 CPU 上限暂未确认，稍后自动重试；已有账号和登录资料保留' };
+  }
+}
+
 async function startBudget() {
   const growthMb = await growthReserve();
   const resources = { ...await readResources(true), growthMb };
   const memory = tgMemoryBudget(resources, settings.memoryMb);
-  const cpu = Math.min(settings.cpu, resources.totalCpus * .75 - resources.reservedCpus);
-  const message = memory.reason || (!Number.isFinite(cpu) || cpu < .25 ? 'CPU 预算不足，已排队保护面板；请休眠其他账号或降低单账号 CPU 上限' : '');
-  return { resources, cpu, memoryMb: memory.memoryMb, message };
+  if (memory.reason) return { resources, cpu: 0, memoryMb: memory.memoryMb, message: memory.reason };
+  const budget = await cpuBudget(resources);
+  return { resources, ...budget, memoryMb: memory.memoryMb };
 }
 let processing = false;
 async function tick() {
@@ -360,6 +413,7 @@ async function tick() {
       }
       return;
     }
+    if (active().length || [...rows.values()].some(row => row.state === 'queued' && row.desired)) await cpuBudget(diskBudget);
     const containers = running.length ? await ownedContainers() : [];
     const liveContainers = new Map(containers.filter(container => container.State === 'running' && container.Labels?.['nurossh.tg.owner'] === namespace).map(container => [container.Labels?.['nurossh.tg.account'], container]));
     const liveIds = new Set(liveContainers.keys());
@@ -428,6 +482,7 @@ async function configure(data) {
   const self = await docker('GET', `/containers/${runtimeName}/json`);
   hostProfiles = self.Mounts.find(mount => mount.Destination === profiles)?.Source;
   if (!hostProfiles || !hostProfiles.startsWith('/')) fail('浏览器持久目录未挂载', 503);
+  cpuGroup.configure({ namespace, hostProfiles, image: self.Config.Image, mounted: self.Mounts.some(m => m.Source === '/sys/fs/cgroup' && m.Destination === '/host-cgroup' && m.RW === true) });
   // Non-secret ownership metadata lets full uninstall find empty orphan
   // networks even after Docker/the runner lost all container endpoints.
   await fsp.writeFile(path.join(profiles, '.tg-owner'), namespace + '\n', { mode: 0o600 });
@@ -448,7 +503,7 @@ async function configure(data) {
     }
     const container = existingIds.has(item.id) ? await inspect(item.id) : null, running = Boolean(container?.State.Running);
     const network = `${name(item.id)}-net`;
-    rows.set(item.id, { dirty: true, profileExpected: Boolean(item.profileExpected || running), containerPresent: Boolean(container), memoryMb: container?.HostConfig?.Memory / 1024 ** 2, cpu: container?.HostConfig?.NanoCpus / 1e9, id: item.id, desired: item.desired, state: running ? 'running' : item.desired ? 'queued' : 'stopped', ip: running ? container.NetworkSettings.Networks[network]?.IPAddress : '', error: '', viewers: 0, retryAt: 0, startAttempts: 0, resourceAttempts: 0 });
+    rows.set(item.id, { dirty: true, profileExpected: Boolean(item.profileExpected || running), containerPresent: Boolean(container), memoryMb: container?.HostConfig?.Memory / 1024 ** 2, cpu: container?.HostConfig?.NanoCpus / 1e9, cpuGrouped: cpuGroup.includes(container?.HostConfig?.CgroupParent), id: item.id, desired: item.desired, state: running ? 'running' : item.desired ? 'queued' : 'stopped', ip: running ? container.NetworkSettings.Networks[network]?.IPAddress : '', error: '', viewers: 0, retryAt: 0, startAttempts: 0, resourceAttempts: 0 });
     if (migrationHold) { const row = rows.get(item.id); row.desired = false; if (container) await stop(item.id); else row.state = 'stopped'; }
     else if (running) {
       if (!item.desired) await stop(item.id);
@@ -470,7 +525,7 @@ async function handle(req) {
     // Docker may be stalled. Reading status must not queue behind its I/O or a
     // large archive; only admission decisions require a fresh resource sample.
     void readResources().catch(() => {});
-    return { accounts: [...rows.values()].map(tgRuntimeAccount), backupBusy: Boolean(backupLease), resources: resourceCache };
+    return { accounts: [...rows.values()].map(tgRuntimeAccount), backupBusy: Boolean(backupLease), resources: { ...resourceCache, cpuBudget: { ...cpuGroup.status(), legacyAccounts: active().filter(row => !row.cpuGrouped).length, limitsPending: active().filter(row => row.cpuUnconfirmed || row.cpu !== Math.min(settings.cpu, cpuGroup.status().total || settings.cpu)).length } } };
   }
   if (req.method === 'POST' && url.pathname === '/backup/end') {
     const input = await readBody(req); if (input.token !== backupLease?.token) fail('备份锁无效', 409);
@@ -488,6 +543,7 @@ async function handle(req) {
         await checkpoint(row.id);
         if (row.containerPresent !== false) await stop(row.id);
       }
+      await cpuGroup.release();
     } catch (error) { closed = false; throw error; }
     return { ok: true };
   });
@@ -521,7 +577,7 @@ async function handle(req) {
       if (backupLease) fail('正在备份，请稍后重试', 409);
       if (input.maxRunning < active().length) fail('当前运行账号多于新上限，请先休眠部分账号', 409);
       const storageChanged = settings.storageGb !== input.storageGb;
-      settings = input;
+      settings = input; cpuSyncRetryAt = 0;
       if (storageChanged) for (const row of rows.values()) row.storageScanAfter = 0;
       retryResourceWaiters();
       return { ok: true };

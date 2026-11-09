@@ -32,6 +32,11 @@ async function run(t, mode = '') {
   const runner = container('runner', '', deployment, '/profiles');
   runner.State.Running = mode === 'running'; runner.NetworkSettings.Networks.tg = { NetworkID: 'our-network' };
   const containers = mode === 'empty-network' ? [theirs] : mode === 'network-only' ? [runner, theirs] : mode === 'no-runner' ? [ours, theirs] : [ours, runner, theirs];
+  if (mode === 'cpu-group') {
+    const anchor = container('cpu-anchor', owner, deployment, '/ownership');
+    anchor.Config.Labels['nurossh.tg.cpu-group'] = '1'; anchor.Mounts[0].RW = false;
+    containers.push(anchor);
+  }
   const networks = [{ Id: 'our-network', Labels: { 'nurossh.tg.owner': owner }, Containers: { ...(['network-only', 'empty-network'].includes(mode) ? {} : { ours: {} }), ...(['no-runner', 'empty-network'].includes(mode) ? {} : { runner: {} }), ...(mode === 'foreign-network' ? { foreign: {} } : {}) } }, { Id: 'foreign-network', Labels: { 'nurossh.tg.owner': otherOwner }, Containers: { foreign: {} } }];
   await fs.writeFile(path.join(root, 'fixture.json'), JSON.stringify({ containers, networks, mode }));
   await fs.writeFile(path.join(root, 'docker'), `#!${process.execPath}
@@ -59,13 +64,14 @@ uninstall_service <<< y`, '_', repo, root], { encoding: 'utf8', env: { ...proces
 }
 
 test('complete uninstall removes only this instance including orphan browsers and networks', async t => {
-  for (const mode of ['', 'no-runner', 'network-only', 'empty-network']) {
+  for (const mode of ['', 'no-runner', 'network-only', 'empty-network', 'cpu-group']) {
     const result = await run(t, mode);
     assert.equal(result.status, 0, result.stderr); assert.equal(result.exists, false);
     assert.ok(result.calls.includes('compose stop'));
     assert.ok(result.calls.includes('compose down -v'));
     assert.ok(result.calls.includes('["network","rm","our-network"]'));
     if (!['network-only', 'empty-network'].includes(mode)) assert.ok(result.calls.includes('["rm","ours"]'));
+    if (mode === 'cpu-group') assert.ok(result.calls.includes('["rm","cpu-anchor"]'));
     assert.ok(!result.calls.some(c => /prune|rmi/.test(c) || c === '["rm","foreign"]' || c === '["network","rm","foreign-network"]'));
   }
 });

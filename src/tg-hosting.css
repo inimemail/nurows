@@ -71,6 +71,16 @@
 .tg-form .ops-field input,.tg-form .ops-field textarea { min-width: 0; width: 100%; }
 .tg-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .tg-dialog-description { font-size: 12px; color: var(--text-muted); line-height: 1.8; margin: 0; }
+.tg-cpu-notice { margin: 0 22px 10px; color: var(--text-muted); font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
+.tg-cpu-settings { min-width: 0; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--card-hover); }
+.tg-cpu-settings>summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px; list-style: none; cursor: pointer; color: var(--text-soft); font-size: 12px; }
+.tg-cpu-settings>summary::-webkit-details-marker { display: none; }
+.tg-cpu-settings>summary small { display: block; margin-top: 4px; color: var(--text-muted); font-size: 11px; }
+.tg-cpu-settings>summary>svg { flex-shrink: 0; transition: transform .15s; }
+.tg-cpu-settings[open]>summary>svg { transform: rotate(180deg); }
+.tg-cpu-settings>div { display: grid; gap: 10px; padding: 0 12px 12px; }
+.tg-cpu-settings .ops-field select { width: 100%; min-width: 0; min-height: 40px; padding: 9px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--card-bg); color: var(--text-soft); }
+@media(max-width:600px) { .tg-cpu-notice { margin: 0 14px 10px; } .tg-cpu-settings .ops-field select { font-size: 16px; } }
 .tg-form-intro { display: flex; gap: 12px; align-items: center; color: var(--accent-text); padding: 13px; border-radius: 10px; background: var(--card-hover); }
 .tg-form-intro p { margin: 0; font-size: 13px; color: var(--text-soft); }
 .tg-form-intro small { display: block; margin-top: 5px; color: var(--text-muted); font-size: 11px; }

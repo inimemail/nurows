@@ -1,4 +1,4 @@
-export const TG_HOSTING_DEFAULTS = Object.freeze({ maxRunning: 2, memoryMb: 1024, cpu: 1, storageGb: 5 });
+export const TG_HOSTING_DEFAULTS = Object.freeze({ maxRunning: 2, memoryMb: 1024, cpu: 1, cpuTotal: 0, storageGb: 5 });
 export const TG_PROFILE_MAX_BYTES = 20 * 1024 ** 3;
 export const TG_PROFILE_MAX_FILES = 100000;
 export const TG_BROWSER_MIN_MEMORY_MB = 512;
@@ -80,6 +80,10 @@ export function tgMemoryBudget(resources, maximumMb) {
   if (memoryMb < TG_BROWSER_MIN_MEMORY_MB) return blocked(`内存预算不足：可用 ${Math.floor(resources.availableMb)} MB，需至少 ${Math.ceil(growthMb + Math.min(reserveMb, 1024) + TG_BROWSER_MIN_MEMORY_MB)} MB；已排队，空闲后自动重试`);
   return { memoryMb, reserveMb, reason: '' };
 }
+export function tgCpuTotal(totalCpus, configured = 0) {
+  if (!Number.isFinite(totalCpus) || totalCpus <= 0 || !Number.isFinite(configured) || configured < 0) throw hostingError('暂时无法确认服务器 CPU 容量', 503);
+  return Math.min(totalCpus, configured || totalCpus * .75);
+}
 export function tgResourceBlock(resources, memoryMb) {
   return tgMemoryBudget(resources, memoryMb).reason;
 }
@@ -99,8 +103,9 @@ export function tgHostingSettings(input = {}) {
   if (!Number.isInteger(value.maxRunning) || value.maxRunning < 1 || value.maxRunning > 50) throw hostingError('同时运行数量应为 1–50');
   if (!Number.isInteger(value.memoryMb) || value.memoryMb < TG_BROWSER_MIN_MEMORY_MB || value.memoryMb > 8192 || value.memoryMb % 128) throw hostingError('单账号内存应为 512–8192 MB，按 128 MB 调整');
   if (!Number.isFinite(value.cpu) || value.cpu < 0.25 || value.cpu > 4 || value.cpu * 4 % 1) throw hostingError('单账号 CPU 应为 0.25–4 核，按 0.25 核调整');
+  if (!Number.isFinite(value.cpuTotal) || value.cpuTotal < 0 || value.cpuTotal > 256 || value.cpuTotal !== 0 && (value.cpuTotal < .25 || value.cpuTotal * 4 % 1)) throw hostingError('整体 CPU 应为自动或 0.25–256 核，按 0.25 核调整');
   if (!Number.isInteger(value.storageGb) || value.storageGb < 1 || value.storageGb > 20) throw hostingError('单账号存储上限应为 1–20 GB');
-  return { maxRunning: value.maxRunning, memoryMb: value.memoryMb, cpu: value.cpu, storageGb: value.storageGb };
+  return { maxRunning: value.maxRunning, memoryMb: value.memoryMb, cpu: value.cpu, cpuTotal: value.cpuTotal, storageGb: value.storageGb };
 }
 export function tgHostingAccount(input, old = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw hostingError('账号信息格式无效');

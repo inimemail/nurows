@@ -4,6 +4,7 @@ COPY tg-hosting/package*.json ./
 RUN npm ci --omit=dev
 COPY tg-hosting/runner.mjs ./runner.mjs
 COPY shared/tg-hosting.js ./shared/tg-hosting.js
+COPY shared/tg-cpu-group.js ./shared/tg-cpu-group.js
 COPY shared/tg-http.js ./shared/tg-http.js
 COPY shared/tg-docker.js ./shared/tg-docker.js
 COPY shared/tg-frame-relay.js ./shared/tg-frame-relay.js

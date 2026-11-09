@@ -17,6 +17,8 @@ services:
       TG_RUNNER_CONTAINER: nurossh-tg-runner
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Only the trusted runner controls its own parent CPU cgroup.
+      - /sys/fs/cgroup:/host-cgroup:rw
       - tg-control:/control
       - ./tg-browser-data:/profiles
       - ./data/tg-hosted-snapshots:/snapshots

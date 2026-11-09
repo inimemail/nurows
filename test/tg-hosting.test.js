@@ -18,7 +18,7 @@ function fixture(t, custom = {}, options = {}) {
   return { service, runner, calls };
 }
 test('hosting validates resource bounds and preserves safe defaults', () => {
-  assert.deepEqual(tgHostingSettings(), { maxRunning: 2, memoryMb: 1024, cpu: 1, storageGb: 5 });
+  assert.deepEqual(tgHostingSettings(), { maxRunning: 2, memoryMb: 1024, cpu: 1, cpuTotal: 0, storageGb: 5 });
   for (const input of [{maxRunning:0},{memoryMb:384},{memoryMb:1000},{cpu:0},{cpu:0.3},{storageGb:0},{storageGb:21},{storageGb:1.5}]) assert.throws(() => tgHostingSettings(input));
   assert.equal(tgHostingSettings({ memoryMb: 512 }).memoryMb, 512);
   assert.equal(tgHostingAccount({ name: ' A ' }).mode, 'keep');
@@ -267,14 +267,16 @@ test('one rejected account does not block other account commands or lose their k
  assert.equal(service.records().length,4);
 });
 
-test('old settings inherit the 5 GB default and partial updates preserve a chosen storage limit', async t => {
+test('old settings inherit CPU/storage defaults and partial updates preserve both CPU limits', async t => {
   const db = new Database(':memory:');
   const runner = { enabled: false }, service = createTgHostingService({ db, key: Buffer.alloc(32, 7), runner });
   t.after(() => { service.close(); db.close(); });
   db.prepare('INSERT INTO tg_hosting_settings VALUES(1,?)').run(JSON.stringify({maxRunning:2,memoryMb:1024,cpu:1}));
   assert.equal(service.settings().storageGb,5);
-  await service.configure({storageGb:8}); await service.configure({cpu:.5});
+  assert.equal(service.settings().cpuTotal,0);
+  await service.configure({storageGb:8,cpuTotal:3}); await service.configure({cpu:.5});
   assert.equal(service.settings().storageGb,8); assert.equal(service.settings().cpu,.5);
+  assert.equal(service.settings().cpuTotal,3);
   const restarted=createTgHostingService({db,key:Buffer.alloc(32,7),runner});
-  assert.equal(restarted.settings().storageGb,8); restarted.close();
+  assert.equal(restarted.settings().storageGb,8); assert.equal(restarted.settings().cpuTotal,3); restarted.close();
 });

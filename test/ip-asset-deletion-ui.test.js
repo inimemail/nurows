@@ -8,7 +8,7 @@ import * as telegramPermissions from '../shared/telegram-permissions.js';
 import * as workspaceSearch from '../shared/workspace-search.js';
 
 const compiled = transformSync(fs.readFileSync(new URL('../src/OrchestrationWorkspace.jsx', import.meta.url), 'utf8'), { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
-function harness(api, assets, search = '', extra = {}) {
+function harness(api, assets, search = '', extra = {}, tab = 'pools') {
   const values = [], messages = [], updates = [];
   let cursor = 0, tree;
   const state = { ipAssets: assets || [{ id: 'a', name: '测试 IP', address: '192.0.2.1', labels: [], health: 'unknown' }], ipPools: [], ipUsageRecords: [], ...extra };
@@ -32,7 +32,7 @@ function harness(api, assets, search = '', extra = {}) {
     if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     throw Error(path);
   } });
-  function render() { cursor = 0; tree = module.exports.default({ tab: 'pools', state, search, api, onState: (next) => updates.push(next), toast: (message) => messages.push(message), Dialog: 'dialog' }); }
+  function render() { cursor = 0; tree = module.exports.default({ tab, state, search, api, onState: (next) => updates.push(next), toast: (message) => messages.push(message), Dialog: 'dialog' }); }
   function nodes(value = tree) {
     if (Array.isArray(value)) return value.flatMap(nodes);
     if (!value || typeof value !== 'object') return [];
@@ -46,7 +46,68 @@ function harness(api, assets, search = '', extra = {}) {
 
 const poolFixture = () => ({ ipPools: [{ id: 'p1', name: '备用池一', assetIds: ['a'], enabled: true }] });
 
-const healthFixture = () => ({ ...poolFixture(), probes: [{ id: 'probe', name: '在线探针', status: 'online', agentVersion: probeCapabilities.POOL_HEALTH_PROBE_VERSION, lastSeenAt: new Date().toISOString() }] });
+const healthFixture = () => ({ ...poolFixture(), ipPools: [{ ...poolFixture().ipPools[0], probeIds: ['probe'] }], probes: [{ id: 'probe', name: '在线探针', status: 'online', agentVersion: probeCapabilities.POOL_HEALTH_PROBE_VERSION, lastSeenAt: new Date().toISOString() }] });
+
+test('probe list deletes a probe directly and prevents repeated deletion requests', async () => {
+  const calls = [];
+  let finish;
+  const view = harness((path, options) => { calls.push({ path, options }); return new Promise(resolve => { finish = resolve; }); }, undefined, '', healthFixture(), 'probes');
+  const remove = view.buttons('删除')[0].props.onClick;
+  const pending = remove(); await remove(); view.render();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, '/api/orchestration/probes/probe');
+  assert.equal(calls[0].options.method, 'DELETE');
+  assert.equal(view.buttons('删除')[0].props.disabled, true);
+  finish({ state: { ...poolFixture(), probes: [] } }); await pending; view.render();
+  assert.match(view.messages[0], /取消所有关联选择/);
+});
+
+test('a pool without any bound probes explicitly shows no probe and can still open its editor', () => {
+  const view = harness(async () => {}, undefined, '', poolFixture());
+  view.buttons('备用池1')[0].props.onClick(); view.render();
+  const row = view.nodes().find(node => node.type?.name === 'Row');
+  assert.match(row.props.subtitle, /无探针/);
+  view.buttons('编辑')[0].props.onClick(); view.render();
+  assert.deepEqual(Array.from(view.nodes().find(node => node.type?.name === 'PoolEditor').props.value.probeIds), []);
+  assert.equal(view.buttons('保存')[0].props.disabled, true);
+});
+
+test('pool editor requires a probe and legacy pools cannot silently use all online probes', async () => {
+  const calls = [];
+  const fixture = healthFixture();
+  delete fixture.ipPools[0].probeIds;
+  const view = harness(async (...args) => { calls.push(args); return { state: fixture }; }, undefined, '', fixture);
+  view.buttons('备用池1')[0].props.onClick(); view.render();
+  view.buttons('检测并删除不通 IP')[0].props.onClick(); view.render();
+  assert.equal(view.buttons('确认检测并删除').length, 0);
+  assert.match(view.messages[0], /先编辑备用池/);
+  view.buttons('编辑')[0].props.onClick(); view.render();
+  assert.equal(view.buttons('保存')[0].props.disabled, true);
+  await view.buttons('保存')[0].props.onClick();
+  assert.equal(calls.length, 0);
+  const editor = view.nodes().find(node => node.type?.name === 'PoolEditor');
+  editor.props.patch({ probeIds: ['probe'] }); view.render();
+  assert.equal(view.buttons('保存')[0].props.disabled, false);
+  await view.buttons('保存')[0].props.onClick();
+  assert.deepEqual(JSON.parse(calls[0][1].body).probeIds, ['probe']);
+});
+
+test('pool health defaults to bound probes and never substitutes an unrelated online probe', () => {
+  const fixture = healthFixture();
+  fixture.probes.push({ ...fixture.probes[0], id: 'unrelated', name: '其他探针' });
+  const view = harness(async () => {}, undefined, '', fixture);
+  view.buttons('备用池1')[0].props.onClick(); view.render();
+  view.buttons('检测并删除不通 IP')[0].props.onClick(); view.render();
+  const fields = () => view.nodes().find(node => node.type?.name === 'PoolHealthFields');
+  assert.deepEqual(Array.from(fields().props.probes, probe => probe.id), ['probe']);
+  assert.deepEqual(Array.from(fields().props.value.probeIds), ['probe']);
+  fields().props.patch({ probeIds: ['unrelated'] }); view.render();
+  assert.equal(view.buttons('确认检测并删除')[0].props.disabled, true);
+  fields().props.patch({ probeIds: ['probe'] });
+  view.state.probes[0].status = 'offline'; view.render();
+  assert.equal(view.buttons('确认检测并删除')[0].props.disabled, true);
+  assert.deepEqual(Array.from(fields().props.value.probeIds), ['probe']);
+});
 
 test('pool health check confirms selected probes and snapshot, defaults to 50 parallel IPs and prevents duplicate starts', async () => {
   const calls = [];
@@ -163,7 +224,7 @@ test('cancel all selection only edits membership and never deletes IP assets', (
   view.buttons('编辑')[0].props.onClick(); view.render();
   const editor = view.nodes().find(node => node.type?.name === 'PoolEditor');
   const editorTree = editor.type(editor.props);
-  const multi = view.nodes(editorTree).find(node => node.type?.name === 'Multi');
+  const multi = view.nodes(editorTree).find(node => node.type?.name === 'Multi' && node.props.label === '已有 IP 资产');
   const multiTree = multi.type(multi.props);
   const clear = view.nodes(multiTree).find(node => node.type === 'button' && node.props.children === '取消全部选择');
   clear.props.onClick(); view.render();

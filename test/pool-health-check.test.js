@@ -9,7 +9,7 @@ import { supportsPoolHealthCheck, POOL_HEALTH_PROBE_VERSION } from '../shared/pr
 function harness(count = 3, extra = {}) {
   const assets = Array.from({ length: count }, (_, i) => ({ id: `a${i}`, address: `8.8.${Math.floor(i / 256)}.${i % 256}`, enabled: true }));
   let state = { ...orchestrationDefaults(), ipAssets: assets,
-    ipPools: [{ id: 'pool', name: '备用池', assetIds: assets.map(asset => asset.id) }],
+    ipPools: [{ id: 'pool', name: '备用池', probeIds: ['p1', 'p2'], assetIds: assets.map(asset => asset.id) }],
     probes: ['p1', 'p2'].map(id => ({ id, status: 'online', enabled: true, agentVersion: POOL_HEALTH_PROBE_VERSION, lastSeenAt: new Date().toISOString(),
       agentSecretHash: crypto.createHash('sha256').update('secret').digest('hex') })), ...extra };
   let writes = 0;
@@ -63,6 +63,72 @@ test('starts 50 parallel checks by default, persists once and never sends invent
   const summary = sanitizeOrchestrationState(response.state);
   assert.equal(summary.ipPools[0].healthCheck.checkingCount, 50);
   assert.equal(normalizeOrchestrationState(h.state()).ipPools[0].healthCheck.queue.length, 5000);
+});
+
+test('cleanup requires a saved pool binding and cannot dispatch to an unrelated online probe', async () => {
+  const h = harness(1);
+  delete h.state().ipPools[0].probeIds;
+  await assert.rejects(h.start(), /先编辑备用池/);
+  h.state().ipPools[0].probeIds = ['p1'];
+  await assert.rejects(h.start(), /只能使用本池绑定/);
+  assert.equal(h.writes(), 0);
+  assert.equal(h.state().ipAssets.length, 1);
+  await h.start({ probeIds: ['p1'] });
+  assert.equal((await h.config('p1')).targets.length, 1);
+  assert.equal((await h.config('p2')).targets.length, 0);
+  await assert.rejects(h.request('put', '/api/orchestration/:resource/:id', {
+    name: 'edited', assetIds: ['a0'], probeIds: ['p2']
+  }, { resource: 'ip-pools', id: 'pool' }), /先停止后再修改/);
+  assert.deepEqual(h.state().ipPools[0].probeIds, ['p1']);
+});
+
+test('deleting bound probes removes every selection and leaves the last binding empty', async () => {
+  const h = harness(1);
+  h.state().probeTargets.push({ id: 'target', probeIds: ['p1', 'p2'], observations: { p1: { ok: true }, p2: { ok: false } }, health: 'healthy' });
+  h.state().dnsGuards.push({ id: 'guard', probeIds: ['p1', 'p2'], cycle: { id: 'cycle' }, currentValues: ['8.8.8.8'] });
+  h.state().dynamicGuards.push({ id: 'dynamic', probeIds: ['p1', 'p2'], revision: 1, cycle: { id: 'old' }, pendingChange: { address: '8.8.8.8' } });
+  await h.request('delete', '/api/orchestration/:resource/:id', {}, { resource: 'probes', id: 'p1' });
+  assert.equal(h.writes(), 1);
+  for (const key of ['probeTargets', 'dnsGuards', 'dynamicGuards', 'ipPools']) assert.deepEqual(h.state()[key][0].probeIds, ['p2']);
+  assert.deepEqual(h.state().probeTargets[0].observations, {});
+  assert.equal(h.state().probeTargets[0].health, 'unknown');
+  assert.equal(h.state().dnsGuards[0].cycle, null);
+  assert.equal(h.state().dynamicGuards[0].cycle, null);
+  assert.equal(h.state().dynamicGuards[0].pendingChange, null);
+  assert.equal(h.state().dynamicGuards[0].revision, 2);
+  await h.request('delete', '/api/orchestration/:resource/:id', {}, { resource: 'probes', id: 'p2' });
+  for (const key of ['probeTargets', 'dnsGuards', 'dynamicGuards', 'ipPools']) assert.deepEqual(h.state()[key][0].probeIds, []);
+  assert.equal(h.state().dnsGuards[0].status, 'waiting_probe');
+  assert.equal(h.state().dynamicGuards[0].status, 'waiting_probe');
+  assert.match(h.state().dnsGuards[0].message, /无探针/);
+  assert.deepEqual(h.state().dnsGuards[0].currentValues, ['8.8.8.8']);
+  assert.equal(h.state().ipAssets.length, 1);
+  assert.equal(h.state().ipPools.length, 1);
+});
+
+test('deleting a probe interrupts a cleanup job without deleting IPs or using remaining failures', async () => {
+  const h = harness(1);
+  await h.start();
+  const check = h.job().checks[0];
+  await h.report('p2', [h.evidence(check)]);
+  await h.request('delete', '/api/orchestration/:resource/:id', {}, { resource: 'probes', id: 'p1' });
+  assert.equal(h.job().status, 'interrupted');
+  assert.equal(h.job().deletedCount, 0);
+  assert.equal(h.state().ipAssets.length, 1);
+  assert.equal((await h.config('p2')).targets.length, 0);
+});
+
+test('probe deletion preserves pending DNS confirmation and an executing command recovery flow', async () => {
+  const h = harness(1);
+  const cycle = { id: 'write', rebalanceCommit: { writeAttempted: true, desired: ['8.8.8.8'] } };
+  const flow = { executionId: 'execution', commandState: 'executing' };
+  h.state().dnsGuards.push({ id: 'guard', probeIds: ['p1'], cycle });
+  h.state().dynamicGuards.push({ id: 'dynamic', probeIds: ['p1'], revision: 1, cycle: { id: 'old' }, flow });
+  await h.request('delete', '/api/orchestration/:resource/:id', {}, { resource: 'probes', id: 'p1' });
+  assert.deepEqual(h.state().dnsGuards[0].probeIds, []);
+  assert.deepEqual(h.state().dnsGuards[0].cycle, cycle);
+  assert.deepEqual(h.state().dynamicGuards[0].probeIds, []);
+  assert.deepEqual(h.state().dynamicGuards[0].flow, flow);
 });
 
 test('one probe succeeds immediately, refills capacity and ignores late failures', async () => {
@@ -236,7 +302,7 @@ test('validation and duplicate starts do not change the job, and stale stop requ
 
 test('global concurrency remains 100 across jobs and stopping releases capacity without per-IP writes', async () => {
   const h = harness(300);
-  h.state().ipPools = Array.from({ length: 3 }, (_, i) => ({ id: `pool${i}`, assetIds: h.state().ipAssets.slice(i * 100, i * 100 + 100).map(asset => asset.id) }));
+  h.state().ipPools = Array.from({ length: 3 }, (_, i) => ({ id: `pool${i}`, probeIds: ['p1', 'p2'], assetIds: h.state().ipAssets.slice(i * 100, i * 100 + 100).map(asset => asset.id) }));
   await h.start({}, 'pool0'); await h.start({}, 'pool1'); await h.start({}, 'pool2');
   assert.equal(h.job('pool0').checks.length, 50);
   assert.equal(h.job('pool1').checks.length, 50);
@@ -292,7 +358,7 @@ test('uncertain runtime failures stop a large scan instead of repeatedly wasting
 
 test('shared IPs are not checked concurrently by two cleanup jobs and IPv6 reports match normalized addresses', async () => {
   const h = harness(1);
-  h.state().ipPools.push({ id: 'other', assetIds: ['a0'] });
+  h.state().ipPools.push({ id: 'other', probeIds: ['p1', 'p2'], assetIds: ['a0'] });
   h.state().ipAssets[0].address = '2606:4700:4700:0:0:0:0:1111';
   await h.start(); await h.start({}, 'other');
   assert.equal(h.job('other').status, 'completed');

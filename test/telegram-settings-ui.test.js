@@ -8,7 +8,7 @@ import * as permissions from '../shared/telegram-permissions.js';
 import * as workspaceSearch from '../shared/workspace-search.js';
 
 const source = fs.readFileSync(new URL('../src/OrchestrationWorkspace.jsx', import.meta.url), 'utf8');
-const compiled = transformSync(`${source}\nexport { BotEditor, normalizeDraft, serializeDraft };`, { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
+const compiled = transformSync(`${source}\nexport { BotEditor, normalizeDraft, serializeDraft, EMPTY };`, { loader: 'jsx', format: 'cjs', jsx: 'automatic' }).code;
 const nodes = (value) => Array.isArray(value) ? value.flatMap(nodes) : !value || typeof value !== 'object' ? [] : [value, ...nodes(value.props?.children)];
 function harness() {
   const module = { exports: {} }, jsx = (type, props) => ({ type, props });
@@ -53,4 +53,23 @@ test('editing an older bot does not silently enable default features or suppress
   const old = ui.normalizeDraft('bot', { menuScopes: ['probes', 'pools'] });
   assert.deepEqual(old.menuScopes, ['probes', 'pools', 'guards', 'assets']);
   assert.equal(old.menuScopeVersion, 2);
+});
+
+test('new bot defaults select every feature and task and keep manual deselections after later additions', () => {
+  const ui = harness();
+  let draft = structuredClone(ui.EMPTY.bot);
+  const state = { automationTasks: [{ id: 't1', name: '任务一' }] };
+  const render = () => ui.BotEditor({ value: draft, patch: next => { draft = { ...draft, ...next }; }, state });
+  const picker = label => nodes(render()).find(node => node.props?.label === label);
+  assert.deepEqual(picker('TG 可用管理功能').props.value, permissions.TELEGRAM_FEATURES.map(([key]) => key));
+  assert.deepEqual(picker('允许执行的自动化任务').props.value, ['t1']);
+  picker('TG 可用管理功能').props.onChange([]);
+  picker('允许执行的自动化任务').props.onChange([]);
+  assert.deepEqual(picker('TG 可用管理功能').props.value, []);
+  assert.deepEqual(picker('允许执行的自动化任务').props.value, []);
+  state.automationTasks.push({ id: 't2', name: '新任务' });
+  assert.deepEqual(picker('允许执行的自动化任务').props.value, ['t2']);
+  picker('允许执行的自动化任务').props.onChange(['t2']);
+  assert.deepEqual(picker('允许执行的自动化任务').props.value, ['t2']);
+  assert.deepEqual(ui.serializeDraft('bot', draft).automationTaskCatalog, ['t1', 't2']);
 });

@@ -16,6 +16,8 @@ import { createWebhookService, registerWebhookRoutes } from './webhooks.js';
 import { createEpayService, registerEpayRoutes } from './epay.js';
 import { createTgHostingService, registerTgHostingRoutes } from './tg-hosting.js';
 import { registerConfigBulkDeleteRoutes } from './config-bulk-delete.js';
+import { registerServerExportRoutes } from './server-export.js';
+import { tokenizeServerImportRow } from '../shared/server-export.js';
 import { runLocalWebhook, runSshWebhook } from './webhook-runtime.js';
 import { poolHealthSummary, poolHealthProbeState, poolHealthSchedule, clonePoolHealthPools } from './pool-health-check.js';
 import { parseStoredRecord } from './storage-validation.js';
@@ -606,6 +608,8 @@ app.put('/api/groups/:id', (req, res) => {
   });
   res.json({ ok: true, state: sanitizeStateForClient(state, req.auth) });
 });
+
+registerServerExportRoutes(app, { readState, passwordFor: getStoredSecretValue });
 
 app.delete('/api/groups/:id/servers', (req, res) => {
   const { confirm, serverIds } = req.body || {};
@@ -3395,7 +3399,7 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
           inventoryChange = { poolIds: [result.pool.id] };
           resultText = `已加入备用池“${result.pool.name}”\n当前 IP：${result.pool.assetIds.length}`;
         } else if (pending.action === 'pool_create_ips') {
-          const result = createPoolWithIps(draft, pending.poolName, pending.addresses, `telegram:${from.id}`);
+          const result = createPoolWithIps(draft, pending.poolName, pending.addresses, `telegram:${from.id}`, pending.probeIds);
           inventoryChange = { poolIds: [result.pool.id] };
           resultText = `已创建备用池“${result.pool.name}”\nIP 数量：${result.pool.assetIds.length}`;
         }
@@ -3472,7 +3476,25 @@ async function handleTelegramUpdate(update, token, botSettings = null) {
     return;
   }
   if (pending?.action === 'pool_create_name' && text) {
-    pending.action = 'pool_create_ips'; pending.poolName = text.slice(0, 200); pending.expiresAt = Date.now() + 10 * 60 * 1000;
+    const probes = (state.probes || []).filter(probe => probe.enabled !== false && probe.status !== 'revoked');
+    if (!probes.length) {
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '请先在网页添加有效探针，再创建备用池。', reply_markup: telegramCancelButtons('menu:pools') });
+      return;
+    }
+    pending.action = 'pool_create_probes'; pending.poolName = text.slice(0, 200); pending.expiresAt = Date.now() + 10 * 60 * 1000;
+    pending.probeChoices = probes.slice(0, 50).map(probe => probe.id);
+    telegramRuntime.pending.set(sessionKey, pending);
+    await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `备用池名称：${pending.poolName}\n请选择检测探针（必选，最多 20 个），发送序号，多个用空格分隔。请确认探针支持池内 IPv4 / IPv6 网络。\n${probes.slice(0, 50).map((probe, index) => `${index + 1}. ${probe.name}`).join('\n')}`, reply_markup: telegramCancelButtons('menu:pools') });
+    return;
+  }
+  if (pending?.action === 'pool_create_probes' && text) {
+    const choices = [...new Set(text.split(/[,，\s]+/).filter(Boolean).map(Number))];
+    const probeIds = choices.map(choice => Number.isInteger(choice) && choice > 0 ? pending.probeChoices[choice - 1] : undefined);
+    if (!probeIds.length || probeIds.length > 20 || probeIds.some(id => !id || !state.probes.some(probe => probe.id === id && probe.enabled !== false && probe.status !== 'revoked'))) {
+      await telegramCall(token, 'sendMessage', { chat_id: chatId, text: '请选择 1–20 个有效的探针序号。', reply_markup: telegramCancelButtons('menu:pools') });
+      return;
+    }
+    pending.action = 'pool_create_ips'; pending.probeIds = probeIds; pending.expiresAt = Date.now() + 10 * 60 * 1000;
     telegramRuntime.pending.set(sessionKey, pending);
     await telegramCall(token, 'sendMessage', { chat_id: chatId, text: `备用池名称：${pending.poolName}\n请发送初始 IP，每行一个。`, reply_markup: telegramCancelButtons('menu:pools') });
     return;
@@ -4626,8 +4648,7 @@ function parseImportText(text) {
 }
 
 function tokenizeRow(line) {
-  const matches = line.match(/"([^"]*)"|'([^']*)'|[^\s,|]+/g) || [];
-  return matches.map((token) => token.replace(/^['"]|['"]$/g, ''));
+  return tokenizeServerImportRow(line);
 }
 
 function buildConnectOptions(serverItem, password) {

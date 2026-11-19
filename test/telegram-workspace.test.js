@@ -3,7 +3,7 @@ import test from 'node:test';
 import { createTelegramWorkspace } from '../server/telegram-workspace.js';
 import { createTelegramActions } from '../server/telegram-actions.js';
 import { clearFinishedIncidents, normalizeOrchestrationState, orchestrationDefaults } from '../server/orchestration.js';
-import { TELEGRAM_FEATURES, telegramScopes } from '../shared/telegram-permissions.js';
+import { TELEGRAM_FEATURES, telegramScopes, telegramScopeAllowed } from '../shared/telegram-permissions.js';
 import { normalizeRenewalState, validateRenewal } from '../server/renewals.js';
 import { renewalExtension } from '../shared/renewals.js';
 
@@ -38,6 +38,26 @@ test('scope migration preserves old combined capabilities and explicit empty nev
   const migrated = normalizeOrchestrationState({ telegramBots: [{ id: 'b', menuScopes: ['probes'] }] }).telegramBots[0];
   assert.equal(migrated.menuScopeVersion, 2);
   assert.deepEqual(migrated.menuScopes, ['probes', 'guards']);
+});
+
+test('new features and tasks are selected during state updates without reopening the bot editor', () => {
+  let state = normalizeOrchestrationState({ telegramBots: [{ id: 'b', menuScopeVersion: 2, menuScopes: ['automation'], automationTaskIds: ['allowed'] }],
+    automationTasks: [{ id: 'allowed' }, { id: 'unchecked' }] });
+  const migrated = structuredClone(state.telegramBots[0]);
+  // A new task follows the same full-state normalization used after creation
+  // and import, even when a bot previously had an explicitly empty selection.
+  state = normalizeOrchestrationState({ ...state, telegramBots: [{ ...migrated, automationTaskIds: [] }],
+    automationTasks: [{ id: 'allowed' }, { id: 'unchecked' }, { id: 'new-task' }] });
+  assert.deepEqual(state.telegramBots[0].automationTaskIds, ['new-task']);
+  assert.deepEqual(state.telegramBots[0].menuScopes, ['automation']);
+  TELEGRAM_FEATURES.push(['future-feature', '后续功能']);
+  try {
+    state = normalizeOrchestrationState({ ...state, automationTasks: [{ id: 'allowed' }, { id: 'unchecked' }, { id: 'new-task' }] });
+    assert.deepEqual(state.telegramBots[0].menuScopes, ['automation', 'future-feature']);
+    assert.equal(telegramScopeAllowed(state.telegramBots[0], 'future-feature'), true);
+    state.telegramBots[0].menuScopes = ['automation'];
+    assert.deepEqual(normalizeOrchestrationState(state).telegramBots[0].menuScopes, ['automation']);
+  } finally { TELEGRAM_FEATURES.pop(); }
 });
 
 test('main menu includes Webhook tasks, granular permissions, and no implicit management for notification-only bots', async () => {

@@ -510,12 +510,97 @@ svg {
 
 .tree-group-button {
   flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 8px;
   text-align: left;
   cursor: pointer;
   color: var(--text-main);
+}
+
+.tree-group-button strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-group-head > .row-actions { flex-shrink: 0; }
+
+.tree-group-head .group-export-button { color: var(--accent-text); }
+.tree-group-head .group-export-button:hover { background: var(--accent-soft); border-color: var(--accent-border); }
+.dialog.wide.server-export-dialog { width: min(1060px, 100%); }
+.server-export-dialog .dialog-head { padding-block: 22px; }
+.server-export-dialog .dialog-head > strong { min-width: 0; overflow-wrap: anywhere; font-size: 17px; letter-spacing: -.3px; }
+.server-export-layout { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: 24px; padding-top: 22px; }
+.server-export-selection, .server-export-output { min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+.server-export-selection { padding-right: 24px; border-right: 1px solid var(--border-soft); }
+.server-export-section-head, .server-export-section-head > div { display: flex; align-items: center; gap: 9px; }
+.server-export-section-head { justify-content: space-between; min-height: 24px; margin-bottom: 2px; }
+.server-export-section-head strong { font-size: 13px; font-weight: 650; color: var(--text-strong); }
+.server-export-step { color: var(--text-muted); font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.server-export-count { padding: 3px 9px; border-radius: 6px; background: var(--accent-soft); color: var(--accent-text); font-size: 10px; }
+.server-export-live { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 10px; }
+.server-export-live > span { width: 5px; height: 5px; border-radius: 50%; background: var(--accent-solid); }
+.server-export-search { position: relative; }
+.server-export-search > svg { position: absolute; left: 13px; top: 50%; transform: translateY(-50%); color: var(--text-muted); pointer-events: none; }
+.server-export-search input { width: 100%; min-height: 44px; padding-left: 39px; font-size: 12px; }
+.server-export-tools { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.server-export-tools > span { margin-right: auto; color: var(--text-soft); font-size: 11px; }
+.server-export-tools .ghost { min-height: 28px; padding: 5px 9px; border-color: transparent; border-radius: 7px; background: transparent; box-shadow: none; font-size: 11px; }
+.server-export-tools .ghost:hover:not(:disabled) { transform: none; background: var(--accent-soft); color: var(--accent-text); }
+.server-export-hint { color: var(--text-muted); font-size: 10px; line-height: 1.8; }
+.server-export-list { height: 318px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; border: 1px solid var(--border-soft); border-radius: 13px; padding: 5px; background: color-mix(in srgb, var(--card-bg) 60%, transparent); }
+.server-export-list label { display: flex; align-items: center; gap: 11px; min-height: 67px; margin-bottom: 4px; padding: 11px 12px; border: 1px solid transparent; border-radius: 9px; cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+.server-export-list label:last-child { margin-bottom: 0; }
+.server-export-list label:hover { background: var(--card-hover); }
+.server-export-list label.selected { background: color-mix(in srgb, var(--accent-soft) 55%, transparent); border-color: var(--accent-border-soft); }
+.server-export-list label > input { flex: 0 0 auto; width: 15px; height: 15px; margin: 0; accent-color: var(--accent-solid); cursor: pointer; }
+.server-export-server-icon { display: grid; place-items: center; width: 31px; height: 34px; flex-shrink: 0; border: 1px solid var(--border-card); border-radius: 8px; color: var(--text-muted); background: var(--panel-bg); }
+.selected .server-export-server-icon { color: var(--accent-text); border-color: var(--accent-border-soft); }
+.server-export-server-copy { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 5px; }
+.server-export-server-copy strong { color: var(--text-strong); font-size: 12px; font-weight: 550; overflow-wrap: anywhere; }
+.server-export-server-copy code { color: var(--text-soft); font-size: 10px; overflow-wrap: anywhere; }
+.server-export-port { align-self: center; color: var(--text-muted); font: 10px monospace; white-space: nowrap; }
+.server-export-formats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.server-export-formats > button { display: flex; align-items: center; gap: 10px; min-height: 75px; padding: 13px; text-align: left; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--card-bg); color: var(--text-muted); cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+.server-export-formats > button.active { border-color: var(--accent-border); background: color-mix(in srgb, var(--accent-soft) 55%, var(--card-bg)); color: var(--accent-text); }
+.server-export-formats > button:hover { border-color: var(--accent-border); }
+.server-export-formats > button > svg { flex-shrink: 0; }
+.server-export-formats > button > span:not(.server-export-format-check) { display: flex; flex-direction: column; gap: 5px; }
+.server-export-formats strong { color: var(--text-strong); font-size: 12px; font-weight: 600; }
+.server-export-formats small { color: var(--text-soft); font-size: 10px; white-space: nowrap; }
+.server-export-format-check { display: grid; place-items: center; flex: 0 0 16px; width: 16px; height: 16px; margin-left: auto; border: 1px solid var(--border-soft); border-radius: 50%; }
+.active .server-export-format-check { color: var(--accent-contrast); background: var(--accent-solid); border-color: var(--accent-solid); }
+.server-export-preview { display: flex; flex-direction: column; flex: 1; min-height: 312px; overflow: hidden; border: 1px solid var(--border-soft); border-radius: 13px; background: var(--input-bg); }
+.server-export-preview-head { display: flex; align-items: center; justify-content: space-between; min-height: 39px; padding: 0 14px; border-bottom: 1px solid var(--border-soft); background: color-mix(in srgb, var(--panel-bg) 65%, transparent); color: var(--text-soft); font-size: 10px; }
+.server-export-preview-head > span:last-child { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.server-export-output textarea { width: 100%; min-height: 270px; flex: 1; resize: none; border: 0; border-radius: 0; padding: 16px; background: transparent; font-family: var(--font-mono, monospace); font-size: 11px; line-height: 2; white-space: pre; tab-size: 2; }
+.server-export-output textarea:focus { background: transparent; box-shadow: inset 0 0 0 2px var(--accent-ring); }
+.server-export-summary { display: inline-flex; align-items: center; gap: 5px; color: var(--text-soft); font-size: 11px; }
+.server-export-summary strong { color: var(--text-strong); font-size: 13px; font-variant-numeric: tabular-nums; }
+.server-export-summary-icon { display: grid; place-items: center; width: 23px; height: 23px; margin-right: 5px; border-radius: 50%; background: var(--accent-soft); color: var(--accent-text); }
+.server-export-dialog .dialog-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 39px; padding: 10px 16px; border-radius: 10px; font-size: 12px; }
+.server-export-dialog .dialog-actions .primary { min-width: 116px; }
+.server-export-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--danger-text, #c15151); font-size: 12px; }
+.server-export-empty { display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; height: 100%; min-height: 140px; padding: 20px; text-align: center; color: var(--text-muted); }
+.server-export-empty > svg { margin-bottom: 4px; opacity: .6; }
+.server-export-empty strong { font-size: 12px; font-weight: 500; color: var(--text-soft); }
+.server-export-empty > span { font-size: 11px; }
+.server-export-spinner { animation: spin 1s linear infinite; }
+.server-export-dialog button:focus-visible, .server-export-list label:focus-within { outline: 2px solid var(--accent-solid); outline-offset: 3px; }
+
+@media (max-width: 760px) {
+  .server-export-layout { grid-template-columns: minmax(0, 1fr); gap: 22px; padding-top: 17px; }
+  .server-export-selection { padding-right: 0; padding-bottom: 20px; border-right: 0; border-bottom: 1px solid var(--border-soft); gap: 11px; }
+  .server-export-list { height: 215px; }
+  .server-export-tools .ghost { min-height: 36px; padding-inline: 12px; }
+  .server-export-formats > button { display: grid; grid-template-columns: minmax(0, 1fr) 16px; min-height: 95px; padding: 11px; gap: 9px; }
+  .server-export-formats > button > svg { width: 17px; grid-column: 1; grid-row: 1; }
+  .server-export-formats > button > span:not(.server-export-format-check) { grid-column: 1 / -1; grid-row: 2; }
+  .server-export-format-check { grid-column: 2; grid-row: 1; }
+  .server-export-preview { min-height: 190px; }
+  .server-export-output textarea { min-height: 160px; font-size: 12px; }
+  .server-export-search input { font-size: 16px; }
+  .server-export-dialog .dialog-footer { flex-direction: column; align-items: stretch; gap: 13px; }
+  .server-export-dialog .dialog-footer > .dialog-actions { display: grid; flex: 0 0 auto; grid-template-columns: .7fr 1fr 1.15fr; gap: 8px; }
+  .server-export-dialog .dialog-actions button { min-height: 44px; padding-inline: 9px; }
+  .server-export-dialog .dialog-actions .primary { min-width: 0; }
 }
 
 .tree-group-button span {

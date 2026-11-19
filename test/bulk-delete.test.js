@@ -58,7 +58,6 @@ test('DNS guard batch deletion is one write, skips active cycles, prunes order a
 
 test('all orchestration resource lists delete in one write while retaining referenced records', async () => {
   const cases = [
-    ['probes', 'probes', { dynamicGuards: [{ probeIds: ['linked'] }] }],
     ['probe-targets', 'probeTargets', { incidents: [{ status: 'automating', targetId: 'linked' }] }],
     ['ip-pools', 'ipPools', { dnsGuards: [{ poolIds: ['linked'] }] }],
     ['dns-accounts', 'dnsAccounts', { dnsGuards: [{ accountId: 'linked' }] }],
@@ -89,13 +88,18 @@ test('asset batch builds occupation once and removes inventory/pool memberships 
   assert.equal(env.state().ipUsageRecords.length, 1);
 });
 
-test('running pool checks and their probes cannot be bulk deleted', async () => {
-  const extra = { ipPools: [{ id: 'pool', healthCheck: { status: 'running', probeIds: ['probe'] } }], probes: [{ id: 'probe' }] };
-  for (const [resource, id] of [['ip-pools', 'pool'], ['probes', 'probe']]) {
-    const env = harness(extra);
-    const result = await orchestration(env, resource, [id]);
-    assert.equal(result.deletedCount, 0); assert.equal(result.skippedCount, 1);
-  }
+test('running pools cannot be deleted but their probes can be bulk deleted and unselected', async () => {
+  const extra = { ipPools: [{ id: 'pool', probeIds: ['probe'], healthCheck: { status: 'running', probeIds: ['probe'] } }], probes: [{ id: 'probe' }],
+    dynamicGuards: [{ id: 'dynamic', probeIds: ['probe'] }], dnsGuards: [{ id: 'guard', probeIds: ['probe'] }], probeTargets: [{ id: 'target', probeIds: ['probe'] }] };
+  const env = harness(extra);
+  const blocked = await orchestration(env, 'ip-pools', ['pool']);
+  assert.equal(blocked.deletedCount, 0);
+  const deleted = await orchestration(env, 'probes', ['probe']);
+  assert.equal(deleted.deletedCount, 1);
+  assert.equal(deleted.skippedCount, 0);
+  assert.equal(env.state().probes.length, 0);
+  for (const key of ['ipPools', 'probeTargets', 'dnsGuards', 'dynamicGuards']) assert.deepEqual(env.state()[key][0].probeIds, []);
+  assert.equal(env.state().ipPools[0].healthCheck.status, 'interrupted');
 });
 
 test('dynamic guard batch cancels waiting flows but retains executing/recovering commands and new tasks', async () => {

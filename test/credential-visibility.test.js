@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { TELEGRAM_FEATURES } from '../shared/telegram-permissions.js';
 import {
   orchestrationDefaults,
   registerOrchestrationRoutes,
@@ -82,6 +83,26 @@ test('sanitized state never exposes encrypted credentials or token hashes', () =
   assert.equal('tokenHash' in sanitized.telegramBots[0], false);
 });
 
+test('new Telegram bots default to all features and tasks and explicit deselections survive saves', async () => {
+  const state = credentialState();
+  state.automationTasks = [{ id: 't1' }, { id: 't2' }];
+  const h = createHarness(state);
+  const response = await h.request('POST', '/api/orchestration/:resource', { params: { resource: 'telegram-bots' }, body: { name: '默认全选' } });
+  const created = response.body.item;
+  assert.deepEqual(created.menuScopes, TELEGRAM_FEATURES.map(([key]) => key));
+  assert.deepEqual(created.automationTaskIds, ['t1', 't2']);
+  assert.deepEqual(created.automationTaskCatalog, ['t1', 't2']);
+  const updated = await h.request('PUT', '/api/orchestration/:resource/:id', { params: { resource: 'telegram-bots', id: created.id },
+    body: { name: '手动取消', menuScopes: [], menuScopeVersion: 2, automationTaskIds: [] } });
+  assert.deepEqual(updated.body.item.menuScopes, []);
+  assert.deepEqual(updated.body.item.automationTaskIds, []);
+  // An editor opened before t3 was created must still include t3 on save.
+  h.readState().automationTasks.push({ id: 't3' });
+  const stale = await h.request('PUT', '/api/orchestration/:resource/:id', { params: { resource: 'telegram-bots', id: created.id }, body: updated.body.item });
+  assert.deepEqual(stale.body.item.menuScopes, []);
+  assert.deepEqual(stale.body.item.automationTaskIds, ['t3']);
+});
+
 test('credential reveal endpoints return saved values without caching and write audits', async () => {
   const harness = createHarness(credentialState());
   const dnsResponse = await harness.request('GET', '/api/dns-accounts/:id/credentials', { params: { id: 'dns-1' } });
@@ -117,8 +138,9 @@ test('editing one DNS credential keeps the other saved fields', async () => {
 
 test('pool alerts require a configured bot and protect its delivery settings', async () => {
   const harness = createHarness(credentialState());
+  harness.readState().probes.push({ id: 'probe' });
   const poolBody = {
-    name: '备用池', assetIds: [], allocationMode: 'one', allocationCount: 1, selectionMode: 'ordered',
+    name: '备用池', probeIds: ['probe'], assetIds: [], allocationMode: 'one', allocationCount: 1, selectionMode: 'ordered',
     enabled: true, alertEnabled: true, alertThresholds: [5, 1, 0], alertBotIds: []
   };
   await assert.rejects(

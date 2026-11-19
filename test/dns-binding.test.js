@@ -32,12 +32,21 @@ test('adds imported IP assets to an existing pool without duplicates', () => {
 });
 
 test('creates a pool and validates DNS address families', () => {
-  const state = { ipAssets: [], ipPools: [], dnsBindings: [{ id: 'dns-1', recordType: 'A', backupIps: [] }], auditLogs: [] };
-  const result = createPoolWithIps(state, '新池', ['3.3.3.3'], 'tester');
+  const state = { probes: [{ id: 'probe' }], ipAssets: [], ipPools: [], dnsBindings: [{ id: 'dns-1', recordType: 'A', backupIps: [] }], auditLogs: [] };
+  const result = createPoolWithIps(state, '新池', ['3.3.3.3'], 'tester', ['probe']);
   assert.equal(result.pool.assetIds.length, 1);
+  assert.deepEqual(result.pool.probeIds, ['probe']);
   setDnsBindingIps(state, 'dns-1', ['4.4.4.4'], 'append', 'tester');
   assert.deepEqual(state.dnsBindings[0].backupIps, ['4.4.4.4']);
   assert.throws(() => setDnsBindingIps(state, 'dns-1', ['2001:db8::1']), /IPv4/);
+});
+
+test('Telegram pool creation rejects missing probe bindings before importing any IP', () => {
+  const state = { ...orchestrationDefaults(), probes: [{ id: 'probe' }] };
+  const before = structuredClone(state);
+  assert.throws(() => createPoolWithIps(state, '新池', ['8.8.8.8'], 'tester'), /必须选择/);
+  assert.throws(() => createPoolWithIps(state, '新池', ['8.8.8.8'], 'tester', ['missing']), /探针/);
+  assert.deepEqual(state, before);
 });
 
 test('creates non-address DNS records and limits CNAME to one target', () => {

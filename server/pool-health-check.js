@@ -45,6 +45,8 @@ export function createPoolHealthCheck(pool, input, state, actor, now = Date.now(
   if (!Array.isArray(input.probeIds) || !input.probeIds.length || input.probeIds.length > 20
     || input.probeIds.some(id => typeof id !== 'string')) throw new Error('请选择 1–20 个在线探针');
   const probeIds = [...new Set(input.probeIds)];
+  if (!pool.probeIds?.length) throw new Error('请先编辑备用池并绑定检测探针');
+  if (probeIds.some(id => !pool.probeIds.includes(id))) throw new Error('只能使用本池绑定的检测探针，请重新选择');
   const probes = new Map(state.probes.map(probe => [probe.id, probe]));
   if (probeIds.some(id => !poolProbeOnline(probes.get(id), now))) throw new Error('所选探针未上线或已停用，请重新选择');
   if (probeIds.some(id => !supportsPoolHealthCheck(probes.get(id)?.agentVersion))) throw new Error(`请先将所选探针升级至 ${POOL_HEALTH_PROBE_VERSION} 或更新版本`);

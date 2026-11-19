@@ -116,6 +116,12 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
     return () => { cancelled = true; stop?.(); if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', start); };
   }, [api, refresh, onState, cache]);
   useEffect(() => {
+    if (!loaded) return;
+    const ids = new Set(data.probes.map(probe => probe.id));
+    setEditor(current => current?.probeIds.some(id => !ids.has(id))
+      ? { ...current, probeIds: current.probeIds.filter(id => ids.has(id)) } : current);
+  }, [data.probes, loaded]);
+  useEffect(() => {
     if (!editor) return;
     const controller = new AbortController();
     api('/api/webhooks/choices', { signal: controller.signal }).then((result) => { if (!controller.signal.aborted) { setWebhookTasks(result.tasks); setWebhookError(''); } }).catch((err) => { if (!controller.signal.aborted) setWebhookError(err.message); });
@@ -203,7 +209,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
         const manualBlock = locked ? '正在处理请求或执行 API 命令，请稍候' : !guard.enabled ? '请先启用任务' : guard.manualRequested ? '手动换 IP 已排队，请勿重复提交' : '';
         return <article className="dynamic-card" key={guard.id}>
           <div className="dynamic-card-title"><div><strong>{guard.name}</strong><span>{guard.domain} · {guard.recordType}</span></div><em className={`ops-status ${tone}`}>{LABELS[guard.status] || guard.status}</em></div>
-          <div className="dynamic-facts"><div><span>当前 IP</span><code>{guard.currentIp || '尚未获取'}</code></div><div><span>最近解析</span><code>{guard.lastResolvedIp || '尚未解析'}</code></div><div title="每日额度按北京时间重置"><span>今日提交</span><strong>{guard.todayCount} / {guard.maxDaily || '不限'}</strong></div><div><span>探针</span><strong>{guard.probeIds.length} 个</strong></div></div>
+          <div className="dynamic-facts"><div><span>当前 IP</span><code>{guard.currentIp || '尚未获取'}</code></div><div><span>最近解析</span><code>{guard.lastResolvedIp || '尚未解析'}</code></div><div title="每日额度按北京时间重置"><span>今日提交</span><strong>{guard.todayCount} / {guard.maxDaily || '不限'}</strong></div><div><span>探针</span><strong>{guard.probeIds.length ? `${guard.probeIds.length} 个` : '无探针'}</strong></div></div>
           <div className="dynamic-card-footer">
             <p className="dynamic-message">{guard.message}<GuardCountdown guard={guard} offset={offset.current} /></p>
             <div className="dynamic-actions">
@@ -231,7 +237,7 @@ export default function DynamicGuardWorkspace({ api, toast, Dialog, onOpenHistor
           <label>检查方式<select value={editor.checkType} onChange={(event) => patch({ checkType: event.target.value })}><option value="ping">Ping</option><option value="tcp">TCP</option></select></label>
           {editor.checkType === 'tcp' ? <label>TCP 端口<input type="number" inputMode="numeric" required min={1} max={65535} value={editor.port} onChange={(event) => patch({ port: event.target.value })} /></label> : null}
         </div>
-        <fieldset className="dynamic-choice"><legend>检查探针 <span>已选 {editor.probeIds.length} 个</span></legend><div>{data.probes.filter((probe) => probe.enabled !== false).map((probe) => <label key={probe.id}><input type="checkbox" checked={editor.probeIds.includes(probe.id)} onChange={(event) => patch({ probeIds: event.target.checked ? [...editor.probeIds, probe.id] : editor.probeIds.filter((id) => id !== probe.id) })} /><span>{probe.name}</span><small>{probe.status !== 'online' || time - Date.parse(probe.lastSeenAt) >= 90000 ? '离线' : '在线'}</small></label>)}</div>{!data.probes.some((probe) => probe.enabled !== false) ? <p>暂无可用探针，请先在探针节点中添加或启用。</p> : null}</fieldset>
+        <fieldset className="dynamic-choice"><legend>检查探针 <span>{editor.probeIds.length ? `已选 ${editor.probeIds.length} 个` : '无探针，请选择'}</span></legend><div>{data.probes.filter((probe) => probe.enabled !== false).map((probe) => <label key={probe.id}><input type="checkbox" checked={editor.probeIds.includes(probe.id)} onChange={(event) => patch({ probeIds: event.target.checked ? [...editor.probeIds, probe.id] : editor.probeIds.filter((id) => id !== probe.id) })} /><span>{probe.name}</span><small>{probe.status !== 'online' || time - Date.parse(probe.lastSeenAt) >= 90000 ? '离线' : '在线'}</small></label>)}</div>{!data.probes.some((probe) => probe.enabled !== false) ? <p>暂无可用探针，请先在探针节点中添加或启用。</p> : null}</fieldset>
         </section>
         <section className="dynamic-form-section" aria-labelledby="dynamic-api-title">
         <div className="dynamic-section-title"><h3 id="dynamic-api-title">换 IP 命令</h3><span>在面板执行 API 请求，无需 SSH 登录目标</span></div>

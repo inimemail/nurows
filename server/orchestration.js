@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { bulkDeleteIds, partitionDeletion } from './bulk-delete.js';
 import { dnsGuardOrder, moveDnsGuard } from '../shared/dns-guard-order.js';
-import { telegramScopes } from '../shared/telegram-permissions.js';
+import { telegramBotSelections } from '../shared/telegram-permissions.js';
 import { supportsPoolHealthCheck } from '../shared/probe-capabilities.js';
 import { execFile as execFileCallback } from 'node:child_process';
 import fs from 'node:fs';
@@ -106,7 +106,7 @@ export function normalizeOrchestrationState(parsed = {}) {
   const defaults = orchestrationDefaults();
   const normalized = Object.fromEntries(Object.keys(defaults).map((key) => [key, Array.isArray(parsed?.[key]) ? parsed[key] : defaults[key]]));
   normalized.dnsGuardOrder = dnsGuardOrder(normalized.dnsGuards, normalized.dnsGuardOrder);
-  normalized.telegramBots = normalized.telegramBots.map((bot) => ({ ...bot, menuScopes: telegramScopes(bot), menuScopeVersion: 2 }));
+  normalized.telegramBots = normalized.telegramBots.map((bot) => ({ ...bot, ...telegramBotSelections(bot, parsed?.automationTasks) }));
   normalized.ipPools = normalized.ipPools.map(({ sharingMode, shareLimit, leaseMinutes, cooldownMinutes, alertChatIds, ...pool }) => pool);
   normalized.ipPools = normalized.ipPools.map((pool) => {
     const hasAlertConfig = ['alertEnabled', 'alertThresholds', 'alertBotIds'].some((key) => Object.prototype.hasOwnProperty.call(pool, key));
@@ -638,6 +638,7 @@ export function registerOrchestrationRoutes(app, deps) {
       const { deleted } = partition;
       result = partition.result;
       if (key === 'ipAssets') removeIpAssets(draft, deleted, true);
+      else if (key === 'probes') removeProbes(draft, deleted, deps);
       else draft[key] = (draft[key] || []).filter(item => !deleted.has(item.id));
       if (key === 'dnsGuards') draft.dnsGuardOrder = (draft.dnsGuardOrder || []).filter(id => !deleted.has(id));
       if (key === 'telegramBots') {
@@ -725,6 +726,8 @@ export function registerOrchestrationRoutes(app, deps) {
     const state = deps.updateState((draft) => {
       if (key === 'ipAssets') {
         deleteUnusedIpAsset(draft, req.params.id, deps);
+      } else if (key === 'probes') {
+        removeProbes(draft, new Set([req.params.id]), deps);
       } else {
         ensureNotReferenced(draft, key, req.params.id);
         draft[key] = draft[key].filter((entry) => entry.id !== req.params.id);
@@ -3100,7 +3103,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     });
   }
   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
-  if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, alertEnabled: Boolean(input.alertEnabled), alertThresholds: normalizeThresholds(input.alertThresholds), alertBotIds: cleanIds(input.alertBotIds, 50), note: cleanText(input.note, 500) };
+  if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), probeIds: cleanIds(input.probeIds ?? existing?.probeIds, 21), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, alertEnabled: Boolean(input.alertEnabled), alertThresholds: normalizeThresholds(input.alertThresholds), alertBotIds: cleanIds(input.alertBotIds, 50), note: cleanText(input.note, 500) };
   if (key === 'dnsAccounts') {
     const provider = DNS_PROVIDERS.has(input.provider) ? input.provider : 'huawei';
     const supplied = input.credentials && typeof input.credentials === 'object' ? input.credentials : {};
@@ -3131,7 +3134,14 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     else if (!tokenHash && existing?.tokenEnc) {
       try { tokenHash = hashSecret(deps.decryptSecret(existing.tokenEnc)); } catch (_error) { tokenHash = ''; }
     }
-    return { ...base, name: requiredText(input.name || 'Telegram 机器人', '机器人名称'), tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, tokenHash, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: [], roles: normalizeRoles(input.roles), menuScopes: telegramScopes({ ...input, menuScopeVersion: input.menuScopeVersion ?? existing?.menuScopeVersion }), menuScopeVersion: 2, automationTaskIds: cleanIds(input.automationTaskIds, 500), lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
+    const settings = { ...existing, ...input, menuScopeVersion: input.menuScopeVersion ?? existing?.menuScopeVersion };
+    if (!existing && !Array.isArray(input.menuScopes)) Object.assign(settings, { menuScopes: [], menuScopeCatalog: [] });
+    else if (Array.isArray(input.menuScopes) && !Array.isArray(input.menuScopeCatalog)) delete settings.menuScopeCatalog;
+    if (!existing && !Array.isArray(input.automationTaskIds)) Object.assign(settings, { automationTaskIds: [], automationTaskCatalog: [] });
+    else if (Array.isArray(input.automationTaskIds) && !Array.isArray(input.automationTaskCatalog)) delete settings.automationTaskCatalog;
+    settings.automationTaskIds = cleanIds(settings.automationTaskIds, 500);
+    const selections = telegramBotSelections(settings, deps.readState(['automationTasks']).automationTasks || []);
+    return { ...base, name: requiredText(input.name || 'Telegram 机器人', '机器人名称'), tokenEnc: token ? deps.encryptSecret(token) : existing?.tokenEnc || null, tokenHash, enabled: input.enabled !== false, userIds: cleanTexts(input.userIds, 500), groupIds: [], roles: normalizeRoles(input.roles), ...selections, lastError: existing?.lastError || '', lastPollAt: existing?.lastPollAt || '' };
   }
   throw new Error('未知资源类型');
 }
@@ -3195,9 +3205,11 @@ export function addIpsToPool(state, poolId, addresses, actor = 'system') {
   return { pool, ...imported };
 }
 
-export function createPoolWithIps(state, name, addresses, actor = 'system') {
+export function createPoolWithIps(state, name, addresses, actor = 'system', probeIds = []) {
+  const pool = normalizeResource('ipPools', { name, probeIds, assetIds: [], allocationMode: 'one', enabled: true });
+  ensureResourceReferences(state, 'ipPools', pool);
   const imported = importIpAssets(state, addresses, {}, actor);
-  const pool = normalizeResource('ipPools', { name, assetIds: imported.assetIds, allocationMode: 'one', enabled: true });
+  pool.assetIds = imported.assetIds;
   state.ipPools.push(pool);
   pushAudit(state, 'ipPools.telegram_create', 'ipPools', pool.id, `通过 Telegram 创建备用池并加入 ${addresses.length} 个 IP`, actor);
   return { pool, ...imported };
@@ -3259,6 +3271,10 @@ function ensureResourceReferences(state, key, item, deps) {
     if (item.poolIds.some((id) => !exists('ipPools', id))) throw new Error('关联的备用池不存在');
   }
   if (key === 'ipPools') {
+    if (!item.probeIds.length || item.probeIds.length > 20) throw new Error('备用池必须选择 1–20 个检测探针');
+    if (item.probeIds.some(id => !state.probes.some(probe => probe.id === id && probe.enabled !== false && probe.status !== 'revoked'))) throw new Error('备用池包含不存在、已停用或已吊销的探针');
+    const previous = state.ipPools.find(pool => pool.id === item.id);
+    if (previous?.healthCheck?.status === 'running' && JSON.stringify([...(previous.probeIds || [])].sort()) !== JSON.stringify([...item.probeIds].sort())) throw new Error('备用池检测正在执行，请先停止后再修改绑定探针');
     const validIds = new Set(state.ipAssets.map((asset) => asset.id));
     if (item.assetIds.some((id) => !validIds.has(id))) throw new Error('备用池包含不存在的 IP');
   }
@@ -3435,14 +3451,48 @@ function manuallyProtectedIpAssets(state, deps = {}) {
   return { ids, addresses };
 }
 
+function removeProbes(state, deleted, deps) {
+  state.probes = state.probes.filter(probe => !deleted.has(probe.id));
+  const changed = item => item.probeIds?.some(id => deleted.has(id));
+  const deselect = item => { item.probeIds = item.probeIds.filter(id => !deleted.has(id)); item.updatedAt = nowIso(); };
+  const waiting = item => item.probeIds.length ? '探针已删除，等待重新检查' : '无探针，请编辑选择探针';
+  for (const target of state.probeTargets || []) {
+    if (!changed(target)) continue;
+    deselect(target);
+    Object.assign(target, { observations: {}, health: 'unknown', checkNowAt: nowIso() });
+  }
+  for (const guard of state.dnsGuards || []) {
+    if (!changed(guard)) continue;
+    deselect(guard);
+    // Preserve confirmation of a DNS write already sent to the provider.
+    // Cancel ordinary checks so removing a successful peer cannot turn the
+    // remaining failures into a replacement decision.
+    if (dnsGuardAssetWrites.has(guard.cycle?.id) || guard.cycle?.rebalanceCommit?.writeAttempted) continue;
+    Object.assign(guard, { cycle: null, status: guard.probeIds.length ? 'queued' : 'waiting_probe',
+      message: waiting(guard), nextCheckAt: '', lastCheckAt: '' });
+  }
+  for (const guard of state.dynamicGuards || []) {
+    if (!changed(guard)) continue;
+    deselect(guard);
+    guard.revision = (Number(guard.revision) || 0) + 1;
+    guard.cycle = null;
+    guard.pendingChange = null;
+    // Keep an executing command and its recovery flow until its result arrives.
+    if (guard.flow?.commandState === 'executing') continue;
+    Object.assign(guard, { status: guard.probeIds.length ? 'queued' : 'waiting_probe', message: waiting(guard), nextAt: 0 });
+  }
+  for (const pool of state.ipPools || []) {
+    if (changed(pool)) deselect(pool);
+    if (pool.healthCheck?.status === 'running' && pool.healthCheck.probeIds?.some(id => deleted.has(id))) {
+      finishPoolHealthCheck(pool, 'interrupted', '检测探针已删除，未确认的 IP 已保留，请重新选择探针后检测', poolHealthHooks(state, deps));
+    }
+  }
+}
+
 function deletionReferences(state, key) {
   const ids = new Set();
   const add = values => { for (const id of values || []) if (id) ids.add(id); };
   const fields = (items, field) => { for (const item of items || []) add(Array.isArray(item[field]) ? item[field] : [item[field]]); };
-  if (key === 'probes') {
-    fields(state.probeTargets, 'probeIds'); fields(state.dnsGuards, 'probeIds'); fields(state.dynamicGuards, 'probeIds');
-    for (const pool of state.ipPools || []) if (pool.healthCheck?.status === 'running') add(pool.healthCheck.probeIds);
-  }
   if (key === 'ipPools') { fields(state.failoverPolicies, 'poolIds'); fields(state.dnsGuards, 'poolIds'); }
   if (key === 'dnsAccounts') { fields(state.dnsZones, 'accountId'); fields(state.dnsBindings, 'accountId'); fields(state.dnsGuards, 'accountId'); }
   if (key === 'dnsZones') fields(state.dnsBindings, 'zoneId');
@@ -3462,7 +3512,6 @@ function ensureNotReferenced(state, key, id) {
   if (key === 'dnsBindings' && dnsBindingSaveRuntime.has(id)) throw new Error('解析记录正在写入远程 DNS，请稍后再删除');
   if (key === 'dnsAccounts' && dnsAccountSaveRuntime.has(id)) throw new Error('账号正在处理远程 DNS 操作，请稍后再删除');
   const references = {
-    probes: state.probeTargets.some((item) => item.probeIds?.includes(id)) || state.dnsGuards.some((item) => item.probeIds?.includes(id)),
     ipPools: state.failoverPolicies.some((item) => item.poolIds?.includes(id)) || state.dnsGuards.some((item) => item.poolIds?.includes(id)),
     dnsAccounts: state.dnsZones.some((item) => item.accountId === id) || state.dnsBindings.some((item) => item.accountId === id) || state.dnsGuards.some((item) => item.accountId === id),
     dnsZones: state.dnsBindings.some((item) => item.zoneId === id),

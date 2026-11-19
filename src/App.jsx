@@ -11,6 +11,7 @@ import RenewalWorkspace from './RenewalWorkspace.jsx';
 import { BookOpen, CalendarClock, Webhook, ShieldCheck, Wallet, MessagesSquare } from 'lucide-react';
 import { HISTORY_LABELS } from './HistoryRecords.jsx';
 import Dialog from './Dialog.jsx';
+import ServerGroupExportDialog from './ServerGroupExportDialog.jsx';
 import { copyNoteText } from './note-clipboard.js';
 import { trackMobileViewport } from './mobile-viewport.js';
 import { canAutoFocusTerminal, isTerminalSubmitKey, terminalCopyText } from './terminal-interaction.js';
@@ -463,6 +464,7 @@ export default function App() {
   const [proxyDraft, setProxyDraft] = useState(EMPTY_PROXY);
   const [editorDialog, setEditorDialog] = useState({ open: false, type: 'server', mode: 'edit' });
   const [groupDialog, setGroupDialog] = useState({ open: false, value: EMPTY_GROUP });
+  const [exportGroup, setExportGroup] = useState(null);
   const [importDialog, setImportDialog] = useState({
     open: false,
     text: '',
@@ -2576,6 +2578,7 @@ export default function App() {
                         <span>{items.length}</span>
                       </button>
                       <div className="row-actions">
+                        <button className="icon-button group-export-button" title="导出本组服务器" aria-label={`导出 ${group.name} 的服务器`} onClick={() => setExportGroup({ ...group })}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 15v5h14v-5" /></svg></button>
                         <button className="icon-button" onClick={() => setGroupDialog({ open: true, value: { ...group } })}><EditIcon /></button>
                         {group.id === 'group-default' ? (
                           <button
@@ -3459,6 +3462,8 @@ export default function App() {
           <div className="confirm-copy">{confirmDialog.message}</div>
         </Dialog>
       ) : null}
+
+      {exportGroup ? <ServerGroupExportDialog key={exportGroup.id} group={exportGroup} servers={state.servers} api={api} toast={toast} onClose={() => setExportGroup(null)} /> : null}
 
       {importDialog.open ? (
         <Dialog

@@ -155,7 +155,8 @@ export function createProfileStorage({ rows, profiles, snapshots, getLimit, excl
   }
   async function prepare(row, { cleanAllowed = true } = {}) {
     let value = await usage(row);
-    if (cleanAllowed && canClean(row) && (value.filesExceeded || value.bytes >= getLimit() * .85 || dailyDue(row)) && (value.cacheBytes > 0 || value.filesExceeded)) {
+    const maintenanceReady = !row.storageMaintenanceRetryAt || row.storageMaintenanceRetryAt <= now();
+    if (cleanAllowed && canClean(row) && (over(value) || maintenanceReady && (value.bytes >= getLimit() * .85 || dailyDue(row))) && (value.cacheBytes > 0 || value.filesExceeded)) {
       await clean(path.join(profiles, row.id)); await remember(row, now(), true); value = await usage(row);
     }
     if (over(value)) { hold(row, value); throw Object.assign(Error(row.error), { storageBlocked: true }); }
@@ -189,23 +190,29 @@ export function createProfileStorage({ rows, profiles, snapshots, getLimit, excl
     }
     if (!row) return;
     working = true;
+    let cachesCleaned = false;
     row.storageScanAfter = now() + (row.state === 'running' || row.storageBlocked ? 5 * 60000 : 30 * 60000);
     try {
       let value = await usage(row);
       const sample = row.storageSample;
       if (rows.get(row.id) !== row || blocked()) return;
-      const nearWithCache = value.bytes >= getLimit() * .85 && value.cacheBytes >= 64 * 1024 ** 2 &&
-        (!row.storageCleanedAt || now() - row.storageCleanedAt >= 30 * 60000);
-      const dailyWithCache = dailyDue(row) && value.cacheBytes > 0;
-      if (dailyDue(row) && !value.cacheBytes && !value.filesExceeded) await remember(row, now());
-      if (!over(value) && !nearWithCache && !dailyWithCache) {
-        if (row.storageBlocked) await exclusive(() => {
-          if (rows.get(row.id) === row && !blocked() && !row.pending && row.storageBlocked && row.storageSample === sample && ['error', 'stopped'].includes(row.state)) {
+      // A previous failed routine cleanup is not a quota violation. Release
+      // legacy holds before daily maintenance can stop the same account again.
+      if (!over(value) && row.storageBlocked && ['error', 'stopped'].includes(row.state)) {
+        await exclusive(() => {
+          if (rows.get(row.id) === row && !blocked() && !row.pending && row.storageSample === sample && !over(value) && row.storageBlocked && ['error', 'stopped'].includes(row.state)) {
             row.storageBlocked = false; row.error = ''; row.state = row.desired ? 'queued' : 'stopped';
+            row.storageMaintenanceRetryAt = now() + 30 * 60000;
           }
         });
         return;
       }
+      const maintenanceReady = !row.storageMaintenanceRetryAt || row.storageMaintenanceRetryAt <= now();
+      const nearWithCache = maintenanceReady && value.bytes >= getLimit() * .85 && value.cacheBytes >= 64 * 1024 ** 2 &&
+        (!row.storageCleanedAt || now() - row.storageCleanedAt >= 30 * 60000);
+      const dailyWithCache = maintenanceReady && dailyDue(row) && value.cacheBytes > 0;
+      if (dailyDue(row) && !value.cacheBytes && !value.filesExceeded) await remember(row, now());
+      if (!over(value) && !nearWithCache && !dailyWithCache) return;
       // Routine work must not disconnect someone using the account. Quota
       // enforcement still takes precedence to protect the host's disk space.
       if (!over(value) && row.viewers > 0) return;
@@ -219,11 +226,19 @@ export function createProfileStorage({ rows, profiles, snapshots, getLimit, excl
           if (row.containerPresent !== false) await stop(row.id);
           row.state = 'stopped'; stopped = true;
           // A forced/OOM exit keeps every current file and the old snapshot.
-          if (!canClean(row)) throw Error('浏览器未正常退出，已暂停并保留全部资料；请重新打开使浏览器恢复后再清理');
-          await clean(path.join(profiles, row.id)); await remember(row, now(), true);
+          if (!canClean(row)) throw Error(over(value)
+            ? '浏览器未正常退出，存储已达上限；已暂停并保留全部资料，请提高上限后打开浏览器恢复'
+            : '浏览器未正常退出，本次缓存清理已暂缓；全部资料保留，后台保持账号将自动恢复');
+          await clean(path.join(profiles, row.id)); cachesCleaned = true; await remember(row, now(), true);
         } catch (error) {
           if (!stopped && wasRunning) row.state = 'running';
-          else { row.storageBlocked = true; row.state = 'error'; }
+          else if (over(value)) { row.storageBlocked = true; row.state = 'error'; }
+          else {
+            row.storageBlocked = false; row.error = ''; row.state = row.desired ? 'queued' : 'stopped';
+          }
+          // Optional housekeeping must not repeatedly interrupt a session.
+          // Actual quota enforcement remains active during this delay.
+          row.storageMaintenanceRetryAt = now() + 30 * 60000;
           throw error;
         }
       });
@@ -237,7 +252,7 @@ export function createProfileStorage({ rows, profiles, snapshots, getLimit, excl
     } catch (error) {
       if (rows.get(row.id) === row) {
         row.storageError = error.code ? `存储检查失败（${error.code}），稍后重试；登录资料保留` : error.message;
-        if (row.storageMaintaining && row.state === 'stopped') {
+        if (cachesCleaned && row.state === 'stopped') {
           row.storageBlocked = true; row.state = 'error'; row.storageScanAfter = now() + 60000;
           row.error = '缓存已清理，暂时无法确认存储用量；账号已暂停，稍后自动重试';
         }

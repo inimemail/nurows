@@ -520,6 +520,7 @@ svg {
 }
 
 .tree-group-button strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-group-head { padding-block: 10px; }
 .tree-group-head > .row-actions { flex-shrink: 0; }
 
 .tree-group-head .group-export-button { color: var(--accent-text); }

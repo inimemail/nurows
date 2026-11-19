@@ -27,11 +27,25 @@ function stop(code = 0) {
     for (const process of children) if (process !== chromium) process.kill('SIGTERM');
   };
   if (chromium && children.has(chromium)) {
-    chromium.once('exit', (exitCode, signal) => { if (exitCode !== 0 || signal) forcedStop = true; stopDisplay(); }); chromium.kill('SIGTERM');
-    setTimeout(() => { if (children.has(chromium)) { forcedStop = true; chromium.kill('SIGKILL'); } stopDisplay(); }, 12000).unref();
+    chromium.once('exit', (exitCode, signal) => { if (exitCode !== 0 || signal) forcedStop = true; stopDisplay(); });
+    // Ask Chromium to flush and close through its existing private pipe first.
+    // ID 0 is reserved here; the login monitor uses positive request IDs.
+    // A command acknowledgement is not proof of a clean exit: keep waiting
+    // for exit code 0 before permitting profile cleanup or snapshot replacement.
+    const terminate = () => { if (children.has(chromium)) chromium.kill('SIGTERM'); };
+    try {
+      const pipe = chromium.stdio?.[3];
+      if (!pipe || pipe.destroyed || !pipe.writable) terminate();
+      else {
+        pipe.once('error', terminate);
+        pipe.write(JSON.stringify({ id: 0, method: 'Browser.close' }) + '\0', error => { if (error) terminate(); });
+      }
+    } catch { terminate(); }
+    setTimeout(terminate, 12000).unref();
+    setTimeout(() => { if (children.has(chromium)) { forcedStop = true; chromium.kill('SIGKILL'); } stopDisplay(); }, 18000).unref();
   } else stopDisplay();
   const poll = setInterval(() => { if (!children.size) { clearInterval(poll); process.exit(forcedStop ? 75 : code); } }, 100);
-  setTimeout(() => { for (const process of children) process.kill('SIGKILL'); process.exit(75); }, 18000).unref();
+  setTimeout(() => { for (const process of children) process.kill('SIGKILL'); process.exit(75); }, 22000).unref();
 }
 process.on('SIGTERM', () => stop()); process.on('SIGINT', () => stop());
 fs.mkdirSync('/profile', { recursive: true, mode: 0o700 });

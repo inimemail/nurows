@@ -215,8 +215,42 @@ test('unclean persistent activity markers prohibit startup and daily cleanup eve
   h.row.state='stopped'; h.row.containerPresent=false;
   await h.monitor.prepare(h.row); assert.deepEqual(h.actions,[]);
   h.advance(24*60*60000); await h.monitor.tick();
-  assert.deepEqual(h.actions,[]); assert.equal(h.row.storageBlocked,true);
+  assert.deepEqual(h.actions,[]); assert.equal(h.row.storageBlocked,false);
+  assert.equal(h.row.state,'queued');
   assert.match(h.row.storageError,/未正常退出/);
+});
+
+test('failed optional maintenance preserves profiles and resumes keep accounts without blocking sleeping accounts', async () => {
+  for (const failure of [{unclean:true}, {cleanError:true}]) for (const desired of [true, false]) {
+    const h = fixture({...failure, usage:{bytes:174 * 1024 ** 2,cacheBytes:64 * 1024 ** 2,files:10}});
+    if (!desired) { h.row.desired = false; h.row.state = 'stopped'; h.row.containerPresent = false; h.row.uncleanStop = failure.unclean; }
+    await h.monitor.tick(); h.advance(24 * 60 * 60000); await h.monitor.tick();
+    assert.equal(h.row.storageBlocked, false);
+    assert.equal(h.row.state, desired ? 'queued' : 'stopped');
+    assert.equal(h.row.error, ''); assert.ok(h.row.storageError);
+    assert.equal(h.row.storageCleanedAt, undefined);
+    const actions = [...h.actions];
+    if (failure.unclean) assert.ok(!actions.includes('clean'));
+    if (desired) { h.row.state = 'running'; h.row.containerPresent = true; }
+    h.advance(5 * 60000); await h.monitor.tick();
+    await h.monitor.prepare(h.row);
+    assert.deepEqual(h.actions, actions, 'tick and startup both defer failed housekeeping');
+    // A real quota violation must still be enforced during the cooldown.
+    h.setLimit(100 * 1024 ** 2); await h.monitor.tick();
+    assert.equal(h.row.storageBlocked, true); assert.equal(h.row.state, 'error');
+  }
+});
+
+test('legacy cleanup holds below quota recover even when daily maintenance is overdue', async () => {
+  for (const desired of [true, false]) {
+    const h = fixture({canClean:()=>false,usage:{bytes:176 * 1024 ** 2,cacheBytes:1024,files:10}});
+    await h.monitor.tick(); h.advance(24 * 60 * 60000);
+    Object.assign(h.row, {desired,state:'error',containerPresent:false,storageBlocked:true,error:'旧的清理异常'});
+    await h.monitor.tick();
+    assert.equal(h.row.storageBlocked, false); assert.equal(h.row.error, '');
+    assert.equal(h.row.state, desired ? 'queued' : 'stopped');
+    assert.deepEqual(h.actions, [], 'recover the hold without touching caches or session files');
+  }
 });
 
 test('persistent daily timestamps survive runner recreation and reject links without touching targets', async t => {
@@ -265,6 +299,51 @@ test('browser shutdown reports unsuccessful Chromium flush as unclean even when 
       setInterval:fn=>{poll=fn;return 1;},clearInterval(){},setTimeout:()=>({unref(){}}),process:{exit:code=>{actual=code;}},
     });
     poll();assert.equal(actual,expected);
+  }
+});
+
+test('browser shutdown requests a graceful close, waits for actual exit and escalates only when necessary', async () => {
+  const {default:vm} = await import('node:vm');
+  const {EventEmitter} = await import('node:events');
+  const source = await fs.readFile(new URL('../tg-hosting/browser.mjs', import.meta.url), 'utf8');
+  const body = source.slice(source.indexOf('const children'), source.indexOf("process.on('SIGTERM'"));
+  for (const scenario of ['clean', 'nonzero', 'stalled', 'pipe-error', 'pipe-throw']) {
+    const children = new Map(), events = [], timers = new Map(); let poll, actual;
+    vm.runInNewContext(body + "launch('display',[]);chromium=launch('chromium',[],true);stop();stop();", {
+      spawn: command => {
+        const child = new EventEmitter(); children.set(command, child); child.stderr = {resume(){}};
+        child.kill = signal => {
+          events.push(`${command}:${signal}`);
+          if (command !== 'chromium') child.emit('exit', 0, null);
+          else if (signal === 'SIGKILL' || scenario.startsWith('pipe-')) child.emit('exit', null, signal);
+        };
+        const pipe = new EventEmitter(); pipe.writable = true;
+        pipe.write = (value, callback) => {
+          assert.equal(value.at(-1), '\0');
+          assert.deepEqual(JSON.parse(value.slice(0,-1)), {id:0,method:'Browser.close'});
+          events.push('Browser.close');
+          if (scenario === 'pipe-throw') throw Error('broken pipe');
+          callback(scenario === 'pipe-error' ? Error('broken pipe') : null);
+          if (scenario === 'pipe-error') pipe.emit('error', Error('broken pipe'));
+        };
+        child.stdio = [null,null,null,pipe];
+        return child;
+      },
+      setInterval:fn=>{poll=fn;return 1;},clearInterval(){},
+      setTimeout:(fn,ms)=>{timers.set(ms,fn);return {unref(){}};},process:{exit:code=>{actual=code;}},
+    });
+    assert.equal(events.filter(value => value === 'Browser.close').length, 1, 'repeated shutdown is idempotent');
+    if (!scenario.startsWith('pipe-')) {
+      assert.deepEqual(events, ['Browser.close']); poll(); assert.equal(actual, undefined, 'a close request alone cannot approve a snapshot');
+      if (scenario === 'stalled') {
+        timers.get(12000)(); assert.deepEqual(events, ['Browser.close','chromium:SIGTERM']);
+        poll(); assert.equal(actual, undefined);
+        timers.get(18000)();
+      } else children.get('chromium').emit('exit', scenario === 'clean' ? 0 : 1, null);
+    }
+    poll(); assert.equal(actual, scenario === 'clean' ? 0 : 75);
+    assert.equal(events.at(-1), 'display:SIGTERM', 'keep the display alive until Chromium exits');
+    assert.ok(timers.has(22000), 'final deadline fits within the Docker stop timeout');
   }
 });
 

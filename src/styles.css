@@ -1294,6 +1294,7 @@ svg {
 .pool-external-tabs button { min-height: 32px; padding: 6px 12px; border: 1px solid transparent; border-radius: 7px; color: var(--text-soft); font-size: 11px; cursor: pointer; }
 .pool-external-tabs button.active { background: var(--accent-soft); color: var(--accent-text); border-color: var(--accent-border-soft); }
 .pool-external-examples pre { margin: 0; padding: 16px; color: var(--text-strong); font-size: 11px; line-height: 1.9; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.pool-external-examples .pool-external-local-command { max-height: 280px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 .pool-external-help { display: block; padding: 0 16px 15px; color: var(--text-muted); font-size: 10px; line-height: 1.8; }
 .pool-external-rules { display: flex; align-items: flex-start; gap: 8px; color: var(--text-soft); font-size: 11px; line-height: 1.8; }
 .pool-external-rules > svg { flex-shrink: 0; margin-top: 3px; color: var(--accent-text); }

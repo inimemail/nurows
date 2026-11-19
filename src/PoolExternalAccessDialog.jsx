@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Check, Copy, Eye, EyeOff, KeyRound, Link, LoaderCircle, RefreshCw, Terminal } from 'lucide-react';
 import { copyNoteText } from './note-clipboard.js';
+import { poolLocalIpCommand } from '../shared/pool-local-ip-command.js';
 
 const quote = text => `'${text.replace(/'/g, "'\\''")}'`;
 const time = value => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '暂无';
@@ -62,6 +63,7 @@ export default function PoolExternalAccessDialog({ pool, api, toast, Dialog, onC
   const access = data?.access;
   const endpoint = data ? new URL(data.path, window.location.origin).href : '';
   const commands = token => {
+    if (example === 'local4' || example === 'local6') return poolLocalIpCommand(endpoint, token, example === 'local4' ? 'ipv4' : 'ipv6');
     const header = `  -H ${quote(`Authorization: Bearer ${token}`)}`;
     const start = `curl --fail-with-body -sS -X POST ${quote(endpoint)} \\\n${header} \\\n`;
     if (example === 'text') return start + "  -H 'Content-Type: text/plain' \\\n  --data-binary @ips.txt";
@@ -82,9 +84,9 @@ export default function PoolExternalAccessDialog({ pool, api, toast, Dialog, onC
         </div>
         <section className="pool-external-examples" aria-label="调用示例">
           <div className="pool-external-example-head"><strong><Terminal size={16} />调用示例</strong><button className="ghost" disabled={Boolean(busy)} onClick={() => copy(commands(data.token))}><Copy size={14} />复制命令</button></div>
-          <div className="pool-external-tabs" role="group" aria-label="示例格式">{[['single', '单个 IP'], ['batch', '多个 IP'], ['text', '文本文件']].map(([key, label]) => <button key={key} aria-pressed={example === key} className={example === key ? 'active' : ''} onClick={() => setExample(key)}>{label}</button>)}</div>
-          <pre>{commands(visible ? data.token : '<本池调用密钥>')}</pre>
-          <span className="pool-external-help">复制命令会自动带入当前密钥。{example === 'text' ? 'ips.txt 每行一个 IP，也支持空格、逗号分隔。' : '把示例地址替换为实际 IP 即可。'}</span>
+          <div className="pool-external-tabs" role="group" aria-label="示例格式">{[['single', '单个 IP'], ['batch', '多个 IP'], ['local4', '本机 IPv4'], ['local6', '本机 IPv6'], ['text', '文本文件']].map(([key, label]) => <button key={key} aria-pressed={example === key} className={example === key ? 'active' : ''} onClick={() => setExample(key)}>{label}</button>)}</div>
+          <pre className={example === 'local4' || example === 'local6' ? 'pool-external-local-command' : ''}>{commands(visible ? data.token : '<本池调用密钥>')}</pre>
+          <span className="pool-external-help">复制命令会自动带入当前密钥。{example === 'local4' || example === 'local6' ? `在目标服务器的 Linux shell 中运行；缺少 curl 时自动安装，需要 root 或 sudo 权限。仅获取并添加公网出口 ${example === 'local4' ? 'IPv4' : 'IPv6'}，安装或获取失败则不提交。NAT、多 IP 机器如需指定其他地址，请使用单个或多个 IP。` : example === 'text' ? 'ips.txt 每行一个 IP，也支持空格、逗号分隔。' : '把示例地址替换为实际 IP 即可。'}</span>
         </section>
         <div className="pool-external-rules"><Check size={15} /><span>只追加、不覆盖，重复 IP 自动去重，支持 IPv4 / IPv6；任一地址无效时整批不入库。单次及池内最多 5000 个 IP，检测沿用本池探针。</span></div>
         <div className="pool-external-meta"><span>密钥更新 <b>{time(access.externalTokenUpdatedAt)}</b></span><span>最近调用 <b>{time(pool.externalLastUsedAt || access.externalLastUsedAt)}</b></span></div>

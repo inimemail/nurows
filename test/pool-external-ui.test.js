@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { transformSync } from 'esbuild';
+import { poolLocalIpCommand } from '../shared/pool-local-ip-command.js';
 
 const compiled = transformSync(fs.readFileSync(new URL('../src/PoolExternalAccessDialog.jsx', import.meta.url),'utf8'),
   {loader:'jsx',format:'cjs',jsx:'automatic'}).code;
@@ -20,6 +21,7 @@ function harness(api) {
     if(path==='react/jsx-runtime')return {jsx,jsxs:jsx};
     if(path==='lucide-react')return Object.fromEntries(['Check','Copy','Eye','EyeOff','KeyRound','Link','LoaderCircle','RefreshCw','Terminal'].map(name=>[name,'svg']));
     if(path.endsWith('note-clipboard.js'))return {copyNoteText:async text=>copies.push(text)};
+    if(path.endsWith('pool-local-ip-command.js'))return {poolLocalIpCommand};
     throw Error(path);
   }});
   const render=()=>{cursor=0;tree=module.exports.default(props);while(effects.length)effects.shift()();};
@@ -62,6 +64,24 @@ test('rotation confirms before sending, prevents duplicate submissions and repla
   finish(configuration('a','new-key'));await pending;view.render();
   assert.equal(view.input('本池调用密钥').props.value,'new-key');assert.equal(view.input('本池调用密钥').props.type,'password');
   await view.button('复制命令').props.onClick();assert.ok(view.copies.at(-1).includes('Bearer new-key'));assert.ok(!view.copies.at(-1).includes('secret-a'));
+});
+
+test('local IPv4 and IPv6 have separate commands and use the current pool key after rotation',async()=>{
+  let token='secret-a';
+  const view=harness(async(_path,options)=>{if(options.method==='POST')token='rotated-key';return configuration('a',token);});
+  await view.settle();
+  for(const [label,version,other] of [['本机 IPv4',4,6],['本机 IPv6',6,4]]){
+    view.button(label).props.onClick();view.render();
+    const preview=view.text(view.nodes().find(node=>node.type==='pre'));
+    assert.ok(preview.includes(`curl -q -${version}`));assert.ok(!preview.includes(`curl -q -${other}`));
+    assert.ok(!preview.includes('secret-a'));
+    await view.button('复制命令').props.onClick();
+    assert.equal(view.copies.at(-1),poolLocalIpCommand('https://panel.example.com/api/external/ip-pools/a/ips','secret-a',version===4?'ipv4':'ipv6'));
+  }
+  view.button('轮换密钥').props.onClick();view.render();
+  await view.button('确认轮换').props.onClick();view.render();
+  await view.button('复制命令').props.onClick();
+  assert.ok(view.copies.at(-1).includes('Bearer rotated-key'));assert.ok(!view.copies.at(-1).includes('secret-a'));
 });
 
 test('late credentials never cross pool selection and closed dialogs ignore an in-flight rotation',async()=>{

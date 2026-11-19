@@ -1264,6 +1264,61 @@ svg {
 .ops-command-block .ghost { min-height: 30px; padding: 5px 10px; }
 .ops-install pre { margin: 6px 0 10px; padding: 13px; overflow: auto; border: 1px solid rgba(126, 231, 178, .22); border-radius: 9px; background: #101a16; color: #e8fff2; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; user-select: text; }
 .ops-install > span { color: var(--text-muted); font-size: 11px; }
+.dialog.wide.pool-external-dialog { width: min(820px, 100%); }
+.pool-external-dialog .dialog-head > strong { min-width: 0; overflow-wrap: anywhere; }
+.pool-external-content { display: flex; flex-direction: column; gap: 20px; padding-top: 22px; }
+.pool-external-intro { display: flex; align-items: center; gap: 13px; }
+.pool-external-icon { display: grid; place-items: center; flex: 0 0 43px; height: 43px; border: 1px solid var(--accent-border-soft); border-radius: 13px; color: var(--accent-text); background: var(--accent-soft); }
+.pool-external-intro > div, .pool-external-rotation > div { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.pool-external-intro strong { color: var(--text-strong); font-size: 14px; }
+.pool-external-intro > div > span, .pool-external-rotation > div > span { color: var(--text-soft); font-size: 11px; line-height: 1.7; }
+.pool-external-status { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--card-bg); }
+.pool-external-status > div { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.pool-external-status small { color: var(--text-muted); font-size: 10px; }
+.pool-external-badge { display: inline-flex; align-items: center; gap: 7px; color: var(--text-soft); font-size: 12px; white-space: nowrap; }
+.pool-external-badge > span { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); }
+.pool-external-badge.enabled { color: var(--accent-text); }
+.pool-external-badge.enabled > span { background: var(--accent-solid); }
+.pool-external-fields { display: grid; gap: 16px; }
+.pool-external-field { min-width: 0; }
+.pool-external-field > label { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--text-strong); font-size: 11px; font-weight: 600; }
+.pool-external-field > label > span:not(.pool-external-label) { border-radius: 4px; padding: 2px 5px; background: var(--accent-soft); color: var(--accent-text); font-size: 9px; }
+.pool-external-label { display: inline-flex; align-items: center; gap: 6px; }
+.pool-external-field > div { display: flex; align-items: center; gap: 7px; }
+.pool-external-field input { min-width: 0; font-family: var(--font-mono, monospace); font-size: 12px; }
+.pool-external-field .icon-button { flex: 0 0 38px; width: 38px; height: 38px; }
+.pool-external-examples { overflow: hidden; border: 1px solid var(--border-soft); border-radius: 13px; background: var(--input-bg); }
+.pool-external-example-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 14px; border-bottom: 1px solid var(--border-soft); background: var(--card-bg); }
+.pool-external-example-head strong { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; color: var(--text-strong); }
+.pool-external-tabs { display: flex; flex-wrap: wrap; gap: 5px; margin: 13px 14px 0; }
+.pool-external-tabs button { min-height: 32px; padding: 6px 12px; border: 1px solid transparent; border-radius: 7px; color: var(--text-soft); font-size: 11px; cursor: pointer; }
+.pool-external-tabs button.active { background: var(--accent-soft); color: var(--accent-text); border-color: var(--accent-border-soft); }
+.pool-external-examples pre { margin: 0; padding: 16px; color: var(--text-strong); font-size: 11px; line-height: 1.9; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.pool-external-help { display: block; padding: 0 16px 15px; color: var(--text-muted); font-size: 10px; line-height: 1.8; }
+.pool-external-rules { display: flex; align-items: flex-start; gap: 8px; color: var(--text-soft); font-size: 11px; line-height: 1.8; }
+.pool-external-rules > svg { flex-shrink: 0; margin-top: 3px; color: var(--accent-text); }
+.pool-external-meta { display: flex; flex-wrap: wrap; gap: 8px 24px; color: var(--text-muted); font-size: 10px; }
+.pool-external-meta b { color: var(--text-soft); margin-left: 6px; font-weight: 400; }
+.pool-external-rotation { display: flex; justify-content: space-between; align-items: center; gap: 16px; border-top: 1px solid var(--border-soft); padding-top: 18px; }
+.pool-external-rotation strong { color: var(--text-strong); font-size: 12px; font-weight: 600; }
+.pool-external-status > button, .pool-external-rotation > button { flex-shrink: 0; }
+.pool-external-content .ghost, .pool-external-content .primary { display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-size: 11px; }
+.pool-external-confirm { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 13px; padding: 14px; border: 1px solid var(--accent-border); border-radius: 12px; background: var(--accent-soft); }
+.pool-external-confirm > strong { color: var(--text-strong); font-size: 12px; }
+.pool-external-confirm > div { display: flex; gap: 8px; }
+.pool-external-loading { display: flex; align-items: center; justify-content: center; gap: 9px; min-height: 150px; color: var(--text-soft); }
+.pool-external-spinner { animation: spin 1s linear infinite; }
+.pool-external-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--danger-text, #c15151); font-size: 12px; }
+.pool-external-footer-note { font-size: 11px; color: var(--text-muted); }
+@media (max-width: 760px) {
+  .pool-external-content { padding-top: 0; gap: 18px; }
+  .pool-external-status > div { flex-direction: column; align-items: flex-start; gap: 5px; }
+  .pool-external-field .icon-button { flex-basis: 44px; width: 44px; height: 44px; }
+  .pool-external-tabs button { min-height: 44px; }
+  .pool-external-meta { flex-direction: column; }
+  .pool-external-rotation { flex-wrap: wrap; }
+  .pool-external-dialog .dialog-footer > .primary { flex: 0 0 auto; min-width: 85px; }
+}
 
 .terminal-deck {
   height: 100%;

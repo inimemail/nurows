@@ -114,6 +114,7 @@ function harness() {
     if (path.endsWith('polling.js')) return { startPolling: () => () => {} };
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { __esModule: true, default: 'dynamic' };
     if (path.endsWith('GuardSortableList.jsx')) return { __esModule: true, default: 'guard-sort' };
+    if (path.endsWith('PoolExternalAccessDialog.jsx')) return { __esModule: true, default: 'pool-external-dialog' };
     throw new Error(path);
   } });
   return { ui: module.exports, call(fn, props) { cursor = 0; effects.length = 0; return fn(props); }, render(props) { cursor = 0; effects.length = 0; return module.exports.default(props); }, runEffects() { effects.forEach((fn) => fn()); } };

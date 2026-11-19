@@ -45,6 +45,7 @@ import {
   runningAutomationIpUses,
   registerOrchestrationRoutes,
   registerProbePublicRoutes,
+  registerPoolPublicRoutes,
   scanOfflineProbes,
   processPoolHealthChecks,
   clearFinishedIncidents,
@@ -358,6 +359,7 @@ app.use((req, res, next) => {
 });
 app.use(cors());
 registerWebhookRoutes(app, webhookService, { publicOnly: true });
+registerPoolPublicRoutes(app, orchestrationDeps);
 registerProbePublicRoutes(app, {
   ...orchestrationDeps,
   onIncidentCreated: (incidentId) => runIncidentWorkflow(incidentId, orchestrationDeps),

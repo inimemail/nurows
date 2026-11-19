@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { bulkDeleteIds, partitionDeletion } from './bulk-delete.js';
+import { poolExternalAccess, sanitizePoolExternalAccess, registerPoolExternalManagementRoutes, registerPoolExternalPublicRoutes } from './pool-external-api.js';
 import { dnsGuardOrder, moveDnsGuard } from '../shared/dns-guard-order.js';
 import { telegramBotSelections } from '../shared/telegram-permissions.js';
 import { supportsPoolHealthCheck } from '../shared/probe-capabilities.js';
@@ -184,7 +185,7 @@ export function sanitizeOrchestrationState(state = {}) {
   const domain = normalizeOrchestrationState(state);
   return {
     ...domain,
-    ipPools: domain.ipPools.map((pool) => ({ ...pool, healthCheck: poolHealthSummary(pool.healthCheck) })),
+    ipPools: domain.ipPools.map((pool) => ({ ...sanitizePoolExternalAccess(pool), healthCheck: poolHealthSummary(pool.healthCheck) })),
     dynamicGuards: domain.dynamicGuards.map((guard) => sanitizeDynamicGuard(guard)),
     dynamicGuardRuns: domain.dynamicGuardRuns.slice(0, 30).map(({ output, ...run }) => run),
     probes: domain.probes.map(({ tokenHash, tokenEnc, agentSecretHash, ...item }) => ({
@@ -243,6 +244,10 @@ export function scanOfflineProbes(deps, now = Date.now()) {
   });
   deps.notifyProbePresence?.(events);
   return events;
+}
+
+export function registerPoolPublicRoutes(app, deps) {
+  registerPoolExternalPublicRoutes(app, { ...deps, importIpAssets, pushAudit });
 }
 
 export function registerProbePublicRoutes(app, deps) {
@@ -484,6 +489,7 @@ export function registerProbePublicRoutes(app, deps) {
 }
 
 export function registerOrchestrationRoutes(app, deps) {
+  registerPoolExternalManagementRoutes(app, { ...deps, pushAudit });
   app.put('/api/dns-guards/order', (req, res) => {
     const { id, targetId, placement } = req.body || {};
     if (typeof id !== 'string' || typeof targetId !== 'string' || id.length > 200 || targetId.length > 200 || !['before', 'after'].includes(placement)) {
@@ -3103,7 +3109,7 @@ function normalizeResource(key, input = {}, existing = null, deps) {
     });
   }
   if (key === 'ipAssets') return { ...base, name: cleanText(input.name, 100) || validateIp(input.address), address: validateIp(input.address), region: cleanText(input.region, 80), carrier: cleanText(input.carrier, 80), labels: cleanTexts(input.labels, 30), enabled: input.enabled !== false, health: ['healthy', 'unhealthy', 'unknown'].includes(input.health) ? input.health : 'unknown', note: cleanText(input.note, 500) };
-  if (key === 'ipPools') return { ...base, name: requiredText(input.name, '备用池名称'), probeIds: cleanIds(input.probeIds ?? existing?.probeIds, 21), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, alertEnabled: Boolean(input.alertEnabled), alertThresholds: normalizeThresholds(input.alertThresholds), alertBotIds: cleanIds(input.alertBotIds, 50), note: cleanText(input.note, 500) };
+  if (key === 'ipPools') return { ...base, ...poolExternalAccess(existing), name: requiredText(input.name, '备用池名称'), probeIds: cleanIds(input.probeIds ?? existing?.probeIds, 21), assetIds: cleanIds(input.assetIds, 5000), allocationMode: ['one', 'count', 'all'].includes(input.allocationMode) ? input.allocationMode : 'one', allocationCount: clampNumber(input.allocationCount, 1, 5000, 1), selectionMode: ['ordered', 'random'].includes(input.selectionMode) ? input.selectionMode : 'ordered', enabled: input.enabled !== false, alertEnabled: Boolean(input.alertEnabled), alertThresholds: normalizeThresholds(input.alertThresholds), alertBotIds: cleanIds(input.alertBotIds, 50), note: cleanText(input.note, 500) };
   if (key === 'dnsAccounts') {
     const provider = DNS_PROVIDERS.has(input.provider) ? input.provider : 'huawei';
     const supplied = input.credentials && typeof input.credentials === 'object' ? input.credentials : {};
@@ -4807,7 +4813,7 @@ function pushAudit(state, action, resourceType, resourceId, summary, actor) {
 }
 
 function sanitizeResource(key, item) {
-  if (key === 'ipPools') return { ...item, healthCheck: poolHealthSummary(item.healthCheck) };
+  if (key === 'ipPools') return { ...sanitizePoolExternalAccess(item), healthCheck: poolHealthSummary(item.healthCheck) };
   if (key === 'dnsAccounts') { const { credentialsEnc, ...safe } = item; return { ...safe, configured: Boolean(credentialsEnc) }; }
   if (key === 'telegramBots') { const { tokenEnc, tokenHash, ...safe } = item; return { ...safe, configured: Boolean(tokenEnc) }; }
   if (key === 'probes') { const { tokenHash, tokenEnc, agentSecretHash, ...safe } = item; return safe; }

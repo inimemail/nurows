@@ -29,6 +29,7 @@ function harness(api, assets, search = '', extra = {}, tab = 'pools') {
     if (path.endsWith('workspace-search.js')) return workspaceSearch;
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     if (path.endsWith('GuardSortableList.jsx')) return { default: 'guard-sort', __esModule: true };
+    if (path.endsWith('PoolExternalAccessDialog.jsx')) return { default: 'pool-external-dialog', __esModule: true };
     if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     throw Error(path);
   } });
@@ -47,6 +48,26 @@ function harness(api, assets, search = '', extra = {}, tab = 'pools') {
 const poolFixture = () => ({ ipPools: [{ id: 'p1', name: '备用池一', assetIds: ['a'], enabled: true }] });
 
 const healthFixture = () => ({ ...poolFixture(), ipPools: [{ ...poolFixture().ipPools[0], probeIds: ['probe'] }], probes: [{ id: 'probe', name: '在线探针', status: 'online', agentVersion: probeCapabilities.POOL_HEALTH_PROBE_VERSION, lastSeenAt: new Date().toISOString() }] });
+
+test('every pool has an external call button including disabled and empty pools, opening the matching pool', () => {
+  const view = harness(async () => {}, undefined, '', {ipPools:[
+    {id:'a',name:'启用池',enabled:true,assetIds:['a']},
+    {id:'b',name:'空池',enabled:false,assetIds:[]}
+  ]});
+  view.buttons('备用池2')[0].props.onClick(); view.render();
+  assert.equal(view.buttons('外部调用').length, 2);
+  for (const [i,id] of ['a','b'].entries()) {
+    view.buttons('外部调用')[i].props.onClick(); view.render();
+    const dialog = view.nodes().find(node=>node.type==='pool-external-dialog');
+    assert.equal(dialog.props.pool.id,id);
+    dialog.props.onChange({externalApiEnabled:false});
+    const next=view.updates.at(-1)(view.state);
+    assert.equal(next.ipPools[i].externalApiEnabled,false);
+    assert.equal(next.ipPools[1-i].externalApiEnabled,undefined);
+    dialog.props.onClose(); view.render();
+    assert.equal(view.nodes().some(node=>node.type==='pool-external-dialog'),false);
+  }
+});
 
 test('probe list deletes a probe directly and prevents repeated deletion requests', async () => {
   const calls = [];

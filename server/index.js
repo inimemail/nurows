@@ -17,6 +17,7 @@ import { createEpayService, registerEpayRoutes } from './epay.js';
 import { createTgHostingService, registerTgHostingRoutes } from './tg-hosting.js';
 import { registerConfigBulkDeleteRoutes } from './config-bulk-delete.js';
 import { registerServerExportRoutes } from './server-export.js';
+import { automationJobFailure } from './automation-failure.js';
 import { tokenizeServerImportRow } from '../shared/server-export.js';
 import { runLocalWebhook, runSshWebhook } from './webhook-runtime.js';
 import { poolHealthSummary, poolHealthProbeState, poolHealthSchedule, clonePoolHealthPools } from './pool-health-check.js';
@@ -2713,14 +2714,15 @@ function waitForAutomationJob(jobId, timeoutSeconds = 1800) {
       if (job.results.every((item) => ['done', 'error'].includes(item.status))) {
         clearInterval(timer);
         const failed = job.results.filter((item) => item.status === 'error' || !item.ok);
-        if (failed.length) reject(new Error(`自动化任务有 ${failed.length} 台执行失败`));
+        if (failed.length) reject(new Error(automationJobFailure(job)));
         else resolve(job.results);
         return;
       }
       if (Date.now() - startedAt > timeoutSeconds * 1000) {
         clearInterval(timer);
+        const message = automationJobFailure(job, { timedOut: true, timeoutSeconds });
         cancelCommandJob(job);
-        reject(new Error('自动化任务等待超时'));
+        reject(new Error(message));
       }
     }, 500);
   });
@@ -2797,7 +2799,7 @@ function notifyIncidentViaTelegram(incidentId) {
   const text = telegramNotice('🚨 故障事件', [
     `🎯 目标：${telegramNoticeValue(incident.targetName)}`,
     `📌 状态：${telegramNoticeValue(status)}`,
-    `💬 说明：${telegramNoticeValue(incident.message || incident.error, '暂无说明', 1000)}`,
+    `💬 说明：${telegramNoticeValue(incident.status === 'failed' ? incident.error || incident.message : incident.message || incident.error, '暂无说明', 1000)}`,
     `🧩 备用 IP：${telegramNoticeValue(incident.allocatedIps?.join(', '), '尚未分配', 500)}`
   ], `🕒 更新时间：${telegramNoticeTime(incident.updatedAt || incident.finishedAt || incident.startedAt)}`);
   for (const settings of configs) {

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test from 'node:test';
+import { dnsProviderRequest } from '../server/dns-provider-request.js';
 import { consumeIncidentIpAssets, crossedInventoryThresholds, dnsVerificationMatches, evaluateIncidentStabilization, evaluateTargetHealth, finalizeIpUsageRecords, importIpAssets, migratePoolAlertBotSelections, normalizeOrchestrationState, parseIpBatch, registerProbePublicRoutes, releaseIncidentIpLocks, requestWaitingIncidentRechecks, restoreDnsBindingLocalState, retryWaitingIpIncidents, rollbackIncident, runIncidentWorkflow, settleStabilizingIncidentForTarget, startIpUsageRecords, syncDnsBindingLocalState } from '../server/orchestration.js';
 
 function failedObservation(checkedAt = new Date().toISOString()) {
@@ -16,6 +17,52 @@ function failedTarget(overrides = {}) {
     ...overrides
   };
 }
+
+test('failover reports the exact failed stage and a transient DNS read never reruns completed automation', async () => {
+  for (const scenario of ['read-recovers', 'read-timeout', 'automation-error']) {
+    const state = {
+      incidents: [{ id: 'incident', targetId: 'target-1', policyId: 'policy', status: 'queued', executionId: '', dnsChangeIds: [], leaseIds: [] }],
+      failoverPolicies: [{ id: 'policy', poolIds: ['pool'], automationTaskId: 'task', dnsBindingIds: ['binding'], autoRollback: true }],
+      probes: [{ id: 'probe-1', enabled: true }], probeTargets: [failedTarget()],
+      ipPools: [{ id: 'pool', assetIds: ['asset'], enabled: true }],
+      ipAssets: [{ id: 'asset', address: '198.51.100.1', enabled: true, health: 'unknown' }],
+      ipLeases: [], ipUsageRecords: [], auditLogs: [], dnsChanges: [],
+      dnsAccounts: [{ id: 'account', provider: 'huawei', credentialsEnc: 'encrypted', enabled: true }],
+      dnsBindings: [{ id: 'binding', name: '主站', domain: 'www.example.com', accountId: 'account', recordType: 'A', updateMode: 'replace', enabled: true }]
+    };
+    let automationCalls = 0, writeCalls = 0, readRequests = 0, remoteValues = ['203.0.113.10'];
+    const deps = {
+      readState: () => state, updateState: fn => fn(state), decryptSecret: () => '{}', checkIp: async () => ({ok:true}),
+      executeAutomation: async () => { automationCalls++; return {jobId:'automation-job'}; },
+      waitAutomation: async () => { if (scenario === 'automation-error') throw Error('自动化任务有 1 台执行失败：198.51.100.1：命令退出码 22'); },
+      resolveDnsBinding: async (_state,_account,_credentials,binding) => ({zone:{name:'example.com'},normalizedBinding:binding}),
+      readDnsRecord: async () => {
+        const result = await dnsProviderRequest('https://provider.example/', {}, { provider:'华为云', readOnly:true }, {
+          wait: async () => {}, timeout: () => new AbortController().signal,
+          fetch: async () => {
+            readRequests++;
+            if (scenario === 'read-timeout' || readRequests === 1) throw new DOMException('The operation was aborted due to timeout','TimeoutError');
+            return new Response(JSON.stringify({values:remoteValues}),{status:200});
+          }
+        });
+        return result.payload;
+      },
+      writeDnsRecord: async (_account,_credentials,_zone,_binding,values) => {writeCalls++;remoteValues=[...values];return ['record'];}
+    };
+    await runIncidentWorkflow('incident',deps);
+    assert.equal(automationCalls,1,'DNS read retry must not repeat a successfully completed automation');
+    assert.equal(state.incidents[0].automationJobId,'automation-job');
+    if(scenario==='read-recovers') {
+      assert.equal(state.incidents[0].status,'succeeded');assert.equal(writeCalls,1);
+      assert.deepEqual(remoteValues,['198.51.100.1']);assert.equal(readRequests,3);
+    } else {
+      assert.equal(state.incidents[0].status,'failed');assert.equal(writeCalls,0);
+      assert.equal(state.ipAssets.length,1);assert.equal(state.ipLeases.length,0);
+      if(scenario==='read-timeout')assert.match(state.incidents[0].error,/DNS 更新（www.example.com）：华为云.*查询超时.*已尝试 2 次/);
+      else assert.match(state.incidents[0].error,/自动化任务：.*198.51.100.1：命令退出码 22/);
+    }
+  }
+});
 
 test('parses IPv4 and IPv6 batches and removes duplicates', () => {
   assert.deepEqual(parseIpBatch('1.1.1.1\n2001:db8::1, 1.1.1.1'), ['1.1.1.1', '2001:db8::1']);

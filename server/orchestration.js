@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { dnsProviderRequest, dnsRequestFailure } from './dns-provider-request.js';
 import { bulkDeleteIds, partitionDeletion } from './bulk-delete.js';
 import { poolExternalAccess, sanitizePoolExternalAccess, registerPoolExternalManagementRoutes, registerPoolExternalPublicRoutes } from './pool-external-api.js';
 import { dnsGuardOrder, moveDnsGuard } from '../shared/dns-guard-order.js';
@@ -1325,6 +1326,7 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
     deps.notifyIncident?.(incidentId);
     return;
   }
+  let failureStage = '备用 IP 分配与预检';
   try {
     const allocated = allocateIpsForIncident(incidentId, deps);
     // A failover incident must not run against the original host when no
@@ -1380,6 +1382,7 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
     }
 
     if (policy.automationTaskId) {
+      failureStage = '自动化任务';
       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'automating', message: '正在执行自动化任务' }));
       const hosts = policy.automationHosts === 'target' ? [target.address] : allocatedForExecution.map((item) => item.address);
       const context = buildIncidentContext(incident, target, allocatedForExecution);
@@ -1393,7 +1396,11 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
     const bindings = snapshot.dnsBindings.filter((item) => policy.dnsBindingIds?.includes(item.id) && item.enabled !== false);
     if (bindings.length) {
       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'dns_updating', message: '正在更新 DNS' }));
-      for (const binding of bindings) await applyDnsBinding(binding, incident.allocatedIps || [], incidentId, deps);
+      for (const binding of bindings) {
+        failureStage = `DNS 更新（${binding.domain}）`;
+        await applyDnsBinding(binding, incident.allocatedIps || [], incidentId, deps);
+      }
+      failureStage = 'DNS 结果验证';
       deps.updateState((draft) => updateIncident(draft, incidentId, { status: 'verifying', message: '正在验证 DNS 变更' }));
       await verifyDnsBindings(bindings, incidentId, deps);
     }
@@ -1416,7 +1423,10 @@ export async function runIncidentWorkflow(incidentId, deps, encryptionKey = null
     });
     deps.notifyIncident?.(incidentId);
   } catch (error) {
-    let failureMessage = error.message || '故障编排失败';
+    const reason = dnsRequestFailure(error) === 'timeout' && !/超时/.test(error.message || '')
+      ? '请求超时，未能在限定时间内取得结果，请检查面板服务器到该服务的网络'
+      : error.message || '故障编排失败';
+    let failureMessage = `${failureStage}：${reason}`;
     if (policy.autoRollback !== false) {
       try {
         await rollbackIncident(incidentId, deps, 'system');
@@ -4598,8 +4608,7 @@ function normalizeCheckEvidence(raw, target) {
 }
 
 async function cloudflareRequest(credentials, method, pathname, body) {
-  const response = await fetch(`https://api.cloudflare.com/client/v4${pathname}`, { method, headers: { authorization: `Bearer ${credentials.apiToken || ''}`, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(12000) });
-  const payload = await response.json();
+  const { response, payload } = await dnsProviderRequest(`https://api.cloudflare.com/client/v4${pathname}`, { method, headers: { authorization: `Bearer ${credentials.apiToken || ''}`, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }, { provider: 'Cloudflare', readOnly: method === 'GET' });
   if (!response.ok || payload.success === false) throw new Error(payload.errors?.[0]?.message || 'Cloudflare API 请求失败');
   return payload;
 }
@@ -4621,8 +4630,7 @@ async function huaweiRequest(account, credentials, method, pathname, body) {
   const authorization = `SDK-HMAC-SHA256 Access=${credentials.accessKey || ''}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
   const headers = { host, 'x-sdk-date': date, authorization };
   if (body) headers['content-type'] = 'application/json';
-  const response = await fetch(parsed, { method: method.toUpperCase(), headers, body: payload || undefined, signal: AbortSignal.timeout(12000) });
-  const result = await response.json().catch(() => ({}));
+  const { response, payload: result } = await dnsProviderRequest(parsed, { method: method.toUpperCase(), headers, body: payload || undefined }, { provider: '华为云', readOnly: method.toUpperCase() === 'GET' });
   if (!response.ok) {
     const error = new Error(result.error_msg || result.message || '华为云 DNS API 请求失败');
     error.providerStatus = response.status;
@@ -4636,8 +4644,7 @@ async function aliyunRequest(credentials, action, params = {}) {
   const sorted = Object.entries(common).sort(([a], [b]) => a.localeCompare(b));
   const query = sorted.map(([key, value]) => `${percentEncode(key)}=${percentEncode(value)}`).join('&');
   const signature = crypto.createHmac('sha1', `${credentials.secretKey || ''}&`).update(`GET&%2F&${percentEncode(query)}`).digest('base64');
-  const response = await fetch(`https://alidns.aliyuncs.com/?${query}&Signature=${percentEncode(signature)}`, { signal: AbortSignal.timeout(12000) });
-  const payload = await response.json().catch(() => ({}));
+  const { response, payload } = await dnsProviderRequest(`https://alidns.aliyuncs.com/?${query}&Signature=${percentEncode(signature)}`, {}, { provider: '阿里云', readOnly: action.startsWith('Describe') });
   if (!response.ok || payload.Code) throw new Error(payload.Message || '阿里云 DNS API 请求失败');
   return payload;
 }
@@ -4656,8 +4663,7 @@ async function tencentRequest(credentials, action, body = {}) {
   const secretSigning = hmac(secretService, 'tc3_request');
   const signature = crypto.createHmac('sha256', secretSigning).update(stringToSign).digest('hex');
   const authorization = `TC3-HMAC-SHA256 Credential=${credentials.secretId || ''}/${scope}, SignedHeaders=content-type;host, Signature=${signature}`;
-  const response = await fetch(`https://${host}`, { method: 'POST', headers: { authorization, 'content-type': 'application/json; charset=utf-8', host, 'x-tc-action': action, 'x-tc-timestamp': String(timestamp), 'x-tc-version': '2021-03-23' }, body: payload, signal: AbortSignal.timeout(12000) });
-  const result = await response.json().catch(() => ({}));
+  const { response, payload: result } = await dnsProviderRequest(`https://${host}`, { method: 'POST', headers: { authorization, 'content-type': 'application/json; charset=utf-8', host, 'x-tc-action': action, 'x-tc-timestamp': String(timestamp), 'x-tc-version': '2021-03-23' }, body: payload }, { provider: '腾讯云 DNSPod', readOnly: action.startsWith('Describe') });
   if (!response.ok || result.Response?.Error) throw new Error(result.Response?.Error?.Message || '腾讯云 DNSPod API 请求失败');
   return result;
 }
@@ -4665,23 +4671,20 @@ async function tencentRequest(credentials, action, body = {}) {
 async function dnspodRequest(credentials, action, params = {}) {
   const token = `${credentials.tokenId || ''},${credentials.tokenSecret || ''}`;
   const body = new URLSearchParams({ login_token: token, format: 'json', lang: 'en', error_on_empty: 'no', ...params });
-  const response = await fetch('https://dnsapi.cn/', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'Nurossh/1.0' }, body, signal: AbortSignal.timeout(12000) });
-  const result = await response.json().catch(() => ({}));
+  const { response, payload: result } = await dnsProviderRequest('https://dnsapi.cn/', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'Nurossh/1.0' }, body }, { provider: 'DNSPod', readOnly: /\.(?:List|Info)$/.test(action) });
   if (!response.ok || result.status?.code !== '1') throw new Error(result.status?.message || 'DNSPod API 请求失败');
   return result;
 }
 
 async function godaddyRequest(credentials, method, pathname, body) {
-  const response = await fetch(`https://api.godaddy.com${pathname}`, { method, headers: { authorization: `sso-key ${credentials.apiKey || ''}:${credentials.apiSecret || ''}`, accept: 'application/json', 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(12000) });
-  const result = await response.json().catch(() => ({}));
+  const { response, payload: result } = await dnsProviderRequest(`https://api.godaddy.com${pathname}`, { method, headers: { authorization: `sso-key ${credentials.apiKey || ''}:${credentials.apiSecret || ''}`, accept: 'application/json', 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) }, { provider: 'GoDaddy', readOnly: method === 'GET' });
   if (!response.ok) throw new Error(result.message || 'GoDaddy API 请求失败');
   return result;
 }
 
 async function porkbunRequest(credentials, pathname, extra = {}) {
   const body = { apikey: credentials.apiKey || '', secretapikey: credentials.secretApiKey || '', ...extra };
-  const response = await fetch(`https://api.porkbun.com${pathname}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(12000) });
-  const result = await response.json().catch(() => ({}));
+  const { response, payload: result } = await dnsProviderRequest(`https://api.porkbun.com${pathname}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }, { provider: 'Porkbun', readOnly: pathname.endsWith('/ping') || pathname.includes('/dns/retrieve/') });
   if (!response.ok || result.status !== 'SUCCESS') throw new Error(result.message || 'Porkbun API 请求失败');
   return result;
 }
@@ -4718,8 +4721,7 @@ async function cloudnsRequest(credentials, pathname, method = 'GET', body) {
   const url = new URL(`https://api.cloudns.net${pathname}`);
   url.searchParams.set('auth-id', credentials.authId || '');
   url.searchParams.set('auth-password', credentials.authPassword || '');
-  const response = await fetch(url, { method, headers: { accept: 'application/json' }, body: body ? new URLSearchParams(body) : undefined, signal: AbortSignal.timeout(12000) });
-  const result = await response.json().catch(() => ({}));
+  const { response, payload: result } = await dnsProviderRequest(url, { method, headers: { accept: 'application/json' }, body: body ? new URLSearchParams(body) : undefined }, { provider: 'ClouDNS', readOnly: method === 'GET' });
   if (!response.ok || result?.status === 'Failed') throw new Error(result?.statusDescription || 'ClouDNS API 请求失败');
   return result;
 }
@@ -4739,8 +4741,7 @@ async function callbackRequest(account, credentials, payload) {
   if (credentials.headers) { try { customHeaders = JSON.parse(credentials.headers); } catch (_error) { throw new Error('自定义请求头 JSON 格式无效'); } }
   const headers = { accept: 'application/json', 'content-type': 'application/json', ...Object.fromEntries(Object.entries(customHeaders).slice(0, 30).map(([key, value]) => [cleanText(key, 100), cleanText(value, 1000)])) };
   if (credentials.token && !headers.authorization) headers.authorization = `Bearer ${credentials.token}`;
-  const response = await fetch(parsed, { method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(12000) });
-  const result = await response.json().catch(() => ({}));
+  const { response, payload: result } = await dnsProviderRequest(parsed, { method: 'POST', headers, body: JSON.stringify(payload) }, { provider: '自定义 DNS 回调', readOnly: ['test', 'zones', 'read'].includes(payload.action) });
   if (!response.ok || result.ok === false || result.error) throw new Error(result.error || `DNS 回调失败（${response.status}）`);
   return result;
 }

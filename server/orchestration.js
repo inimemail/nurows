@@ -183,10 +183,13 @@ export function normalizeOrchestrationState(parsed = {}) {
   return normalized;
 }
 
-export function sanitizeOrchestrationState(state = {}) {
+export function sanitizeOrchestrationState(state = {}, { compact = false } = {}) {
   const domain = normalizeOrchestrationState(state);
+  const latestRuns = new Map();
+  if(compact)for(const run of domain.dnsGuardRuns)if(!latestRuns.has(run.guardId))latestRuns.set(run.guardId,run);
   return {
     ...domain,
+    dnsGuards: compact ? domain.dnsGuards.map(dnsGuardStatusSummary) : domain.dnsGuards,
     ipPools: domain.ipPools.map((pool) => ({ ...sanitizePoolExternalAccess(pool), healthCheck: poolHealthSummary(pool.healthCheck) })),
     dynamicGuards: domain.dynamicGuards.map((guard) => sanitizeDynamicGuard(guard)),
     dynamicGuardRuns: domain.dynamicGuardRuns.slice(0, 30).map(({ output, ...run }) => run),
@@ -197,7 +200,7 @@ export function sanitizeOrchestrationState(state = {}) {
     dnsAccounts: domain.dnsAccounts.map(({ credentialsEnc, ...item }) => ({ ...item, configured: Boolean(credentialsEnc) })),
     telegramBots: domain.telegramBots.map(({ tokenEnc, tokenHash, ...item }) => ({ ...item, configured: Boolean(tokenEnc) })),
     incidents: domain.incidents.slice(0, 200),
-    dnsGuardRuns: domain.dnsGuardRuns.slice(0, DNS_GUARD_HISTORY_LIMIT),
+    dnsGuardRuns: compact ? [...latestRuns.values()] : domain.dnsGuardRuns.slice(0, DNS_GUARD_HISTORY_LIMIT),
     ipUsageRecords: domain.ipUsageRecords.slice(0, 5000),
     dnsChanges: domain.dnsChanges.slice(0, 300),
     auditLogs: domain.auditLogs.slice(0, 500)

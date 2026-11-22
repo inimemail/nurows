@@ -2369,7 +2369,7 @@ function sanitizeStateForClient(state, auth = null) {
     proxies: state.proxies.map(sanitizeProxyForClient),
     automationTasks: state.automationTasks.map(sanitizeAutomationTaskForClient),
     automationRuns: state.automationRuns || [],
-    ...sanitizeOrchestrationState(state),
+    ...sanitizeOrchestrationState(state, { compact: true }),
     ...renewalSnapshot(state),
     workspace: getWorkspaceForUser(state, auth)
   };

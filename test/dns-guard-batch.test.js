@@ -238,3 +238,32 @@ test('large configuration batches yield to incoming stop requests between rules'
   assert.equal(result.counts.succeeded,3);assert.equal(result.counts.canceled,3);
   assert.equal(h.state().dnsGuards.filter(guard=>guard.sourcesEnabled===false).length,3);
 });
+
+test('all advanced previews are read-only and every action rejects execution without explicit confirmation',async()=>{
+  const operations=[
+    {action:'ips_add',text:'192.0.2.2'},{action:'ips_remove',text:'192.0.2.1'},
+    {action:'sources_enabled',enabled:false},{action:'sources_add',text:'new.example.com'},
+    {action:'sources_remove',text:'a-source.example.com'},{action:'sources_replace',text:'new.example.com'},
+    {action:'sources_map',text:'a-source.example.com | new.example.com'},
+    {action:'enabled',enabled:false},{action:'check'},
+    {action:'references',field:'probeIds',mode:'add',values:['p2']},
+    {action:'settings',field:'interval',value:60}
+  ];
+  for(const operation of operations){
+    const h=harness({guard:{cycle:null},state:{probes:[{id:'p'},{id:'p2'}]}}),before=structuredClone(h.state());
+    const job=await h.preview({ids:['a'],...operation});
+    assert.equal(job.rows[0].status,'ready',operation.action);
+    await assert.rejects(h.request('post','/api/dns-guards/batch/:jobId/apply',{}, {jobId:job.id}),/确认/);
+    assert.deepEqual(h.state(),before,operation.action);assert.equal(h.writes.length,0,operation.action);
+    assert.equal(h.changed.length,0,operation.action);assert.equal((await h.read(job.id)).status,'ready');
+  }
+});
+
+test('source toggle preview omits unchanged sources and settings from every row',async()=>{
+  const h=harness();h.mutate(state=>{for(const guard of state.dnsGuards)guard.sources=Array.from({length:100},(_,i)=>({id:`s${i}`,domain:`s${i}.example.com`,name:'来源'.repeat(30)}));});
+  const before=structuredClone(h.state());
+  const job=await h.preview({ids:['a','b'],action:'sources_enabled',enabled:false});
+  assert.ok(job.rows.every(row=>row.status==='ready'));
+  for(const row of job.rows){assert.deepEqual(row.before,{sourcesEnabled:true});assert.deepEqual(row.after,{sourcesEnabled:false});}
+  assert.ok(JSON.stringify(job).length<1500);assert.deepEqual(h.state(),before);
+});

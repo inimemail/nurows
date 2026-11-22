@@ -6,7 +6,7 @@ import { commandJobDelta, mergeCommandDelta } from '../shared/command-output.js'
 import { startPolling } from '../shared/polling.js';
 import { sanitizeDynamicGuard } from '../server/dynamic-guard.js';
 import { poolHealthProbeState, poolHealthSummary, poolHealthSchedule } from '../server/pool-health-check.js';
-import { collectDnsGuardPoolCandidates, orchestrationDefaults, registerOrchestrationRoutes } from '../server/orchestration.js';
+import { collectDnsGuardPoolCandidates, orchestrationDefaults, registerOrchestrationRoutes, sanitizeOrchestrationState } from '../server/orchestration.js';
 
 // Load individual runtime functions without opening storage or starting services.
 const source = fs.readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
@@ -342,4 +342,28 @@ test('workspace polling recovers a transient error without shortening its normal
   await new Promise(setImmediate);
   assert.equal(calls, 2);
   stop();
+});
+
+test('background tabs pause polling, abort pending reads and resume without overlapping requests',async t=>{
+  t.mock.timers.enable({apis:['setTimeout','Date']});
+  const listeners=new Set(),signals=[];let release,errors=0;
+  const doc={hidden:false,addEventListener:(_event,fn)=>listeners.add(fn),removeEventListener:(_event,fn)=>listeners.delete(fn)};
+  const stop=startPolling(signal=>{signals.push(signal);return new Promise(resolve=>{release=resolve;});},5000,{visibilityDocument:doc,onError:()=>errors++});
+  doc.hidden=true;for(const listener of listeners)listener();
+  assert.equal(signals[0].aborted,true);t.mock.timers.tick(30000);assert.equal(signals.length,1);
+  doc.hidden=false;for(const listener of listeners)listener();assert.equal(signals.length,1);
+  release();await new Promise(setImmediate);t.mock.timers.tick(0);assert.equal(signals.length,2);
+  stop();assert.equal(listeners.size,0);assert.equal(signals[1].aborted,true);
+  release();await new Promise(setImmediate);t.mock.timers.tick(30000);assert.equal(signals.length,2);assert.equal(errors,0);
+});
+
+test('full client snapshots keep latest DNS runs and cycle summaries while history endpoints retain evidence',()=>{
+  const state={...orchestrationDefaults(),dnsGuards:[{id:'g',name:'Guard',domain:'g.example.com',probeIds:['p'],cycle:{id:'cycle',phase:'remote',startedAt:'2026-11-22',checks:Array.from({length:50},(_,i)=>({id:`check${i}`,observations:{p:{output:'evidence'.repeat(200)}}}))}}],
+    dnsGuardRuns:Array.from({length:1000},(_,i)=>({id:`run${i}`,guardId:'g',beforeValues:['192.0.2.1'],message:'history'.repeat(50)}))};
+  const full=sanitizeOrchestrationState(state),compact=sanitizeOrchestrationState(state,{compact:true});
+  assert.equal(compact.dnsGuards[0].cycle.id,'cycle');assert.equal(compact.dnsGuards[0].cycle.checks,undefined);
+  assert.equal(compact.dnsGuardRuns.length,1);assert.equal(compact.dnsGuardRuns[0].id,'run0');
+  assert.equal(full.dnsGuardRuns.length,1000);assert.equal(full.dnsGuards[0].cycle.checks.length,50);
+  assert.ok(JSON.stringify(compact).length<JSON.stringify(full).length/20);
+  assert.equal(state.dnsGuardRuns.length,1000);assert.equal(state.dnsGuards[0].cycle.checks.length,50);
 });

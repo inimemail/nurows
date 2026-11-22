@@ -8,6 +8,7 @@ import { copyNoteText } from './note-clipboard.js';
 const STATUS = {queued:'排队',preparing:'读取中',ready:'待确认',unchanged:'无需修改',skipped:'已跳过',applying:'执行中',succeeded:'已完成',pending:'待确认远程结果',failed:'失败',canceled:'已取消'};
 const SOURCE_ACTIONS = ['sources_add','sources_replace'];
 const ACTIVE_JOBS = ['preparing','applying','recovering'];
+const RULE_PAGE_SIZE=40,RESULT_PAGE_SIZE=20;
 const keyOf = value => JSON.stringify(value);
 function describe(value, state) {
   if (Array.isArray(value)) return value.join('\n') || '无 IP';
@@ -35,18 +36,24 @@ export default function DnsGuardBatchDialog({state,api,toast,Dialog,onClose,onFi
   const [refField,setRefField]=useState('probeIds'),[refMode,setRefMode]=useState('add'),[refIds,setRefIds]=useState([]);
   const [setting,setSetting]=useState('interval'),[settingValue,setSettingValue]=useState(30);
   const [job,setJob]=useState(null),[planKey,setPlanKey]=useState(''),[busy,setBusy]=useState(false),[error,setError]=useState('');
+  const [rulePage,setRulePage]=useState(1),[resultPage,setResultPage]=useState(1);
   const pending=useRef(false),mounted=useRef(true),completed=useRef('');
   useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;};},[]);
   const guards=useMemo(()=>{
     const records=state.dnsGuards||[],byId=new Map(records.map(guard=>[guard.id,guard]));
     return dnsGuardOrder(records,state.dnsGuardOrder||[]).map(id=>byId.get(id));
   },[state.dnsGuards,state.dnsGuardOrder]);
-  const selectedSet=new Set(selected);
-  const ids=guards.filter(guard=>selectedSet.has(guard.id)).map(guard=>guard.id);
+  const selectedSet=useMemo(()=>new Set(selected),[selected]);
+  const ids=useMemo(()=>guards.filter(guard=>selectedSet.has(guard.id)).map(guard=>guard.id),[guards,selectedSet]);
+  const searchIndex=useMemo(()=>open?guards.map(guard=>({guard,text:[guard.name,guard.domain,guard.recordType,...(guard.sources||[]).flatMap(source=>[source.name,source.domain,source.backupDomain])].join(' ').toLowerCase()})):[],[guards,open]);
   const visible=useMemo(()=>{
     const terms=query.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    return guards.filter(guard=>terms.every(term=>[guard.name,guard.domain,guard.recordType,...(guard.sources||[]).flatMap(source=>[source.name,source.domain,source.backupDomain])].join(' ').toLowerCase().includes(term)));
-  },[guards,query]);
+    return terms.length?searchIndex.filter(item=>terms.every(term=>item.text.includes(term))).map(item=>item.guard):guards;
+  },[guards,searchIndex,query]);
+  const rulePages=Math.max(1,Math.ceil(visible.length/RULE_PAGE_SIZE)),currentRulePage=Math.min(rulePage,rulePages);
+  const pageGuards=visible.slice((currentRulePage-1)*RULE_PAGE_SIZE,currentRulePage*RULE_PAGE_SIZE);
+  const resultPages=Math.max(1,Math.ceil((job?.rows.length||0)/RESULT_PAGE_SIZE)),currentResultPage=Math.min(resultPage,resultPages);
+  const pageResults=useMemo(()=>open?(job?.rows||[]).slice((currentResultPage-1)*RESULT_PAGE_SIZE,currentResultPage*RESULT_PAGE_SIZE).map(row=>({row,diff:difference(row,state)})):[],[job,currentResultPage,state.probes,state.ipPools,state.telegramBots,open]);
   const payload={ids,action,...(['ips_add','ips_remove','sources_add','sources_remove','sources_replace','sources_map'].includes(action)?{text}:{}),
     ...(['sources_enabled','enabled'].includes(action)?{enabled}:{}),
     ...(SOURCE_ACTIONS.includes(action)?{perRule}:{}),
@@ -56,7 +63,12 @@ export default function DnsGuardBatchDialog({state,api,toast,Dialog,onClose,onFi
   const working=busy||ACTIVE_JOBS.includes(job?.status);
   const actionable=job?.status==='ready'&&planKey===requestKey&&job.rows.some(row=>row.status==='ready');
   const failedIds=job?.rows.filter(row=>['failed','skipped'].includes(row.status)).map(row=>row.id)||[];
-  const onFinishedRef=useRef(onFinished);onFinishedRef.current=onFinished;
+  const callbacks=useRef({onFinished,onClose,toast});callbacks.current={onFinished,onClose,toast};
+  useEffect(()=>{
+    if(!open&&!working&&(!job||job.status==='ready'||(job.status==='done'&&job.rows.every(row=>['succeeded','unchanged'].includes(row.status))))){
+      setJob(null);setPlanKey('');setText('');setError('');setResultPage(1);
+    }
+  },[open,working,job]);
 
   useEffect(()=>{
     if(!job||!ACTIVE_JOBS.includes(job.status))return;
@@ -70,16 +82,23 @@ export default function DnsGuardBatchDialog({state,api,toast,Dialog,onClose,onFi
     }});
   },[api,job?.id,job?.status]);
   useEffect(()=>{
-    if(job?.status==='done'&&completed.current!==job.id){completed.current=job.id;onFinishedRef.current?.();}
+    if(job?.status==='done'&&completed.current!==job.id){
+      completed.current=job.id;
+      callbacks.current.onFinished?.();
+      const clean=job.rows.every(row=>['succeeded','unchanged'].includes(row.status));
+      callbacks.current.toast(clean?`操作完成：成功 ${job.counts.succeeded||0} 条${job.counts.unchanged?`，无需修改 ${job.counts.unchanged} 条`:''}`:'操作已结束，部分规则未完成，请查看逐条结果');
+      if(clean)callbacks.current.onClose();
+    }
   },[job?.id,job?.status]);
-
   const command=async kind=>{
+    if(kind==='apply'&&(!actionable||working))return;
     if(pending.current)return;pending.current=true;setBusy(true);setError('');
     try {
-      const next=await api(kind==='preview'?'/api/dns-guards/batch/preview':`/api/dns-guards/batch/${encodeURIComponent(job.id)}/${kind}`,
-        {method:'POST',body:JSON.stringify(kind==='preview'?payload:kind==='apply'?{confirm:'apply-dns-guard-batch'}:{})});
+      const previewing=kind==='preview';
+      const next=await api(previewing?'/api/dns-guards/batch/preview':`/api/dns-guards/batch/${encodeURIComponent(job.id)}/${kind}`,
+        {method:'POST',body:JSON.stringify(previewing?payload:kind==='apply'?{confirm:'apply-dns-guard-batch'}:{})});
       if(!mounted.current)return;
-      if(kind==='preview')setPlanKey(requestKey);
+      if(previewing){setPlanKey(requestKey);setResultPage(1);}
       setJob(next);
     }catch(err){
       if(mounted.current){
@@ -96,17 +115,19 @@ export default function DnsGuardBatchDialog({state,api,toast,Dialog,onClose,onFi
   };
   const refs={probeIds:state.probes,poolIds:state.ipPools,alertBotIds:state.telegramBots}[refField]||[];
   const summary=job?`${job.rows.length} 条 · 待确认 ${job.counts.ready||0} · 完成 ${job.counts.succeeded||0} · 跳过 ${job.counts.skipped||0} · 失败 ${job.counts.failed||0}${job.counts.pending?` · 待核对 ${job.counts.pending}`:''}`:'';
+  const progress=busy?'提交中…':job?.status==='preparing'?'准备中…':job?.status==='recovering'?'核对执行结果…':job?.status==='applying'?`执行中 ${job.counts.succeeded||0} / ${job.rows.length}`:'';
 
   if(!open)return null;
   return <Dialog title="DNS 守护 · 高级操作" xwide className="guard-batch-dialog" onClose={onClose}
-    footer={<><span className="guard-batch-footer"><Check size={15}/>已选 <b>{ids.length}</b> / {guards.length} 条规则</span><div className="dialog-actions"><button className="ghost" onClick={onClose}>关闭</button>{job?.status==='applying'?<button className="ghost" disabled={busy||job.cancelRequested} onClick={()=>command('cancel')}>停止后续操作</button>:null}<button className="ghost" disabled={working||!ids.length} onClick={()=>command('preview')}>{busy?'处理中…':'预览更改'}</button><button className="primary" disabled={!actionable||busy} onClick={()=>command('apply')}>确认执行 {actionable?job.counts.ready:''}</button></div></>}>
-    <div className="guard-batch-intro"><span><Layers size={20}/></span><div><strong>一次选择，逐条核对后执行</strong><p>先预览每条规则的变化，再确认执行。普通检查可重新开始；远程 DNS 写入最多等待 30 秒，未确认的规则会跳过并说明原因。</p></div></div>
+    footer={<><span className="guard-batch-footer"><Check size={15}/>已选 <b>{ids.length}</b> / {guards.length} 条规则</span><div className="dialog-actions"><button className="ghost" onClick={onClose}>关闭</button>{job?.status==='applying'?<button className="ghost" disabled={busy||job.cancelRequested} onClick={()=>command('cancel')}>停止后续操作</button>:null}<button className="ghost" disabled={working||!ids.length} onClick={()=>command('preview')}>预览更改</button><button className="primary" disabled={!actionable||working} onClick={()=>command('apply')}>{progress||`确认执行 ${actionable?job.counts.ready:''}`}</button></div></>}>
+    <div className="guard-batch-intro"><span><Layers size={20}/></span><div><strong>一次选择，逐条核对后执行</strong><p>预览只显示变化，点击“确认执行”后才会生效。全部成功后自动关闭；有未完成项会保留结果。远程 DNS 写入最多等待 30 秒。</p></div></div>
     <div className="guard-batch-layout">
-      <section className="guard-batch-picker" aria-label="选择守护规则"><div className="guard-batch-section-head"><strong>01 选择规则</strong><span>{visible.length} 条匹配</span></div>
-        <div className="guard-batch-search"><Search size={16}/><input aria-label="搜索守护规则" placeholder="搜索名称、域名、DDNS 来源" value={query} disabled={working} onChange={event=>setQuery(event.target.value)}/></div>
+      <section className="guard-batch-picker" aria-label="选择守护规则"><div className="guard-batch-section-head"><strong>01 选择规则</strong><span>{visible.length} 条匹配 · 已选 {ids.length}</span></div>
+        <div className="guard-batch-search"><Search size={16}/><input aria-label="搜索守护规则" placeholder="搜索名称、域名、DDNS 来源" value={query} disabled={working} onChange={event=>{setQuery(event.target.value);setRulePage(1);}}/></div>
         <div className="guard-batch-select-tools"><button className="ghost" disabled={working} onClick={()=>setSelected(current=>[...new Set([...current,...visible.map(guard=>guard.id)])])}>全选搜索结果</button><button className="ghost" disabled={working} onClick={()=>setSelected(current=>{const next=new Set(current);for(const guard of visible){if(next.has(guard.id))next.delete(guard.id);else next.add(guard.id);}return [...next];})}>反选</button><button className="ghost" disabled={working} onClick={()=>setSelected([])}>清空</button></div>
-        <div className="guard-batch-rule-list">{visible.map(guard=><label key={guard.id} className={selectedSet.has(guard.id)?'selected':''}><input type="checkbox" disabled={working} checked={selectedSet.has(guard.id)} onChange={()=>setSelected(current=>current.includes(guard.id)?current.filter(id=>id!==guard.id):[...current,guard.id])}/><span><strong>{guard.name}</strong><code>{guard.recordType} · {guard.domain}</code><small>{guard.currentValues?.length||0} 个 IP · {guard.sources?.length||0} 个来源{guard.sourcesEnabled===false?' · 来源禁用':''}{guard.enabled===false?' · 任务停用':guard.cycle?' · 检查中':''}</small></span></label>)}{!visible.length?<p className="guard-batch-empty">没有匹配的规则</p>:null}</div>
-        <small className="guard-batch-hint">搜索不会清除隐藏的已选项，单次最多操作 500 条。</small>
+        <div className="guard-batch-rule-list">{pageGuards.map(guard=><label key={guard.id} className={selectedSet.has(guard.id)?'selected':''}><input type="checkbox" disabled={working} checked={selectedSet.has(guard.id)} onChange={()=>setSelected(current=>current.includes(guard.id)?current.filter(id=>id!==guard.id):[...current,guard.id])}/><span><strong>{guard.name}</strong><code>{guard.recordType} · {guard.domain}</code><small>{guard.currentValues?.length||0} 个 IP · {guard.sources?.length||0} 个来源{guard.sourcesEnabled===false?' · 来源禁用':''}{guard.enabled===false?' · 任务停用':guard.cycle?' · 检查中':''}</small></span></label>)}{!visible.length?<p className="guard-batch-empty">没有匹配的规则</p>:null}</div>
+        {rulePages>1?<nav className="guard-batch-pagination" aria-label="规则分页"><button className="ghost" disabled={currentRulePage<=1} onClick={()=>setRulePage(currentRulePage-1)}>上一页规则</button><span>{currentRulePage} / {rulePages} 页 · 共 {visible.length} 条</span><button className="ghost" disabled={currentRulePage>=rulePages} onClick={()=>setRulePage(currentRulePage+1)}>下一页规则</button></nav>:null}
+        <small className="guard-batch-hint">全选与反选作用于全部搜索结果，跨页保留选择，单次最多 500 条。</small>
       </section>
       <section className="guard-batch-editor" aria-label="配置批量操作"><div className="guard-batch-section-head"><strong>02 设置操作</strong><SlidersHorizontal size={16}/></div>
         <label className="guard-batch-field"><span>操作类型</span><select aria-label="操作类型" disabled={working} value={action} onChange={event=>{setAction(event.target.value);setText('');}}>{DNS_GUARD_BATCH_ACTIONS.map(([id,label])=><option key={id} value={id}>{label}</option>)}</select></label>
@@ -121,10 +142,11 @@ export default function DnsGuardBatchDialog({state,api,toast,Dialog,onClose,onFi
       </section>
     </div>
     {error?<div className="guard-batch-error" role="alert">{error}</div>:null}
-    {job?<section className="guard-batch-results" aria-label="批量操作预览与结果"><div className="guard-batch-section-head"><strong>{ACTIVE_JOBS.includes(job.status)?<LoaderCircle size={15} className="ops-source-spinner"/>:null}03 {job.status==='recovering'?'正在核对任务状态':job.status==='done'?'执行结果':'逐条预览'} · {dnsGuardBatchLabel(job.action)}</strong><span>{summary}</span></div>
+    {job?<section className="guard-batch-results" aria-label="批量操作预览与结果"><div className="guard-batch-section-head"><strong>{ACTIVE_JOBS.includes(job.status)?<LoaderCircle size={15} className="ops-source-spinner"/>:null}03 {job.status==='recovering'?'正在核对任务状态':job.status==='done'?'执行结果':job.status==='applying'?'正在执行':'逐条预览'} · {dnsGuardBatchLabel(job.action)}</strong><span>{summary}</span></div>
       {planKey!==requestKey&&!working?<p className="guard-batch-stale">选择或参数已变化，请重新预览后再执行。</p>:null}
       {job.status==='done'&&failedIds.length?<button className="ghost" onClick={()=>{setSelected(failedIds);setJob(null);}}>仅选择失败 / 跳过项重试</button>:null}
-      <div className="guard-batch-result-list">{job.rows.map(row=>{const [before,after]=difference(row,state);return <article key={row.id}><div className="guard-batch-result-heading"><div><strong>{row.name}</strong><span>{row.recordType} · {row.domain}</span></div><em className={row.status}>{STATUS[row.status]||row.status}</em></div>{before||after?<div className="guard-batch-diff"><pre>{before}</pre><ArrowRight size={14}/><pre>{after}</pre></div>:null}<p>{row.message}</p></article>;})}</div>
+      <div className="guard-batch-result-list">{pageResults.map(({row,diff:[before,after]})=>{return <article key={row.id}><div className="guard-batch-result-heading"><div><strong>{row.name}</strong><span>{row.recordType} · {row.domain}</span></div><em className={row.status}>{STATUS[row.status]||row.status}</em></div>{before||after?<div className="guard-batch-diff"><div><small>更改前</small><pre>{before}</pre></div><ArrowRight size={14}/><div><small>更改后</small><pre>{after}</pre></div></div>:null}<p>{row.message}</p></article>;})}</div>
+      {resultPages>1?<nav className="guard-batch-pagination" aria-label="结果分页"><button className="ghost" disabled={currentResultPage<=1} onClick={()=>setResultPage(currentResultPage-1)}>上一页结果</button><span>{currentResultPage} / {resultPages} 页 · 共 {job.rows.length} 条</span><button className="ghost" disabled={currentResultPage>=resultPages} onClick={()=>setResultPage(currentResultPage+1)}>下一页结果</button></nav>:null}
       <small className="guard-batch-hint">关闭弹窗后操作继续执行，本页重新打开可查看进度；服务重启会结束本次批量任务，已完成更改保留，可重新预览核对。</small>
     </section>:null}
   </Dialog>;

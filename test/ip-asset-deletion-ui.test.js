@@ -61,7 +61,7 @@ test('each guard has a source shortcut, sends one scoped update and changes its 
   const pending=click();await click();view.render();
   assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/dns-guards/g1/sources-enabled');
   assert.equal(calls[0].options.method,'PUT');assert.deepEqual(JSON.parse(calls[0].options.body),{enabled:false});
-  assert.equal(view.buttons('禁用域名来源')[0].props.disabled,true);
+  assert.equal(view.buttons('切换中…')[0].props.disabled,true);
   const updated={...fixture.dnsGuards[0],sourcesEnabled:false};
   finish({guard:updated});await pending;view.render();
   const next=view.updates.at(-1)({...view.state,dnsGuardOrder:['g2','g1'],ipPools:[{id:'new-pool'}]});

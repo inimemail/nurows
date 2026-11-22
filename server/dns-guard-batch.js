@@ -168,7 +168,10 @@ export function createDnsGuardBatchService(deps) {
             row.patch=configPatch(guard,job.payload,deps.readState(['dnsGuards']).dnsGuards);
             const next=deps.normalizeGuard({...guard,...row.patch},guard);
             deps.validateGuard(deps.readState(),next);
-            row.before=viewConfig(deps.normalizeGuard(guard,guard));row.after=viewConfig(next);
+            const before=viewConfig(deps.normalizeGuard(guard,guard)),after=viewConfig(next);
+            const changed=Object.keys(before).filter(key=>!same(before[key],after[key]));
+            row.before=Object.fromEntries(changed.map(key=>[key,before[key]]));
+            row.after=Object.fromEntries(changed.map(key=>[key,after[key]]));
           }
           const latest=deps.readState(['dnsGuards']).dnsGuards.find(item=>item.id===row.id);
           if(!latest||guardBatchFingerprint(latest)!==row.fingerprint)throw error('预览期间规则已修改，请重新预览',409);

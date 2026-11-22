@@ -37,7 +37,7 @@ function harness(api, assets, search = '', extra = {}, tab = 'pools') {
   function nodes(value = tree) {
     if (Array.isArray(value)) return value.flatMap(nodes);
     if (!value || typeof value !== 'object') return [];
-    return [value, ...nodes(value.props?.children ?? null), ...nodes(value.props?.actions ?? null), ...nodes(value.props?.footer ?? null)];
+    return [value, ...nodes(value.type === 'guard-sort' ? value.props.items.map(value.props.children) : value.props?.children ?? null), ...nodes(value.props?.actions ?? null), ...nodes(value.props?.footer ?? null)];
   }
   const text = (value) => Array.isArray(value) ? value.map(text).join('') : value && typeof value === 'object' ? text(value.props?.children) : String(value ?? '');
   const buttons = (label) => nodes().filter((node) => node.type === 'button' && text(node) === label);
@@ -48,6 +48,39 @@ function harness(api, assets, search = '', extra = {}, tab = 'pools') {
 const poolFixture = () => ({ ipPools: [{ id: 'p1', name: '备用池一', assetIds: ['a'], enabled: true }] });
 
 const healthFixture = () => ({ ...poolFixture(), ipPools: [{ ...poolFixture().ipPools[0], probeIds: ['probe'] }], probes: [{ id: 'probe', name: '在线探针', status: 'online', agentVersion: probeCapabilities.POOL_HEALTH_PROBE_VERSION, lastSeenAt: new Date().toISOString() }] });
+
+test('each guard has a source shortcut, sends one scoped update and changes its label only after success', async () => {
+  const calls=[];let finish;
+  const fixture={dnsGuards:[{id:'g1',name:'守护一',domain:'one.example.com',sources:[{id:'source',domain:'source.example.com'}]},
+    {id:'g2',name:'守护二',sourcesEnabled:false,sources:[]}]};
+  const view=harness((path,options)=>{calls.push({path,options});return new Promise(resolve=>{finish=resolve;});},undefined,'',fixture,'probes');
+  view.buttons('DNS 守护2')[0].props.onClick();view.render();
+  assert.equal(view.buttons('禁用域名来源').length,1);assert.equal(view.buttons('启用域名来源').length,1);
+  const click=view.buttons('禁用域名来源')[0].props.onClick;
+  const pending=click();await click();view.render();
+  assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/dns-guards/g1/sources-enabled');
+  assert.equal(calls[0].options.method,'PUT');assert.deepEqual(JSON.parse(calls[0].options.body),{enabled:false});
+  assert.equal(view.buttons('禁用域名来源')[0].props.disabled,true);
+  const updated={...fixture.dnsGuards[0],sourcesEnabled:false};
+  finish({guard:updated});await pending;view.render();
+  const next=view.updates.at(-1)({...view.state,dnsGuardOrder:['g2','g1'],ipPools:[{id:'new-pool'}]});
+  assert.equal(next.dnsGuards[0].sourcesEnabled,false);assert.equal(next.dnsGuards[1].sourcesEnabled,false);
+  assert.deepEqual(next.dnsGuardOrder,['g2','g1']);assert.deepEqual(next.ipPools,[{id:'new-pool'}]);
+  Object.assign(view.state,next);view.render();assert.equal(view.buttons('启用域名来源').length,2);
+  const enabling=view.buttons('启用域名来源')[0].props.onClick();view.render();
+  assert.deepEqual(JSON.parse(calls[1].options.body),{enabled:true});
+  finish({guard:{...updated,sourcesEnabled:true}});await enabling;
+  Object.assign(view.state,view.updates.at(-1)(view.state));view.render();assert.equal(view.buttons('禁用域名来源').length,1);
+});
+
+test('source shortcut errors preserve the saved enabled state and allow retry', async () => {
+  const view=harness(async()=>{throw Error('正在确认远程写入');},undefined,'',
+    {dnsGuards:[{id:'g',name:'守护',sources:[],sourcesEnabled:true}]},'probes');
+  view.buttons('DNS 守护1')[0].props.onClick();view.render();
+  await view.buttons('禁用域名来源')[0].props.onClick();view.render();
+  assert.equal(view.messages.at(-1),'正在确认远程写入');assert.equal(view.updates.length,0);
+  assert.equal(view.buttons('禁用域名来源')[0].props.disabled,false);
+});
 
 test('every pool has an external call button including disabled and empty pools, opening the matching pool', () => {
   const view = harness(async () => {}, undefined, '', {ipPools:[

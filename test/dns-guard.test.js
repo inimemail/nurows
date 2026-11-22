@@ -461,6 +461,152 @@ function guardConfigSaver(deps) {
   };
 }
 
+function guardSourcesToggle(deps) {
+  const routes = new Map();
+  registerOrchestrationRoutes(Object.fromEntries(['get', 'post', 'put', 'delete'].map((method) => [method, (path, fn) => routes.set(`${method} ${path}`, fn)])),
+    { ...deps, sanitizeState: value => value });
+  return (enabled, id = 'guard-1') => {
+    let result, statusCode = 200;
+    routes.get('put /api/dns-guards/:id/sources-enabled')({params:{id},auth:{username:'test'},body:{enabled}},
+      {json(value){result=value;},status(code){statusCode=code;return this;}});
+    return { ...result, statusCode };
+  };
+}
+
+test('source master switch skips primary and backup DNS, preserves healthy source ownership and still removes failed IPs', async () => {
+  for (const recordType of ['A', 'AAAA']) {
+    const ips = recordType === 'A' ? ['198.51.100.10','198.51.100.11'] : ['2001:db8::10','2001:db8::11'];
+    const deps = sourceGuardFixture(ips, {recordType,sourceOwnedValues:[ips[1]],ownedValues:[ips[1]],
+      sourceState:{home:{primary:[ips[1]],healthyValues:[ips[1]],pending:true,lastError:'old failure'}}});
+    const toggle = guardSourcesToggle(deps), sources = structuredClone(deps.getState().dnsGuards[0].sources);
+    const response = toggle(false);
+    assert.equal(response.guard.sourcesEnabled,false);
+    assert.deepEqual(deps.getState().dnsGuards[0].sources,sources);
+    await nextSourceCycle(deps);
+    assert.deepEqual(deps.lookups,[]);assert.deepEqual(deps.getRemote(),ips);
+    assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues,[ips[1]]);
+    await nextSourceCycle(deps,address=>address===ips[1]);
+    assert.deepEqual(deps.getRemote(),[ips[1]]);assert.deepEqual(deps.lookups,[]);
+    assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues,[ips[1]]);
+    assert.equal(deps.getState().dnsGuards[0].sourceState.home.status,'disabled');
+    assert.deepEqual(deps.getState().dnsGuards[0].sourceErrors,[]);
+  }
+});
+
+test('source master switch keeps pool filling operational, survives restart, and re-enable restores source candidates', async () => {
+  const deps=sourceGuardFixture([],{sourcesEnabled:false,poolIds:['fill-pool'],poolFillMode:'fill',poolTargetCount:2,maxActiveIps:4});
+  addFillStock(deps,2);
+  const originalSources=structuredClone(deps.getState().dnsGuards[0].sources);
+  await nextSourceCycle(deps);
+  assert.equal(deps.getRemote().length,2);assert.deepEqual(deps.lookups,[]);
+  const reloaded=normalizeOrchestrationState(deps.getState());
+  assert.equal(reloaded.dnsGuards[0].sourcesEnabled,false);
+  assert.deepEqual(reloaded.dnsGuards[0].sources.map(({id,domain,backupDomain})=>({id,domain,backupDomain})),originalSources);
+  guardSourcesToggle(deps)(true);
+  await nextSourceCycle(deps);
+  assert.ok(deps.lookups.some(([domain])=>domain==='home.example.com'));
+  assert.ok(deps.getRemote().includes('203.0.113.20'));
+  assert.deepEqual(deps.getState().dnsGuards[0].sources,originalSources);
+});
+
+test('source master setting defaults on and editor saves preserve omitted settings without clearing source configuration', async () => {
+  assert.equal(normalizeOrchestrationState({dnsGuards:[{}]}).dnsGuards[0].sourcesEnabled,true);
+  const deps=sourceGuardFixture(),save=guardConfigSaver(deps),sources=structuredClone(deps.getState().dnsGuards[0].sources);
+  await save({sourcesEnabled:false});
+  assert.equal(deps.getState().dnsGuards[0].sourcesEnabled,false);
+  const routes=new Map();
+  registerOrchestrationRoutes(Object.fromEntries(['get','post','put','delete'].map(method=>[method,(path,fn)=>routes.set(`${method} ${path}`,fn)])),{...deps,sanitizeState:value=>value});
+  const body={...deps.getState().dnsGuards[0]};delete body.sourcesEnabled;
+  await routes.get('put /api/orchestration/:resource/:id')({params:{resource:'dns-guards',id:'guard-1'},auth:{username:'test'},body},
+    {json(){}},error=>{throw error;});
+  assert.equal(deps.getState().dnsGuards[0].sourcesEnabled,false);
+  await save({sourcesEnabled:true});assert.equal(deps.getState().dnsGuards[0].sourcesEnabled,true);
+  assert.deepEqual(deps.getState().dnsGuards[0].sources.map(item=>item.domain),sources.map(item=>item.domain));
+});
+
+test('source quick toggle validates input, is idempotent, scopes to one guard and never enables a disabled guard', () => {
+  const deps=sourceGuardFixture(undefined,{enabled:false}),toggle=guardSourcesToggle(deps);
+  deps.getState().dnsGuards.push({...structuredClone(deps.getState().dnsGuards[0]),id:'other',sourcesEnabled:true});
+  const before=structuredClone(deps.getState());
+  assert.equal(toggle('false').statusCode,400);assert.deepEqual(deps.getState(),before);
+  assert.throws(()=>toggle(false,'missing'),/不存在/);
+  toggle(false);assert.equal(deps.getState().dnsGuards[0].enabled,false);
+  assert.equal(deps.getState().dnsGuards[1].sourcesEnabled,true);
+  const logs=deps.getState().auditLogs.length;
+  toggle(false);assert.equal(deps.getState().auditLogs.length,logs);
+});
+
+test('turning sources off while source probes are in flight discards old candidates and keeps saved domains', async () => {
+  const deps=sourceGuardFixture([]);
+  await runDueDnsGuards(deps);
+  const oldCycle=deps.getState().dnsGuards[0].cycle;
+  assert.ok(oldCycle.checks.some(check=>check.address==='203.0.113.20'));
+  guardSourcesToggle(deps)(false);
+  assert.equal(deps.getState().dnsGuards[0].cycle,null);
+  for(const check of oldCycle.checks)check.observations['probe-1']={ok:true,attempts:1};
+  await processReadyDnsGuards(deps);
+  const lookupCount=deps.lookups.length;
+  await nextSourceCycle(deps);
+  assert.equal(deps.lookups.length,lookupCount);assert.deepEqual(deps.getRemote(),[]);
+  assert.equal(deps.getState().dnsGuards[0].sources.length,1);
+});
+
+test('rapid source off/on invalidates provider preparation even if the resulting settings match', async () => {
+  const deps=sourceGuardFixture();let resolveRead;
+  deps.readDnsRecord=()=>new Promise(resolve=>{resolveRead=resolve;});
+  const preparation=runDueDnsGuards(deps);
+  while(!resolveRead)await new Promise(resolve=>setImmediate(resolve));
+  const toggle=guardSourcesToggle(deps);toggle(false);toggle(true);
+  resolveRead({values:['198.51.100.10'],recordIds:['record-1']});
+  await preparation;
+  assert.equal(deps.getState().dnsGuards[0].cycle,null);assert.deepEqual(deps.lookups,[]);
+});
+
+test('late errors from canceled provider preparation cannot overwrite a newly toggled rule', async () => {
+  for (const failure of [new Error('old provider permission error'),Object.assign(new Error('old timeout'),{name:'TimeoutError'})]) {
+    const deps=sourceGuardFixture();let rejectRead;
+    deps.readDnsRecord=()=>new Promise((_resolve,reject)=>{rejectRead=reject;});
+    const preparation=runDueDnsGuards(deps);
+    while(!rejectRead)await new Promise(resolve=>setImmediate(resolve));
+    guardSourcesToggle(deps)(false);
+    const expected=structuredClone(deps.getState().dnsGuards[0]);
+    const logCount=deps.getState().auditLogs.length;
+    rejectRead(failure);await preparation;
+    assert.deepEqual(deps.getState().dnsGuards[0],expected);
+    assert.equal(deps.getState().auditLogs.length,logCount,'canceled work cannot publish stale errors or retries');
+  }
+});
+
+test('paused sources preserve healthy source IPs while automatic pool rebalance still completes', async () => {
+  const deps=autoBalanceFixture(4);
+  const guard=deps.getState().dnsGuards[0],sourceIp='198.51.100.99';
+  Object.assign(guard,{sourcesEnabled:false,sources:[{id:'home',domain:'home.example.com',backupDomain:'backup.example.com'}],
+    sourceOwnedValues:[sourceIp],currentValues:[...deps.getRemote(),sourceIp],ownedValues:[...deps.getRemote(),sourceIp],poolTargetCount:5});
+  // Supply the extra existing source IP as part of the remote provider state.
+  await deps.writeDnsRecord(null,null,null,null,guard.currentValues);
+  addFillStock(deps,2,1,'b');
+  await nextSourceCycle(deps);
+  assert.deepEqual(deps.lookups,[]);assert.ok(deps.getRemote().includes(sourceIp));
+  assert.deepEqual(deps.getState().dnsGuards[0].sourceOwnedValues,[sourceIp]);
+  assert.equal(deps.getState().ipPools.find(pool=>pool.id==='a').assetIds.length,2);
+  assert.equal(Object.values(deps.getState().dnsGuards[0].poolOrigins).filter(id=>id==='b').length,2);
+});
+
+test('source quick toggle cannot interrupt an in-flight DNS write or a pending rebalance confirmation', async () => {
+  const deps=sourceGuardFixture([]);
+  await runDueDnsGuards(deps);
+  const original=deps.writeDnsRecord;let entered,release;
+  const started=new Promise(resolve=>{entered=resolve;});
+  deps.writeDnsRecord=async(...args)=>{entered();await new Promise(resolve=>{release=resolve;});return original(...args);};
+  const completing=finishGuardChecks(deps);await started;
+  assert.throws(()=>guardSourcesToggle(deps)(false),error=>error.statusCode===409);
+  release();await completing;
+  const guard=deps.getState().dnsGuards[0];
+  guard.cycle={id:'pending',rebalanceCommit:{writeAttempted:true}};
+  assert.throws(()=>guardSourcesToggle(deps)(false),/正在确认自动均衡/);
+  assert.notEqual(guard.sourcesEnabled,false);
+});
+
 for (const phase of ['read', 'write']) test(`manual candidate deletion during provider ${phase} cannot race a DNS commit`, async () => {
   const deps = sourceGuardFixture(['198.51.100.10'], { sources: [], poolIds: ['fill-pool'], poolFillMode: 'fill', poolTargetCount: 2 });
   addFillStock(deps, 1);

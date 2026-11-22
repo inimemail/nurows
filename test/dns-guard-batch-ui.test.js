@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import {transformSync} from 'esbuild';
 import * as batch from '../shared/dns-guard-batch.js';
+import * as guardOrder from '../shared/dns-guard-order.js';
 const compiled=transformSync(fs.readFileSync(new URL('../src/DnsGuardBatchDialog.jsx',import.meta.url),'utf8'),{loader:'jsx',format:'cjs',jsx:'automatic'}).code;
 function harness(api){
   const slots=[],effects=[],copies=[],messages=[],polls=[];let cursor=0,tree,finished=0;
@@ -18,6 +19,7 @@ function harness(api){
     if(path==='react/jsx-runtime')return{jsx,jsxs:jsx};
     if(path==='lucide-react')return Object.fromEntries(['Search','Layers','LoaderCircle','Check','Copy','ArrowRight','SlidersHorizontal'].map(name=>[name,'svg']));
     if(path.endsWith('dns-guard-batch.js'))return batch;
+    if(path.endsWith('dns-guard-order.js'))return guardOrder;
     if(path.endsWith('note-clipboard.js'))return{copyNoteText:async text=>copies.push(text)};
     if(path.endsWith('polling.js'))return{startPolling(fn,interval,options){const poll={fn,interval,options,stopped:false};polls.push(poll);return()=>{poll.stopped=true;};}};
     throw Error(path);
@@ -101,4 +103,24 @@ test('expired jobs after a service restart release controls and allow a fresh pr
   assert.equal(view.field('批量操作内容').props.value,'192.0.2.2');
   assert.ok(view.text(view.nodes()).includes('批量任务不存在或已过期'));
   assert.equal(view.checks()[0].props.checked,true);
+});
+
+test('advanced rule order follows saved list sorting and later changes, preserving selections through search',async()=>{
+  const calls=[],view=harness(async(path,options)=>{calls.push({path,options});return preview();});
+  const names=()=>{
+    const list=view.nodes().find(node=>node.props?.className==='guard-batch-rule-list');
+    return view.nodes(list).filter(node=>node.type==='strong').map(node=>view.text(node));
+  };
+  view.props.state.dnsGuardOrder=['b','deleted','b','a'];view.render();
+  assert.deepEqual(names(),['Beta','Alpha']);
+  view.checks()[0].props.onChange();view.render();
+  view.props.state.dnsGuardOrder=['a','b'];view.render();
+  assert.deepEqual(names(),['Alpha','Beta']);
+  assert.equal(view.checks()[0].props.checked,false);assert.equal(view.checks()[1].props.checked,true);
+  view.set('搜索守护规则','Beta');assert.deepEqual(names(),['Beta']);
+  view.props.state.dnsGuardOrder=['b','a'];view.render();
+  view.set('搜索守护规则','');assert.deepEqual(names(),['Beta','Alpha']);
+  view.button('全选搜索结果').props.onClick();view.render();view.set('批量操作内容','192.0.2.2');
+  await view.button('预览更改').props.onClick();
+  assert.deepEqual(JSON.parse(calls[0].options.body).ids,['b','a']);
 });

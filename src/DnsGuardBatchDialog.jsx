@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Search, Layers, LoaderCircle, Check, Copy, ArrowRight, SlidersHorizontal } from 'lucide-react';
 import { DNS_GUARD_BATCH_ACTIONS, DNS_GUARD_BATCH_SETTINGS, dnsGuardBatchLabel } from '../shared/dns-guard-batch.js';
+import { dnsGuardOrder } from '../shared/dns-guard-order.js';
 import { startPolling } from '../shared/polling.js';
 import { copyNoteText } from './note-clipboard.js';
 
@@ -36,7 +37,10 @@ export default function DnsGuardBatchDialog({state,api,toast,Dialog,onClose,onFi
   const [job,setJob]=useState(null),[planKey,setPlanKey]=useState(''),[busy,setBusy]=useState(false),[error,setError]=useState('');
   const pending=useRef(false),mounted=useRef(true),completed=useRef('');
   useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;};},[]);
-  const guards=state.dnsGuards||[];
+  const guards=useMemo(()=>{
+    const records=state.dnsGuards||[],byId=new Map(records.map(guard=>[guard.id,guard]));
+    return dnsGuardOrder(records,state.dnsGuardOrder||[]).map(id=>byId.get(id));
+  },[state.dnsGuards,state.dnsGuardOrder]);
   const selectedSet=new Set(selected);
   const ids=guards.filter(guard=>selectedSet.has(guard.id)).map(guard=>guard.id);
   const visible=useMemo(()=>{

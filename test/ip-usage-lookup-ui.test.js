@@ -43,9 +43,9 @@ test('toolbar places batch lookup before history and creation, including an empt
   const section = view.exports.renderSection('guards', { state: {}, visibleRecords: [], search: 'no-match', openIpLookup: () => opened++ });
   const header = view.exports.DataView(section.props);
   const buttons = view.nodes(header).filter(node => node.type === 'button');
-  assert.deepEqual(buttons.map(node => view.text(node)), ['全部删除', '批量查 IP', '检查记录', '新增守护任务']);
+  assert.deepEqual(buttons.map(node => view.text(node)), ['全部删除', '高级操作', '批量查 IP', '检查记录', '新增守护任务']);
   assert.equal(buttons[0].props.disabled, true);
-  buttons[1].props.onClick();
+  buttons[2].props.onClick();
   assert.equal(opened, 1);
 });
 

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { dnsProviderRequest, dnsRequestFailure } from './dns-provider-request.js';
+import { registerDnsGuardBatchRoutes } from './dns-guard-batch.js';
 import { bulkDeleteIds, partitionDeletion } from './bulk-delete.js';
 import { poolExternalAccess, sanitizePoolExternalAccess, registerPoolExternalManagementRoutes, registerPoolExternalPublicRoutes } from './pool-external-api.js';
 import { dnsGuardOrder, moveDnsGuard } from '../shared/dns-guard-order.js';
@@ -491,6 +492,24 @@ export function registerProbePublicRoutes(app, deps) {
 
 export function registerOrchestrationRoutes(app, deps) {
   registerPoolExternalManagementRoutes(app, { ...deps, pushAudit });
+  registerDnsGuardBatchRoutes(app, {
+    ...deps, pushAudit,
+    normalizeGuard: (input, existing) => normalizeResource('dnsGuards', input, existing, deps),
+    validateGuard: (state, guard) => ensureResourceReferences(state, 'dnsGuards', guard, deps),
+    assertEditable: id => assertDnsGuardProviderIdle(id, deps, '正在写入远程 DNS，请确认完成后重试本规则'),
+    invalidate: id => dnsGuardPreparationVersions.set(id, (dnsGuardPreparationVersions.get(id) || 0) + 1),
+    readRemote: id => withDnsGuardProviderOperation(id, async () => {
+      const state = deps.readState();
+      const guard = state.dnsGuards.find(item => item.id === id);
+      if (!guard) throw new Error('DNS 守护任务不存在');
+      assertDnsGuardRebalanceConfirmed(guard);
+      const account = state.dnsAccounts.find(item => item.id === guard.accountId && item.enabled !== false);
+      if (!account) throw new Error('DNS 服务商账号不可用');
+      const resolved = await resolveDnsGuardRecord(state, guard, account, decryptCredentials(account, deps), deps, true);
+      return filterAddressFamily(resolved.remote.values, guard.recordType);
+    }, 30000),
+    writeRemote: (id, input, actor, assertCurrent) => writeDnsGuardRemoteValues(id, input, deps, actor, { waitMs: 30000, assertCurrent })
+  });
   app.put('/api/dns-guards/:id/sources-enabled', (req, res) => {
     if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ error: '请指定是否启用域名来源' });
     assertDnsGuardProviderIdle(req.params.id, deps, '正在读写远程 DNS，请稍后再切换域名来源');
@@ -1107,14 +1126,14 @@ async function syncDnsGuardRemoteLocked(guardId, deps, actor) {
   return { values, direction: 'remote_to_local', state: next };
 }
 
-export async function writeDnsGuardRemoteValues(guardId, input, deps, actor = 'system') {
+export async function writeDnsGuardRemoteValues(guardId, input, deps, actor = 'system', options = {}) {
   const current = deps.readState().dnsGuards.find((item) => item.id === guardId);
   if (!current) throw new Error('DNS 守护任务不存在');
   dnsGuardPreparationVersions.set(guardId, (dnsGuardPreparationVersions.get(guardId) || 0) + 1);
   return withDnsGuardProviderOperation(
     guardId,
-    () => writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor),
-    DNS_GUARD_MANUAL_OPERATION_WAIT_MS
+    () => writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor, options),
+    options.waitMs ?? DNS_GUARD_MANUAL_OPERATION_WAIT_MS
   );
 }
 
@@ -1140,10 +1159,11 @@ async function acquireDnsGuardProvider(guardId, waitMs) {
   dnsGuardProviderRuntime.add(guardId);
 }
 
-async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
+async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor, options = {}) {
   const state = deps.readState();
   const guard = state.dnsGuards.find((item) => item.id === guardId);
   if (!guard) throw new Error('DNS 守护任务不存在');
+  options.assertCurrent?.(guard);
   assertDnsGuardRebalanceConfirmed(guard);
   const values = normalizeGuardRemoteValues(input.values, guard.recordType);
   const expectedValues = Array.isArray(input.expectedValues) ? normalizeGuardRemoteValues(input.expectedValues, guard.recordType) : null;
@@ -1153,8 +1173,10 @@ async function writeDnsGuardRemoteValuesLocked(guardId, input, deps, actor) {
   const writeDnsRecord = deps.writeDnsRecord || updateDnsRecord;
   const readDnsRecord = deps.readDnsRecord || getDnsRecord;
   const { zone, normalizedBinding, remote } = await resolveDnsGuardRecord(state, guard, account, credentials, deps, true);
-  const beforeValues = filterAddressFamily(remote.values, guard.recordType).slice(0, DNS_GUARD_MAX_VALUES);
-  if (expectedValues && !sameStringSet(beforeValues, expectedValues)) {
+  options.assertCurrent?.(deps.readState(['dnsGuards']).dnsGuards.find(item => item.id === guardId));
+  const remoteValues = filterAddressFamily(remote.values, guard.recordType);
+  const beforeValues = remoteValues.slice(0, DNS_GUARD_MAX_VALUES);
+  if (expectedValues && !sameStringSet(remoteValues, expectedValues)) {
     const error = new Error('远程 IP 已发生变化，请重新读取后再保存');
     error.statusCode = 409;
     throw error;

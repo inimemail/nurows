@@ -30,6 +30,7 @@ function harness(api, assets, search = '', extra = {}, tab = 'pools') {
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     if (path.endsWith('GuardSortableList.jsx')) return { default: 'guard-sort', __esModule: true };
     if (path.endsWith('PoolExternalAccessDialog.jsx')) return { default: 'pool-external-dialog', __esModule: true };
+    if (path.endsWith('DnsGuardBatchDialog.jsx')) return { default: 'guard-batch-dialog', __esModule: true };
     if (path.endsWith('note-clipboard.js')) return { copyNoteText() {} };
     throw Error(path);
   } });

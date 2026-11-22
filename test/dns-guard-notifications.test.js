@@ -129,6 +129,7 @@ test('guard editor exposes default-empty bot selection and serializes changes wi
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     if (path.endsWith('GuardSortableList.jsx')) return { default: 'guard-sort', __esModule: true };
     if (path.endsWith('PoolExternalAccessDialog.jsx')) return { default: 'pool-external-dialog', __esModule: true };
+    if (path.endsWith('DnsGuardBatchDialog.jsx')) return { default: 'guard-batch-dialog', __esModule: true };
     throw Error(path);
   } });
   let draft = module.exports.normalizeDraft('guard', { probeIds: ['probe'], poolIds: ['pool'] });

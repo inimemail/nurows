@@ -24,6 +24,7 @@ function harness() {
     if (path.endsWith('DynamicGuardWorkspace.jsx')) return { default: 'dynamic', __esModule: true };
     if (path.endsWith('GuardSortableList.jsx')) return { default: 'guard-sort', __esModule: true };
     if (path.endsWith('PoolExternalAccessDialog.jsx')) return { default: 'pool-external-dialog', __esModule: true };
+    if (path.endsWith('DnsGuardBatchDialog.jsx')) return { default: 'guard-batch-dialog', __esModule: true };
     throw new Error(path);
   } });
   return module.exports;

@@ -35,11 +35,17 @@ const EMPTY = {
   ,bot: { name: '', token: '', enabled: true, userIds: '', rolesText: '', automationTaskIds: [], automationTaskCatalog: [], menuScopeVersion: 2, menuScopes: [], menuScopeCatalog: [] }
 };
 
-export default function OrchestrationWorkspace({ tab, state, stateReady = true, dynamicGuardCache, search = '', onSearchChange, onSearchScopeChange, api: requestApi, onState: publishState, toast, Dialog, onHistoryCleanup, onOpenHistory, historyRevision, historyClearing }) {
-  const [section, setSection] = useState(() => {
+export default function OrchestrationWorkspace({ tab, state, stateReady = true, dynamicGuardCache, search = '', onSearchChange, onSearchScopeChange, initialSection, onSectionChange, api: requestApi, onState: publishState, toast, Dialog, onHistoryCleanup, onOpenHistory, historyRevision, historyClearing }) {
+  const [sectionsByTab, setSectionsByTab] = useState(() => {
     const link = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('tgSection') : '';
-    return ({ probes: 'nodes', targets: 'targets', policies: 'policies', guards: 'guards', dynamic: 'dynamic', incidents: 'incidents', assets: 'assets', pools: 'pools', usage: 'usage', dns: 'bindings' })[link] || (tab === 'probes' ? 'nodes' : tab === 'pools' ? 'assets' : 'accounts');
+    const linked = ({ probes: 'nodes', targets: 'targets', policies: 'policies', guards: 'guards', dynamic: 'dynamic', incidents: 'incidents', assets: 'assets', pools: 'pools', usage: 'usage', dns: 'bindings' })[link];
+    return linked ? { [tab]: linked } : {};
   });
+  const section = sectionsByTab[tab] || initialSection;
+  const setSection = (next) => {
+    setSectionsByTab(current => ({ ...current, [tab]: next }));
+    onSectionChange?.(next);
+  };
   const [editor, setEditor] = useState({ open: false, type: '', value: null });
   const [editorBusy, setEditorBusy] = useState(false);
   const probeDeletingRef = useRef(new Set());
@@ -108,7 +114,7 @@ export default function OrchestrationWorkspace({ tab, state, stateReady = true, 
   const poolCheckActive = tab === 'pools' && state.ipPools?.some(pool => pool.healthCheck?.status === 'running');
 
   useEffect(() => {
-    if (historyClearing || active === 'dynamic') return;
+    if (!stateReady || historyClearing || active === 'dynamic') return;
     let cancelled = false;
     const stop = startPolling(async (signal) => {
       if (bulkDeletingRef.current) return;
@@ -117,10 +123,10 @@ export default function OrchestrationWorkspace({ tab, state, stateReady = true, 
       const data = await api(`/api/orchestration/status/${active}`, { signal });
       if (bulkDeletingRef.current || mutationVersion !== bulkMutationVersion.current) return;
       if (guardOrderChange.current.saving || orderVersion !== guardOrderChange.current.version) delete data.dnsGuardOrder;
-      if (!cancelled) onState((current) => ({ ...current, ...data }));
+      if (!cancelled && !signal?.aborted) onState((current) => ({ ...current, ...data }));
     }, guardCheckActive || poolCheckActive ? 5000 : 10000);
     return () => { cancelled = true; stop(); };
-  }, [api, onState, active, guardCheckActive, poolCheckActive, historyRevision, historyClearing]);
+  }, [api, onState, stateReady, active, guardCheckActive, poolCheckActive, historyRevision, historyClearing]);
 
   useEffect(() => {
     if (!stateReady || !Array.isArray(state.probes)) return;

@@ -1339,7 +1339,7 @@ function resumePendingIncidents() {
 function handleTerminalConnection(ws, req, url) {
   const serverId = url.searchParams.get('serverId') || '';
   const terminalId = sanitizeTerminalRuntimeId(url.searchParams.get('terminalId') || serverId);
-  const state = readState();
+  const state = readState(['servers', 'proxies']);
   const session = getSessionFromRequest(req);
   const serverItem = state.servers.find((item) => item.id === serverId);
 
@@ -1375,7 +1375,7 @@ function handleTerminalConnection(ws, req, url) {
       proxy,
       proxyPassword
     });
-    terminalSessions.set(terminalId, runtime);
+    if (!runtime.closed) terminalSessions.set(terminalId, runtime);
   }
 
   attachTerminalClient(runtime, ws);
@@ -1411,18 +1411,20 @@ function createTerminalRuntime({ id, serverId, serverItem, serverPassword, proxy
     closeTerminalRuntime(runtime, false);
   };
 
-  const connectOptions = buildConnectOptions(serverItem, serverPassword);
+  const connectOptions = { ...buildConnectOptions(serverItem, serverPassword), readyTimeout: 60_000 };
   const connect = (socket) => {
-    ssh.connect(socket ? { ...connectOptions, sock: socket } : connectOptions);
+    if (runtime.closed) {
+      socket?.destroy();
+      return;
+    }
+    try {
+      ssh.connect(socket ? { ...connectOptions, sock: socket } : connectOptions);
+      ssh.setNoDelay(true);
+    } catch (error) {
+      socket?.destroy();
+      markClosed(error.message || 'SSH 连接失败');
+    }
   };
-
-  if (proxy) {
-    createProxySocket({ ...proxy, password: proxyPassword }, serverItem.host, serverItem.port)
-      .then((socket) => connect(socket))
-      .catch((error) => markClosed(`代理连接失败: ${error.message}`));
-  } else {
-    connect(null);
-  }
 
   ssh.on('ready', () => {
     ssh.shell(
@@ -1432,6 +1434,10 @@ function createTerminalRuntime({ id, serverId, serverItem, serverPassword, proxy
         term: 'xterm-256color'
       },
       (error, stream) => {
+        if (runtime.closed) {
+          stream?.end();
+          return;
+        }
         if (error) {
           markClosed(error.message || '终端打开失败');
           return;
@@ -1456,12 +1462,26 @@ function createTerminalRuntime({ id, serverId, serverItem, serverPassword, proxy
   });
 
   ssh.on('error', (error) => {
-    markClosed(error.message || 'SSH 连接失败');
+    if (error.level === 'client-authentication') {
+      markClosed('SSH 认证失败，请核对该服务器在面板中保存的用户名和密码，以及服务器是否允许密码登录');
+    } else if (error.level === 'client-timeout') {
+      markClosed(`SSH 握手超时（${connectOptions.readyTimeout / 1000} 秒），请检查端口、网络和代理`);
+    } else {
+      markClosed(error.message || 'SSH 连接失败');
+    }
   });
 
   ssh.on('close', () => {
     markClosed();
   });
+
+  if (proxy) {
+    createProxySocket({ ...proxy, password: proxyPassword }, serverItem.host, serverItem.port)
+      .then(connect)
+      .catch((error) => markClosed(`代理连接失败: ${error.message}`));
+  } else {
+    connect(null);
+  }
 
   return runtime;
 }
@@ -1531,7 +1551,7 @@ function closeTerminalRuntime(runtime, notifyClients) {
   } catch (_error) {
     // Ignore best-effort cleanup failures.
   }
-  terminalSessions.delete(runtime.id);
+  if (terminalSessions.get(runtime.id) === runtime) terminalSessions.delete(runtime.id);
 
   if (notifyClients) {
     broadcastTerminalSession(runtime, { type: 'closed' });

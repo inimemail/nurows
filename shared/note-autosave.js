@@ -7,7 +7,15 @@ export function createNoteAutosave({ save, onChange = () => {} }) {
     timer = null,
     maxTimer = null,
     error = null,
-    closed = false;
+    closed = false,
+    readBody = null;
+  function materialize() {
+    if (readBody) {
+      current = { ...current, body: readBody() };
+      readBody = null;
+    }
+    return current;
+  }
   const notify = () => {
     if (!closed)
       onChange({
@@ -27,7 +35,7 @@ export function createNoteAutosave({ save, onChange = () => {} }) {
     if (running)
       return running.then(() => (edit !== saved ? flush() : current));
     if (!current || edit === saved) return Promise.resolve(current);
-    const sent = structuredClone(current),
+    const sent = structuredClone(materialize()),
       version = edit;
     error = null;
     running = Promise.resolve()
@@ -59,8 +67,10 @@ export function createNoteAutosave({ save, onChange = () => {} }) {
       error = null;
       notify();
     },
-    update(patch) {
-      current = { ...current, ...patch };
+    update(patch, pendingBody) {
+      if (Object.keys(patch).length) current = { ...current, ...patch };
+      if (pendingBody) readBody = pendingBody;
+      else if (Object.hasOwn(patch, "body")) readBody = null;
       edit++;
       error = null;
       notify();
@@ -70,12 +80,13 @@ export function createNoteAutosave({ save, onChange = () => {} }) {
         maxTimer = setTimeout(() => flush().catch(() => {}), 10000);
     },
     flush,
-    get: () => current,
+    get: materialize,
     discard() {
       if (running) throw new Error("保存正在执行");
       clear();
       saved = edit;
       error = null;
+      readBody = null;
     },
     resume() {
       closed = false;

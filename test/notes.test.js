@@ -181,6 +181,37 @@ test("an empty title response does not replace the user's in-progress title with
   assert.equal(manager.get().title, "继续输入");
   manager.dispose();
 });
+test("autosave reads only the latest pending body and keeps it through title edits and save responses", async () => {
+  const requests = [];
+  let reads = 0, finish;
+  const manager = createNoteAutosave({
+    save: async doc => {
+      requests.push(doc);
+      if (requests.length === 1) await new Promise(resolve => { finish = resolve; });
+      return { ...doc, revision: doc.revision + 1 };
+    },
+  });
+  const body = text => () => { reads++; return text; };
+  manager.open({ id: "a", title: "Title", body: "", revision: 1 });
+  manager.update({}, body("superseded"));
+  manager.update({}, body("first"));
+  assert.equal(reads, 0);
+  const saving = manager.flush();
+  await Promise.resolve();
+  manager.update({}, body("second"));
+  manager.update({ title: "Updated title" });
+  assert.equal(reads, 1);
+  finish();
+  await saving;
+  assert.equal(reads, 2);
+  assert.deepEqual(requests.map(({ body, title, revision }) => [body, title, revision]), [
+    ["first", "Title", 1],
+    ["second", "Updated title", 2],
+  ]);
+  assert.equal(manager.get().body, "second");
+  assert.equal(manager.dirty(), false);
+  manager.dispose();
+});
 test("failed saves retain text and block switching until saved or explicitly discarded", async () => {
   const manager = createNoteAutosave({
     save: async () => {

@@ -22,7 +22,8 @@ export default function NoteTree({
   onCreate,
   onPlace,
   onDelete,
-  collapseKey = 0,
+  branches,
+  onBranchChange,
   depth = 0,
 }) {
   return (
@@ -43,7 +44,8 @@ export default function NoteTree({
             onCreate,
             onPlace,
             onDelete,
-            collapseKey,
+            branches,
+            onBranchChange,
             depth,
           }}
         />
@@ -65,18 +67,16 @@ function NoteTreeItem(props) {
     onCreate,
     onPlace,
     onDelete,
-    collapseKey,
+    branches,
+    onBranchChange,
     depth,
   } = props;
-  const [expanded, setExpanded] = useState(false);
-  const [page, setPage] = useState(1);
+  const expanded = Object.hasOwn(branches, item.id);
+  const page = branches[item.id] || 1;
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [retry, setRetry] = useState(0);
-  useEffect(() => {
-    setExpanded(false);
-  }, [collapseKey]);
   useEffect(() => {
     if (!expanded) return;
     const controller = new AbortController();
@@ -91,7 +91,9 @@ function NoteTreeItem(props) {
     });
     api(`/api/notes/documents?${query}`, { signal: controller.signal })
       .then((result) => {
-        if (alive) setData(result);
+        if (!alive) return;
+        if (result.page > result.pages) onBranchChange(item.id, result.pages);
+        else setData(result);
       })
       .catch((e) => {
         if (alive && e.name !== "AbortError") setError(e.message);
@@ -138,7 +140,7 @@ function NoteTreeItem(props) {
             className="note-tree-toggle"
             aria-expanded={expanded}
             aria-label={`${expanded ? "收起" : "展开"}子文档：${title}`}
-            onClick={() => setExpanded((value) => !value)}
+            onClick={() => onBranchChange(item.id, expanded ? 0 : 1)}
           >
             <ChevronRight />
           </button>
@@ -173,7 +175,7 @@ function NoteTreeItem(props) {
             <button
               disabled={busy || depth >= 11}
               onClick={() => {
-                setExpanded(true);
+                if (!expanded) onBranchChange(item.id, 1);
                 onCreate(item);
               }}
             >
@@ -232,7 +234,7 @@ function NoteTreeItem(props) {
                 <div className="notes-pagination">
                   <button
                     disabled={page === 1}
-                    onClick={() => setPage((n) => n - 1)}
+                    onClick={() => onBranchChange(item.id, page - 1)}
                   >
                     上一页
                   </button>
@@ -241,7 +243,7 @@ function NoteTreeItem(props) {
                   </span>
                   <button
                     disabled={page >= data.pages}
-                    onClick={() => setPage((n) => n + 1)}
+                    onClick={() => onBranchChange(item.id, page + 1)}
                   >
                     下一页
                   </button>

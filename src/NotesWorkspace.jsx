@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   BookOpen,
   FileText,
@@ -31,13 +31,18 @@ import {
   ChevronsDownUp,
 } from "lucide-react";
 import { createNoteAutosave } from "../shared/note-autosave.js";
-import NoteEditor from "./NoteEditor.jsx";
 import NoteTree from "./NoteTree.jsx";
 import NoteOutline from "./NoteOutline.jsx";
-import { collectNoteHeadings, setHeadingSectionCollapsed } from "./note-details.js";
+import { collectNoteHeadings, setHeadingSectionCollapsed } from "./note-headings.js";
 import { copyNoteText } from "./note-clipboard.js";
 import Dialog from "./Dialog.jsx";
+import { readWorkspaceLocation, saveWorkspaceLocation } from "./workspace-location.js";
 import "./notes.css";
+
+const loadNoteEditor = () => import("./NoteEditor.jsx");
+const NoteEditor = lazy(loadNoteEditor);
+const noteId = (value) => typeof value === "string" && /^[a-f0-9-]{36}$/.test(value);
+const noteLink = () => new URLSearchParams(window.location.hash.slice(1)).get("note");
 
 const time = (value) =>
   new Date(value).toLocaleString("zh-CN", {
@@ -91,18 +96,26 @@ export default function NotesWorkspace({
   search = "",
   onSearchScopeChange,
   onBeforeLeave,
+  username,
 }) {
+  const [resume] = useState(() => readWorkspaceLocation(username, "notes") || {});
+  const [initialDocument] = useState(() => {
+    const linked = noteLink();
+    return noteId(linked) ? linked : noteId(resume.id) ? resume.id : "";
+  });
   const [books, setBooks] = useState([]),
-    [book, setBook] = useState(""),
-    [view, setView] = useState("all"),
-    [parents, setParents] = useState([]);
+    [book, setBook] = useState(noteId(resume.book) ? resume.book : ""),
+    [view, setView] = useState(["all", "favorites", "recent", "trash"].includes(resume.view) ? resume.view : "all"),
+    [parents, setParents] = useState(() => Array.isArray(resume.parents)
+      ? resume.parents.filter(item => noteId(item?.id) && typeof item.title === "string").slice(0, 50)
+      : []);
   const [listing, setListing] = useState({
       documents: [],
       page: 1,
       pages: 1,
       total: 0,
     }),
-    [page, setPage] = useState(1),
+    [page, setPage] = useState(Number.isSafeInteger(resume.page) && resume.page > 0 ? resume.page : 1),
     [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(true),
     [error, setError] = useState(""),
@@ -118,10 +131,48 @@ export default function NotesWorkspace({
     [version, setVersion] = useState(null),
     [attachments, setAttachments] = useState([]);
   const [tagText, setTagText] = useState("");
-  const [fullscreen, setFullscreen] = useState(false);
-  const [sidebarHidden, setSidebarHidden] = useState(false);
-  const [collapseKey, setCollapseKey] = useState(0);
+  const [fullscreen, setFullscreen] = useState(resume.fullscreen === true);
+  const [sidebarHidden, setSidebarHidden] = useState(resume.sidebarHidden === true);
+  const [branches, setBranches] = useState(() => Object.fromEntries(
+    Object.entries(resume.branches || {})
+      .filter(([id, value]) => noteId(id) && Number.isSafeInteger(value) && value > 0)
+      .slice(-30),
+  ));
   const workspace = useRef(null);
+  const writingScroll = useRef(null);
+  const [opening, setOpening] = useState(Boolean(initialDocument));
+  const notePosition = useRef(resume);
+  const readyDocument = useRef("");
+  const scrollCleanup = useRef(null);
+  const failedDocument = useRef("");
+  function persistLocation() {
+    saveWorkspaceLocation(username, "notes", notePosition.current);
+  }
+  function scrollTarget() {
+    const element = writingScroll.current;
+    if (!element) return null;
+    return getComputedStyle(element).overflowY === "visible" ? document.scrollingElement : element;
+  }
+  useEffect(() => {
+    notePosition.current = {
+      ...notePosition.current, book, view, parents, page, fullscreen, sidebarHidden,
+      branches: Object.fromEntries(Object.entries(branches).slice(-30)),
+    };
+    persistLocation();
+  }, [username, book, view, parents, page, fullscreen, sidebarHidden, branches]);
+  useLayoutEffect(() => {
+    const rebind = () => {
+      const id = readyDocument.current;
+      if (!id || !editor.current) return;
+      scrollCleanup.current?.(false);
+      readyDocument.current = "";
+      editorReady(editor.current, id);
+    };
+    rebind();
+    const mobile = matchMedia("(max-width: 760px)");
+    mobile.addEventListener("change", rebind);
+    return () => mobile.removeEventListener("change", rebind);
+  }, [fullscreen]);
   useEffect(() => {
     if (!fullscreen) return;
     const previous = document.body.style.overflow;
@@ -167,36 +218,38 @@ export default function NotesWorkspace({
         if (state.document) {
           if (state.dirty)
             draftTimer.current = setTimeout(
-              () => rememberDraft(state.document),
+              () => rememberDraft(managerRef.current.get()),
               400,
             );
           else clearDraft(state.document.id);
         }
         if (mounted.current) {
-          setSaveState(state);
+          setSaveState((prior) => prior.dirty === state.dirty &&
+            prior.saving === state.saving && prior.error === state.error ? prior : state);
           setDoc(state.document);
           if (state.document && !state.dirty)
-            setListing((prior) => ({
-              ...prior,
-              documents: prior.documents.map((item) =>
-                item.id === state.document.id
-                  ? {
-                      ...item,
-                      title: state.document.title || "未命名文档",
-                      favorite: state.document.favorite,
-                      updatedAt: state.document.updatedAt,
-                    }
-                  : item,
-              ),
-            }));
+            setListing((prior) => {
+              const item = prior.documents.find(item => item.id === state.document.id);
+              const title = state.document.title || "未命名文档";
+              if (!item || (item.title === title && item.favorite === state.document.favorite && item.updatedAt === state.document.updatedAt)) return prior;
+              return { ...prior, documents: prior.documents.map(note => note === item
+                ? { ...item, title, favorite: state.document.favorite, updatedAt: state.document.updatedAt }
+                : note) };
+            });
         }
       },
     });
   const manager = managerRef.current;
-  async function reloadBooks() {
-    const data = await api("/api/notes");
-    if (mounted.current) {
+  async function reloadBooks(signal) {
+    const data = await api("/api/notes", { signal });
+    if (mounted.current && !signal?.aborted) {
       setBooks(data.notebooks);
+      const currentBookId = notePosition.current.book;
+      if (currentBookId && !data.notebooks.some(b => b.id === currentBookId)) {
+        setParents([]);
+        setPage(1);
+        setBranches({});
+      }
       setBook((prior) =>
         data.notebooks.some((b) => b.id === prior)
           ? prior
@@ -205,9 +258,11 @@ export default function NotesWorkspace({
     }
   }
   useEffect(() => {
+    const controller = new AbortController();
     mounted.current = true;
     manager.resume();
-    reloadBooks().catch((e) => {
+    reloadBooks(controller.signal).catch((e) => {
+      if (controller.signal.aborted) return;
       setError(e.message);
       setLoading(false);
     });
@@ -225,14 +280,18 @@ export default function NotesWorkspace({
     window.addEventListener("beforeunload", unload);
     document.addEventListener("visibilitychange", hidden);
     const hash = () => {
-      const id = new URLSearchParams(location.hash.slice(1)).get("note");
-      if (/^[a-f0-9-]{36}$/.test(id || "")) open(id);
+      const id = noteLink();
+      if (noteId(id) && manager.get()?.id !== id) open(id);
     };
-    const initialHash = setTimeout(hash, 0);
+    // Start the document and notebook requests together on a returning visit.
+    const restore = setTimeout(() => {
+      if (initialDocument) open(initialDocument, true, controller.signal);
+    }, 0);
     window.addEventListener("hashchange", hash);
     onBeforeLeave?.(async () => {
       try {
         await manager.flush();
+        scrollCleanup.current?.();
         return true;
       } catch (e) {
         toast(e.message);
@@ -241,6 +300,7 @@ export default function NotesWorkspace({
     });
     return () => {
       mounted.current = false;
+      controller.abort();
       requestEpoch.current++;
       clearTimeout(draftTimer.current);
       if (manager.dirty()) rememberDraft(manager.get());
@@ -248,15 +308,22 @@ export default function NotesWorkspace({
       window.removeEventListener("beforeunload", unload);
       document.removeEventListener("visibilitychange", hidden);
       window.removeEventListener("hashchange", hash);
-      clearTimeout(initialHash);
+      clearTimeout(restore);
+      scrollCleanup.current?.(false);
       onBeforeLeave?.(null);
     };
   }, []);
+  const previousSearch = useRef(search);
+  const searchChanged = search !== previousSearch.current;
   useEffect(() => {
-    setPage(1);
-  }, [book, view, search, parents]);
+    if (searchChanged) {
+      previousSearch.current = search;
+      setPage(1);
+    }
+  }, [search, searchChanged]);
   useEffect(() => {
     if (!book) return;
+    if (searchChanged && page !== 1) return;
     const controller = new AbortController();
     let active = true;
     const timer = setTimeout(
@@ -274,6 +341,10 @@ export default function NotesWorkspace({
             signal: controller.signal,
           });
           if (active) {
+            if (result.page > result.pages) {
+              setPage(result.pages);
+              return;
+            }
             setListing(result);
             setError("");
           }
@@ -309,7 +380,30 @@ export default function NotesWorkspace({
     setRevision((n) => n + 1);
     reloadBooks().catch(() => {});
   }
+  function changeBranch(id, nextPage) {
+    setBranches(prior => {
+      const next = { ...prior };
+      delete next[id];
+      if (nextPage) next[id] = nextPage;
+      return next;
+    });
+  }
+  function clearNoteLink() {
+    if (noteLink()) {
+      const url = new URL(window.location.href);
+      url.hash = "";
+      window.history.replaceState(window.history.state, "", url);
+    }
+  }
   function accept(value) {
+    if (notePosition.current.id !== value.id) {
+      notePosition.current = { ...notePosition.current, id: value.id, scrollTop: 0 };
+    }
+    if (noteLink() !== value.id) clearNoteLink();
+    persistLocation();
+    scrollCleanup.current?.();
+    editor.current = null;
+    readyDocument.current = "";
     manager.open(value);
     setTagText(value.tags.join("、"));
     setEditorEpoch((n) => n + 1);
@@ -317,24 +411,105 @@ export default function NotesWorkspace({
     setAttachments([]);
     setDrawer(false);
   }
-  async function open(id) {
+  function editorReady(instance, id) {
+    editor.current = instance;
+    if (readyDocument.current === id) return;
+    readyDocument.current = id;
+    const target = scrollTarget();
+    if (!target) return;
+    const element = writingScroll.current;
+    const pageScroll = target === document.scrollingElement;
+    const events = pageScroll ? window : target;
+    const origin = () => pageScroll ? element.getBoundingClientRect().top + target.scrollTop : 0;
+    const relativeTop = Number(notePosition.current.scrollTop) || 0;
+    let restoring = true;
+    let timer, frame, observer, deadline;
+    const stopRestoring = () => {
+      restoring = false;
+      observer?.disconnect();
+      cancelAnimationFrame(frame);
+      clearTimeout(deadline);
+    };
+    const restore = () => {
+      const desired = relativeTop ? Math.max(0, origin() + relativeTop) : 0;
+      target.scrollTop = desired;
+      if (Math.abs(target.scrollTop - desired) < 2) stopRestoring();
+    };
+    const save = () => {
+      if (!restoring && notePosition.current.id === id) {
+        const scrollTop = target.scrollTop ? target.scrollTop - origin() : 0;
+        notePosition.current = { ...notePosition.current, scrollTop };
+        persistLocation();
+      }
+    };
+    const scheduleSave = () => {
+      if (restoring || timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        save();
+      }, 200);
+    };
+    // Images can expand the document after the editor has mounted.
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(restore);
+      observer.observe(instance.view.dom);
+    }
+    frame = requestAnimationFrame(restore);
+    deadline = setTimeout(stopRestoring, 5000);
+    events.addEventListener("scroll", scheduleSave, { passive: true });
+    window.addEventListener("pagehide", save);
+    const interrupt = () => { if (restoring) stopRestoring(); };
+    element.addEventListener("pointerdown", interrupt);
+    element.addEventListener("wheel", interrupt, { passive: true });
+    scrollCleanup.current = (capture = true) => {
+      if (capture) save();
+      stopRestoring();
+      clearTimeout(timer);
+      events.removeEventListener("scroll", scheduleSave);
+      window.removeEventListener("pagehide", save);
+      element.removeEventListener("pointerdown", interrupt);
+      element.removeEventListener("wheel", interrupt);
+      scrollCleanup.current = null;
+    };
+  }
+  async function open(id, restoring = false, signal) {
     await act(async () => {
-      await manager.flush();
-      const epoch = ++requestEpoch.current;
-      const result = await api(`/api/notes/documents/${id}`);
-      if (epoch !== requestEpoch.current || !mounted.current) return;
-      let recovery;
+      failedDocument.current = "";
+      if (manager.get()?.id === id) { setDrawer(false); return; }
+      setOpening(true);
+      loadNoteEditor().catch(() => {});
       try {
-        recovery = JSON.parse(sessionStorage.getItem(draftKey(id)) || "null");
-      } catch {}
-      accept(result.document);
-      if (
-        recovery &&
-        (recovery.body !== result.document.body ||
-          recovery.title !== result.document.title)
-      ) {
-        rememberDraft(recovery);
-        setDialog({ type: "recovery", draft: recovery });
+        if (manager.dirty()) await manager.flush();
+        const epoch = ++requestEpoch.current;
+        const result = await api(`/api/notes/documents/${id}`, { signal });
+        if (signal?.aborted || epoch !== requestEpoch.current || !mounted.current) return;
+        let recovery;
+        try {
+          recovery = JSON.parse(sessionStorage.getItem(draftKey(id)) || "null");
+        } catch {}
+        accept(result.document);
+        if (
+          recovery &&
+          (recovery.body !== result.document.body ||
+            recovery.title !== result.document.title)
+        ) {
+          rememberDraft(recovery);
+          setDialog({ type: "recovery", draft: recovery });
+        }
+      } catch (error) {
+        if (signal?.aborted) return;
+        if (error.status === 404) {
+          if (notePosition.current.id === id) {
+            notePosition.current = { ...notePosition.current, id: "", scrollTop: 0 };
+            persistLocation();
+          }
+          if (noteLink() === id) clearNoteLink();
+        } else if (restoring) {
+          failedDocument.current = id;
+        }
+        throw error;
+      } finally {
+        if (mounted.current && !signal?.aborted) setOpening(false);
       }
     });
   }
@@ -398,6 +573,7 @@ export default function NotesWorkspace({
         await reloadBooks();
         setBook(result.id);
         setParents([]);
+        setPage(1);
       }
       if (dialog.type === "link") {
         const href = String(data.get("url")).trim();
@@ -619,6 +795,7 @@ export default function NotesWorkspace({
             onClick={() => {
               setError("");
               refresh();
+              if (failedDocument.current) open(failedDocument.current, true);
             }}
           >
             重试读取
@@ -646,7 +823,9 @@ export default function NotesWorkspace({
               onChange={(e) => {
                 setBook(e.target.value);
                 setParents([]);
+                setBranches({});
                 setView("all");
+                setPage(1);
               }}
             >
               {books.map((b) => (
@@ -680,6 +859,7 @@ export default function NotesWorkspace({
                 onClick={() => {
                   setView(key);
                   setParents([]);
+                  setPage(1);
                 }}
               >
                 <Icon />
@@ -699,7 +879,7 @@ export default function NotesWorkspace({
                 className="icon-button"
                 title="收起所有子文档"
                 aria-label="收起所有子文档"
-                onClick={() => setCollapseKey((n) => n + 1)}
+                onClick={() => setBranches({})}
               >
                 <ChevronsDownUp />
               </button>
@@ -708,7 +888,7 @@ export default function NotesWorkspace({
           {parents.length ? (
             <button
               className="notes-back"
-              onClick={() => setParents((p) => p.slice(0, -1))}
+              onClick={() => { setParents((p) => p.slice(0, -1)); setPage(1); }}
             >
               <ChevronLeft />
               返回上级目录
@@ -730,7 +910,8 @@ export default function NotesWorkspace({
                 onCreate={(item) => create("blank", { parentId: item.id })}
                 onPlace={place}
                 onDelete={(item) => setDialog({ type: "delete", item })}
-                collapseKey={collapseKey}
+                branches={branches}
+                onBranchChange={changeBranch}
               />
             ) : (
               listing.documents.map((item) => (
@@ -776,13 +957,11 @@ export default function NotesWorkspace({
                         ? setDialog({ type: "trash", item })
                         : open(item.id)
                     }
-                    onDoubleClick={() =>
-                      view !== "trash" &&
-                      setParents((p) => [
-                        ...p,
-                        { id: item.id, title: item.title },
-                      ])
-                    }
+                    onDoubleClick={() => {
+                      if (view === "trash") return;
+                      setParents(p => [...p, { id: item.id, title: item.title }]);
+                      setPage(1);
+                    }}
                   >
                     <FileText />
                     <span>
@@ -802,12 +981,10 @@ export default function NotesWorkspace({
                         className="note-row-tool"
                         title="打开子文档目录"
                         aria-label={`${item.title} 的子文档`}
-                        onClick={() =>
-                          setParents((p) => [
-                            ...p,
-                            { id: item.id, title: item.title },
-                          ])
-                        }
+                        onClick={() => {
+                          setParents(p => [...p, { id: item.id, title: item.title }]);
+                          setPage(1);
+                        }}
                       >
                         <ChevronRight />
                       </button>
@@ -1116,7 +1293,7 @@ export default function NotesWorkspace({
           ) : null}
           {doc ? (
             <div className="note-writing-layout">
-              <div className="note-writing-scroll">
+              <div className="note-writing-scroll" ref={writingScroll}>
                 <input
                   className="notes-title"
                   aria-label="文档标题"
@@ -1143,18 +1320,20 @@ export default function NotesWorkspace({
                     }}
                   />
                 </div>
-                <NoteEditor
-                  key={`${doc.id}:${editorEpoch}`}
-                  document={doc}
-                  toast={toast}
-                  disabled={busy}
-                  saved={!saveState.dirty}
-                  onChange={(body) => patch({ body })}
-                  onReady={(value) => (editor.current = value)}
-                  onOutline={setOutline}
-                  onLink={() => setDialog({ type: "link" })}
-                  onUpload={upload}
-                />
+                <Suspense fallback={<p className="notes-list-empty" role="status">正在加载编辑器…</p>}>
+                  <NoteEditor
+                    key={`${doc.id}:${editorEpoch}`}
+                    document={doc}
+                    toast={toast}
+                    disabled={busy}
+                    saved={!saveState.dirty}
+                    onChange={(readBody) => manager.update({}, readBody)}
+                    onReady={(instance) => editorReady(instance, doc.id)}
+                    onOutline={outlineOpen ? setOutline : null}
+                    onLink={() => setDialog({ type: "link" })}
+                    onUpload={upload}
+                  />
+                </Suspense>
                 <div className="notes-editor-foot">
                   <span>
                     修订 {doc.revision} ·{" "}
@@ -1214,6 +1393,8 @@ export default function NotesWorkspace({
                 />
               ) : null}
             </div>
+          ) : opening ? (
+            <p className="notes-list-empty" role="status">正在打开上次的文档…</p>
           ) : (
             <div className="notes-empty">
               <span className="notes-empty-icon">
@@ -1365,7 +1546,15 @@ export default function NotesWorkspace({
                         method: "DELETE",
                         body: JSON.stringify({ revision: value.revision }),
                       });
-                      if (isCurrent) manager.open(null);
+                      if (isCurrent) {
+                        scrollCleanup.current?.();
+                        notePosition.current = { ...notePosition.current, id: "", scrollTop: 0 };
+                        clearNoteLink();
+                        persistLocation();
+                        manager.open(null);
+                        editor.current = null;
+                      }
+                      changeBranch(value.id, 0);
                       setDialog(null);
                       refresh();
                     })

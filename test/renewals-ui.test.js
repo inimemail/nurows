@@ -119,7 +119,7 @@ test('renewal navigation is before Telegram, uses isolated workspace, and mobile
   const app = fs.readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
   const css = fs.readFileSync(new URL('../src/renewals.css', import.meta.url), 'utf8');
   assert.ok(app.indexOf("{ key: 'renewals'") < app.indexOf("{ key: 'telegram'"));
-  assert.match(app, /tab === 'renewals' \? <RenewalWorkspace/);
+  assert.match(app, /tab === 'renewals' \? \(\s*<Suspense[^>]*>[\s\S]*?<RenewalWorkspace\b/);
   assert.match(css, /\.renewal-workspace \.ops-tabs \{[^}]*flex-wrap: nowrap/);
   assert.match(css, /\.renewal-dialog \.ops-editor-grid \{ grid-template-columns: minmax\(0, 1fr\)/);
   assert.match(css, /\.renewal-status \{[^}]*align-self: start/);

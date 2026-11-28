@@ -28,7 +28,15 @@ import {
   Copy,
 } from "lucide-react";
 
-const lowlight = createLowlight(common);
+const highlighter = createLowlight(common);
+const detectedLanguages = ["bash", "javascript", "json", "python", "yaml", "sql", "xml"];
+const noHighlight = { children: [] };
+const lowlight = {
+  listLanguages: highlighter.listLanguages,
+  registered: highlighter.registered,
+  highlight: (language, text) => text.length > 10000 ? noHighlight : highlighter.highlight(language, text),
+  highlightAuto: (text) => text.length > 2000 ? noHighlight : highlighter.highlightAuto(text, { subset: detectedLanguages }),
+};
 const SafeImage = Image.extend({
   addAttributes() {
     return {
@@ -110,6 +118,7 @@ export default function NoteEditor({
   const [slash, setSlash] = useState(null),
     [selection, setSelection] = useState(false),
     [, render] = useState(0);
+  const lastBody = useRef(doc.body);
   const outlineTimer = useRef(null),
     upload = useRef(null);
   const editor = useEditor({
@@ -155,14 +164,18 @@ export default function NoteEditor({
       },
     },
     onUpdate: ({ editor: e }) => {
-      callbacks.current.onChange(e.getHTML());
+      callbacks.current.onChange(() => {
+        lastBody.current = e.getHTML();
+        return lastBody.current;
+      });
       const { from, $from } = e.state.selection;
-      const text = $from.parent.textBetween(0, $from.parentOffset, " ");
-      setSlash(text === "/" ? from : null);
+      setSlash($from.parentOffset === 1 && $from.parent.textBetween(0, 1) === "/" ? from : null);
       clearTimeout(outlineTimer.current);
-      outlineTimer.current = setTimeout(() => {
-        callbacks.current.onOutline(collectNoteHeadings(e.state.doc));
-      }, 350);
+      if (callbacks.current.onOutline) {
+        outlineTimer.current = setTimeout(() => {
+          callbacks.current.onOutline?.(collectNoteHeadings(e.state.doc));
+        }, 350);
+      }
     },
     onSelectionUpdate: ({ editor: e }) => {
       setSelection(!e.state.selection.empty);
@@ -170,7 +183,6 @@ export default function NoteEditor({
     },
     onCreate: ({ editor: e }) => {
       callbacks.current.onReady(e);
-      callbacks.current.onOutline(collectNoteHeadings(e.state.doc));
     },
   });
   useEffect(() => {
@@ -181,17 +193,21 @@ export default function NoteEditor({
       !saved ||
       !editor ||
       editor.view.composing ||
-      editor.getHTML() === doc.body
+      lastBody.current === doc.body
     )
       return;
     const { from, to } = editor.state.selection;
     editor.commands.setContent(doc.body, { emitUpdate: false });
+    lastBody.current = doc.body;
     const end = editor.state.doc.content.size;
     editor.commands.setTextSelection({
       from: Math.min(from, end),
       to: Math.min(to, end),
     });
-  }, [doc.revision, saved, editor]);
+  }, [doc.body, saved, editor]);
+  useEffect(() => {
+    if (editor && onOutline) onOutline(collectNoteHeadings(editor.state.doc));
+  }, [editor, onOutline]);
   useEffect(() => () => clearTimeout(outlineTimer.current), []);
   if (!editor) return null;
   function insert(action) {

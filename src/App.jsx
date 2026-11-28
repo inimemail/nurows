@@ -6,8 +6,6 @@ import { openAuthenticatedWebSocket } from '../shared/websocket-client.js';
 import { workspaceSearchPlaceholder } from '../shared/workspace-search.js';
 import { filterPickerServers } from '../shared/server-picker-search.js';
 import { workspaceResultPreviews, mergeCommandDelta } from '../shared/command-output.js';
-import OrchestrationWorkspace from './OrchestrationWorkspace.jsx';
-import RenewalWorkspace from './RenewalWorkspace.jsx';
 import { BookOpen, CalendarClock, Webhook, ShieldCheck, Wallet, MessagesSquare } from 'lucide-react';
 import { HISTORY_LABELS } from './HistoryRecords.jsx';
 import Dialog from './Dialog.jsx';
@@ -16,6 +14,9 @@ import { copyNoteText } from './note-clipboard.js';
 import { trackMobileViewport } from './mobile-viewport.js';
 import { canAutoFocusTerminal, isTerminalSubmitKey, terminalCopyText } from './terminal-interaction.js';
 import SettingsDialog, { HistoryBrowser } from './SettingsDialog.jsx';
+import { readWorkspaceLocation, saveWorkspaceLocation } from './workspace-location.js';
+const OrchestrationWorkspace = lazy(() => import('./OrchestrationWorkspace.jsx'));
+const RenewalWorkspace = lazy(() => import('./RenewalWorkspace.jsx'));
 const NotesWorkspace = lazy(() => import('./NotesWorkspace.jsx'));
 const WebhookWorkspace = lazy(() => import('./WebhookWorkspace.jsx'));
 const AuthenticatorWorkspace = lazy(() => import('./AuthenticatorWorkspace.jsx'));
@@ -432,6 +433,7 @@ export default function App() {
   const [tab, setTab] = useState('servers');
   const notesBeforeLeave = useRef(null);
   const [search, setSearch] = useState('');
+  const navigationVersion = useRef(0);
   const [workspaceSearchScope, setWorkspaceSearchScope] = useState(null);
   const [busy, setBusy] = useState({});
   const [selectedServerId, setSelectedServerId] = useState('');
@@ -507,6 +509,7 @@ export default function App() {
   const [toasts, setToasts] = useState([]);
   const [stateLoaded, setStateLoaded] = useState(false);
   const topTabsRef = useRef(null);
+  const initialSection = useMemo(() => readWorkspaceLocation(auth.username, tab)?.section, [auth.username, tab]);
 
   useEffect(() => {
     if (window.matchMedia('(max-width: 760px)').matches) return;
@@ -1015,6 +1018,19 @@ export default function App() {
   }
 
   async function loadState() {
+    const version = navigationVersion.current;
+    const local = readWorkspaceLocation(auth.username, 'main');
+    const telegramSection = new URLSearchParams(window.location.search).get('tgSection');
+    const telegramTab = { guards: 'probes', dynamic: 'probes', probes: 'probes', targets: 'probes', policies: 'probes', incidents: 'probes', assets: 'pools', pools: 'pools', usage: 'pools', dns: 'dns', automation: 'automation', renewals: 'renewals', epay: 'epay' }[telegramSection];
+    const linkedTab = /^#note=[a-f0-9-]{36}$/.test(window.location.hash) ? 'notes' : telegramTab;
+    const localTab = TABS.some(item => item.key === local?.tab) ? local.tab : '';
+    if (linkedTab || localTab) {
+      const nextTab = linkedTab || localTab;
+      const nextSearch = !linkedTab && typeof local?.search === 'string' ? local.search : '';
+      setTab(nextTab);
+      setSearch(nextSearch);
+      if (linkedTab) saveWorkspaceLocation(auth.username, 'main', { tab: nextTab, search: nextSearch });
+    }
     try {
       const data = await api('/api/state', {
         onUnauthorized: () => setAuth((current) => ({ ...current, authenticated: false }))
@@ -1044,8 +1060,10 @@ export default function App() {
         Boolean(serverWorkspace.commandText) || Boolean(serverWorkspace.temporaryCommandText);
       if (hasServerWorkspace || !terminalSessions.length) {
         restoringWorkspaceRef.current = true;
-        setTab(serverWorkspace.tab);
-        setSearch(serverWorkspace.search);
+        if (navigationVersion.current === version && !linkedTab && !localTab) {
+          setTab(serverWorkspace.tab);
+          setSearch(serverWorkspace.search);
+        }
         setSelectedServerId(serverWorkspace.selectedServerId);
         setSelectedCommandId('');
         setSelectedProxyId(serverWorkspace.selectedProxyId);
@@ -1068,15 +1086,34 @@ export default function App() {
           restoringWorkspaceRef.current = false;
         }, 0);
       }
-      const telegramSection = new URLSearchParams(window.location.search).get('tgSection');
-      const telegramTab = { guards: 'probes', dynamic: 'probes', probes: 'probes', targets: 'probes', policies: 'probes', incidents: 'probes', assets: 'pools', pools: 'pools', usage: 'pools', dns: 'dns', automation: 'automation', renewals: 'renewals', epay: 'epay' }[telegramSection];
-      if (telegramTab) setTab(telegramTab);
-      if (/^#note=[a-f0-9-]{36}$/.test(window.location.hash)) setTab('notes');
       setStateLoaded(true);
     } catch (error) {
       setStateLoaded(true);
       toast(error.message);
     }
+  }
+
+  function changeNavigation(nextTab, nextSearch) {
+    navigationVersion.current++;
+    saveWorkspaceLocation(auth.username, 'main', { tab: nextTab, search: nextSearch });
+    setTab(nextTab);
+    setSearch(nextSearch);
+    if (nextTab !== tab) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('tgSection');
+      url.searchParams.delete('tgItem');
+      if (url.hash.startsWith('#note=')) url.hash = '';
+      if (url.href !== window.location.href) window.history.replaceState(window.history.state, '', url);
+    }
+  }
+
+  function changeOrchestrationSection(section) {
+    changeNavigation(tab, search);
+    saveWorkspaceLocation(auth.username, tab, { section });
+    const url = new URL(window.location.href);
+    url.searchParams.delete('tgSection');
+    url.searchParams.delete('tgItem');
+    if (url.href !== window.location.href) window.history.replaceState(window.history.state, '', url);
   }
 
   function toast(message) {
@@ -2454,7 +2491,7 @@ export default function App() {
           {TABS.map((item) => {
             const Icon = item.icon;
             return (
-              <button key={item.key} className={'top-tab ' + (tab === item.key ? 'active' : '')} onClick={async () => { if (tab === 'notes' && item.key !== 'notes' && notesBeforeLeave.current && !await notesBeforeLeave.current()) return; setTab(item.key); }}>
+              <button key={item.key} className={'top-tab ' + (tab === item.key ? 'active' : '')} onClick={async () => { if (tab === 'notes' && item.key !== 'notes' && notesBeforeLeave.current && !await notesBeforeLeave.current()) return; changeNavigation(item.key, search); }}>
                 <Icon />
                 <span>{item.label}</span>
               </button>
@@ -2465,7 +2502,7 @@ export default function App() {
         <div className="top-actions">
           <div className="search-shell">
             <SearchIcon />
-            <input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder={compactSearchPlaceholder} aria-label={searchPlaceholder} title={searchPlaceholder} />
+            <input type="search" value={search} onChange={(event) => changeNavigation(tab, event.target.value)} placeholder={compactSearchPlaceholder} aria-label={searchPlaceholder} title={searchPlaceholder} />
           </div>
           <button
             className="ghost theme-toggle"
@@ -2703,9 +2740,17 @@ export default function App() {
 
           <main className={'main-column ' + (workspaceFullscreenActive ? 'main-column-terminal-fullscreen' : '') + (['webhooks', 'probes', 'pools', 'dns', 'renewals', 'telegram', 'notes', 'authenticator', 'epay', 'tgHosting'].includes(tab) ? ' orchestration-main' : '')}>
           {tab === 'webhooks' ? <Suspense fallback={<div className="ops-empty">正在加载 Webhook 任务…</div>}><WebhookWorkspace api={api} toast={toast} Dialog={Dialog} cache={webhookCache} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
-          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? <OrchestrationWorkspace tab={tab} state={state} stateReady={stateLoaded} dynamicGuardCache={dynamicGuardCache} search={search} onSearchChange={setSearch} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} /> : null}
-          {tab === 'renewals' ? <RenewalWorkspace state={state} search={search} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} /> : null}
-          {tab === 'notes' ? <Suspense fallback={<div className="surface workspace-panel">正在加载笔记...</div>}><NotesWorkspace api={api} toast={toast} search={search} onSearchScopeChange={setWorkspaceSearchScope} onBeforeLeave={handler => { notesBeforeLeave.current = handler; }} /></Suspense> : null}
+          {['probes', 'pools', 'dns', 'telegram'].includes(tab) ? (
+            <Suspense fallback={<div className="ops-empty">正在加载工作区…</div>}>
+              <OrchestrationWorkspace tab={tab} state={state} stateReady={stateLoaded} dynamicGuardCache={dynamicGuardCache} search={search} onSearchChange={value => changeNavigation(tab, value)} initialSection={initialSection} onSectionChange={changeOrchestrationSection} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} onHistoryCleanup={requestHistoryCleanup} onOpenHistory={setHistoryScope} historyRevision={historyRevision} historyClearing={busy.clearHistory} />
+            </Suspense>
+          ) : null}
+          {tab === 'renewals' ? (
+            <Suspense fallback={<div className="ops-empty">正在加载续费管理…</div>}>
+              <RenewalWorkspace state={state} search={search} onSearchScopeChange={setWorkspaceSearchScope} api={api} onState={setState} toast={toast} Dialog={Dialog} />
+            </Suspense>
+          ) : null}
+          {tab === 'notes' ? <Suspense fallback={<div className="surface workspace-panel">正在加载笔记...</div>}><NotesWorkspace key={auth.username} username={auth.username} api={api} toast={toast} search={search} onSearchScopeChange={setWorkspaceSearchScope} onBeforeLeave={handler => { notesBeforeLeave.current = handler; }} /></Suspense> : null}
           {tab === 'authenticator' ? <Suspense fallback={<div className="ops-empty">正在加载验证器…</div>}><AuthenticatorWorkspace api={api} toast={toast} Dialog={Dialog} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
           {tab === 'epay' ? <Suspense fallback={<div className="ops-empty">正在加载易支付…</div>}><EpayWorkspace api={api} toast={toast} Dialog={Dialog} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
           {tab === 'tgHosting' ? <Suspense fallback={<div className="ops-empty">正在加载 TG 托管…</div>}><TgHostingWorkspace api={api} toast={toast} search={search} onSearchScopeChange={setWorkspaceSearchScope} /></Suspense> : null}
@@ -2766,7 +2811,7 @@ export default function App() {
                     }}
                     onExitFullscreen={() => setTerminalFullscreenOpen(false)}
                   />
-                ) : (
+                ) : tab === 'servers' ? (
                   <ServerOverview
                     selectedServer={selectedServer}
                     state={state}
@@ -2776,7 +2821,7 @@ export default function App() {
                     onImport={() => setImportDialog((current) => ({ ...current, open: true }))}
                     onCreateGroup={() => setGroupDialog({ open: true, value: EMPTY_GROUP })}
                   />
-                )}
+                ) : null}
               </div>
             </section>
 
@@ -4110,9 +4155,12 @@ function TerminalWorkspace({
   const terminalRef = useRef(null);
   const fitRef = useRef(null);
   const socketRef = useRef(null);
+  const socketReadyRef = useRef(false);
+  const lastResizeRef = useRef(null);
   const resizeRef = useRef(() => {});
   const canReconnectRef = useRef(false);
   const visibleRef = useRef(isVisible);
+  const suggestionFrame = useRef(null);
   const [status, setStatus] = useState('连接中...');
   const [ready, setReady] = useState(false);
   const [canReconnect, setCanReconnect] = useState(false);
@@ -4195,8 +4243,16 @@ function TerminalWorkspace({
     setCurrentInput(value);
   }
 
-  function updateSuggestionPosition(nextTerminal = terminalRef.current) {
-    const terminal = nextTerminal;
+  function updateSuggestionPosition() {
+    if (!visibleRef.current || !suggestionRef.current || suggestionFrame.current !== null) return;
+    suggestionFrame.current = requestAnimationFrame(() => {
+      suggestionFrame.current = null;
+      if (visibleRef.current && suggestionRef.current) positionSuggestion();
+    });
+  }
+
+  function positionSuggestion() {
+    const terminal = terminalRef.current;
     const shell = rootShellRef.current;
     if (!terminal || !shell || !terminal.rows) {
       return;
@@ -4247,7 +4303,7 @@ function TerminalWorkspace({
   }
 
   function executeSuggestedCommand() {
-    if (!commandSuggestion || !canWriteToSocket(socketRef.current)) {
+    if (!commandSuggestion || !socketReadyRef.current || !canWriteToSocket(socketRef.current)) {
       return;
     }
     const clearCurrentInput = '\u007f'.repeat(currentInputRef.current.length);
@@ -4411,7 +4467,7 @@ function TerminalWorkspace({
     terminalRef.current = terminal;
     fitRef.current = fitAddon;
     resizeRef.current = () => {
-      if (!fitRef.current || !terminalRef.current) {
+      if (!visibleRef.current || !fitRef.current || !terminalRef.current) {
         return;
       }
       try {
@@ -4419,32 +4475,26 @@ function TerminalWorkspace({
       } catch (_error) {
         return;
       }
-      if (socketRef.current?.readyState === WebSocket.OPEN) {
-        socketRef.current.send(JSON.stringify({
-          type: 'resize',
-          cols: terminalRef.current.cols,
-          rows: terminalRef.current.rows
-        }));
+      const socket = socketRef.current;
+      const { cols, rows } = terminalRef.current;
+      const last = lastResizeRef.current;
+      if (socketReadyRef.current && canWriteToSocket(socket) &&
+          (last?.socket !== socket || last.cols !== cols || last.rows !== rows)) {
+        socket.send(JSON.stringify({ type: 'resize', cols, rows }));
+        lastResizeRef.current = { socket, cols, rows };
       }
-      updateSuggestionPosition(terminalRef.current);
+      updateSuggestionPosition();
     };
 
     const inputDisposable = terminal.onData((data) => {
-      applyInputChunk(data);
-      if (socketRef.current?.readyState === WebSocket.OPEN) {
+      if (socketReadyRef.current && canWriteToSocket(socketRef.current)) {
         socketRef.current.send(JSON.stringify({ type: 'input', data }));
+        applyInputChunk(data);
         return;
       }
-      if (canReconnectRef.current) {
-        setCanReconnect(false);
-        setStatus('重连中...');
-        terminal.writeln('\r\n[系统] 正在重连当前会话...');
-        setConnectNonce((current) => current + 1);
-      }
+      reconnectTerminal();
     });
-    const cursorDisposable = terminal.onCursorMove(() => {
-      updateSuggestionPosition(terminal);
-    });
+    const cursorDisposable = terminal.onCursorMove(updateSuggestionPosition);
 
     const observer = new ResizeObserver(() => {
       resizeRef.current();
@@ -4455,6 +4505,8 @@ function TerminalWorkspace({
       observer.disconnect();
       inputDisposable.dispose();
       cursorDisposable.dispose();
+      if (suggestionFrame.current !== null) cancelAnimationFrame(suggestionFrame.current);
+      suggestionFrame.current = null;
       resizeRef.current = () => {};
       socketRef.current = null;
       fitRef.current = null;
@@ -4503,6 +4555,8 @@ function TerminalWorkspace({
     const controller = new AbortController();
     let socket;
 
+    socketReadyRef.current = false;
+    syncCurrentInput('');
     setReady(false);
     setCanReconnect(false);
     setStatus(connectNonce ? '重连中...' : '连接中...');
@@ -4513,6 +4567,7 @@ function TerminalWorkspace({
         return;
       }
       disconnectHandled = true;
+      socketReadyRef.current = false;
       setReady(false);
       setCanReconnect(true);
       setStatus(message);
@@ -4530,8 +4585,10 @@ function TerminalWorkspace({
       });
 
       socket.addEventListener('message', (event) => {
+        if (cleanedUp || disconnectHandled) return;
         const message = JSON.parse(event.data);
         if (message.type === 'ready') {
+          socketReadyRef.current = true;
           setStatus('已连接');
           setReady(true);
           setCanReconnect(false);
@@ -4561,14 +4618,16 @@ function TerminalWorkspace({
           handleDisconnect(message.message || '连接失败，按任意键重连');
         }
         if (message.type === 'closed') {
-          if (disconnectHandled || cleanedUp) {
+          if (mode === 'ssh') {
+            handleDisconnect('连接已关闭，按任意键重连');
             return;
           }
           disconnectHandled = true;
+          socketReadyRef.current = false;
           setReady(false);
           setCanReconnect(false);
-          setStatus(mode === 'command-job' ? '会话已结束' : '连接已关闭');
-          terminal.writeln('\r\n[系统] ' + (mode === 'command-job' ? '当前执行会话已结束。' : '连接已关闭，按任意键重连'));
+          setStatus('会话已结束');
+          terminal.writeln('\r\n[系统] 当前执行会话已结束。');
         }
       });
 
@@ -4584,13 +4643,15 @@ function TerminalWorkspace({
 
     return () => {
       cleanedUp = true;
+      socketReadyRef.current = false;
+      lastResizeRef.current = null;
       controller.abort();
       if (socketRef.current === socket) {
         socketRef.current = null;
       }
       socket?.close();
     };
-  }, [connectNonce, isLiveSession, mode, session.jobId, session.serverId, session.title]);
+  }, [connectNonce, isLiveSession, mode, session.jobId, session.serverId]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -4607,10 +4668,7 @@ function TerminalWorkspace({
     if (!commandSuggestion) {
       return;
     }
-    const timer = window.setTimeout(() => {
-      updateSuggestionPosition();
-    }, 0);
-    return () => window.clearTimeout(timer);
+    updateSuggestionPosition();
   }, [commandSuggestion, currentInput, isVisible, isFullscreen, ready]);
 
   return (
